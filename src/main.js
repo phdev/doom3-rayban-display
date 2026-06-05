@@ -75,12 +75,21 @@ refs.canvas.focus({ preventScroll: true });
 // and uncaught errors. Add ?nodiag to hide it.
 const diagEl = document.querySelector("#diag");
 const diagLines = [];
+let diagProgLine = "";
 const showDiag = !/[?&]nodiag\b/.test(location.search);
-function diag(line) {
+function renderDiag() {
   if (!diagEl || !showDiag) return;
+  diagEl.textContent = (diagProgLine ? diagLines.concat(`▸ ${diagProgLine}`) : diagLines).join("\n");
+}
+function diag(line) {
   diagLines.push(line);
   if (diagLines.length > 24) diagLines.shift();
-  diagEl.textContent = diagLines.join("\n");
+  renderDiag();
+}
+// Single in-place line for download/load progress (so it doesn't flood the log).
+function diagProgress(line) {
+  diagProgLine = line;
+  renderDiag();
 }
 diag(`ua: ${navigator.userAgent.slice(0, 80)}`);
 diag(`screen ${screen.width}x${screen.height} dpr${window.devicePixelRatio} canvas ${runtimeConfig.width}x${runtimeConfig.height} mode=${runtimeConfig.inputMode}`);
@@ -120,6 +129,7 @@ async function start() {
       config: runtimeConfig,
       onProgress: ({ percent, label }) => {
         setLoadingProgress(percent, label);
+        if (label) diagProgress(`${Math.round(percent)}% ${label}`);
       },
       onStatus: (text) => {
         refs.statusText.textContent = text;

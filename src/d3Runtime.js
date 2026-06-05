@@ -752,7 +752,12 @@ async function readBundledPk4Bytes(onStatus, log, progress) {
     progress?.(54, "Fetching PK4");
     onStatus?.("Loading compressed display PK4...");
     log?.("Fetching compressed display PK4...");
-    const compressed = await fetchBytes(BUNDLED_PK4_GZIP_URL);
+    const compressed = await fetchBytes(BUNDLED_PK4_GZIP_URL, {
+      progress,
+      progressBase: 54,
+      progressSpan: 34,
+      progressLabel: "Downloading PK4 (gz)"
+    });
     if (compressed) {
       if (isGzipPayload(compressed)) {
         progress?.(60, "Decompressing PK4");
@@ -773,7 +778,12 @@ async function readBundledPk4Bytes(onStatus, log, progress) {
   progress?.(54, "Fetching PK4");
   onStatus?.("Loading display PK4...");
   log?.("Fetching raw display PK4...");
-  const bytes = await fetchBytes(BUNDLED_PK4_URL);
+  const bytes = await fetchBytes(BUNDLED_PK4_URL, {
+    progress,
+    progressBase: 54,
+    progressSpan: 34,
+    progressLabel: "Downloading PK4"
+  });
   // On a static SPA host an absent file may come back as index.html; only
   // accept real PK4 (ZIP) or gzip payloads, otherwise report "no PK4" so the
   // engine still starts (and reports missing game data itself).
