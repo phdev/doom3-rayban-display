@@ -395,6 +395,15 @@ function buildArguments(config) {
     // low machine spec, and downsize textures for faster uploads.
     "+set", "com_machineSpec", "0",
     "+set", "r_shadows", "0",
+    // Skip ROQ cinematic decoding. The RoQ decoder calls a null function pointer
+    // in this WASM build (idCinematicLocal::ImageForTime, reached from
+    // RB_BindVariableStageImage when a surface has a video texture), which traps
+    // the whole render loop and blacks the screen the moment any cinematic
+    // surface is in view. With this set, ImageForTime returns empty early and the
+    // renderer binds a black image for those surfaces — the rest of the scene
+    // renders. (This is also why the menu's animated logo panel shows a
+    // placeholder.) See README "Limitations".
+    "+set", "r_skipROQ", "1",
     "+set", "image_downSize", "1",
     "+set", "image_downSizeLimit", "256",
     "+set", "image_downSizeBump", "1",
@@ -462,6 +471,9 @@ function buildAutoexecConfig(config) {
     "seta in_mouse \"0\"",
     "seta in_alwaysRun \"0\"",
     "seta r_gammaInShader \"0\"",
+    // Skip ROQ video decoding — the WASM RoQ decoder traps on a null function
+    // pointer and blacks the whole frame; see buildArguments() / README.
+    "seta r_skipROQ \"1\"",
     "bind \"w\" \"_forward\"",
     "bind \"s\" \"_back\"",
     "bind \"a\" \"_moveleft\"",

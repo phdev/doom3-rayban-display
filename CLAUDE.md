@@ -44,25 +44,36 @@ patches/dhewm3-meta-rayban-display.patch`.
 
 ## State (2026-06)
 
-DOOM 3 **renders in the browser.** The main menu (Mars backdrop, starfield, UI
-frame, NEW GAME / LOAD GAME / MULTIPLAYER / OPTIONS / MODS / UPDATES / CREDITS /
-EXIT) composites to `#gameCanvas` at ~50–60 fps on real owned data. Boots to the
-menu by default (`D3_AUTO_MAP = false`); `?args=%2Bmap%20game/mars_city1` loads a
-level.
+DOOM 3 **renders in the browser — menu and in-level 3D.** The main menu (Mars
+backdrop, starfield, UI frame, NEW GAME / … / EXIT) composites to `#gameCanvas`
+at ~50–60 fps, and loading a level (`?args=%2Bmap%20game/mars_city1`) renders the
+3D world (Mars-base geometry + per-pixel lighting) on real GPU hardware. Boots to
+the menu by default (`D3_AUTO_MAP = false`).
+
+Getting in-level 3D on screen took three independent fixes:
+1. **Present** — SDL3 canvas selector (see below); the engine drew to the wrong
+   canvas. Fixed the black menu.
+2. **Pak completeness** — `reduce-d3-map-pk4.py` under-included a level's deps.
+   Now: fixpoint def-graph walk; accumulate same-named decl blocks (entityDef and
+   model defs share names — overwrite dropped body meshes); seed player + default
+   weapons/PDA/flashlight; always keep `glprogs/` (ARB shaders the lit path
+   needs). Plus the engine drops a missing moveable/item/camera collision model
+   instead of aborting the map. `mars_city1` now loads with **zero fatal errors**.
+3. **ROQ cinematic crash** — the WASM RoQ decoder calls a **null function pointer**
+   in `idCinematicLocal::ImageForTime` (reached from `RB_BindVariableStageImage`
+   when a video surface is drawn), trapping the render loop → black screen. Config
+   sets **`r_skipROQ 1`** so `ImageForTime` returns empty early and the renderer
+   binds black for those surfaces. Found by relinking with `--profiling-funcs`
+   for named WASM stack traces.
 
 **Remaining:**
-- The menu's central animated logo panel shows grey banding (a render-to-texture
-  subview / cinematic; reduced-pak asset/decode detail, not a present bug).
-- **In-level load.** `?args=+map game/mars_city1` does not fully load on the
-  bundled reduced pak. The patch makes missing moveable/item/camera **collision
-  models** non-fatal (drop the entity, keep loading — `Moveable.cpp`, `Item.cpp`,
-  `SecurityCamera.cpp`), which gets past the first abort, but `mars_city1`'s
-  opening cinematic needs **character** models/anims that the reducer stripped;
-  the empty-defaulted model then trips a fatal `Joint '…' not found for
-  'head_joint'` (`Actor.cpp:676` and siblings). Getting in-level 3D on screen
-  needs a more complete pak (regenerate from owned data incl. character/cinematic
-  deps, or load fuller data via `?pk4=`) — not more engine patching. The engine
-  itself renders (menu is proof).
+- **ROQ video disabled** (`r_skipROQ 1`): the menu's animated logo panel and
+  in-game monitors show a black placeholder. Fixing the decoder's null function
+  (so videos play) is future work.
+- **Headless software-GL is too slow** for a full level's first frame (minutes);
+  use a real GPU. The `mars_city1` opening is genuinely dark — bump `r_brightness`.
+- Bundled pak must be regenerated per-map from owned data via
+  `scripts/install-demo-data.sh` (`D3_DATA_DIR=<owned base/>`).
 
 ## Key learning — the present bug (black canvas)
 

@@ -213,10 +213,19 @@ def main(argv=None):
         keep = set()
 
         # 1. Map files + always-kept declaration text.
+        # Map-independent renderer essentials the dependency walk can't reach via
+        # map tokens. glprogs/ holds the ARB vertex/fragment programs DOOM 3's
+        # lit 3D path needs (GL4ES translates them to GLSL) — without them every
+        # interaction shader compiles from empty source ("Missing main()") and the
+        # world renders black, even though the 2-D menu (which doesn't use them)
+        # is fine.
+        ALWAYS_KEEP_PREFIXES = ("glprogs/",)
         decl_text = []
         for name, (zpath, original) in entries.items():
             ext = name[name.rfind("."):] if "." in name else ""
             if name.startswith(prefix + ".") or name.startswith(prefix + "/"):
+                keep.add(name)
+            elif name.startswith(ALWAYS_KEEP_PREFIXES):
                 keep.add(name)
             elif ext in TEXT_KEEP_EXTS:
                 keep.add(name)
@@ -226,7 +235,7 @@ def main(argv=None):
         #    map references can be resolved to concrete assets (bounded to what
         #    the map and its entities actually use, not the whole game).
         materials = {}   # material name -> set(stripped image paths)
-        defs = {}        # entityDef/model name -> body text
+        defs = {}        # entityDef/model name -> concatenated body text
         for name in decl_text:
             zpath, original = entries[name]
             ext = name[name.rfind("."):] if "." in name else ""
@@ -238,26 +247,58 @@ def main(argv=None):
                     materials.setdefault(declname, set()).update(
                         strip_ext(t) for t in asset_tokens(body))
                 else:
-                    defs[declname] = body
+                    # DOOM 3 routinely gives the entityDef and its model def the
+                    # SAME name (e.g. `entityDef marscity_cinematic_sarge` and
+                    # `model marscity_cinematic_sarge`). Overwriting would shadow
+                    # one with the other — typically dropping the model def's
+                    # `mesh` (the body md5mesh carrying the joints the head
+                    # attaches to). Concatenate so the closure sees both.
+                    defs[declname] = defs.get(declname, "") + "\n" + body
 
         # 3. Seed referenced tokens from the map files, then expand one level
         #    through the entityDefs the map instantiates, and resolve material
         #    names to their images.
         used = set()
-        for name in [n for n in keep if n.startswith(prefix)]:
-            zpath, original = entries[name]
-            used |= tokens(pool.text(zpath, original))
-        # also catch material/def names referenced by bare name in the map
         seed_names = set()
         for name in [n for n in keep if n.startswith(prefix)]:
             zpath, original = entries[name]
-            for t in TOKEN_RE.findall(pool.text(zpath, original)):
+            text = pool.text(zpath, original)
+            used |= tokens(text)
+            for t in TOKEN_RE.findall(text):
                 seed_names.add(t.lower())
-        for nm in list(seed_names):
-            if nm in defs:
-                body = defs[nm]
-                used |= tokens(body)
-                seed_names |= {t.lower() for t in TOKEN_RE.findall(body)}
+        # Every single-player map spawns the player and gives it the default
+        # inventory, but none of that is referenced by a map token — so the
+        # closure below would never reach the player body model or the
+        # weapon/PDA/flashlight models, and the empty-defaulted player then
+        # fatally fails its head-joint lookup at spawn. Seed the player def (it
+        # references its def_weaponN in turn) plus the always-present items.
+        ESSENTIAL_DEFS = {
+            "player_doommarine", "player_base",
+            "weapon_fists", "weapon_pistol", "weapon_flashlight", "weapon_pda",
+        }
+        seed_names |= ESSENTIAL_DEFS
+        used |= ESSENTIAL_DEFS
+        # Transitive closure through the entityDef/model def graph: a map entity
+        # names an AI/character def, which names a model def, which lists the
+        # md5mesh + every md5anim. A single pass stops at the first hop and drops
+        # character meshes/animations (the empty-defaulted model then fatally
+        # fails a joint lookup at spawn), so walk the def graph to a fixpoint.
+        worklist = list(seed_names)
+        expanded = set()
+        while worklist:
+            nm = worklist.pop()
+            if nm in expanded:
+                continue
+            expanded.add(nm)
+            body = defs.get(nm)
+            if body is None:
+                continue
+            used |= tokens(body)
+            for t in TOKEN_RE.findall(body):
+                tl = t.lower()
+                seed_names.add(tl)
+                if tl in defs and tl not in expanded:
+                    worklist.append(tl)
 
         referenced = set(used)
         for nm in seed_names | used:

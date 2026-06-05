@@ -10,11 +10,14 @@ It is the DOOM 3 sibling of
 follows the same architecture: a Vite web app shell, an engine source patch, and
 a local packaging workflow.
 
-> **Status — DOOM 3 renders in the browser.** The engine compiles, boots, loads
-> real data, runs the render loop at ~50–60 fps, and **presents to the canvas**:
-> the DOOM 3 main menu (Mars backdrop, starfield, UI frame, and the full
-> NEW GAME / LOAD GAME / MULTIPLAYER / OPTIONS / MODS / UPDATES / CREDITS / EXIT
-> bar) draws correctly. Unlike Quake II (Qwasm2/Yamagi), dhewm3 ships no official
+> **Status — DOOM 3 renders in the browser, menu *and* in-level 3D.** The engine
+> compiles, boots, loads real data, runs the render loop at ~50–60 fps, and
+> **presents to the canvas**: the DOOM 3 main menu (Mars backdrop, starfield, UI
+> frame, and the full NEW GAME / LOAD GAME / MULTIPLAYER / OPTIONS / MODS /
+> UPDATES / CREDITS / EXIT bar) draws correctly, and loading a level
+> (`?args=+map game/mars_city1`) renders the **3D world** — Mars-base geometry,
+> per-pixel lighting, glowing light panels — on real GPU hardware. Unlike
+> Quake II (Qwasm2/Yamagi), dhewm3 ships no official
 > Emscripten target, so this repo adds one. The patch + build scripts have been
 > verified end to end against real, owned DOOM 3 data: dhewm3 builds to a ~6 MB
 > `dhewm3.wasm` with GL4ES, instantiates against a WebGL2 context on the
@@ -36,12 +39,16 @@ a local packaging workflow.
 > Every hard browser blocker is solved (anti-root check, networking, worker
 > threads, the async-sound tic, terminal/stdin input, mouse-grab pointer-lock,
 > the legacy-GL proc table, C++ exceptions, the blocking frame loop, the
-> GL4ES↔WebGL binding, **and the present/compositing path** — see
-> [the canvas-selector fix](#the-canvas-selector-fix-how-doom-3-reaches-the-screen)).
-> **Remaining item:** the menu's central animated logo panel shows a placeholder
-> (a reduced-pak cinematic/subview detail, not a present-path bug). See
-> [Limitations](#limitations). This repo does **not** include DOOM 3 game data —
-> you must own DOOM 3 and provide your own `base/*.pk4`.
+> GL4ES↔WebGL binding, **the present/compositing path**
+> ([canvas-selector fix](#the-canvas-selector-fix-how-doom-3-reaches-the-screen)),
+> graceful handling of reduced-pak gaps, and the **ROQ-cinematic null-function
+> trap** that black-screened any view containing a video surface (skipped via
+> `r_skipROQ 1`)). **Remaining items:** ROQ video textures are disabled (so the
+> menu's animated logo panel and in-game monitors show a black placeholder), and
+> the bundled reduced pak must be regenerated from your owned data to include a
+> level's full dependencies. See [Limitations](#limitations). This repo does
+> **not** include DOOM 3 game data — you must own DOOM 3 and provide your own
+> `base/*.pk4`.
 
 ## Play URL
 
@@ -261,27 +268,34 @@ and no manual `emscripten_webgl_make_context_current` are needed.
 
 ## Limitations
 
-- **Menu logo placeholder.** The main menu renders correctly, but its central
-  animated DOOM 3 logo panel shows grey banding instead of the spinning logo.
-  That panel is a render-to-texture subview / cinematic; the placeholder is a
-  reduced-pak asset/cinematic-decode detail, not a present-path bug (the rest of
-  the menu — fonts, planet, starfield, buttons — composites correctly). Loading
-  fuller owned data via `?pk4=` may fill it in. This is the main thing left to
-  polish.
-- **Reduced-pak completeness (in-level load).** The menu renders, but loading a
-  full level (e.g. `?args=+map game/mars_city1`) currently fails on the bundled
-  reduced pak. `scripts/reduce-d3-map-pk4.py` is a heuristic dependency walker
-  and strips assets the map needs — first a prop's collision model, then (deeper)
-  `mars_city1`'s opening-cinematic character models/animations. Missing **render**
-  models/materials/sounds already degrade gracefully (default box / silence), and
-  the patch now also makes a missing **moveable/item/camera collision model**
-  non-fatal (drop the entity, keep loading) instead of aborting the map. But a
-  missing **character** model defaults to empty and then a fatal joint lookup
-  (`Joint 'Shoulders' not found for 'head_joint'`) still aborts the cinematic.
-  To actually render a level you need a more complete pak — regenerate it from
-  your owned data including the map's character/cinematic dependencies, or load
-  fuller owned data via `?pk4=`. This is the main thing left to get in-level 3D
-  on screen.
+- **ROQ video textures are disabled (`r_skipROQ 1`).** DOOM 3 plays `.roq`
+  cinematics on video-screen surfaces and behind the main-menu logo. The RoQ
+  decoder in this WASM build calls a **null function pointer**
+  (`idCinematicLocal::ImageForTime`, reached from `RB_BindVariableStageImage`
+  when a cinematic surface is drawn), which traps the whole render loop — so the
+  *instant* any video surface enters the view, the screen goes black. The config
+  sets `r_skipROQ 1`, which makes the decoder return empty early; the renderer
+  then binds a black image for those surfaces and **everything else renders**.
+  Cost: the menu's animated logo panel and in-game monitors show a black
+  placeholder. Fixing the decoder itself (so videos play) is future work.
+- **Reduced-pak completeness (in-level load).** Loading a full level needs the
+  map's complete dependency set, which `scripts/reduce-d3-map-pk4.py` originally
+  under-included (it crashed `mars_city1` on missing collision models, then
+  character models/anims). The reducer now (1) walks the entityDef/model def
+  graph to a **fixpoint**, (2) **accumulates** same-named decl blocks (DOOM 3
+  names an entityDef and its model def identically, so a naïve overwrite dropped
+  body meshes), (3) seeds the **player + default weapons/PDA/flashlight** (no map
+  token references them), and (4) always keeps **`glprogs/`** (the ARB shader
+  programs the lit 3D path needs). The engine also drops a missing
+  **moveable/item/camera collision model** entity instead of aborting the map.
+  With a pak regenerated from owned data this way, `mars_city1` loads with **zero
+  fatal errors** and renders. Regenerate with `scripts/install-demo-data.sh`
+  (point `D3_DATA_DIR` at your owned `base/`).
+- **Performance / headless.** A full level is far heavier than the menu; under
+  headless *software* WebGL (swiftshader) the first frame can take minutes. On
+  real GPU hardware (Apple M1 via ANGLE/Metal, and the glasses) it renders
+  promptly. The opening of `mars_city1` is also genuinely dark — bump
+  `r_brightness` / `r_gamma` to see more.
 - **Single-threaded.** SDL thread/condvar creation fails (non-pthread build).
   Harmless for boot, but sound and any worker threads are stubbed. A fuller
   build may want `-pthread` + `-sPROXY_TO_PTHREAD` (the app already sends the
