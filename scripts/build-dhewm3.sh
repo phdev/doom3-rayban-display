@@ -77,9 +77,12 @@ emcmake cmake \
   -DHARDLINK_GAME=ON \
   -DONATIVE=OFF \
   -DD3_EMSCRIPTEN_EMBED="$EMBED_DIR" \
-  -DCMAKE_EXE_LINKER_FLAGS="-L${GL4ES_PATH}/lib -lGL" \
+  -DCMAKE_EXE_LINKER_FLAGS="-Wl,--whole-archive ${GL4ES_PATH}/lib/libGL.a -Wl,--no-whole-archive" \
   -DCMAKE_C_FLAGS="-I${GL4ES_PATH}/include -I${VENDOR_EFX}" \
   -DCMAKE_CXX_FLAGS="-I${GL4ES_PATH}/include -I${VENDOR_EFX}"
+# NOTE: GL4ES must be whole-archived: dhewm3 resolves GL at runtime via
+# gl4es_GetProcAddress, so without --whole-archive the linker dead-strips
+# GL4ES's init/proc symbols and every legacy GL call resolves to null.
 
 cmake --build "$BUILD_DIR/build" --parallel "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 

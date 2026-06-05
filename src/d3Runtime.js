@@ -10,6 +10,9 @@ const BUNDLED_PK4_PATH = "base/pak-display.pk4";
 const BUNDLED_PK4_URL = `${ENGINE_BASE}${BUNDLED_PK4_PATH}`;
 const BUNDLED_PK4_GZIP_URL = `${BUNDLED_PK4_URL}.gz`;
 const URL_PK4_PARAM = "pk4";
+// When false, boot to the DOOM 3 main menu (lighter) instead of auto-loading a
+// level. A level can still be requested via ?args=+map ...
+const D3_AUTO_MAP = false;
 const TIMEOUTS = {
   probe: 15000,
   script: 20000,
@@ -379,11 +382,28 @@ function buildArguments(config) {
     // The wearable drives the camera through _D3_AddViewAngles, so disable the
     // engine's own pointer-lock mouse path.
     "+set", "in_mouse", "0",
-    "+set", "g_showPlayerShadow", "1",
+    // CRITICAL: terminal/stdin console input blocks forever in the browser
+    // (Sys_ConsoleInput reads a tty that never delivers). Disable it.
+    "+set", "in_tty", "0",
+    "+set", "g_showPlayerShadow", "0",
     // The shell mounts PK4 + config under /base in the Emscripten FS; point the
     // engine's base path there (default would be the executable dir).
     "+set", "fs_basepath", "/",
-    "+set", "fs_savepath", "/save"
+    "+set", "fs_savepath", "/save",
+    // Performance defaults for a software/WebGL renderer on a wearable: stencil
+    // shadows are the single biggest cost in DOOM 3, so disable them, run the
+    // low machine spec, and downsize textures for faster uploads.
+    "+set", "com_machineSpec", "0",
+    "+set", "r_shadows", "0",
+    "+set", "image_downSize", "1",
+    "+set", "image_downSizeLimit", "256",
+    "+set", "image_downSizeBump", "1",
+    "+set", "image_downSizeBumpLimit", "256",
+    // Load textures synchronously: the single-threaded browser build has no
+    // background worker, and the cached path would block forever waiting on it.
+    "+set", "image_useCache", "0",
+    // Apply gamma/brightness directly rather than via the shader present pass.
+    "+set", "r_gammaInShader", "0"
   ];
 
   const queryArgs = new URLSearchParams(window.location.search).get("args");
@@ -391,7 +411,11 @@ function buildArguments(config) {
 
   args.push(...extraArgs);
 
-  if (!hasStartupCommand(extraArgs)) {
+  // Default to booting the main menu (light: menu GUIs + fonts) rather than
+  // auto-loading a level. Pass ?args=%2Bmap%20game/mars_city1 to load a map.
+  if (!hasStartupCommand(extraArgs) && !D3_AUTO_MAP) {
+    // boot to main menu
+  } else if (!hasStartupCommand(extraArgs)) {
     args.push("+map", "game/mars_city1");
   }
 

@@ -1,5 +1,5 @@
 diff --git a/neo/CMakeLists.txt b/neo/CMakeLists.txt
-index 69f1892..9a00ad0 100644
+index 69f1892..0cd891a 100644
 --- a/neo/CMakeLists.txt
 +++ b/neo/CMakeLists.txt
 @@ -194,8 +194,15 @@ if(CMAKE_MAJOR_VERSION LESS 3 OR ( CMAKE_MAJOR_VERSION EQUAL 3 AND CMAKE_MINOR_V
@@ -49,7 +49,7 @@ index 69f1892..9a00ad0 100644
  		add_compile_options(-march=native)
  	elseif(NOT APPLE AND cpu STREQUAL "x86")
  		add_compile_options(-march=pentium3)
-@@ -535,6 +549,41 @@ set(CMAKE_CXX_FLAGS_RELWITHDEBINFO ${CMAKE_C_FLAGS_RELWITHDEBINFO})
+@@ -535,6 +549,44 @@ set(CMAKE_CXX_FLAGS_RELWITHDEBINFO ${CMAKE_C_FLAGS_RELWITHDEBINFO})
  set(CMAKE_CXX_FLAGS_RELEASE "-DNDEBUG ${CMAKE_C_FLAGS_RELEASE}")
  set(CMAKE_CXX_FLAGS_MINSIZEREL "-DNDEBUG ${CMAKE_C_FLAGS_MINSIZEREL}")
  
@@ -71,6 +71,7 @@ index 69f1892..9a00ad0 100644
 +	# from GL4ES translated to WebGL2.
 +	set(d3_wasm_ldflags
 +		"-sUSE_SDL=2"
++		"-fexceptions"
 +		"-sFULL_ES2=1 -sFULL_ES3=1 -sMIN_WEBGL_VERSION=1 -sMAX_WEBGL_VERSION=2"
 +		"-sINITIAL_MEMORY=512MB -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2GB -sSTACK_SIZE=8MB"
 +		"-sEXPORTED_FUNCTIONS=${d3_wasm_exports}"
@@ -84,14 +85,16 @@ index 69f1892..9a00ad0 100644
 +	set(ldflags "${ldflags} ${d3_wasm_ldflags}")
 +
 +	# SDL2 headers come from the Emscripten port at compile time; GL headers
-+	# come from GL4ES (added via -I in the build script).
-+	add_compile_options(-sUSE_SDL=2 -fPIC)
++	# come from GL4ES (added via -I in the build script). -fexceptions makes
++	# C++ try/catch work (Emscripten disables it by default), so dhewm3's
++	# recoverable idException errors drop to the console instead of aborting.
++	add_compile_options(-sUSE_SDL=2 -fPIC -fexceptions)
 +endif()
 +
  # mingw and msvc
  if(WIN32)
  	add_definitions(-DWINVER=0x0501)
-@@ -699,6 +748,7 @@ set(src_framework
+@@ -699,6 +751,7 @@ set(src_framework
  	framework/FileSystem.cpp
  	framework/KeyInput.cpp
  	framework/UsercmdGen.cpp
@@ -99,7 +102,7 @@ index 69f1892..9a00ad0 100644
  	framework/Session_menu.cpp
  	framework/Session.cpp
  	framework/async/AsyncClient.cpp
-@@ -909,6 +959,7 @@ set(src_game
+@@ -909,6 +962,7 @@ set(src_game
  	game/AF.cpp
  	game/AFEntity.cpp
  	game/Actor.cpp
@@ -107,6 +110,33 @@ index 69f1892..9a00ad0 100644
  	game/Camera.cpp
  	game/Entity.cpp
  	game/BrittleFracture.cpp
+diff --git a/neo/framework/Common.cpp b/neo/framework/Common.cpp
+index dbf6c54..8730889 100644
+--- a/neo/framework/Common.cpp
++++ b/neo/framework/Common.cpp
+@@ -2531,7 +2531,6 @@ void idCommonLocal::Frame( void ) {
+ 			}
+ 		} else {
+ 			session->Frame();
+-
+ 			// normal, in-sequence screen update
+ 			session->UpdateScreen( false );
+ 		}
+@@ -3175,8 +3174,14 @@ void idCommonLocal::Init( int argc, char **argv ) {
+ 		Sys_Error( "Error during initialization" );
+ 	}
+ 
++#ifdef __EMSCRIPTEN__
++	// No worker threads in the single-threaded browser build; the async game /
++	// sound tic is driven from idCommonLocal::Frame() instead.
++	runAsyncThread = false;
++#else
+ 	runAsyncThread = true;
+ 	Sys_CreateThread( AsyncThread, this, asyncThread, "AsyncThread" );
++#endif
+ }
+ 
+ 
 diff --git a/neo/framework/FileSystem.cpp b/neo/framework/FileSystem.cpp
 index 7edeb4d..adae33e 100644
 --- a/neo/framework/FileSystem.cpp
@@ -804,6 +834,32 @@ index 01b05ab..c89878a 100644
  	if ( gameLocal.inCinematic && gameLocal.skipCinematic ) {
  		return;
  	}
+diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
+index 7914093..cf1cac2 100644
+--- a/neo/renderer/RenderSystem_init.cpp
++++ b/neo/renderer/RenderSystem_init.cpp
+@@ -820,10 +820,21 @@ void R_InitOpenGL( void ) {
+ 	}
+ 
+ // load qgl function pointers
++#ifdef __EMSCRIPTEN__
++// GL4ES translates DOOM 3's legacy GL to WebGL2 and legitimately omits a few
++// fixed-function entry points that don't exist in GLES/WebGL (accumulation
++// buffer, etc.) and that DOOM 3's renderer never actually calls. Warn instead
++// of aborting so a missing legacy proc doesn't kill an otherwise valid context.
++#define QGLPROC(name, rettype, args) \
++	q##name = (rettype(APIENTRYP)args)GLimp_ExtensionPointer(#name); \
++	if (!q##name) \
++		common->Printf("^3OpenGL proc unavailable via GL4ES: %s\n", #name);
++#else
+ #define QGLPROC(name, rettype, args) \
+ 	q##name = (rettype(APIENTRYP)args)GLimp_ExtensionPointer(#name); \
+ 	if (!q##name) \
+ 		common->FatalError("Unable to initialize OpenGL (%s)", #name);
++#endif
+ 
+ #include "renderer/qgl_proc.h"
+ 
 diff --git a/neo/sound/snd_local.h b/neo/sound/snd_local.h
 index 808faaa..a1f260a 100644
 --- a/neo/sound/snd_local.h
@@ -822,6 +878,96 @@ index 808faaa..a1f260a 100644
  
  // DG: make this code build with older OpenAL headers that don't know about ALC_SOFT_HRTF
  //     which provides LPALCRESETDEVICESOFT for idSoundSystemLocal::alcResetDeviceSOFT()
+diff --git a/neo/sys/events.cpp b/neo/sys/events.cpp
+index 3550256..e81e3cb 100644
+--- a/neo/sys/events.cpp
++++ b/neo/sys/events.cpp
+@@ -1804,6 +1804,14 @@ Sys_GenerateEvents
+ void Sys_GenerateEvents() {
+ 	D3P_ScopedCPUSample(Sys_GenerateEvents);
+ 
++#ifdef __EMSCRIPTEN__
++	// In the browser: no pointer to grab (the wearable bridge drives the camera
++	// via D3_AddViewAngles) and no terminal to read (Sys_ConsoleInput would
++	// block forever on stdin). Just pump SDL/browser events.
++	SDL_PumpEvents();
++	return;
++#endif
++
+ 	handleMouseGrab();
+ 
+ 	char *s = Sys_ConsoleInput();
+diff --git a/neo/sys/glimp.cpp b/neo/sys/glimp.cpp
+index 7efe196..5f5da4e 100644
+--- a/neo/sys/glimp.cpp
++++ b/neo/sys/glimp.cpp
+@@ -122,6 +122,20 @@ static SDL_Surface *window = NULL;
+ #define SDL_WINDOW_FULLSCREEN SDL_FULLSCREEN
+ #endif
+ 
++#ifdef __EMSCRIPTEN__
++// GL4ES translates DOOM 3's legacy/fixed-function GL to WebGL2. It must be
++// initialized with the underlying (browser GLES2) proc loader and a
++// framebuffer-size callback, after which gl4es_GetProcAddress returns the
++// wrapped entry points the engine looks up at runtime.
++#include "gl4esinit.h"
++static int d3_em_fb_w = 600;
++static int d3_em_fb_h = 600;
++static void APIENTRY_GL4ES D3_Emscripten_GetMainFBSize(int *width, int *height) {
++	if (width)  *width  = d3_em_fb_w;
++	if (height) *height = d3_em_fb_h;
++}
++#endif
++
+ #if SDL_VERSION_ATLEAST(3, 0, 0)
+ 
+ extern idCVar in_grabKeyboard;
+@@ -575,12 +589,32 @@ try_again:
+ 
+ 		context = SDL_GL_CreateContext(window);
+ 
++#ifdef __EMSCRIPTEN__
++		// Bring up GL4ES against the just-created WebGL2 context so the engine's
++		// runtime GL lookups (glBegin, glColor*, ...) resolve to GL4ES rather
++		// than the browser's bare GLES2 (where they are all null).
++		d3_em_fb_w = parms.width;
++		d3_em_fb_h = parms.height;
++		set_getprocaddress( (void *(APIENTRY_GL4ES *)(const char *))SDL_GL_GetProcAddress );
++		set_getmainfbsize( D3_Emscripten_GetMainFBSize );
++		initialize_gl4es();
++#endif
++
+ 		GLimp_SetSwapInterval( r_swapInterval.GetInteger() );
+ 		r_swapInterval.ClearModified();
+ 
+ 		// for HighDPI, window size and drawable size can differ
+ 		GLimp_UpdateWindowSize();
+ 
++#ifdef __EMSCRIPTEN__
++		// Emscripten's SDL reports a 0x0 window; pin the dimensions to the
++		// canvas size we requested so the renderer viewport isn't degenerate.
++		glConfig.vidWidth = parms.width;
++		glConfig.vidHeight = parms.height;
++		glConfig.winWidth = parms.width;
++		glConfig.winHeight = parms.height;
++#endif
++
+ 		SetSDLIcon(); // for SDL2  this must be done after creating the window
+ 
+ 		// TODO: also check for fullscreen-desktop?
+@@ -1242,7 +1276,12 @@ GLimp_ExtensionPointer
+ GLExtension_t GLimp_ExtensionPointer(const char *name) {
+ 	assert(SDL_WasInit(SDL_INIT_VIDEO));
+ 
++#ifdef __EMSCRIPTEN__
++	// Resolve through GL4ES so legacy/fixed-function entry points exist.
++	return (GLExtension_t)gl4es_GetProcAddress(name);
++#else
+ 	return (GLExtension_t)SDL_GL_GetProcAddress(name);
++#endif
+ }
+ 
+ void GLimp_GrabInput(int flags) {
 diff --git a/neo/sys/linux/main.cpp b/neo/sys/linux/main.cpp
 index 3468d39..2cefde6 100644
 --- a/neo/sys/linux/main.cpp

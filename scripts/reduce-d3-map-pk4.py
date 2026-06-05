@@ -52,27 +52,97 @@ def strip_ext(path):
     return path
 
 
-def load_archive(path):
-    if not zipfile.is_zipfile(path):
-        raise SystemExit(f"error: not a valid PK4 (ZIP): {path}")
+def resolve_inputs(input_arg):
+    """Accept a single PK4, or a directory of PK4s (DOOM 3 ships pak000..pak008
+    plus game00..game03). Returns a sorted list of PK4 paths in load order."""
+    p = Path(input_arg)
+    if p.is_dir():
+        paths = sorted(q for q in p.glob("*.pk4") if q.is_file())
+        if not paths:
+            raise SystemExit(f"error: no *.pk4 in {p}")
+        return paths
+    if not p.is_file():
+        raise SystemExit(f"error: input not found: {p}")
+    return [p]
+
+
+def load_archives(paths):
+    """Build {normalized_name: (zip_path, original_name)} across all paks, with
+    later paks overriding earlier ones (id Tech 4 load order)."""
     entries = {}
-    with zipfile.ZipFile(path) as archive:
-        for info in archive.infolist():
-            if info.is_dir():
-                continue
-            entries[norm(info.filename)] = info.filename
+    for path in paths:
+        if not zipfile.is_zipfile(path):
+            raise SystemExit(f"error: not a valid PK4 (ZIP): {path}")
+        with zipfile.ZipFile(path) as archive:
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                entries[norm(info.filename)] = (path, info.filename)
     return entries
 
 
-def read_text(archive, original):
-    try:
-        return archive.read(original).decode("latin-1", "ignore")
-    except KeyError:
-        return ""
+class ArchivePool:
+    """Lazily-opened, cached ZipFile handles keyed by path."""
+    def __init__(self):
+        self._open = {}
+
+    def read(self, path, original):
+        zf = self._open.get(path)
+        if zf is None:
+            zf = self._open[path] = zipfile.ZipFile(path)
+        return zf.read(original)
+
+    def text(self, path, original):
+        try:
+            return self.read(path, original).decode("latin-1", "ignore")
+        except KeyError:
+            return ""
+
+    def close(self):
+        for zf in self._open.values():
+            zf.close()
 
 
 def tokens(text):
     return {t.lower() for t in TOKEN_RE.findall(text) if "/" in t or "." in t}
+
+
+ASSET_PREFIXES = ("textures/", "models/", "guis/", "env/", "fx/", "lights/",
+                  "sound/", "video/", "dds/", "generated/")
+
+
+def iter_decl_blocks(text):
+    """Yield (last_header_token, body) for each top-level `header { body }` block.
+    Works for materials (`name { }`) and defs (`entityDef name { }`) — the decl
+    key is the last whitespace token before the opening brace."""
+    depth = 0
+    i = 0
+    n = len(text)
+    header_start = 0
+    body_start = 0
+    name = None
+    while i < n:
+        c = text[i]
+        if c == "{":
+            if depth == 0:
+                header = text[header_start:i].split("//")[-1] if False else text[header_start:i]
+                toks = header.split()
+                name = toks[-1].lower() if toks else None
+                body_start = i + 1
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                if name:
+                    yield name, text[body_start:i]
+                header_start = i + 1
+                name = None
+        i += 1
+
+
+def asset_tokens(text):
+    return {t.lower() for t in TOKEN_RE.findall(text)
+            if t.lower().startswith(ASSET_PREFIXES)}
 
 
 def map_prefix(map_name):
@@ -116,21 +186,21 @@ def downsample_wav(data, rate, width):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Reduce a DOOM 3 PK4 to one map")
-    parser.add_argument("--input", required=True, help="input PK4 (owned data)")
+    parser = argparse.ArgumentParser(description="Reduce DOOM 3 PK4(s) to one map")
+    parser.add_argument("--input", required=True,
+                        help="input PK4 file, or a base/ directory of *.pk4")
     parser.add_argument("--output", required=True, help="output reduced PK4")
     parser.add_argument("--map", default="game/mars_city1", help="map to keep")
     parser.add_argument("--keep-list", help="JSON file with extra keep globs")
+    parser.add_argument("--no-audio", action="store_true",
+                        help="drop all sound/* assets (smallest output; sound is off in the wearable build)")
     parser.add_argument("--audio-rate", type=int, default=0, help="downsample WAV to this rate (0=skip)")
     parser.add_argument("--audio-width", type=int, default=1, help="WAV sample width in bytes")
     args = parser.parse_args(argv)
 
-    input_path = Path(args.input)
+    input_paths = resolve_inputs(args.input)
     output_path = Path(args.output)
-    if not input_path.is_file():
-        raise SystemExit(f"error: input not found: {input_path}")
-
-    entries = load_archive(input_path)
+    entries = load_archives(input_paths)
     prefix = map_prefix(args.map)
 
     extra_globs = []
@@ -138,12 +208,13 @@ def main(argv=None):
         cfg = json.loads(Path(args.keep_list).read_text())
         extra_globs = cfg.get("keep", [])
 
-    with zipfile.ZipFile(input_path) as archive:
+    pool = ArchivePool()
+    try:
         keep = set()
 
         # 1. Map files + always-kept declaration text.
         decl_text = []
-        for name, original in entries.items():
+        for name, (zpath, original) in entries.items():
             ext = name[name.rfind("."):] if "." in name else ""
             if name.startswith(prefix + ".") or name.startswith(prefix + "/"):
                 keep.add(name)
@@ -151,25 +222,80 @@ def main(argv=None):
                 keep.add(name)
                 decl_text.append(name)
 
-        # 2. Collect every asset-looking token referenced by the map + decls.
-        referenced = set()
-        scan_sources = [n for n in keep if n.startswith(prefix)] + decl_text
-        for name in scan_sources:
-            referenced |= tokens(read_text(archive, entries[name]))
+        # 2. Index material -> images and entityDef -> body across all decls, so
+        #    map references can be resolved to concrete assets (bounded to what
+        #    the map and its entities actually use, not the whole game).
+        materials = {}   # material name -> set(stripped image paths)
+        defs = {}        # entityDef/model name -> body text
+        for name in decl_text:
+            zpath, original = entries[name]
+            ext = name[name.rfind("."):] if "." in name else ""
+            if ext not in (".mtr", ".def"):
+                continue
+            text = pool.text(zpath, original)
+            for declname, body in iter_decl_blocks(text):
+                if ext == ".mtr":
+                    materials.setdefault(declname, set()).update(
+                        strip_ext(t) for t in asset_tokens(body))
+                else:
+                    defs[declname] = body
+
+        # 3. Seed referenced tokens from the map files, then expand one level
+        #    through the entityDefs the map instantiates, and resolve material
+        #    names to their images.
+        used = set()
+        for name in [n for n in keep if n.startswith(prefix)]:
+            zpath, original = entries[name]
+            used |= tokens(pool.text(zpath, original))
+        # also catch material/def names referenced by bare name in the map
+        seed_names = set()
+        for name in [n for n in keep if n.startswith(prefix)]:
+            zpath, original = entries[name]
+            for t in TOKEN_RE.findall(pool.text(zpath, original)):
+                seed_names.add(t.lower())
+        for nm in list(seed_names):
+            if nm in defs:
+                body = defs[nm]
+                used |= tokens(body)
+                seed_names |= {t.lower() for t in TOKEN_RE.findall(body)}
+
+        referenced = set(used)
+        for nm in seed_names | used:
+            if nm in materials:
+                referenced |= materials[nm]
 
         ref_stripped = {strip_ext(t) for t in referenced}
 
-        # 3. Keep binary assets that are referenced (by full path or basename
-        #    without extension), plus extra user globs.
-        for name, original in entries.items():
+        # 4. Keep binary assets referenced (by path or basename without ext),
+        #    plus extra user globs. md5mesh skins are resolved one more level.
+        for name, (zpath, original) in entries.items():
             if name in keep:
                 continue
             ext = name[name.rfind("."):] if "." in name else ""
+            if args.no_audio and ext in SOUND_EXTS:
+                continue
             if ext in IMAGE_EXTS or ext in MODEL_EXTS or ext in SOUND_EXTS:
                 if name in referenced or strip_ext(name) in ref_stripped:
                     keep.add(name)
                     continue
             if any(fnmatch.fnmatch(name, norm(g)) for g in extra_globs):
+                if args.no_audio and ext in SOUND_EXTS:
+                    continue
+                keep.add(name)
+
+        # 5. Resolve materials referenced inside kept md5mesh models.
+        extra_imgs = set()
+        for name in [n for n in keep if n.endswith(".md5mesh")]:
+            zpath, original = entries[name]
+            for t in TOKEN_RE.findall(pool.text(zpath, original)):
+                if t.lower() in materials:
+                    extra_imgs |= materials[t.lower()]
+        extra_stripped = {strip_ext(t) for t in extra_imgs}
+        for name, (zpath, original) in entries.items():
+            if name in keep:
+                continue
+            ext = name[name.rfind("."):] if "." in name else ""
+            if ext in IMAGE_EXTS and strip_ext(name) in extra_stripped:
                 keep.add(name)
 
         # 4. Write the reduced archive (downsampling audio on the way out).
@@ -177,16 +303,19 @@ def main(argv=None):
         kept_bytes = 0
         with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as out:
             for name in sorted(keep):
-                data = archive.read(entries[name])
+                zpath, original = entries[name]
+                data = pool.read(zpath, original)
                 if args.audio_rate and name.endswith(".wav"):
                     data = downsample_wav(data, args.audio_rate, args.audio_width)
                 out.writestr(name, data)
                 kept_bytes += len(data)
+    finally:
+        pool.close()
 
-    original_size = input_path.stat().st_size
+    original_size = sum(p.stat().st_size for p in input_paths)
     reduced_size = output_path.stat().st_size
     print(
-        f"Reduced {input_path.name}: {len(entries)} files ({original_size/1e6:.1f} MB) "
+        f"Reduced {len(input_paths)} PK4(s): {len(entries)} files ({original_size/1e6:.1f} MB) "
         f"-> {len(keep)} files ({reduced_size/1e6:.1f} MB) for map {args.map}",
         file=sys.stderr,
     )

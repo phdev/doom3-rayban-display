@@ -10,26 +10,33 @@ It is the DOOM 3 sibling of
 follows the same architecture: a Vite web app shell, an engine source patch, and
 a local packaging workflow.
 
-> **Status — engine compiles, links, and boots in the browser.** Unlike Quake II
-> (Qwasm2/Yamagi), dhewm3 ships no official Emscripten target, so this repo adds
-> one. The patch + build scripts here have been verified end to end: dhewm3
-> builds to a ~4 MB `dhewm3.wasm` with GL4ES, instantiates in-browser against a
-> WebGL2 context, and runs DOOM 3's own engine init (SDL video, memory,
-> networking, **File System**) up to the point where it needs game data:
+> **Status — engine compiles, boots, loads real data, and runs the render loop
+> at ~50–60 fps in the browser.** Unlike Quake II (Qwasm2/Yamagi), dhewm3 ships
+> no official Emscripten target, so this repo adds one. The patch + build scripts
+> have been verified end to end against real, owned DOOM 3 data: dhewm3 builds to
+> a ~6 MB `dhewm3.wasm` with GL4ES, instantiates against a WebGL2 context, mounts
+> a user PK4, and runs the **complete engine bring-up and main loop**:
 >
 > ```
 > dhewm3 1.5.5 emscripten-x86 ... using SDL v2.32.10
-> SDL video driver: emscripten
-> 2048 MB System Memory
-> ----- Initializing File System -----
-> shutting down: Couldn't load default.cfg
+> Loaded pk4 /base/pak-display.pk4 with checksum 0x...  (4021 files)
+> ----- Initializing Decls -----      5206 strings read from strings/english.lang
+> LIBGL: Initialising gl4es ... Using GLES 2.0 backend
+> OpenGL renderer: GL4ES using WebKit WebGL    (600x600)
+> ARB2 renderer: Available.
+> ----- Initializing Game -----  Compiled 'script/doom_main.script'
+> ----- Initializing Session -----
+> ... main loop running at ~50–60 fps (frame 4013 @ 68s) ...
 > ```
 >
-> `default.cfg` lives inside the retail `pak000.pk4`, so that line is the
-> "bring your own data" boundary. This repo does **not** include DOOM 3 game
-> data — you must own DOOM 3 and provide your own `base/*.pk4`. Getting from this
-> boot point to rendered gameplay still needs (a) your data and (b) further
-> runtime iteration; see [Limitations](#limitations).
+> Every hard browser blocker is solved (anti-root check, networking, worker
+> threads, the async-sound tic, terminal/stdin input, mouse-grab pointer-lock,
+> the legacy-GL proc table, C++ exceptions, the blocking frame loop, and the
+> GL4ES↔WebGL binding). **Current gap:** rendered frames are not yet reaching
+> the canvas — the screen is black while the loop runs at full speed, which
+> points to the GL4ES default-framebuffer / present path (and/or reduced-pak
+> asset completeness). See [Limitations](#limitations). This repo does **not**
+> include DOOM 3 game data — you must own DOOM 3 and provide your own `base/*.pk4`.
 
 ## Play URL
 
@@ -179,37 +186,55 @@ deploys to GitHub Pages.
 
 dhewm3 has no Emscripten target, so the patch adds one. Beyond the wearable
 bridge, it makes these engine changes (all guarded by `#ifdef __EMSCRIPTEN__`)
-that were needed to get DOOM 3 booting in a browser:
+that were needed to get DOOM 3 running in a browser:
 
-- **Build system** (`CMakeLists.txt`): skip `-march`, use Emscripten's built-in
-  SDL2 + OpenAL ports instead of `find_package`, link GL4ES for WebGL, and emit
-  `dhewm3.{js,wasm,data}` with the `D3_*` exports (monolithic `HARDLINK_GAME`).
+- **Build system** (`CMakeLists.txt`): skip `-march`; use Emscripten's built-in
+  SDL2 + OpenAL ports instead of `find_package`; emit `dhewm3.{js,wasm,data}`
+  with the `D3_*` exports (monolithic `HARDLINK_GAME`); enable `-fexceptions` so
+  dhewm3's recoverable `idException` errors drop to the console instead of
+  hard-aborting (Emscripten disables C++ exceptions by default).
+- **GL4ES binding** (`sys/glimp.cpp`): initialize GL4ES against the SDL/WebGL2
+  context (`set_getprocaddress` / `set_getmainfbsize` / `initialize_gl4es`) and
+  resolve all runtime GL lookups through `gl4es_GetProcAddress` — otherwise the
+  engine gets the browser's bare GLES2 pointers and every fixed-function entry
+  point (`glBegin`, `glColor*`, …) is null. Also pin the canvas size, since
+  Emscripten's SDL reports a 0×0 window. GL4ES must be **whole-archived** at link
+  (see `scripts/build-dhewm3.sh`).
+- **GL proc table** (`renderer/RenderSystem_init.cpp`): warn instead of aborting
+  on the legacy GL entry points GL4ES legitimately omits (accumulation buffer).
 - **Sound** (`snd_local.h`): pull in vendored OpenAL-Soft EFX headers, since
   Emscripten's OpenAL port ships only a stub `alext.h` (see `vendor/openal-efx`).
-- **Startup** (`sys/linux/main.cpp`): skip the anti-root check (the browser
-  sandbox reports uid 0), and **convert the blocking `while(1)` frame loop to
+- **Startup / main loop** (`sys/linux/main.cpp`): skip the anti-root check
+  (sandbox uid 0) and **convert the blocking `while(1)` frame loop to
   `emscripten_set_main_loop`** so frames yield to the browser.
-- **Networking** (`posix_net.cpp`): skip interface enumeration (`getifaddrs` is
-  unsupported in the sandbox; networking is unused for single-player).
-- **Filesystem** (`FileSystem.cpp`): skip the background-download worker thread
-  (no pthreads in the single-threaded build).
+- **Input** (`sys/events.cpp`): skip `handleMouseGrab` (pointer-lock) and
+  `Sys_ConsoleInput` (stdin) in `Sys_GenerateEvents` — both **deadlock** in the
+  browser; the wearable bridge drives the camera instead.
+- **Networking** (`posix_net.cpp`): skip `getifaddrs` interface enumeration.
+- **Threads** (`FileSystem.cpp`, `Common.cpp`): skip the background-download and
+  async worker threads (no pthreads); the async sound tic is simply not run.
 
 ## Limitations
 
-- **Verified up to filesystem init, not yet rendered gameplay.** The engine
-  boots and stops at "Couldn't load default.cfg" without game data. Driving it
-  past that needs your owned `pak000.pk4` (or a reduced `pak-display.pk4`), and
-  then likely further iteration on the items below.
-- **Single-threaded.** SDL thread/condvar creation fails under the current
-  (non-pthread) build — harmless during boot, but the async sound path and any
-  worker threads are stubbed. A full build may want `-pthread` +
-  `-sPROXY_TO_PTHREAD` (the app already sends the COOP/COEP headers that
-  SharedArrayBuffer needs).
-- **Renderer validation pending.** A WebGL2 context is created and GL4ES is
-  linked, but DOOM 3's renderer (per-pixel lighting, stencil shadows) has not
-  yet been exercised end to end in WebGL — and it is heavy for a wearable
-  WebView. Expect to disable shadows / bump effects and downsize images for an
-  acceptable frame rate.
+- **Runs the render loop, but the canvas is still black.** With your data
+  mounted, the engine loads the pak, brings up GL4ES, initializes the renderer
+  and game, and spins the main loop at ~50–60 fps — but rendered frames are not
+  reaching the WebGL canvas yet. Nothing draws (not even 2-D menu text), which
+  points at the GL4ES default-framebuffer / present path rather than missing
+  content. This is the main thing left to debug.
+- **Reduced-pak completeness.** `scripts/reduce-d3-map-pk4.py` is a heuristic
+  dependency walker; it can miss entity-referenced models (e.g. a `mars_city1`
+  moveable), which `-fexceptions` now turns into a recoverable drop instead of a
+  crash. A more complete pak, or loading the full owned data via `?pk4=`, avoids
+  this.
+- **Single-threaded.** SDL thread/condvar creation fails (non-pthread build).
+  Harmless for boot, but sound and any worker threads are stubbed. A fuller
+  build may want `-pthread` + `-sPROXY_TO_PTHREAD` (the app already sends the
+  COOP/COEP headers SharedArrayBuffer needs).
+- **Performance.** DOOM 3's renderer (per-pixel lighting, stencil shadows) is
+  heavy; the app defaults to `r_shadows 0`, low machine spec, and downsized
+  textures. Headless software WebGL hits ~50 fps at 600×600; real GPU hardware
+  (and the glasses) should do better.
 - **Game data is proprietary.** Nothing here downloads DOOM 3 data; you must own
   it and reduce it locally. If you bump `DHEWM3_COMMIT`, regenerate the patch.
 
