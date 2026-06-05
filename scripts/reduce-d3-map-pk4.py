@@ -185,6 +185,52 @@ def downsample_wav(data, rate, width):
     return result if len(result) < len(data) else data
 
 
+_IMG_RESIZE_EXTS = {".tga", ".jpg", ".jpeg", ".png", ".bmp"}
+
+
+def downsize_image(data, name, max_dim):
+    """Downscale an image so its longest side is <= max_dim, re-encoding in the
+    same format. DOOM 3 textures are mostly power-of-two, so scaling by an
+    integer factor keeps them power-of-two. .dds (compressed) and .pcx are left
+    alone. Returns the original bytes on any failure or if already small."""
+    ext = name[name.rfind("."):].lower() if "." in name else ""
+    if ext not in _IMG_RESIZE_EXTS:
+        return data
+    try:
+        from PIL import Image
+    except ImportError:
+        return data
+    try:
+        im = Image.open(io.BytesIO(data))
+        im.load()
+    except Exception:
+        return data
+    w, h = im.size
+    if max(w, h) <= max_dim:
+        return data
+    scale = max_dim / float(max(w, h))
+    new = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
+    try:
+        im = im.resize(new, Image.LANCZOS)
+        out = io.BytesIO()
+        if ext in (".jpg", ".jpeg"):
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            im.save(out, format="JPEG", quality=85)
+        elif ext == ".tga":
+            # DOOM 3's TGA loader wants bottom-left origin; PIL defaults to
+            # top-left and sets the descriptor bit, but be explicit/uncompressed.
+            im.save(out, format="TGA", compression=None)
+        elif ext == ".png":
+            im.save(out, format="PNG", optimize=True)
+        else:
+            im.save(out, format="BMP")
+        result = out.getvalue()
+        return result if len(result) < len(data) else data
+    except Exception:
+        return data
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Reduce DOOM 3 PK4(s) to one map")
     parser.add_argument("--input", required=True,
@@ -196,6 +242,11 @@ def main(argv=None):
                         help="drop all sound/* assets (smallest output; sound is off in the wearable build)")
     parser.add_argument("--audio-rate", type=int, default=0, help="downsample WAV to this rate (0=skip)")
     parser.add_argument("--audio-width", type=int, default=1, help="WAV sample width in bytes")
+    parser.add_argument("--max-texture", type=int, default=0,
+                        help="downsize TGA/JPG/PNG images so the longest side is at most this "
+                             "many pixels (power-of-two recommended, e.g. 256; 0=keep full size). "
+                             "Shrinks the pak, its in-memory copy, and decode memory for low-end "
+                             "targets like a phone or the wearable display.")
     args = parser.parse_args(argv)
 
     input_paths = resolve_inputs(args.input)
@@ -356,6 +407,8 @@ def main(argv=None):
                 data = pool.read(zpath, original)
                 if args.audio_rate and name.endswith(".wav"):
                     data = downsample_wav(data, args.audio_rate, args.audio_width)
+                elif args.max_texture:
+                    data = downsize_image(data, name, args.max_texture)
                 out.writestr(name, data)
                 kept_bytes += len(data)
     finally:
