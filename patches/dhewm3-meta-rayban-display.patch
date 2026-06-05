@@ -1,8 +1,8 @@
 diff --git a/neo/CMakeLists.txt b/neo/CMakeLists.txt
-index 69f1892..0cd891a 100644
+index 69f1892..8ea002e 100644
 --- a/neo/CMakeLists.txt
 +++ b/neo/CMakeLists.txt
-@@ -194,8 +194,15 @@ if(CMAKE_MAJOR_VERSION LESS 3 OR ( CMAKE_MAJOR_VERSION EQUAL 3 AND CMAKE_MINOR_V
+@@ -194,29 +194,46 @@ if(CMAKE_MAJOR_VERSION LESS 3 OR ( CMAKE_MAJOR_VERSION EQUAL 3 AND CMAKE_MINOR_V
  endif()
  
  # libs
@@ -20,7 +20,29 @@ index 69f1892..0cd891a 100644
  
  if (SDL3)
  	if(SDL2)
-@@ -214,9 +221,14 @@ elseif (SDL2)
+ 		message(WARNING "You enabled both SDL2 and SDL3. Only one can be used at a time, disabling SDL2")
+ 		set(SDL2 OFF CACHE BOOL "Use SDL2 (make sure SDL3 is disabled!)" FORCE)
+ 	endif()
+-	# 1. Look for a SDL3 package,
+-	# 2. look for the SDL3-shared component, and
+-	# 3. fail if the shared component cannot be found.
+-	find_package(SDL3 REQUIRED CONFIG REQUIRED COMPONENTS SDL3-shared)
+-	# TODO: include dirs?
+-	set(SDLx_LIBRARY SDL3::SDL3)
++	if(EMSCRIPTEN)
++		# Emscripten's built-in SDL3 port (enabled via -sUSE_SDL=3 in flags).
++		set(SDLx_LIBRARY "")
++	else()
++		# 1. Look for a SDL3 package,
++		# 2. look for the SDL3-shared component, and
++		# 3. fail if the shared component cannot be found.
++		find_package(SDL3 REQUIRED CONFIG REQUIRED COMPONENTS SDL3-shared)
++		# TODO: include dirs?
++		set(SDLx_LIBRARY SDL3::SDL3)
++	endif()
+ 	add_definitions(-DD3_SDL3=1)
+ elseif (SDL2)
+ 	# skip SDL2main
  	if(APPLE OR WIN32)
  		set(SDL2_BUILDING_LIBRARY TRUE)
  	endif()
@@ -28,7 +50,7 @@ index 69f1892..0cd891a 100644
 -	include_directories(${SDL2_INCLUDE_DIR})
 -	set(SDLx_LIBRARY ${SDL2_LIBRARY})
 +	if(EMSCRIPTEN)
-+		# Emscripten's built-in SDL2 port (enabled via -sUSE_SDL=2 in flags).
++		# Emscripten's built-in SDL2 port (enabled via -sUSE_SDL=3 in flags).
 +		set(SDLx_LIBRARY "")
 +	else()
 +		find_package(SDL2 REQUIRED)
@@ -38,7 +60,7 @@ index 69f1892..0cd891a 100644
  else()
  	# skip SDLmain
  	if(APPLE OR WIN32)
-@@ -360,7 +372,9 @@ if(D3_COMPILER_IS_GCC_OR_CLANG)
+@@ -360,7 +377,9 @@ if(D3_COMPILER_IS_GCC_OR_CLANG)
  	add_compile_options(-pipe)
  	add_compile_options(-Wall)
  
@@ -49,7 +71,7 @@ index 69f1892..0cd891a 100644
  		add_compile_options(-march=native)
  	elseif(NOT APPLE AND cpu STREQUAL "x86")
  		add_compile_options(-march=pentium3)
-@@ -535,6 +549,44 @@ set(CMAKE_CXX_FLAGS_RELWITHDEBINFO ${CMAKE_C_FLAGS_RELWITHDEBINFO})
+@@ -535,6 +554,47 @@ set(CMAKE_CXX_FLAGS_RELWITHDEBINFO ${CMAKE_C_FLAGS_RELWITHDEBINFO})
  set(CMAKE_CXX_FLAGS_RELEASE "-DNDEBUG ${CMAKE_C_FLAGS_RELEASE}")
  set(CMAKE_CXX_FLAGS_MINSIZEREL "-DNDEBUG ${CMAKE_C_FLAGS_MINSIZEREL}")
  
@@ -70,9 +92,12 @@ index 69f1892..0cd891a 100644
 +	# MAIN_MODULE is required. SDL2 comes from Emscripten's built-in port, GL
 +	# from GL4ES translated to WebGL2.
 +	set(d3_wasm_ldflags
-+		"-sUSE_SDL=2"
++		"-sUSE_SDL=3"
 +		"-fexceptions"
 +		"-sFULL_ES2=1 -sFULL_ES3=1 -sMIN_WEBGL_VERSION=1 -sMAX_WEBGL_VERSION=2"
++		# SDL3 creates the WebGL context directly on the "#gameCanvas" element
++		# (selected via SDL_HINT_EMSCRIPTEN_CANVAS_SELECTOR in GLimp_Init) and
++		# presents it with SDL_GL_SwapWindow, matching the proven Qwasm2 GL4ES path.
 +		"-sINITIAL_MEMORY=512MB -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2GB -sSTACK_SIZE=8MB"
 +		"-sEXPORTED_FUNCTIONS=${d3_wasm_exports}"
 +		"-sEXPORTED_RUNTIME_METHODS=[\"ccall\",\"cwrap\",\"FS\",\"callMain\"]"
@@ -88,13 +113,13 @@ index 69f1892..0cd891a 100644
 +	# come from GL4ES (added via -I in the build script). -fexceptions makes
 +	# C++ try/catch work (Emscripten disables it by default), so dhewm3's
 +	# recoverable idException errors drop to the console instead of aborting.
-+	add_compile_options(-sUSE_SDL=2 -fPIC -fexceptions)
++	add_compile_options(-sUSE_SDL=3 -fPIC -fexceptions)
 +endif()
 +
  # mingw and msvc
  if(WIN32)
  	add_definitions(-DWINVER=0x0501)
-@@ -699,6 +751,7 @@ set(src_framework
+@@ -699,6 +759,7 @@ set(src_framework
  	framework/FileSystem.cpp
  	framework/KeyInput.cpp
  	framework/UsercmdGen.cpp
@@ -102,7 +127,7 @@ index 69f1892..0cd891a 100644
  	framework/Session_menu.cpp
  	framework/Session.cpp
  	framework/async/AsyncClient.cpp
-@@ -909,6 +962,7 @@ set(src_game
+@@ -909,6 +970,7 @@ set(src_game
  	game/AF.cpp
  	game/AFEntity.cpp
  	game/Actor.cpp
@@ -110,6 +135,15 @@ index 69f1892..0cd891a 100644
  	game/Camera.cpp
  	game/Entity.cpp
  	game/BrittleFracture.cpp
+@@ -1280,7 +1342,7 @@ include_directories(${CMAKE_BINARY_DIR})
+ include_directories(${CMAKE_SOURCE_DIR})
+ 
+ add_library(idlib STATIC ${src_idlib})
+-if(SDL3)
++if(SDL3 AND NOT EMSCRIPTEN)
+ 	target_link_libraries(idlib SDL3::Headers) # so it can use SDL_Endian.h
+ endif()
+ if (AROS)
 diff --git a/neo/framework/Common.cpp b/neo/framework/Common.cpp
 index dbf6c54..8730889 100644
 --- a/neo/framework/Common.cpp
@@ -898,10 +932,10 @@ index 3550256..e81e3cb 100644
  
  	char *s = Sys_ConsoleInput();
 diff --git a/neo/sys/glimp.cpp b/neo/sys/glimp.cpp
-index 7efe196..5f5da4e 100644
+index 7efe196..21c2cb7 100644
 --- a/neo/sys/glimp.cpp
 +++ b/neo/sys/glimp.cpp
-@@ -122,6 +122,20 @@ static SDL_Surface *window = NULL;
+@@ -122,6 +122,22 @@ static SDL_Surface *window = NULL;
  #define SDL_WINDOW_FULLSCREEN SDL_FULLSCREEN
  #endif
  
@@ -911,6 +945,8 @@ index 7efe196..5f5da4e 100644
 +// framebuffer-size callback, after which gl4es_GetProcAddress returns the
 +// wrapped entry points the engine looks up at runtime.
 +#include "gl4esinit.h"
++#include <emscripten/html5.h>
++#include <emscripten/html5_webgl.h>
 +static int d3_em_fb_w = 600;
 +static int d3_em_fb_h = 600;
 +static void APIENTRY_GL4ES D3_Emscripten_GetMainFBSize(int *width, int *height) {
@@ -922,16 +958,78 @@ index 7efe196..5f5da4e 100644
  #if SDL_VERSION_ATLEAST(3, 0, 0)
  
  extern idCVar in_grabKeyboard;
-@@ -575,12 +589,32 @@ try_again:
+@@ -184,6 +200,20 @@ bool GLimp_Init(glimpParms_t parms) {
+ 
+ 	assert(SDL_WasInit(SDL_INIT_VIDEO));
+ 
++#ifdef __EMSCRIPTEN__
++	// SDL3's Emscripten video driver creates the WebGL context on the canvas
++	// matched by this CSS selector (default "#canvas") via
++	// emscripten_webgl_create_context(). Our page hosts the engine on
++	// "#gameCanvas", so without this the selector resolves to null, context
++	// creation returns 0, GLctx stays undefined (getSupportedExtensions crash)
++	// and nothing the engine renders ever reaches the visible canvas.
++  #ifdef SDL_HINT_EMSCRIPTEN_CANVAS_SELECTOR
++	SDL_SetHint(SDL_HINT_EMSCRIPTEN_CANVAS_SELECTOR, "#gameCanvas");
++  #else
++	SDL_SetHint("SDL_EMSCRIPTEN_CANVAS_SELECTOR", "#gameCanvas");
++  #endif
++#endif
++
+ 	My_SDL_WindowFlags flags = SDL_WINDOW_OPENGL;
+ 
+ 	if (parms.fullScreen == 1)
+@@ -315,13 +345,30 @@ try_again:
+ 		SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, tdepthbits);
+ 		SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, tstencilbits);
+ 
++#ifdef __EMSCRIPTEN__
++		// Request 0 alpha bits so the WebGL canvas is created opaque
++		// (alpha:false). DOOM 3 renders to an opaque framebuffer and never
++		// writes meaningful framebuffer alpha; on an alpha:true canvas the
++		// browser would composite the page background through it (black screen).
++		SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 0);
++#else
+ 		SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, talphabits);
++#endif
+ 
+ 		SDL_GL_SetAttribute(SDL_GL_STEREO, parms.stereo ? 1 : 0);
+ 
+ 		SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, (multisamples > 1) ? 1 : 0);
+ 		SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, multisamples);
+ 
++#ifdef __EMSCRIPTEN__
++		// Request a GLES 3.0 context (the proven Qwasm2 recipe). Emscripten's
++		// SDL3 port creates a WebGL2 context that composites to the canvas;
++		// GL4ES then translates DOOM 3's desktop GL into it.
++		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
++		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
++		SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
++#endif
++
+ #if SDL_VERSION_ATLEAST(2, 0, 0) // SDL2 and SDL3 window creation
+ 
+ 		if ( r_glDebugContext.GetBool() ) {
+@@ -575,12 +622,42 @@ try_again:
  
  		context = SDL_GL_CreateContext(window);
  
 +#ifdef __EMSCRIPTEN__
-+		// Bring up GL4ES against the just-created WebGL2 context so the engine's
-+		// runtime GL lookups (glBegin, glColor*, ...) resolve to GL4ES rather
-+		// than the browser's bare GLES2 (where they are all null).
++		// SDL3 created the WebGL context on "#gameCanvas" (see the canvas-selector
++		// hint above) and already made it current, so the engine renders straight
++		// to the displayed canvas. Bring up GL4ES against that context so the
++		// engine's runtime GL lookups (glBegin, glColor*, ...) resolve to GL4ES
++		// rather than the browser's bare GLES2 (where they are all null).
 +		d3_em_fb_w = parms.width;
 +		d3_em_fb_h = parms.height;
++		// Render straight to the real WebGL backbuffer: disable GL4ES's main
++		// framebuffer / FBO-blit emulation, which otherwise redirects the
++		// "default framebuffer" into an internal texture that never reaches the
++		// canvas (the engine renders, but the canvas stays blank).
++		setenv( "LIBGL_FB", "0", 1 );
++		setenv( "LIBGL_FBOFORCETEX", "0", 1 );
++		setenv( "LIBGL_BLITFULLSCREEN", "0", 1 );
++		setenv( "LIBGL_NOTEST", "1", 1 );
 +		set_getprocaddress( (void *(APIENTRY_GL4ES *)(const char *))SDL_GL_GetProcAddress );
 +		set_getmainfbsize( D3_Emscripten_GetMainFBSize );
 +		initialize_gl4es();
@@ -955,7 +1053,27 @@ index 7efe196..5f5da4e 100644
  		SetSDLIcon(); // for SDL2  this must be done after creating the window
  
  		// TODO: also check for fullscreen-desktop?
-@@ -1242,7 +1276,12 @@ GLimp_ExtensionPointer
+@@ -1130,8 +1207,19 @@ void GLimp_Shutdown() {
+ GLimp_SwapBuffers
+ ===================
+ */
++#ifdef __EMSCRIPTEN__
++// GL4ES batches GL commands; flush them to the WebGL backbuffer before the
++// platform swap. Declared in GL4ES.
++extern "C" void gl4es_pre_swap( void );
++#endif
++
+ void GLimp_SwapBuffers() {
+ 	D3P_BeginCPUSample(SDL_GL_SwapWindow);
++#ifdef __EMSCRIPTEN__
++	// GL4ES batches GL commands; flush them to the WebGL backbuffer before the
++	// platform swap presents the frame.
++	gl4es_pre_swap();
++#endif
+ #if SDL_VERSION_ATLEAST(2, 0, 0)
+ 	SDL_GL_SwapWindow(window);
+ #else
+@@ -1242,7 +1330,12 @@ GLimp_ExtensionPointer
  GLExtension_t GLimp_ExtensionPointer(const char *name) {
  	assert(SDL_WasInit(SDL_INIT_VIDEO));
  

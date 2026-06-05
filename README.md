@@ -10,15 +10,19 @@ It is the DOOM 3 sibling of
 follows the same architecture: a Vite web app shell, an engine source patch, and
 a local packaging workflow.
 
-> **Status — engine compiles, boots, loads real data, and runs the render loop
-> at ~50–60 fps in the browser.** Unlike Quake II (Qwasm2/Yamagi), dhewm3 ships
-> no official Emscripten target, so this repo adds one. The patch + build scripts
-> have been verified end to end against real, owned DOOM 3 data: dhewm3 builds to
-> a ~6 MB `dhewm3.wasm` with GL4ES, instantiates against a WebGL2 context, mounts
-> a user PK4, and runs the **complete engine bring-up and main loop**:
+> **Status — DOOM 3 renders in the browser.** The engine compiles, boots, loads
+> real data, runs the render loop at ~50–60 fps, and **presents to the canvas**:
+> the DOOM 3 main menu (Mars backdrop, starfield, UI frame, and the full
+> NEW GAME / LOAD GAME / MULTIPLAYER / OPTIONS / MODS / UPDATES / CREDITS / EXIT
+> bar) draws correctly. Unlike Quake II (Qwasm2/Yamagi), dhewm3 ships no official
+> Emscripten target, so this repo adds one. The patch + build scripts have been
+> verified end to end against real, owned DOOM 3 data: dhewm3 builds to a ~6 MB
+> `dhewm3.wasm` with GL4ES, instantiates against a WebGL2 context on the
+> `#gameCanvas` element, mounts a user PK4, and runs the **complete engine
+> bring-up, main loop, and present**:
 >
 > ```
-> dhewm3 1.5.5 emscripten-x86 ... using SDL v2.32.10
+> dhewm3 1.5.5 emscripten-x86 ... using SDL v3.x
 > Loaded pk4 /base/pak-display.pk4 with checksum 0x...  (4021 files)
 > ----- Initializing Decls -----      5206 strings read from strings/english.lang
 > LIBGL: Initialising gl4es ... Using GLES 2.0 backend
@@ -26,17 +30,18 @@ a local packaging workflow.
 > ARB2 renderer: Available.
 > ----- Initializing Game -----  Compiled 'script/doom_main.script'
 > ----- Initializing Session -----
-> ... main loop running at ~50–60 fps (frame 4013 @ 68s) ...
+> ... main loop running at ~50–60 fps; main menu compositing to #gameCanvas ...
 > ```
 >
 > Every hard browser blocker is solved (anti-root check, networking, worker
 > threads, the async-sound tic, terminal/stdin input, mouse-grab pointer-lock,
-> the legacy-GL proc table, C++ exceptions, the blocking frame loop, and the
-> GL4ES↔WebGL binding). **Current gap:** rendered frames are not yet reaching
-> the canvas — the screen is black while the loop runs at full speed, which
-> points to the GL4ES default-framebuffer / present path (and/or reduced-pak
-> asset completeness). See [Limitations](#limitations). This repo does **not**
-> include DOOM 3 game data — you must own DOOM 3 and provide your own `base/*.pk4`.
+> the legacy-GL proc table, C++ exceptions, the blocking frame loop, the
+> GL4ES↔WebGL binding, **and the present/compositing path** — see
+> [the canvas-selector fix](#the-canvas-selector-fix-how-doom-3-reaches-the-screen)).
+> **Remaining item:** the menu's central animated logo panel shows a placeholder
+> (a reduced-pak cinematic/subview detail, not a present-path bug). See
+> [Limitations](#limitations). This repo does **not** include DOOM 3 game data —
+> you must own DOOM 3 and provide your own `base/*.pk4`.
 
 ## Play URL
 
@@ -189,7 +194,7 @@ bridge, it makes these engine changes (all guarded by `#ifdef __EMSCRIPTEN__`)
 that were needed to get DOOM 3 running in a browser:
 
 - **Build system** (`CMakeLists.txt`): skip `-march`; use Emscripten's built-in
-  SDL2 + OpenAL ports instead of `find_package`; emit `dhewm3.{js,wasm,data}`
+  SDL3 + OpenAL ports instead of `find_package`; emit `dhewm3.{js,wasm,data}`
   with the `D3_*` exports (monolithic `HARDLINK_GAME`); enable `-fexceptions` so
   dhewm3's recoverable `idException` errors drop to the console instead of
   hard-aborting (Emscripten disables C++ exceptions by default).
@@ -200,6 +205,11 @@ that were needed to get DOOM 3 running in a browser:
   point (`glBegin`, `glColor*`, …) is null. Also pin the canvas size, since
   Emscripten's SDL reports a 0×0 window. GL4ES must be **whole-archived** at link
   (see `scripts/build-dhewm3.sh`).
+- **Present / canvas selector** (`sys/glimp.cpp`): set
+  `SDL_HINT_EMSCRIPTEN_CANVAS_SELECTOR` to `#gameCanvas` before window creation so
+  SDL3 builds the WebGL context on the page's actual canvas, then present with
+  `SDL_GL_SwapWindow` (flushing GL4ES via `gl4es_pre_swap` first). See
+  [the canvas-selector fix](#the-canvas-selector-fix-how-doom-3-reaches-the-screen).
 - **GL proc table** (`renderer/RenderSystem_init.cpp`): warn instead of aborting
   on the legacy GL entry points GL4ES legitimately omits (accumulation buffer).
 - **Sound** (`snd_local.h`): pull in vendored OpenAL-Soft EFX headers, since
@@ -214,14 +224,44 @@ that were needed to get DOOM 3 running in a browser:
 - **Threads** (`FileSystem.cpp`, `Common.cpp`): skip the background-download and
   async worker threads (no pthreads); the async sound tic is simply not run.
 
+## The canvas-selector fix (how DOOM 3 reaches the screen)
+
+For a long time the engine ran the full main loop at ~60 fps but the canvas
+stayed **black** — frames rendered, nothing showed. The root cause was the
+WebGL context landing on the wrong canvas:
+
+- SDL3's Emscripten video driver creates its WebGL context with
+  `emscripten_webgl_create_context(selector, …)`, where `selector` defaults to
+  **`#canvas`** (`SDL_HINT_EMSCRIPTEN_CANVAS_SELECTOR`).
+- Emscripten 6 resolves that selector with `document.querySelector(selector)` —
+  there is no `#canvas`→`Module.canvas` alias anymore.
+- This app hosts the engine on **`#gameCanvas`**, so the selector resolved to
+  `null`, context creation returned `0`, `GLctx` stayed undefined (the
+  `getSupportedExtensions` crash), and every frame rendered into a context that
+  was never composited to the visible canvas.
+
+The fix is one line — tell SDL3 which canvas to use, before creating the window:
+
+```c
+SDL_SetHint(SDL_HINT_EMSCRIPTEN_CANVAS_SELECTOR, "#gameCanvas");
+```
+
+With the context on the right canvas, the normal path works: render through
+GL4ES, `gl4es_pre_swap()` to flush, then `SDL_GL_SwapWindow()` to present — the
+same approach the working Quake II reference ([Qwasm2](https://github.com/yamagi/Qwasm2)'s
+GL4ES `ref_gl1`) uses with SDL2 (which passes the canvas *element* directly via
+`Browser.createContext`, so it never hit this). No `GL_PREINITIALIZED_CONTEXT`
+and no manual `emscripten_webgl_make_context_current` are needed.
+
 ## Limitations
 
-- **Runs the render loop, but the canvas is still black.** With your data
-  mounted, the engine loads the pak, brings up GL4ES, initializes the renderer
-  and game, and spins the main loop at ~50–60 fps — but rendered frames are not
-  reaching the WebGL canvas yet. Nothing draws (not even 2-D menu text), which
-  points at the GL4ES default-framebuffer / present path rather than missing
-  content. This is the main thing left to debug.
+- **Menu logo placeholder.** The main menu renders correctly, but its central
+  animated DOOM 3 logo panel shows grey banding instead of the spinning logo.
+  That panel is a render-to-texture subview / cinematic; the placeholder is a
+  reduced-pak asset/cinematic-decode detail, not a present-path bug (the rest of
+  the menu — fonts, planet, starfield, buttons — composites correctly). Loading
+  fuller owned data via `?pk4=` may fill it in. This is the main thing left to
+  polish.
 - **Reduced-pak completeness.** `scripts/reduce-d3-map-pk4.py` is a heuristic
   dependency walker; it can miss entity-referenced models (e.g. a `mars_city1`
   moveable), which `-fexceptions` now turns into a recoverable drop instead of a

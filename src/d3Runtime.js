@@ -461,6 +461,7 @@ function buildAutoexecConfig(config) {
     `seta g_skill "${getNumericConfig(config.skill, 1)}"`,
     "seta in_mouse \"0\"",
     "seta in_alwaysRun \"0\"",
+    "seta r_gammaInShader \"0\"",
     "bind \"w\" \"_forward\"",
     "bind \"s\" \"_back\"",
     "bind \"a\" \"_moveleft\"",
