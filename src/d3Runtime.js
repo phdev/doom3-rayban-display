@@ -47,8 +47,14 @@ export function createRuntimeConfig() {
 
   return glassesDetected
     ? {
-        width: 600,
-        height: 600,
+        // Low-memory profile (wearable / phone): smaller framebuffer and, more
+        // importantly, a smaller engine texture cap — mobile Safari/WebGL runs
+        // out of GPU memory uploading a full level's textures and drops the
+        // context (3D goes black while the HUD survives). 448px render + a 128px
+        // texture limit quarters the GPU texture memory vs 600/256.
+        width: 448,
+        height: 448,
+        imageDownSizeLimit: 128,
         inputMode: "wearable",
         lowLatencyControls: true,
         audioEnabled: false,
@@ -66,6 +72,7 @@ export function createRuntimeConfig() {
     : {
         width: 600,
         height: 600,
+        imageDownSizeLimit: 256,
         inputMode: "desktop",
         lowLatencyControls: false,
         audioEnabled: false,
@@ -409,9 +416,9 @@ function buildArguments(config) {
     // placeholder.) See README "Limitations".
     "+set", "r_skipROQ", "1",
     "+set", "image_downSize", "1",
-    "+set", "image_downSizeLimit", "256",
+    "+set", "image_downSizeLimit", String(getNumericConfig(config.imageDownSizeLimit, 256)),
     "+set", "image_downSizeBump", "1",
-    "+set", "image_downSizeBumpLimit", "256",
+    "+set", "image_downSizeBumpLimit", String(getNumericConfig(config.imageDownSizeLimit, 256)),
     // Load textures synchronously: the single-threaded browser build has no
     // background worker, and the cached path would block forever waiting on it.
     "+set", "image_useCache", "0",

@@ -46,6 +46,7 @@ app.innerHTML = `
     <div id="yawMeter" class="yaw-meter" data-zone="deadzone" aria-hidden="true"></div>
     <span id="statusText" class="runtime-hidden" aria-hidden="true"></span>
     <span id="imuStatus" class="runtime-hidden" aria-hidden="true"></span>
+    <pre id="diag" style="position:fixed;left:4px;top:4px;right:4px;margin:0;z-index:9999;font:11px/1.35 ui-monospace,Menlo,monospace;color:#7fff7f;background:rgba(0,0,0,.66);padding:5px 6px;white-space:pre-wrap;word-break:break-word;pointer-events:none;max-height:46vh;overflow:hidden"></pre>
   </main>
 `;
 
@@ -67,6 +68,33 @@ refs.canvas.width = runtimeConfig.width;
 refs.canvas.height = runtimeConfig.height;
 refs.canvas.style.aspectRatio = `${runtimeConfig.width} / ${runtimeConfig.height}`;
 refs.canvas.focus({ preventScroll: true });
+
+// On-device diagnostics (the loading panel hides the canvas; this overlay stays
+// on top so a black-screened phone still shows WHY). Reports the WebGL renderer
+// + limits, any WebGL context loss (the classic iOS out-of-GPU-memory failure),
+// and uncaught errors. Add ?nodiag to hide it.
+const diagEl = document.querySelector("#diag");
+const diagLines = [];
+const showDiag = !/[?&]nodiag\b/.test(location.search);
+function diag(line) {
+  if (!diagEl || !showDiag) return;
+  diagLines.push(line);
+  if (diagLines.length > 24) diagLines.shift();
+  diagEl.textContent = diagLines.join("\n");
+}
+diag(`ua: ${navigator.userAgent.slice(0, 80)}`);
+diag(`screen ${screen.width}x${screen.height} dpr${window.devicePixelRatio} canvas ${runtimeConfig.width}x${runtimeConfig.height} mode=${runtimeConfig.inputMode}`);
+diag(`mem: deviceMemory=${navigator.deviceMemory ?? "?"}GB jsHeapLimit=${(performance.memory?.jsHeapSizeLimit / 1048576 | 0) || "?"}MB`);
+// NOTE: do NOT call canvas.getContext() here — a canvas has a single WebGL
+// context, and probing it would steal it from the engine (SDL3 creates its own).
+// The engine logs its GL renderer ("OpenGL renderer: ...") to the runtime log.
+refs.canvas.addEventListener("webglcontextlost", (e) => {
+  diag("⚠ WEBGL CONTEXT LOST — almost certainly out of GPU memory");
+  appendRuntimeLog("[gl] webglcontextlost");
+}, false);
+refs.canvas.addEventListener("webglcontextrestored", () => diag("gl: context restored"), false);
+window.addEventListener("error", (e) => diag(`ERR: ${e.message} @ ${(e.filename || "").split("/").pop()}:${e.lineno}`));
+window.addEventListener("unhandledrejection", (e) => diag(`REJECT: ${(e.reason && (e.reason.message || e.reason)) || e.reason}`));
 
 window.__d3AutoStart = true;
 queueMicrotask(() => {
@@ -95,6 +123,7 @@ async function start() {
       },
       onStatus: (text) => {
         refs.statusText.textContent = text;
+        diag(`status: ${text}`);
       },
       onEnemyIndicators: setEnemyIndicators,
       onAutoFire: handleAutoFireStarted,
@@ -126,6 +155,7 @@ async function start() {
   } catch (error) {
     refs.statusText.textContent = error.message || String(error);
     appendRuntimeLog(`[app] ${refs.statusText.textContent}`);
+    diag(`BOOT FAILED: ${refs.statusText.textContent}`);
     setLoadingProgress(100, "Error");
     setLoadingVisible(false);
   } finally {
@@ -153,6 +183,11 @@ function appendRuntimeLog(text) {
 
 function handleRuntimeLog(text) {
   appendRuntimeLog(text);
+
+  // Surface the engine's milestone/error lines on the on-device diagnostic.
+  if (/OpenGL renderer|Loaded pk4|GL_RENDERER|ARB2|^ERROR|: ERROR|Game map|Map Initialization|shader|Missing main|context lost|out of memory|abort|GLES|backend/i.test(text)) {
+    diag(text.trim().slice(0, 110));
+  }
 
   if (/Found interface lib|idRenderSystem::Init|OpenGL Window/i.test(text)) {
     setLoadingProgress(82, "Loading renderer");
