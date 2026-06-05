@@ -80,6 +80,8 @@ const showDiag = !/[?&]nodiag\b/.test(location.search);
 function renderDiag() {
   if (!diagEl || !showDiag) return;
   diagEl.textContent = (diagProgLine ? diagLines.concat(`▸ ${diagProgLine}`) : diagLines).join("\n");
+  // Keep the newest lines (errors land last) visible when the log overflows.
+  diagEl.scrollTop = diagEl.scrollHeight;
 }
 function diag(line) {
   diagLines.push(line);
@@ -195,7 +197,10 @@ function handleRuntimeLog(text) {
   appendRuntimeLog(text);
 
   // Surface the engine's milestone/error lines on the on-device diagnostic.
-  if (/OpenGL renderer|Loaded pk4|GL_RENDERER|ARB2|^ERROR|: ERROR|Game map|Map Initialization|shader|Missing main|context lost|out of memory|abort|GLES|backend/i.test(text)) {
+  // Exclude the repetitive r_gammaInShader warning — it floods the overlay.
+  if (/adjust gamma or brightness/i.test(text)) {
+    // skip noise
+  } else if (/OpenGL renderer|Loaded pk4|ERROR|Error:|Warning:|Game [Mm]ap|Map Initialization|spawn|Missing main|context lost|out of memory|Aborted|alloc|memory|Init Game|interaction|shutdown/i.test(text)) {
     diag(text.trim().slice(0, 110));
   }
 
