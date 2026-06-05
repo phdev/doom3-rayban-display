@@ -213,13 +213,21 @@ def main(argv=None):
         keep = set()
 
         # 1. Map files + always-kept declaration text.
-        # Map-independent renderer essentials the dependency walk can't reach via
-        # map tokens. glprogs/ holds the ARB vertex/fragment programs DOOM 3's
-        # lit 3D path needs (GL4ES translates them to GLSL) — without them every
-        # interaction shader compiles from empty source ("Missing main()") and the
-        # world renders black, even though the 2-D menu (which doesn't use them)
-        # is fine.
-        ALWAYS_KEEP_PREFIXES = ("glprogs/",)
+        # Map-independent essentials the dependency walk can't reach via map
+        # tokens (they're referenced by the engine / the menu / the HUD, not the
+        # map):
+        #   glprogs/      - ARB vertex/fragment programs the lit 3D path needs
+        #                   (GL4ES translates them to GLSL); without them every
+        #                   interaction shader compiles from empty source
+        #                   ("Missing main()") and the world renders black.
+        #   fonts/        - every bit of on-screen text (menu, HUD, subtitles).
+        #   guis/assets/  - GUI image assets: the main menu (mars planet, button
+        #                   art) and the in-game HUD. Without these the .gui files
+        #                   load but have no textures, so the menu renders black.
+        #   ui/assets/    - the GUI device context (idDeviceContext::Init) loads
+        #                   the cursor + scrollbar images from here; every GUI,
+        #                   including the main menu, needs them to render.
+        ALWAYS_KEEP_PREFIXES = ("glprogs/", "fonts/", "guis/assets/", "ui/assets/")
         decl_text = []
         for name, (zpath, original) in entries.items():
             ext = name[name.rfind("."):] if "." in name else ""
