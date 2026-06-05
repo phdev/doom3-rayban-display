@@ -10,15 +10,17 @@ It is the DOOM 3 sibling of
 follows the same architecture: a Vite web app shell, an engine source patch, and
 a local packaging workflow.
 
-> **Status — DOOM 3 renders in the browser, menu *and* in-level 3D.** The engine
+> **Status — DOOM 3 renders the 3D game world in the browser.** The engine
 > compiles, boots, loads real data, runs the render loop at ~50–60 fps, and
-> **presents to the canvas**: the DOOM 3 main menu (Mars backdrop, starfield, UI
-> frame, and the full NEW GAME / LOAD GAME / MULTIPLAYER / OPTIONS / MODS /
-> UPDATES / CREDITS / EXIT bar) draws correctly, and loading a level
-> (`?args=+map game/mars_city1`) renders the **3D world** — Mars-base geometry,
-> per-pixel lighting, glowing light panels — on real GPU hardware. Unlike
-> Quake II (Qwasm2/Yamagi), dhewm3 ships no official
-> Emscripten target, so this repo adds one. The patch + build scripts have been
+> **presents to the canvas**: the app boots into `game/mars_city1` and renders the
+> **3D world** — Mars-base geometry, per-pixel lighting, glowing light panels — on
+> real GPU hardware (Apple M1 via ANGLE/Metal). The main menu present path is also
+> proven (an earlier menu render confirmed the pipeline), but the menu currently
+> draws black with the level-complete reduced pak (the GUI cursor renders; the
+> main-page windows don't — see [Limitations](#limitations)), so the app bypasses
+> it and boots straight into the level. Unlike Quake II (Qwasm2/Yamagi), dhewm3
+> ships no official Emscripten target, so this repo adds one. The patch + build
+> scripts have been
 > verified end to end against real, owned DOOM 3 data: dhewm3 builds to a ~6 MB
 > `dhewm3.wasm` with GL4ES, instantiates against a WebGL2 context on the
 > `#gameCanvas` element, mounts a user PK4, and runs the **complete engine
@@ -51,6 +53,11 @@ a local packaging workflow.
 > `base/*.pk4`.
 
 ## Play URL
+
+The app **boots straight into a level** (`game/mars_city1` by default) so launch
+renders the 3D world. Override the map with `?args=%2Bmap%20<name>`. (The main
+menu is bypassed on boot — it currently draws black in the browser build with the
+reduced pak; see [Limitations](#limitations).)
 
 URL:
 
@@ -268,6 +275,16 @@ and no manual `emscripten_webgl_make_context_current` are needed.
 
 ## Limitations
 
+- **Main menu draws black (boot bypasses it).** Loading a level renders the 3D
+  world, but the main menu currently draws black with the reduced pak, so the app
+  boots straight into `game/mars_city1` instead (`D3_AUTO_MAP`). It's been traced
+  a long way: the GUI device context initializes and the **cursor renders**
+  (proving the 2-D GUI pipeline works), and it's independent of the intro /
+  `StartMenu` mode — but the main-menu page windows stay invisible. The reducer
+  now keeps the menu's assets (`fonts/`, `guis/assets/`, `ui/assets/`); the
+  remaining cause (a GUI window-render/state detail specific to the browser build)
+  is still open. An earlier capture *did* render the full menu, so the present
+  path itself is fine.
 - **ROQ video textures are disabled (`r_skipROQ 1`).** DOOM 3 plays `.roq`
   cinematics on video-screen surfaces and behind the main-menu logo. The RoQ
   decoder in this WASM build calls a **null function pointer**

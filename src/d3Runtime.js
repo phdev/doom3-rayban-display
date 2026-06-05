@@ -10,9 +10,13 @@ const BUNDLED_PK4_PATH = "base/pak-display.pk4";
 const BUNDLED_PK4_URL = `${ENGINE_BASE}${BUNDLED_PK4_PATH}`;
 const BUNDLED_PK4_GZIP_URL = `${BUNDLED_PK4_URL}.gz`;
 const URL_PK4_PARAM = "pk4";
-// When false, boot to the DOOM 3 main menu (lighter) instead of auto-loading a
-// level. A level can still be requested via ?args=+map ...
-const D3_AUTO_MAP = false;
+// Boot straight into the level so launch shows the rendered 3D world. The main
+// menu currently draws black in the browser build with the reduced pak (the GUI
+// device context + cursor render, but the main-menu page windows don't — under
+// investigation), whereas an in-game map renders correctly. Override the map
+// with ?args=+map <name>, or force the menu with ?args=+disconnect.
+const D3_AUTO_MAP = true;
+const D3_DEFAULT_MAP = "game/mars_city1";
 const TIMEOUTS = {
   probe: 15000,
   script: 20000,
@@ -420,12 +424,10 @@ function buildArguments(config) {
 
   args.push(...extraArgs);
 
-  // Default to booting the main menu (light: menu GUIs + fonts) rather than
-  // auto-loading a level. Pass ?args=%2Bmap%20game/mars_city1 to load a map.
-  if (!hasStartupCommand(extraArgs) && !D3_AUTO_MAP) {
-    // boot to main menu
-  } else if (!hasStartupCommand(extraArgs)) {
-    args.push("+map", "game/mars_city1");
+  // Boot straight into the level (D3_AUTO_MAP) so launch renders the 3D world.
+  // Pass ?args=%2Bmap%20<name> to choose a different map (overrides the default).
+  if (!hasStartupCommand(extraArgs) && D3_AUTO_MAP) {
+    args.push("+map", D3_DEFAULT_MAP);
   }
 
   return args;

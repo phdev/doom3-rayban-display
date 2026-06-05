@@ -44,11 +44,13 @@ patches/dhewm3-meta-rayban-display.patch`.
 
 ## State (2026-06)
 
-DOOM 3 **renders in the browser — menu and in-level 3D.** The main menu (Mars
-backdrop, starfield, UI frame, NEW GAME / … / EXIT) composites to `#gameCanvas`
-at ~50–60 fps, and loading a level (`?args=%2Bmap%20game/mars_city1`) renders the
-3D world (Mars-base geometry + per-pixel lighting) on real GPU hardware. Boots to
-the menu by default (`D3_AUTO_MAP = false`).
+DOOM 3 **renders the 3D game world in the browser.** The app boots straight into
+`game/mars_city1` (`D3_AUTO_MAP = true`, `D3_DEFAULT_MAP`) and renders the 3D world
+(Mars-base geometry + per-pixel lighting) to `#gameCanvas` at ~50–60 fps on real
+GPU hardware. The main menu is bypassed on boot — it draws black with the reduced
+pak (the GUI cursor renders, so the 2-D pipeline works; the main-page windows
+don't — open item). An earlier capture rendered the full menu, so the present path
+is fine. Override the map with `?args=%2Bmap%20<name>`.
 
 Getting in-level 3D on screen took three independent fixes:
 1. **Present** — SDL3 canvas selector (see below); the engine drew to the wrong
