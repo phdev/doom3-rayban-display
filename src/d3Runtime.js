@@ -1,0 +1,1213 @@
+import {
+  clearCachedUrlPk4,
+  readCachedUrlPk4,
+  readPk4Bytes,
+  saveCachedUrlPk4
+} from "./storage.js";
+
+const ENGINE_BASE = `${import.meta.env.BASE_URL}wasm/`;
+const BUNDLED_PK4_PATH = "base/pak-display.pk4";
+const BUNDLED_PK4_URL = `${ENGINE_BASE}${BUNDLED_PK4_PATH}`;
+const BUNDLED_PK4_GZIP_URL = `${BUNDLED_PK4_URL}.gz`;
+const URL_PK4_PARAM = "pk4";
+const TIMEOUTS = {
+  probe: 15000,
+  script: 20000,
+  runtime: 45000,
+  pk4: 120000
+};
+const PK4_FETCH_STALL_TIMEOUT_MS = 20000;
+const PK4_FETCH_RETRY_DELAY_MS = 750;
+const PK4_MANIFEST_TIMEOUT_MS = 8000;
+// The game module is hard-linked into the monolithic wasm binary (HARDLINK_GAME),
+// so there is no separate game.wasm to probe for.
+const REQUIRED_ENGINE_FILES = [
+  "dhewm3.js",
+  "dhewm3.wasm",
+  "dhewm3.data"
+];
+
+// dhewm3's Emscripten target emits files named after the CMake target, so no
+// rename map is needed. Kept for parity with the upstream Quake II shell and to
+// allow future engine builds that emit generic index.* artifacts.
+const GENERATED_FILE_MAP = new Map();
+let installedUrlPk4Href = null;
+
+export function createRuntimeConfig() {
+  var glassesDetected =
+    /Android.*wv/.test(navigator.userAgent)
+    || screen.width <= 640;
+
+  return glassesDetected
+    ? {
+        width: 600,
+        height: 600,
+        inputMode: "wearable",
+        lowLatencyControls: true,
+        audioEnabled: false,
+        displayBrightness: 1.35,
+        displayContrast: 1.1,
+        displaySaturate: 1.05,
+        // DOOM 3 ships very dark; lift engine gamma/brightness for the display.
+        rGamma: 1.35,
+        rBrightness: 1.2,
+        skill: 1,
+        yawSensitivity: 2.4,
+        turnBurstDegrees: 42,
+        headTickMs: 50
+      }
+    : {
+        width: 600,
+        height: 600,
+        inputMode: "desktop",
+        lowLatencyControls: false,
+        audioEnabled: false,
+        displayBrightness: 1,
+        displayContrast: 1,
+        displaySaturate: 1,
+        rGamma: 1.1,
+        rBrightness: 1,
+        skill: 1,
+        yawSensitivity: 1.8,
+        turnBurstDegrees: 36,
+        headTickMs: 50
+      };
+}
+
+function applyDisplayTuning(canvas, config) {
+  canvas.style.setProperty("--d3-display-brightness", String(getNumericConfig(config.displayBrightness, 1)));
+  canvas.style.setProperty("--d3-display-contrast", String(getNumericConfig(config.displayContrast, 1)));
+  canvas.style.setProperty("--d3-display-saturate", String(getNumericConfig(config.displaySaturate, 1)));
+}
+
+function getNumericConfig(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+export async function probeEngineArtifacts() {
+  const checks = await Promise.all(
+    REQUIRED_ENGINE_FILES.map(async (file) => {
+      try {
+        const response = await fetch(`${ENGINE_BASE}${file}`, {
+          method: "HEAD",
+          cache: "no-store"
+        });
+        return [file, response.ok];
+      } catch {
+        return [file, false];
+      }
+    })
+  );
+
+  return checks
+    .filter(([, ok]) => !ok)
+    .map(([file]) => file);
+}
+
+export async function probeBundledPk4() {
+  try {
+    const gzipResponse = await fetch(BUNDLED_PK4_GZIP_URL, {
+      method: "HEAD",
+      cache: "no-store"
+    });
+
+    if (gzipResponse.ok) {
+      return {
+        name: "Compressed display pak-display.pk4",
+        size: Number(gzipResponse.headers.get("content-length") || 0),
+        url: BUNDLED_PK4_GZIP_URL
+      };
+    }
+
+    const response = await fetch(BUNDLED_PK4_URL, {
+      method: "HEAD",
+      cache: "no-store"
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    return {
+      name: "Display pak-display.pk4",
+      size: Number(response.headers.get("content-length") || 0),
+      url: BUNDLED_PK4_URL
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function bootDoom3({
+  canvas,
+  output,
+  status,
+  config,
+  onEnemyIndicators,
+  onAutoFire,
+  onProgress,
+  onStatus,
+  onLog
+}) {
+  const log = (text) => bootLog(output, text, onLog);
+  const progress = (percent, label) => onProgress?.({ percent, label });
+
+  try {
+    progress(2, "Checking files");
+    log("Checking engine artifacts...");
+    const missing = await withTimeout(
+      probeEngineArtifacts(),
+      TIMEOUTS.probe,
+      "engine artifact check"
+    );
+
+    if (missing.length > 0) {
+      throw new Error(`Missing engine artifact: ${missing.join(", ")}`);
+    }
+
+    canvas.width = config.width;
+    canvas.height = config.height;
+    canvas.style.aspectRatio = `${config.width} / ${config.height}`;
+    applyDisplayTuning(canvas, config);
+    log(`Canvas configured at ${config.width}x${config.height} for ${config.inputMode}`);
+
+    progress(16, "Loading engine");
+    const module = createModule({
+      canvas,
+      output,
+      status,
+      config,
+      progress,
+      onEnemyIndicators,
+      onAutoFire,
+      onStatus,
+      onLog
+    });
+    const runtimeReady = new Promise((resolve, reject) => {
+      module.onRuntimeInitialized = () => resolve();
+      module.onAbort = (reason) => reject(new Error(String(reason || "DOOM 3 aborted")));
+    });
+    window.Module = module;
+
+    log("Loading engine script...");
+    await withTimeout(loadScript(`${ENGINE_BASE}dhewm3.js`), TIMEOUTS.script, "engine script load");
+
+    progress(28, "Preparing runtime");
+    log("Waiting for WebAssembly runtime...");
+    await withTimeout(runtimeReady, TIMEOUTS.runtime, "WebAssembly runtime initialization");
+    progress(42, "Runtime ready");
+    log("Runtime initialized");
+
+    if (isRuntimeFS(module.FS)) {
+      progress(48, "Loading data");
+      log("Installing PK4 data...");
+      await withTimeout(
+        installPk4Data(module.FS, onStatus, {
+          writablePath: false,
+          progress,
+          log
+        }),
+        TIMEOUTS.pk4,
+        "PK4 install"
+      );
+
+      progress(72, "Configuring");
+      installRuntimeConfig(module.FS, config, log);
+    } else {
+      progress(72, "Configuring");
+      log("Runtime filesystem is not exposed yet; deferring PK4 install");
+    }
+
+    if (typeof module.callMain !== "function") {
+      throw new Error("DOOM 3 runtime did not expose callMain");
+    }
+
+    progress(78, "Starting engine");
+    log("Starting DOOM 3 main...");
+    module.callMain([...module.arguments]);
+    progress(82, "Starting DOOM 3");
+    log("DOOM 3 main started");
+
+    return {
+      module,
+      callAddViewAngles(dyaw, dpitch) {
+        if (typeof module._D3_AddViewAngles === "function") {
+          module._D3_AddViewAngles(dyaw, dpitch);
+        }
+      },
+      setWearableAction(action, down) {
+        if (typeof module._D3_SetWearableAction === "function") {
+          module._D3_SetWearableAction(action, down ? 1 : 0);
+        }
+      },
+      readEnemyIndicators() {
+        if (typeof module._D3_GetEnemyIndicators === "function") {
+          const mask = module._D3_GetEnemyIndicators();
+          return {
+            left: Boolean(mask & 1),
+            right: Boolean(mask & 2)
+          };
+        }
+
+        return {
+          left: Boolean(module.d3EnemyIndicators?.left),
+          right: Boolean(module.d3EnemyIndicators?.right)
+        };
+      },
+      requestEnemyTurn(direction) {
+        const normalized = direction < 0 ? -1 : direction > 0 ? 1 : 0;
+        if (typeof module._D3_RequestEnemyTurn === "function") {
+          module._D3_RequestEnemyTurn(normalized);
+          return;
+        }
+
+        module.d3EnemyTurnRequest = normalized;
+      }
+    };
+  } catch (error) {
+    log(`Error: ${formatError(error)}`);
+    throw error;
+  }
+}
+
+function createModule({
+  canvas,
+  output,
+  status,
+  config,
+  progress,
+  onEnemyIndicators,
+  onAutoFire,
+  onStatus,
+  onLog
+}) {
+  return {
+    _canLockPointer: false,
+    canvas,
+    d3EnemyTurnRequest: 0,
+    d3EnemyIndicators: { left: false, right: false },
+    d3ConsumeEnemyTurn() {
+      const direction = this.d3EnemyTurnRequest;
+      this.d3EnemyTurnRequest = 0;
+      return direction;
+    },
+    d3SetEnemyIndicators(left, right) {
+      this.d3EnemyIndicators = {
+        left: Boolean(left),
+        right: Boolean(right)
+      };
+      onEnemyIndicators?.({
+        left: Boolean(left),
+        right: Boolean(right)
+      });
+    },
+    d3AutoFireStarted() {
+      onAutoFire?.();
+    },
+    d3TurnToEnemyYaw(yaw) {
+      if (typeof this._D3_SetViewYaw === "function") {
+        this._D3_SetViewYaw(yaw);
+      }
+    },
+    print(text) {
+      appendOutput(output, text);
+      onLog?.(text);
+    },
+    printErr(text) {
+      appendOutput(output, text);
+      onLog?.(text);
+    },
+    locateFile(path) {
+      return `${ENGINE_BASE}${GENERATED_FILE_MAP.get(path) ?? path}`;
+    },
+    setStatus(text) {
+      if (status) {
+        status.textContent = text || "Running";
+      }
+      onStatus?.(text || "Running");
+    },
+    hideConsole() {
+      canvas.classList.add("is-running");
+    },
+    showConsole() {
+      canvas.classList.remove("is-running");
+    },
+    winResized() {},
+    setGamma(value) {
+      const gamma = getNumericConfig(value, -1);
+      const displayBrightness = getNumericConfig(config.displayBrightness, 1);
+      const gammaBrightness = gamma < 0 ? 1 : gamma * 2;
+      canvas.style.setProperty("--d3-display-brightness", String(displayBrightness * gammaBrightness));
+    },
+    captureMouse() {},
+    d3InstallPendingData: async (FS) => {
+      const log = (text) => bootLog(output, text, onLog);
+      progress?.(48, "Loading data");
+      await installPk4Data(FS, onStatus, { progress, log });
+      progress?.(72, "Configuring");
+      installRuntimeConfig(FS, config, log, { writablePath: true });
+    },
+    noInitialRun: true,
+    totalDependencies: 0,
+    monitorRunDependencies(left) {
+      this.totalDependencies = Math.max(this.totalDependencies, left);
+      this.setStatus(
+        left
+          ? `Preparing ${this.totalDependencies - left}/${this.totalDependencies}`
+          : "Ready"
+      );
+    },
+    arguments: buildArguments(config)
+  };
+}
+
+function buildArguments(config) {
+  const args = [
+    "+set", "r_fullscreen", "0",
+    "+set", "r_mode", "-1",
+    "+set", "r_customWidth", String(config.width),
+    "+set", "r_customHeight", String(config.height),
+    "+set", "r_aspectRatio", "0",
+    "+set", "r_multiSamples", "0",
+    "+set", "r_gamma", String(getNumericConfig(config.rGamma, 1.1)),
+    "+set", "r_brightness", String(getNumericConfig(config.rBrightness, 1)),
+    "+set", "com_skipIntroVideos", "1",
+    "+set", "com_showFPS", "0",
+    "+set", "s_noSound", config.audioEnabled ? "0" : "1",
+    "+set", "g_skill", String(getNumericConfig(config.skill, 1)),
+    // The wearable drives the camera through _D3_AddViewAngles, so disable the
+    // engine's own pointer-lock mouse path.
+    "+set", "in_mouse", "0",
+    "+set", "g_showPlayerShadow", "1"
+  ];
+
+  const queryArgs = new URLSearchParams(window.location.search).get("args");
+  const extraArgs = queryArgs ? queryArgs.trim().split(/\s+/).filter(Boolean) : [];
+
+  args.push(...extraArgs);
+
+  if (!hasStartupCommand(extraArgs)) {
+    args.push("+map", "game/mars_city1");
+  }
+
+  return args;
+}
+
+function hasStartupCommand(args) {
+  const commands = new Set(["+map", "+devmap", "+connect", "+loadgame"]);
+  return args.some((arg) => commands.has(arg.toLowerCase()));
+}
+
+function installRuntimeConfig(FS, config, log, options = {}) {
+  const autoexecConfig = buildAutoexecConfig(config);
+
+  mkdirTree(FS, "/base");
+  FS.writeFile("/base/autoexec.cfg", autoexecConfig);
+
+  if (options.writablePath) {
+    mkdirTree(FS, "/dhewm3/base");
+    FS.writeFile("/dhewm3/base/autoexec.cfg", autoexecConfig);
+  }
+
+  log(`Installed runtime config (${config.width}x${config.height})`);
+}
+
+function buildAutoexecConfig(config) {
+  return [
+    "// DOOM 3 Display runtime configuration (auto-executed by id Tech 4)",
+    "seta com_skipIntroVideos \"1\"",
+    "seta sys_lang \"english\"",
+    "seta s_volume_dB \"-40\"",
+    "seta r_fullscreen \"0\"",
+    `seta r_customWidth "${config.width}"`,
+    `seta r_customHeight "${config.height}"`,
+    "seta r_mode \"-1\"",
+    "seta r_aspectRatio \"0\"",
+    "seta r_swapInterval \"0\"",
+    `seta r_gamma "${getNumericConfig(config.rGamma, 1.1)}"`,
+    `seta r_brightness "${getNumericConfig(config.rBrightness, 1)}"`,
+    "seta r_skipBump \"0\"",
+    "seta image_downSize \"1\"",
+    "seta image_useCompression \"1\"",
+    `seta g_skill "${getNumericConfig(config.skill, 1)}"`,
+    "seta in_mouse \"0\"",
+    "seta in_alwaysRun \"0\"",
+    "bind \"w\" \"_forward\"",
+    "bind \"s\" \"_back\"",
+    "bind \"a\" \"_moveleft\"",
+    "bind \"d\" \"_moveright\"",
+    "bind \"MOUSE1\" \"_attack\"",
+    "bind \"MOUSE2\" \"_forward\"",
+    "bind \"SPACE\" \"_moveup\"",
+    "bind \"CTRL\" \"_movedown\"",
+    "bind \"e\" \"_use\"",
+    "bind \"f\" \"_impulse11\"",
+    "echo \"Display runtime config loaded\"",
+    ""
+  ].join("\n");
+}
+
+async function installPk4Data(FS, onStatus, options = {}) {
+  const settings = {
+    writablePath: true,
+    progress: null,
+    log: null,
+    ...options
+  };
+  const urlPk4Source = getUrlPk4Source();
+  if (urlPk4Source) {
+    if (installedUrlPk4Href === urlPk4Source.url && fileExists(FS, "/base/pak-display.pk4")) {
+      settings.progress?.(68, "PK4 ready");
+      onStatus?.("URL PK4 ready");
+      settings.log?.("URL PK4 is already mounted");
+      return;
+    }
+
+    const cachedUrlBytes = await readCachedUrlPk4Bytes(
+      urlPk4Source.url,
+      onStatus,
+      settings.log,
+      settings.progress
+    );
+    if (cachedUrlBytes) {
+      settings.progress?.(64, "Installing PK4");
+      settings.log?.(`Installing cached URL PK4 (${formatByteCount(cachedUrlBytes.byteLength)})...`);
+      writePk4(FS, cachedUrlBytes, "cached URL", settings);
+      installedUrlPk4Href = urlPk4Source.url;
+      settings.progress?.(68, "PK4 ready");
+      return;
+    }
+
+    const urlBytes = await readUrlPk4Bytes(urlPk4Source, onStatus, settings.log, settings.progress);
+    settings.progress?.(64, "Installing PK4");
+    settings.log?.(`Installing URL PK4 (${formatByteCount(urlBytes.byteLength)})...`);
+    writePk4(FS, urlBytes, "URL", settings);
+    installedUrlPk4Href = urlPk4Source.url;
+    cacheUrlPk4Bytes(urlPk4Source.url, urlBytes, settings.log);
+    settings.progress?.(68, "PK4 ready");
+    return;
+  }
+
+  settings.progress?.(50, "Reading data");
+  settings.log?.("Reading imported PK4 storage...");
+  const storedBytes = await readPk4Bytes();
+
+  if (storedBytes) {
+    settings.progress?.(58, "Installing PK4");
+    onStatus?.("Installing imported PK4...");
+    settings.log?.(`Installing imported PK4 (${formatByteCount(storedBytes.byteLength)})...`);
+    writePk4(FS, storedBytes, "imported", settings);
+    settings.progress?.(68, "PK4 ready");
+    return;
+  }
+
+  if (fileExists(FS, "/base/pak-display.pk4")) {
+    settings.progress?.(68, "PK4 ready");
+    onStatus?.("Bundled display PK4 ready");
+    settings.log?.("Bundled display PK4 is already mounted");
+    console.info("Bundled display PK4 is embedded at /base/pak-display.pk4");
+    return;
+  }
+
+  const bundledBytes = await readBundledPk4Bytes(onStatus, settings.log, settings.progress);
+  if (bundledBytes) {
+    settings.progress?.(64, "Installing PK4");
+    settings.log?.(`Installing bundled PK4 (${formatByteCount(bundledBytes.byteLength)})...`);
+    writePk4(FS, bundledBytes, "bundled", settings);
+    settings.progress?.(68, "PK4 ready");
+  }
+}
+
+async function readCachedUrlPk4Bytes(sourceUrl, onStatus, log, progress) {
+  progress?.(50, "Checking cache");
+  onStatus?.("Checking cached URL PK4...");
+
+  let bytes = null;
+  try {
+    bytes = await readCachedUrlPk4(sourceUrl);
+  } catch (error) {
+    log?.(`Could not read cached URL PK4: ${formatError(error)}`);
+    return null;
+  }
+
+  if (!bytes) {
+    return null;
+  }
+
+  if (isPk4Payload(bytes)) {
+    progress?.(58, "Loading cached PK4");
+    onStatus?.("Loading cached URL PK4...");
+    log?.(`Using cached URL PK4 (${formatByteCount(bytes.byteLength)})...`);
+    return bytes;
+  }
+
+  log?.("Cached URL PK4 was invalid; clearing it and fetching again...");
+  try {
+    await clearCachedUrlPk4(sourceUrl);
+  } catch (error) {
+    log?.(`Could not clear invalid cached URL PK4: ${formatError(error)}`);
+  }
+
+  return null;
+}
+
+function cacheUrlPk4Bytes(sourceUrl, pk4Bytes, log) {
+  if (!isPk4Payload(pk4Bytes)) {
+    return;
+  }
+
+  const byteLength = pk4Bytes.byteLength;
+  window.setTimeout(() => {
+    saveCachedUrlPk4(sourceUrl, pk4Bytes, {
+      name: "URL pak-display.pk4"
+    })
+      .then(() => {
+        log?.(`Cached URL PK4 for future launches (${formatByteCount(byteLength)})`);
+      })
+      .catch((error) => {
+        log?.(`Could not cache URL PK4: ${formatError(error)}`);
+      });
+  }, 0);
+}
+
+async function readUrlPk4Bytes(source, onStatus, log, progress) {
+  const candidates = getUrlPk4Candidates(source.url);
+  let lastError = null;
+
+  for (const candidate of candidates) {
+    progress?.(54, "Fetching PK4");
+    onStatus?.(candidate.status);
+    log?.(candidate.message);
+
+    let bytes = null;
+    try {
+      bytes = candidate.kind === "chunks"
+        ? await fetchChunkedBytes(candidate, progress, log)
+        : await fetchBytes(candidate.url, {
+            cache: "no-store",
+            progress,
+            progressBase: 54,
+            progressSpan: 6,
+            progressLabel: candidate.compressed ? "Fetching compressed PK4" : "Fetching PK4"
+          });
+    } catch (error) {
+      lastError = error;
+      log?.(`URL PK4 fetch failed from ${candidate.url || candidate.manifestUrl}: ${formatError(error)}`);
+      if (!candidate.optional) {
+        break;
+      }
+      await delay(PK4_FETCH_RETRY_DELAY_MS);
+      continue;
+    }
+
+    if (!bytes) {
+      lastError = new Error(`No PK4 response from ${candidate.url}`);
+      if (!candidate.optional) {
+        break;
+      }
+      log?.(`${candidate.fallbackName} was not available; trying next PK4 source...`);
+      await delay(PK4_FETCH_RETRY_DELAY_MS);
+      continue;
+    }
+
+    if (isGzipPayload(bytes)) {
+      if (!("DecompressionStream" in globalThis)) {
+        lastError = new Error("This browser cannot decompress gzip PK4 files");
+        if (!candidate.optional) {
+          break;
+        }
+        log?.("Browser cannot decompress the compressed URL PK4; trying raw URL...");
+        continue;
+      }
+
+      progress?.(60, "Decompressing PK4");
+      onStatus?.("Decompressing URL PK4...");
+      log?.(`Decompressing URL PK4 (${formatByteCount(bytes.byteLength)} compressed)...`);
+      const decompressed = await decompressGzip(bytes);
+      if (isPk4Payload(decompressed)) {
+        return decompressed;
+      }
+
+      lastError = new Error("Decompressed URL data is not a valid DOOM 3 PK4");
+      if (!candidate.optional) {
+        break;
+      }
+      continue;
+    }
+
+    if (isPk4Payload(bytes)) {
+      progress?.(60, "Loading PK4");
+      return bytes;
+    }
+
+    lastError = new Error(`${candidate.url} did not return DOOM 3 PK4 data`);
+    if (!candidate.optional) {
+      break;
+    }
+    log?.("Compressed URL PK4 candidate was not valid PK4 data; trying raw URL...");
+    await delay(PK4_FETCH_RETRY_DELAY_MS);
+  }
+
+  throw new Error(
+    `Could not fetch PK4 URL. The file must be served over HTTP(S) with browser access enabled. ${formatError(lastError)}`
+  );
+}
+
+async function readBundledPk4Bytes(onStatus, log, progress) {
+  if (isCompactWebViewRuntime()) {
+    progress?.(54, "Fetching PK4");
+    onStatus?.("Loading chunked display PK4...");
+    log?.("Fetching chunked display PK4...");
+    const chunked = await fetchChunkedBytes({
+      manifestUrl: appendPathSuffix(BUNDLED_PK4_URL, ".manifest.json"),
+      progressLabel: "Fetching display PK4 chunks"
+    }, progress, log);
+
+    if (chunked) {
+      progress?.(60, "Loading PK4");
+      return chunked;
+    }
+
+    log?.("Chunked display PK4 was not found; trying compressed display PK4...");
+  }
+
+  if ("DecompressionStream" in globalThis) {
+    progress?.(54, "Fetching PK4");
+    onStatus?.("Loading compressed chunked display PK4...");
+    log?.("Fetching compressed chunked display PK4...");
+    const chunkedCompressed = await fetchChunkedBytes({
+      manifestUrl: appendPathSuffix(BUNDLED_PK4_GZIP_URL, ".manifest.json"),
+      progressLabel: "Fetching compressed display PK4 chunks"
+    }, progress, log);
+
+    if (chunkedCompressed && isGzipPayload(chunkedCompressed)) {
+      progress?.(60, "Decompressing PK4");
+      onStatus?.("Decompressing display PK4...");
+      log?.(`Decompressing display PK4 (${formatByteCount(chunkedCompressed.byteLength)} compressed)...`);
+      return decompressGzip(chunkedCompressed);
+    }
+
+    if (chunkedCompressed) {
+      progress?.(60, "Loading PK4");
+      log?.(`Using chunked browser-decoded display PK4 (${formatByteCount(chunkedCompressed.byteLength)})...`);
+      return chunkedCompressed;
+    }
+
+    progress?.(54, "Fetching PK4");
+    onStatus?.("Loading compressed display PK4...");
+    log?.("Fetching compressed display PK4...");
+    const compressed = await fetchBytes(BUNDLED_PK4_GZIP_URL);
+    if (compressed) {
+      if (isGzipPayload(compressed)) {
+        progress?.(60, "Decompressing PK4");
+        onStatus?.("Decompressing display PK4...");
+        log?.(`Decompressing display PK4 (${formatByteCount(compressed.byteLength)} compressed)...`);
+        return decompressGzip(compressed);
+      }
+
+      progress?.(60, "Loading PK4");
+      log?.(`Using browser-decoded display PK4 (${formatByteCount(compressed.byteLength)})...`);
+      return compressed;
+    }
+    log?.("Compressed display PK4 was not found; trying raw PK4...");
+  }
+
+  progress?.(54, "Fetching PK4");
+  onStatus?.("Loading display PK4...");
+  log?.("Fetching raw display PK4...");
+  const bytes = await fetchBytes(BUNDLED_PK4_URL);
+  if (!bytes) {
+    onStatus?.("No PK4 available");
+    log?.("No bundled PK4 was available");
+  }
+
+  return bytes;
+}
+
+async function fetchChunkedBytes(candidate, progress, log) {
+  const manifest = await fetchChunkManifest(candidate.manifestUrl);
+  if (!manifest) {
+    return null;
+  }
+
+  const chunks = normalizeChunkManifest(manifest, candidate.manifestUrl);
+  if (!chunks.length) {
+    throw new Error(`Chunk manifest did not include chunks: ${candidate.manifestUrl}`);
+  }
+
+  const totalSize = Number(manifest.totalSize || 0);
+  const buffers = [];
+  let loaded = 0;
+
+  log?.(`Fetching ${chunks.length} PK4 chunks from ${candidate.manifestUrl}...`);
+
+  for (let index = 0; index < chunks.length; index += 1) {
+    const chunk = chunks[index];
+    const expectedSize = Number(chunk.size || 0);
+    const base = totalSize > 0 ? 54 + 6 * (loaded / totalSize) : 54;
+    const span = totalSize > 0 && expectedSize > 0
+      ? 6 * (expectedSize / totalSize)
+      : 6 / chunks.length;
+    const label = `Fetching chunk ${index + 1}/${chunks.length}`;
+    const bytes = await fetchBytesWithRetries(chunk.url, {
+      cache: "no-store",
+      progress,
+      progressBase: base,
+      progressSpan: span,
+      progressLabel: label
+    });
+
+    if (!bytes) {
+      throw new Error(`Missing PK4 chunk ${index + 1}/${chunks.length}`);
+    }
+
+    if (expectedSize > 0 && bytes.byteLength !== expectedSize) {
+      throw new Error(
+        `PK4 chunk ${index + 1}/${chunks.length} had ${formatByteCount(bytes.byteLength)}, expected ${formatByteCount(expectedSize)}`
+      );
+    }
+
+    buffers.push(bytes);
+    loaded += bytes.byteLength;
+    progress?.(
+      54 + 6 * Math.min(totalSize > 0 ? loaded / totalSize : (index + 1) / chunks.length, 1),
+      `${candidate.progressLabel} ${formatByteCount(loaded)}${totalSize > 0 ? `/${formatByteCount(totalSize)}` : ""}`
+    );
+  }
+
+  if (totalSize > 0 && loaded !== totalSize) {
+    throw new Error(`Chunked PK4 had ${formatByteCount(loaded)}, expected ${formatByteCount(totalSize)}`);
+  }
+
+  const bytes = new Uint8Array(loaded);
+  let offset = 0;
+  for (const buffer of buffers) {
+    bytes.set(buffer, offset);
+    offset += buffer.byteLength;
+  }
+
+  return bytes;
+}
+
+async function fetchChunkManifest(url) {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), PK4_MANIFEST_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      cache: "no-store",
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    return response.json();
+  } catch {
+    return null;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+function normalizeChunkManifest(manifest, manifestUrl) {
+  if (!Array.isArray(manifest.chunks)) {
+    return [];
+  }
+
+  return manifest.chunks
+    .map((chunk) => {
+      const path = typeof chunk === "string" ? chunk : chunk.path;
+      if (!path) {
+        return null;
+      }
+
+      return {
+        url: new URL(path, manifestUrl).href,
+        size: typeof chunk === "string" ? 0 : Number(chunk.size || 0)
+      };
+    })
+    .filter(Boolean);
+}
+
+async function fetchBytesWithRetries(url, options) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const bytes = await fetchBytes(url, options);
+      if (bytes) {
+        return bytes;
+      }
+      lastError = new Error(`No response from ${url}`);
+    } catch (error) {
+      lastError = error;
+    }
+
+    if (attempt < 3) {
+      await delay(PK4_FETCH_RETRY_DELAY_MS * attempt);
+    }
+  }
+
+  throw lastError;
+}
+
+async function fetchBytes(url, options = {}) {
+  const {
+    timeoutMs = TIMEOUTS.pk4,
+    stallTimeoutMs = PK4_FETCH_STALL_TIMEOUT_MS,
+    progress = null,
+    progressBase = 54,
+    progressSpan = 6,
+    progressLabel = "Fetching",
+    ...fetchOptions
+  } = options;
+  const controller = new AbortController();
+  let timeoutReason = "";
+  let overallTimer = null;
+  let stallTimer = null;
+
+  const abortWith = (reason) => {
+    timeoutReason = reason;
+    controller.abort();
+  };
+
+  const resetStallTimer = () => {
+    if (!stallTimeoutMs) {
+      return;
+    }
+    window.clearTimeout(stallTimer);
+    stallTimer = window.setTimeout(
+      () => abortWith(`${progressLabel} stalled for ${Math.round(stallTimeoutMs / 1000)}s`),
+      stallTimeoutMs
+    );
+  };
+
+  overallTimer = window.setTimeout(
+    () => abortWith(`${progressLabel} timed out after ${Math.round(timeoutMs / 1000)}s`),
+    timeoutMs
+  );
+
+  try {
+    resetStallTimer();
+    const response = await fetch(url, {
+      cache: "force-cache",
+      ...fetchOptions,
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const total = Number(response.headers.get("content-length") || 0);
+    if (!response.body?.getReader) {
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      progress?.(progressBase + progressSpan, progressLabel);
+      return bytes;
+    }
+
+    const reader = response.body.getReader();
+    const chunks = [];
+    let loaded = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      resetStallTimer();
+      if (done) {
+        break;
+      }
+
+      chunks.push(value);
+      loaded += value.byteLength;
+      if (total > 0) {
+        const percent = progressBase + progressSpan * Math.min(loaded / total, 1);
+        progress?.(
+          percent,
+          `${progressLabel} ${formatByteCount(loaded)}/${formatByteCount(total)}`
+        );
+      } else {
+        progress?.(progressBase, `${progressLabel} ${formatByteCount(loaded)}`);
+      }
+    }
+
+    const bytes = new Uint8Array(loaded);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+
+    progress?.(progressBase + progressSpan, progressLabel);
+    return bytes;
+  } catch (error) {
+    if (timeoutReason) {
+      throw new Error(timeoutReason);
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(overallTimer);
+    window.clearTimeout(stallTimer);
+  }
+}
+
+function getUrlPk4Candidates(url) {
+  const candidates = [];
+  const compactRuntime = isCompactWebViewRuntime();
+
+  if (!/\.gz([?#]|$)/i.test(url)) {
+    const rawManifestUrl = appendPathSuffix(url, ".manifest.json");
+    if (compactRuntime) {
+      candidates.push({
+        kind: "chunks",
+        url,
+        manifestUrl: rawManifestUrl,
+        compressed: false,
+        optional: true,
+        status: "Loading chunked URL PK4...",
+        message: `Fetching chunked URL PK4 from ${rawManifestUrl}...`,
+        fallbackName: "Chunked URL PK4",
+        progressLabel: "Fetching chunked PK4"
+      });
+    }
+  }
+
+  if ("DecompressionStream" in globalThis && !/\.gz([?#]|$)/i.test(url)) {
+    const gzipUrl = appendPathSuffix(url, ".gz");
+    const gzipManifestUrl = appendPathSuffix(gzipUrl, ".manifest.json");
+    candidates.push({
+      kind: "chunks",
+      url: gzipUrl,
+      manifestUrl: gzipManifestUrl,
+      compressed: true,
+      optional: true,
+      status: "Loading compressed chunked URL PK4...",
+      message: `Fetching compressed chunked URL PK4 from ${gzipManifestUrl}...`,
+      fallbackName: "Compressed chunked URL PK4",
+      progressLabel: "Fetching compressed chunks"
+    });
+    candidates.push({
+      kind: "file",
+      url: gzipUrl,
+      compressed: true,
+      optional: true,
+      status: "Loading compressed URL PK4...",
+      message: `Fetching compressed URL PK4 from ${gzipUrl}...`,
+      fallbackName: "Compressed URL PK4"
+    });
+  }
+
+  candidates.push({
+    kind: "file",
+    url,
+    compressed: /\.gz([?#]|$)/i.test(url),
+    optional: false,
+    status: /\.gz([?#]|$)/i.test(url) ? "Loading compressed URL PK4..." : "Loading URL PK4...",
+    message: `Fetching URL PK4 from ${url}...`,
+    fallbackName: "URL PK4"
+  });
+
+  return candidates;
+}
+
+function appendPathSuffix(url, suffix) {
+  const nextUrl = new URL(url, window.location.href);
+  nextUrl.pathname = `${nextUrl.pathname}${suffix}`;
+  return nextUrl.href;
+}
+
+function isCompactWebViewRuntime() {
+  return /Android.*wv/.test(navigator.userAgent) || screen.width <= 640;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function getUrlPk4Source() {
+  const rawValue = new URLSearchParams(window.location.search).get(URL_PK4_PARAM);
+  const value = rawValue?.trim();
+
+  if (!value) {
+    return null;
+  }
+
+  if (looksLikeLocalPath(value)) {
+    throw new Error(
+      "The pk4 parameter must be an HTTP(S) URL or a path relative to this page, not a local filesystem path"
+    );
+  }
+
+  let url = null;
+  try {
+    url = new URL(value, window.location.href);
+  } catch {
+    throw new Error(`Invalid pk4 parameter: ${value}`);
+  }
+
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("The pk4 parameter must use HTTP or HTTPS");
+  }
+
+  return { url: url.href };
+}
+
+function looksLikeLocalPath(value) {
+  return (
+    value.startsWith("file:") ||
+    value.startsWith("~/") ||
+    /^\/(users|volumes|home|private|tmp)\//i.test(value) ||
+    /^[a-z]:[\\/]/i.test(value)
+  );
+}
+
+async function decompressGzip(bytes) {
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+function writePk4(FS, pk4Bytes, source, options) {
+  if (!isPk4Payload(pk4Bytes)) {
+    throw new Error(`${source} data is not a valid DOOM 3 PK4`);
+  }
+
+  mkdirTree(FS, "/base");
+  FS.writeFile("/base/pak-display.pk4", pk4Bytes);
+
+  if (options.writablePath) {
+    mkdirTree(FS, "/dhewm3/base");
+    FS.writeFile("/dhewm3/base/pak-display.pk4", pk4Bytes);
+    console.info(`Installed ${source} PK4 at /base/pak-display.pk4 and /dhewm3/base/pak-display.pk4`);
+  } else {
+    console.info(`Installed ${source} PK4 at /base/pak-display.pk4`);
+  }
+}
+
+function withTimeout(promise, ms, label) {
+  let timer = null;
+
+  const timeout = new Promise((_, reject) => {
+    timer = window.setTimeout(() => {
+      reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`));
+    }, ms);
+  });
+
+  return Promise.race([promise, timeout]).finally(() => {
+    window.clearTimeout(timer);
+  });
+}
+
+function bootLog(output, text, onLog) {
+  const line = `[boot] ${text}`;
+  appendOutput(output, line);
+  onLog?.(line);
+  console.info(line);
+}
+
+function formatByteCount(value) {
+  if (!value) {
+    return "0 B";
+  }
+
+  const units = ["B", "KB", "MB", "GB"];
+  let amount = value;
+  let unit = 0;
+
+  while (amount >= 1024 && unit < units.length - 1) {
+    amount /= 1024;
+    unit += 1;
+  }
+
+  return `${amount.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+function formatError(error) {
+  if (error?.message) {
+    return error.message;
+  }
+
+  if (typeof error === "string") {
+    return error;
+  }
+
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
+}
+
+function isGzipPayload(bytes) {
+  return bytes.byteLength >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b;
+}
+
+function isPk4Payload(bytes) {
+  // PK4 files are ZIP archives: local file header "PK\x03\x04" or, for an empty
+  // archive, the end-of-central-directory record "PK\x05\x06".
+  return (
+    bytes.byteLength >= 4 &&
+    bytes[0] === 0x50 &&
+    bytes[1] === 0x4b &&
+    (bytes[2] === 0x03 || bytes[2] === 0x05 || bytes[2] === 0x07) &&
+    (bytes[3] === 0x04 || bytes[3] === 0x06 || bytes[3] === 0x08)
+  );
+}
+
+function fileExists(FS, path) {
+  try {
+    return FS.analyzePath(path).exists;
+  } catch {
+    return false;
+  }
+}
+
+function mkdirTree(FS, path) {
+  const parts = path.split("/").filter(Boolean);
+  let current = "";
+
+  for (const part of parts) {
+    current += `/${part}`;
+    if (fileExists(FS, current)) {
+      continue;
+    }
+
+    try {
+      FS.mkdir(current);
+    } catch (error) {
+      if (!fileExists(FS, current)) {
+        throw error;
+      }
+    }
+  }
+}
+
+function isRuntimeFS(FS) {
+  return Boolean(
+    FS &&
+    typeof FS.mkdir === "function" &&
+    typeof FS.writeFile === "function" &&
+    typeof FS.analyzePath === "function"
+  );
+}
+
+function appendOutput(output, text) {
+  if (!output) {
+    return;
+  }
+
+  output.value += `${text}\n`;
+  output.scrollTop = output.scrollHeight;
+}
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = src;
+    script.async = true;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error(`Failed to load ${src}`));
+    document.body.appendChild(script);
+  });
+}

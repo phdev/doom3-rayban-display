@@ -1,0 +1,51 @@
+name: Deploy GitHub Pages
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # NOTE: The DOOM 3 WebAssembly engine build is experimental and requires
+      # the Emscripten SDK plus DOOM 3 game data you own. It is intentionally
+      # NOT run in CI (no proprietary data, long build). To ship a playable
+      # build, run scripts/build-gl4es.sh + scripts/build-dhewm3.sh and
+      # scripts/install-demo-data.sh locally so public/wasm/ is populated before
+      # this workflow runs, or wire those steps in here with your own data
+      # source. The steps below build only the web app shell.
+      - run: npm run build
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

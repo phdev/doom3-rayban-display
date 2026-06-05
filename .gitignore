@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.vite/
+.build/
+__pycache__/
+dist-pak/
+public/wasm/*.js
+public/wasm/*.wasm
+public/wasm/*.data
+public/wasm/base/
+*.pk4
+.DS_Store

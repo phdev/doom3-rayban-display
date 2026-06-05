@@ -1,0 +1,22 @@
+{
+  "inputPk4": "/absolute/path/to/owned/base/pak000.pk4",
+  "outputPk4": "dist-pak/base/pak-display.pk4",
+  "map": "game/mars_city1",
+  "keep": [
+    "maps/game/mars_city1.*",
+    "materials/*.mtr",
+    "def/*.def",
+    "script/*.script",
+    "guis/mainmenu.gui",
+    "guis/hud.gui",
+    "textures/common/*",
+    "models/md5/monsters/zombie*/*",
+    "models/md5/weapons/pistol_view/*",
+    "sound/*.sndshd"
+  ],
+  "notes": [
+    "DOOM 3 data is proprietary; use this only on data you own.",
+    "Globs in keep[] are force-included on top of the automatic dependency pass.",
+    "Prefer running reduce-d3-map-pk4.py and inspecting the report before trimming further."
+  ]
+}

@@ -1,0 +1,772 @@
+diff --git a/neo/CMakeLists.txt b/neo/CMakeLists.txt
+index 69f1892..9fb26ba 100644
+--- a/neo/CMakeLists.txt
++++ b/neo/CMakeLists.txt
+@@ -535,6 +535,38 @@ set(CMAKE_CXX_FLAGS_RELWITHDEBINFO ${CMAKE_C_FLAGS_RELWITHDEBINFO})
+ set(CMAKE_CXX_FLAGS_RELEASE "-DNDEBUG ${CMAKE_C_FLAGS_RELEASE}")
+ set(CMAKE_CXX_FLAGS_MINSIZEREL "-DNDEBUG ${CMAKE_C_FLAGS_MINSIZEREL}")
+ 
++# Meta Ray-Ban Display: Emscripten / WebAssembly target (experimental).
++# Produces dhewm3.js / dhewm3.wasm / dhewm3.data and exposes the D3_* wearable
++# bridge to JavaScript. The runtime is driven by the web app shell in
++# https://github.com/phdev/doom3-rayban-display .
++if(EMSCRIPTEN)
++	# D3_EMSCRIPTEN_EMBED may point at a directory whose contents are baked into
++	# dhewm3.data (e.g. base/autoexec.cfg and an optional reduced pak-display.pk4).
++	if(NOT DEFINED D3_EMSCRIPTEN_EMBED)
++		set(D3_EMSCRIPTEN_EMBED "${CMAKE_SOURCE_DIR}/sys/wasm/embed")
++	endif()
++
++	set(d3_wasm_exports "[\"_main\",\"_D3_AddViewAngles\",\"_D3_SetViewYaw\",\"_D3_SetWearableAction\",\"_D3_GetEnemyIndicators\",\"_D3_GetEnemyYaw\",\"_D3_RequestEnemyTurn\",\"_D3_SetEnemyIndicators\",\"_D3_SetEnemyIndicatorYaw\",\"_D3_ConsumeEnemyTurn\"]")
++
++	set(d3_wasm_ldflags
++		"-sMAIN_MODULE=2"
++		"-sFULL_ES2=1 -sFULL_ES3=1 -sMIN_WEBGL_VERSION=1 -sMAX_WEBGL_VERSION=2"
++		"-sINITIAL_MEMORY=512MB -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2GB -sSTACK_SIZE=8MB"
++		"-sEXPORTED_FUNCTIONS=${d3_wasm_exports}"
++		"-sEXPORTED_RUNTIME_METHODS=[\"ccall\",\"cwrap\",\"FS\",\"callMain\"]"
++		"-sEXIT_RUNTIME=0 -sINVOKE_RUN=0"
++		"--post-js ${CMAKE_SOURCE_DIR}/sys/wasm/d3_runtime_exports.js"
++		"--preload-file ${D3_EMSCRIPTEN_EMBED}@/"
++		"-lidbfs.js"
++	)
++	string(REPLACE ";" " " d3_wasm_ldflags "${d3_wasm_ldflags}")
++	set(ldflags "${ldflags} ${d3_wasm_ldflags}")
++
++	# DOOM 3 expects an OpenGL context; GL4ES (or Emscripten's GL emulation)
++	# translates the legacy calls to WebGL. -fPIC keeps MAIN_MODULE happy.
++	add_compile_options(-fPIC)
++endif()
++
+ # mingw and msvc
+ if(WIN32)
+ 	add_definitions(-DWINVER=0x0501)
+@@ -699,6 +731,7 @@ set(src_framework
+ 	framework/FileSystem.cpp
+ 	framework/KeyInput.cpp
+ 	framework/UsercmdGen.cpp
++	framework/d3_wearable.cpp
+ 	framework/Session_menu.cpp
+ 	framework/Session.cpp
+ 	framework/async/AsyncClient.cpp
+@@ -909,6 +942,7 @@ set(src_game
+ 	game/AF.cpp
+ 	game/AFEntity.cpp
+ 	game/Actor.cpp
++	game/D3Wearable.cpp
+ 	game/Camera.cpp
+ 	game/Entity.cpp
+ 	game/BrittleFracture.cpp
+diff --git a/neo/framework/UsercmdGen.cpp b/neo/framework/UsercmdGen.cpp
+index 6bba28f..9f732b9 100644
+--- a/neo/framework/UsercmdGen.cpp
++++ b/neo/framework/UsercmdGen.cpp
+@@ -34,6 +34,7 @@ If you have questions concerning this license or the applicable additional terms
+ #include "framework/async/AsyncNetwork.h"
+ 
+ #include "framework/UsercmdGen.h"
++#include "framework/d3_wearable.h"
+ 
+ /*
+ ================
+@@ -1056,6 +1057,13 @@ void idUsercmdGenLocal::MakeCurrent( void ) {
+ 		// get basic movement from mouse
+ 		MouseMove();
+ 
++#ifdef __EMSCRIPTEN__
++		// Meta Ray-Ban Display: fold in head-tracking yaw/pitch and latched
++		// wearable actions before the angles are committed to the usercmd.
++		D3_ApplyWearableView( viewangles );
++		D3_ApplyWearableButtons( cmd );
++#endif
++
+ 		// check to make sure the angles haven't wrapped
+ 		if ( viewangles[PITCH] - oldAngles[PITCH] > 90 ) {
+ 			viewangles[PITCH] = oldAngles[PITCH] + 90;
+diff --git a/neo/framework/d3_wearable.cpp b/neo/framework/d3_wearable.cpp
+new file mode 100644
+index 0000000..6fd3433
+--- /dev/null
++++ b/neo/framework/d3_wearable.cpp
+@@ -0,0 +1,252 @@
++/*
++===========================================================================
++
++Meta Ray-Ban Display wearable bridge for dhewm3 (DOOM 3).
++
++Engine-side implementation of the wearable bridge. Only compiled for the
++Emscripten/WebAssembly target. Mirrors the GLQuake II Display patch:
++
++  - JavaScript head tracking calls D3_AddViewAngles() to nudge the camera.
++  - JavaScript gestures call D3_SetWearableAction() to latch forward / jump /
++    attack / crouch / use / flashlight.
++  - The game module writes enemy indicator state and reads turn requests.
++
++===========================================================================
++*/
++
++#include "sys/platform.h"
++#include "idlib/math/Vector.h"
++#include "idlib/Lib.h"
++#include "framework/UsercmdGen.h"
++#include "framework/d3_wearable.h"
++
++#ifdef __EMSCRIPTEN__
++
++#include <emscripten/emscripten.h>
++
++// The flashlight is selected as a weapon in classic DOOM 3; this impulse
++// matches the "f" bind written into base/autoexec.cfg.
++#define D3_FLASHLIGHT_IMPULSE	11
++
++static bool		d3_wearable_actions[D3_WEARABLE_ACTION_COUNT];
++static float	d3_wearable_pending_yaw;
++static float	d3_wearable_pending_pitch;
++static int		d3_wearable_enemy_indicators;
++static int		d3_wearable_enemy_turn_request;
++static float	d3_wearable_enemy_yaws[2];
++static bool		d3_wearable_flashlight_edge;
++
++static float
++D3_Normalize360( float angle )
++{
++	while ( angle >= 360.0f )
++	{
++		angle -= 360.0f;
++	}
++
++	while ( angle < 0.0f )
++	{
++		angle += 360.0f;
++	}
++
++	return angle;
++}
++
++extern "C" {
++
++EMSCRIPTEN_KEEPALIVE
++void
++D3_AddViewAngles( float dyaw, float dpitch )
++{
++	d3_wearable_pending_yaw += dyaw;
++	d3_wearable_pending_pitch += dpitch;
++}
++
++EMSCRIPTEN_KEEPALIVE
++void
++D3_SetViewYaw( float yaw )
++{
++	// Absolute yaw is applied on the next ApplyWearableView() by zeroing the
++	// accumulator and storing the target as a delta from the current angle.
++	d3_wearable_pending_yaw = D3_Normalize360( yaw ) - 100000.0f;
++}
++
++EMSCRIPTEN_KEEPALIVE
++int
++D3_GetEnemyIndicators( void )
++{
++	return d3_wearable_enemy_indicators;
++}
++
++EMSCRIPTEN_KEEPALIVE
++float
++D3_GetEnemyYaw( int direction )
++{
++	if ( ( direction < 0 ) && ( d3_wearable_enemy_indicators & 1 ) )
++	{
++		return d3_wearable_enemy_yaws[0];
++	}
++
++	if ( ( direction > 0 ) && ( d3_wearable_enemy_indicators & 2 ) )
++	{
++		return d3_wearable_enemy_yaws[1];
++	}
++
++	return 0.0f;
++}
++
++EMSCRIPTEN_KEEPALIVE
++void
++D3_RequestEnemyTurn( int direction )
++{
++	if ( direction < 0 )
++	{
++		d3_wearable_enemy_turn_request = -1;
++	}
++	else if ( direction > 0 )
++	{
++		d3_wearable_enemy_turn_request = 1;
++	}
++	else
++	{
++		d3_wearable_enemy_turn_request = 0;
++	}
++}
++
++EMSCRIPTEN_KEEPALIVE
++void
++D3_SetEnemyIndicators( int left, int right )
++{
++	d3_wearable_enemy_indicators = ( left ? 1 : 0 ) | ( right ? 2 : 0 );
++}
++
++EMSCRIPTEN_KEEPALIVE
++void
++D3_SetEnemyIndicatorYaw( int direction, float yaw )
++{
++	if ( direction < 0 )
++	{
++		d3_wearable_enemy_yaws[0] = D3_Normalize360( yaw );
++	}
++	else if ( direction > 0 )
++	{
++		d3_wearable_enemy_yaws[1] = D3_Normalize360( yaw );
++	}
++}
++
++EMSCRIPTEN_KEEPALIVE
++int
++D3_ConsumeEnemyTurn( void )
++{
++	const int direction = d3_wearable_enemy_turn_request;
++	d3_wearable_enemy_turn_request = 0;
++	return direction;
++}
++
++EMSCRIPTEN_KEEPALIVE
++void
++D3_SetWearableAction( int action, int down )
++{
++	if ( ( action < 0 ) || ( action >= D3_WEARABLE_ACTION_COUNT ) )
++	{
++		return;
++	}
++
++	const bool wasDown = d3_wearable_actions[action];
++	d3_wearable_actions[action] = down ? true : false;
++
++	if ( ( action == D3_WEARABLE_FLASHLIGHT ) && d3_wearable_actions[action] && !wasDown )
++	{
++		d3_wearable_flashlight_edge = true;
++	}
++}
++
++void
++D3_NotifyAutoFireStarted( void )
++{
++	EM_ASM({
++		if ( ( typeof Module !== "undefined" ) &&
++			( typeof Module.d3AutoFireStarted === "function" ) )
++		{
++			Module.d3AutoFireStarted();
++		}
++	});
++}
++
++} // extern "C"
++
++bool
++D3_WearableActionDown( int action )
++{
++	if ( ( action < 0 ) || ( action >= D3_WEARABLE_ACTION_COUNT ) )
++	{
++		return false;
++	}
++
++	return d3_wearable_actions[action];
++}
++
++void
++D3_ApplyWearableView( idVec3 &viewangles )
++{
++	if ( d3_wearable_pending_yaw <= -50000.0f )
++	{
++		// Absolute set requested via D3_SetViewYaw().
++		viewangles[YAW] = D3_Normalize360( d3_wearable_pending_yaw + 100000.0f );
++	}
++	else if ( d3_wearable_pending_yaw != 0.0f )
++	{
++		viewangles[YAW] = D3_Normalize360( viewangles[YAW] + d3_wearable_pending_yaw );
++	}
++
++	if ( d3_wearable_pending_pitch != 0.0f )
++	{
++		viewangles[PITCH] += d3_wearable_pending_pitch;
++
++		if ( viewangles[PITCH] > 89.0f )
++		{
++			viewangles[PITCH] = 89.0f;
++		}
++
++		if ( viewangles[PITCH] < -89.0f )
++		{
++			viewangles[PITCH] = -89.0f;
++		}
++	}
++
++	d3_wearable_pending_yaw = 0.0f;
++	d3_wearable_pending_pitch = 0.0f;
++}
++
++void
++D3_ApplyWearableButtons( usercmd_t &cmd )
++{
++	if ( d3_wearable_actions[D3_WEARABLE_FORWARD] && ( cmd.forwardmove < 100 ) )
++	{
++		cmd.forwardmove = 100;
++	}
++
++	if ( d3_wearable_actions[D3_WEARABLE_JUMP] && ( cmd.upmove < 127 ) )
++	{
++		cmd.upmove = 127;
++	}
++
++	if ( d3_wearable_actions[D3_WEARABLE_CROUCH] && ( cmd.upmove > -127 ) )
++	{
++		cmd.upmove = -127;
++	}
++
++	if ( d3_wearable_actions[D3_WEARABLE_ATTACK] )
++	{
++		cmd.buttons |= BUTTON_ATTACK;
++	}
++
++	if ( d3_wearable_flashlight_edge )
++	{
++		cmd.impulse = D3_FLASHLIGHT_IMPULSE;
++		cmd.flags ^= UCF_IMPULSE_SEQUENCE;
++		d3_wearable_flashlight_edge = false;
++	}
++}
++
++#endif // __EMSCRIPTEN__
+diff --git a/neo/framework/d3_wearable.h b/neo/framework/d3_wearable.h
+new file mode 100644
+index 0000000..1b43afb
+--- /dev/null
++++ b/neo/framework/d3_wearable.h
+@@ -0,0 +1,72 @@
++/*
++===========================================================================
++
++Meta Ray-Ban Display wearable bridge for dhewm3 (DOOM 3).
++
++This header declares the C interface shared between the engine (framework) and
++the game module. The JavaScript host calls the EMSCRIPTEN_KEEPALIVE exports to
++drive the camera and inject wearable actions; the game module calls the enemy
++indicator helpers to mirror the Quake II Ray-Ban Display assist behaviour.
++
++===========================================================================
++*/
++
++#ifndef __D3_WEARABLE_H__
++#define __D3_WEARABLE_H__
++
++#ifdef __EMSCRIPTEN__
++
++#include "idlib/math/Vector.h"
++#include "framework/UsercmdGen.h"
++
++// Wearable action ids, matching src/wearableInput.js ACTION_IDS.
++enum {
++	D3_WEARABLE_FORWARD,
++	D3_WEARABLE_ATTACK,
++	D3_WEARABLE_JUMP,
++	D3_WEARABLE_CROUCH,
++	D3_WEARABLE_USE,
++	D3_WEARABLE_FLASHLIGHT,
++	D3_WEARABLE_ACTION_COUNT
++};
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Camera control, called from JavaScript head tracking / turn bursts.
++void	D3_AddViewAngles( float dyaw, float dpitch );
++void	D3_SetViewYaw( float yaw );
++
++// Wearable action latch, called from JavaScript gesture input.
++void	D3_SetWearableAction( int action, int down );
++
++// Enemy assist state, written by the game module, read by JavaScript.
++int		D3_GetEnemyIndicators( void );
++float	D3_GetEnemyYaw( int direction );
++void	D3_RequestEnemyTurn( int direction );
++void	D3_SetEnemyIndicators( int left, int right );
++void	D3_SetEnemyIndicatorYaw( int direction, float yaw );
++int		D3_ConsumeEnemyTurn( void );
++
++// Notify the JavaScript host that auto-fire engaged (so it can drop sticky
++// forward and lower IMU sensitivity briefly).
++void	D3_NotifyAutoFireStarted( void );
++
++#ifdef __cplusplus
++}
++#endif
++
++// Engine-side helpers used by the usercmd generator (C++ only).
++#ifdef __cplusplus
++// Consume the pending head-tracking deltas into the live view angles.
++void	D3_ApplyWearableView( idVec3 &viewangles );
++// Force movement / button bits from the latched wearable actions.
++void	D3_ApplyWearableButtons( usercmd_t &cmd );
++// Read a latched wearable action (for the game module).
++bool	D3_WearableActionDown( int action );
++#endif
++
++#endif // __EMSCRIPTEN__
++
++#endif // __D3_WEARABLE_H__
+diff --git a/neo/game/D3Wearable.cpp b/neo/game/D3Wearable.cpp
+new file mode 100644
+index 0000000..ef1357d
+--- /dev/null
++++ b/neo/game/D3Wearable.cpp
+@@ -0,0 +1,254 @@
++/*
++===========================================================================
++
++Meta Ray-Ban Display wearable assist for dhewm3 (DOOM 3) — game module side.
++
++Only compiled for the Emscripten/WebAssembly target. Scans for hostile idAI
++actors and:
++
++  - lights the left/right edge indicators when an off-screen enemy is near,
++  - snaps the player view toward a side enemy on a host turn request,
++  - forces BUTTON_ATTACK when a hostile is centered in view (auto-fire).
++
++The heavy lifting lives here so the Player.cpp hook stays a single line.
++
++===========================================================================
++*/
++
++#include "sys/platform.h"
++#include "idlib/Lib.h"
++#include "framework/UsercmdGen.h"
++#include "framework/d3_wearable.h"
++
++#include "Game_local.h"
++#include "Player.h"
++#include "ai/AI.h"
++#include "D3Wearable.h"
++
++#ifdef __EMSCRIPTEN__
++
++#define D3_WEARABLE_ENEMY_RANGE			1200.0f
++#define D3_WEARABLE_AUTOFIRE_DOT		0.9063078f	// cos(25 degrees)
++#define D3_WEARABLE_VIEW_HALF_ANGLE		35.0f
++#define D3_WEARABLE_REAR_BOTH_ANGLE		160.0f
++
++static float
++D3_Normalize180( float angle )
++{
++	angle = idMath::AngleNormalize180( angle );
++	return angle;
++}
++
++static bool
++D3_WearableIsHostile( idPlayer *player, idEntity *candidate )
++{
++	if ( !candidate || candidate == player )
++	{
++		return false;
++	}
++
++	if ( !candidate->IsType( idAI::Type ) )
++	{
++		return false;
++	}
++
++	if ( candidate->health <= 0 )
++	{
++		return false;
++	}
++
++	idActor *actor = static_cast<idActor *>( candidate );
++
++	// Different team from the player is treated as hostile.
++	if ( actor->team == player->team )
++	{
++		return false;
++	}
++
++	return true;
++}
++
++static idVec3
++D3_WearableTargetCenter( idEntity *candidate )
++{
++	idVec3 center = candidate->GetPhysics()->GetOrigin();
++	const idBounds &bounds = candidate->GetPhysics()->GetBounds();
++	center.z += ( bounds[0].z + bounds[1].z ) * 0.5f;
++	return center;
++}
++
++static bool
++D3_WearableCanSee( idPlayer *player, idEntity *candidate, const idVec3 &start, const idVec3 &end )
++{
++	trace_t tr;
++	gameLocal.clip.TracePoint( tr, start, end, MASK_SHOT_BOUNDINGBOX, player );
++
++	if ( tr.fraction >= 1.0f )
++	{
++		return true;
++	}
++
++	return ( gameLocal.GetTraceEntity( tr ) == candidate );
++}
++
++static idEntity *
++D3_WearableFindCenterEnemy( idPlayer *player, const idVec3 &eye, const idVec3 &forward )
++{
++	idEntity *best = NULL;
++	float best_dot = D3_WEARABLE_AUTOFIRE_DOT;
++
++	for ( int i = 0; i < MAX_GENTITIES; i++ )
++	{
++		idEntity *candidate = gameLocal.entities[i];
++
++		if ( !D3_WearableIsHostile( player, candidate ) )
++		{
++			continue;
++		}
++
++		idVec3 target = D3_WearableTargetCenter( candidate );
++		idVec3 dir = target - eye;
++		float dist = dir.Normalize();
++
++		if ( ( dist <= 1.0f ) || ( dist > D3_WEARABLE_ENEMY_RANGE ) )
++		{
++			continue;
++		}
++
++		float dot = dir * forward;
++
++		if ( dot < best_dot )
++		{
++			continue;
++		}
++
++		if ( !D3_WearableCanSee( player, candidate, eye, target ) )
++		{
++			continue;
++		}
++
++		best = candidate;
++		best_dot = dot;
++	}
++
++	return best;
++}
++
++static idEntity *
++D3_WearableFindSideEnemy( idPlayer *player, const idVec3 &eye, float viewYaw, int direction, float *yaw_out )
++{
++	idEntity *best = NULL;
++	float best_dist = D3_WEARABLE_ENEMY_RANGE + 1.0f;
++
++	for ( int i = 0; i < MAX_GENTITIES; i++ )
++	{
++		idEntity *candidate = gameLocal.entities[i];
++
++		if ( !D3_WearableIsHostile( player, candidate ) )
++		{
++			continue;
++		}
++
++		idVec3 target = D3_WearableTargetCenter( candidate );
++		idVec3 flat = target - eye;
++		flat.z = 0.0f;
++		float dist = flat.Normalize();
++
++		if ( ( dist <= 1.0f ) || ( dist > D3_WEARABLE_ENEMY_RANGE ) )
++		{
++			continue;
++		}
++
++		float target_yaw = flat.ToYaw();
++		float yaw_delta = D3_Normalize180( target_yaw - viewYaw );
++		float abs_delta = idMath::Fabs( yaw_delta );
++
++		if ( abs_delta <= D3_WEARABLE_VIEW_HALF_ANGLE )
++		{
++			continue;
++		}
++
++		// direction < 0 == player's left == positive yaw delta in DOOM 3.
++		if ( ( ( direction < 0 ) && ( yaw_delta <= D3_WEARABLE_VIEW_HALF_ANGLE ) && ( abs_delta < D3_WEARABLE_REAR_BOTH_ANGLE ) ) ||
++			 ( ( direction > 0 ) && ( yaw_delta >= -D3_WEARABLE_VIEW_HALF_ANGLE ) && ( abs_delta < D3_WEARABLE_REAR_BOTH_ANGLE ) ) )
++		{
++			continue;
++		}
++
++		if ( !D3_WearableCanSee( player, candidate, eye, target ) )
++		{
++			continue;
++		}
++
++		if ( dist < best_dist )
++		{
++			best = candidate;
++			best_dist = dist;
++
++			if ( yaw_out )
++			{
++				*yaw_out = target_yaw;
++			}
++		}
++	}
++
++	return best;
++}
++
++void
++D3_WearablePlayerAssist( idPlayer *player, usercmd_t *cmd )
++{
++	if ( !player || !cmd || player->health <= 0 || player->spectating )
++	{
++		D3_SetEnemyIndicators( 0, 0 );
++		return;
++	}
++
++	const idVec3 eye = player->GetEyePosition();
++	const float viewYaw = player->viewAngles.yaw;
++	idVec3 forward = player->viewAngles.ToForward();
++
++	// Side-enemy indicators.
++	float left_yaw = viewYaw;
++	float right_yaw = viewYaw;
++	idEntity *left_enemy = D3_WearableFindSideEnemy( player, eye, viewYaw, -1, &left_yaw );
++	idEntity *right_enemy = D3_WearableFindSideEnemy( player, eye, viewYaw, 1, &right_yaw );
++
++	D3_SetEnemyIndicators( left_enemy != NULL, right_enemy != NULL );
++
++	if ( left_enemy )
++	{
++		D3_SetEnemyIndicatorYaw( -1, left_yaw );
++	}
++
++	if ( right_enemy )
++	{
++		D3_SetEnemyIndicatorYaw( 1, right_yaw );
++	}
++
++	// Snap toward a side enemy when the host requests a turn burst.
++	int turn = D3_ConsumeEnemyTurn();
++
++	if ( ( ( turn < 0 ) && left_enemy ) || ( ( turn > 0 ) && right_enemy ) )
++	{
++		float yaw = ( turn < 0 ) ? left_yaw : right_yaw;
++		idAngles angles = player->viewAngles;
++		angles.yaw = yaw;
++		player->SetViewAngles( angles );
++		D3_SetViewYaw( yaw );
++
++		// recompute forward for auto-fire after the snap
++		forward = angles.ToForward();
++	}
++
++	// Auto-fire when a hostile is centered and visible.
++	idEntity *centered = D3_WearableFindCenterEnemy( player, eye, forward );
++
++	if ( centered )
++	{
++		cmd->buttons |= BUTTON_ATTACK;
++		D3_NotifyAutoFireStarted();
++	}
++}
++
++#endif // __EMSCRIPTEN__
+diff --git a/neo/game/D3Wearable.h b/neo/game/D3Wearable.h
+new file mode 100644
+index 0000000..bd37bff
+--- /dev/null
++++ b/neo/game/D3Wearable.h
+@@ -0,0 +1,27 @@
++/*
++===========================================================================
++
++Meta Ray-Ban Display wearable assist for dhewm3 (DOOM 3) — game module side.
++
++Mirrors the GLQuake II Display auto-fire / enemy-indicator assist. Only built
++for the Emscripten/WebAssembly target.
++
++===========================================================================
++*/
++
++#ifndef __D3_WEARABLE_GAME_H__
++#define __D3_WEARABLE_GAME_H__
++
++#ifdef __EMSCRIPTEN__
++
++class idPlayer;
++class usercmd_t;
++
++// Called once per player think, after the usercmd is latched. Updates the
++// left/right enemy indicators, snaps the view toward a side enemy when the
++// host requests a turn, and forces attack when a hostile is centered.
++void D3_WearablePlayerAssist( idPlayer *player, usercmd_t *cmd );
++
++#endif // __EMSCRIPTEN__
++
++#endif // __D3_WEARABLE_GAME_H__
+diff --git a/neo/game/Player.cpp b/neo/game/Player.cpp
+index 01b05ab..c89878a 100644
+--- a/neo/game/Player.cpp
++++ b/neo/game/Player.cpp
+@@ -37,6 +37,7 @@ If you have questions concerning this license or the applicable additional terms
+ #include "ai/AI.h"
+ #include "WorldSpawn.h"
+ #include "Player.h"
++#include "D3Wearable.h"
+ #include "Camera.h"
+ #include "Fx.h"
+ #include "Misc.h"
+@@ -6220,6 +6221,11 @@ void idPlayer::Think( void ) {
+ 	buttonMask &= usercmd.buttons;
+ 	usercmd.buttons &= ~buttonMask;
+ 
++#ifdef __EMSCRIPTEN__
++	// Meta Ray-Ban Display: enemy indicators + auto-fire assist.
++	D3_WearablePlayerAssist( this, &usercmd );
++#endif
++
+ 	if ( gameLocal.inCinematic && gameLocal.skipCinematic ) {
+ 		return;
+ 	}
+diff --git a/neo/sys/wasm/d3_runtime_exports.js b/neo/sys/wasm/d3_runtime_exports.js
+new file mode 100644
+index 0000000..2e7755b
+--- /dev/null
++++ b/neo/sys/wasm/d3_runtime_exports.js
+@@ -0,0 +1,28 @@
++// Meta Ray-Ban Display: re-expose Emscripten runtime helpers on Module so the
++// web app shell (src/d3Runtime.js) can install PK4 data and call main itself.
++(function () {
++	if (typeof callMain === "function") {
++		Module["callMain"] = callMain;
++	}
++	if (typeof ccall === "function") {
++		Module["ccall"] = ccall;
++	}
++	if (typeof cwrap === "function") {
++		Module["cwrap"] = cwrap;
++	}
++	if (typeof FS === "object") {
++		Module["FS"] = FS;
++	}
++	if (typeof FS_createPath === "function") {
++		Module["FS_createPath"] = FS_createPath;
++	}
++	if (typeof FS_createDataFile === "function") {
++		Module["FS_createDataFile"] = FS_createDataFile;
++	}
++	if (typeof addRunDependency === "function") {
++		Module["addRunDependency"] = addRunDependency;
++	}
++	if (typeof removeRunDependency === "function") {
++		Module["removeRunDependency"] = removeRunDependency;
++	}
++}());

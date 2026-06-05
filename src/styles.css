@@ -1,0 +1,219 @@
+:root {
+  color-scheme: dark;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  background: #040404;
+  color: #c9c4ba;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  width: 100%;
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  overflow: hidden;
+  background: #040404;
+}
+
+.game-shell {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 100vw;
+  height: 100vh;
+  background: #040404;
+  overflow: hidden;
+}
+
+.game-canvas {
+  display: block;
+  width: min(100vw, 100vh, 600px);
+  height: min(100vw, 100vh, 600px);
+  border: 0;
+  outline: none;
+  background: #040404;
+  image-rendering: auto;
+  --d3-display-brightness: 1;
+  --d3-display-contrast: 1;
+  --d3-display-saturate: 1;
+  filter:
+    brightness(var(--d3-display-brightness))
+    contrast(var(--d3-display-contrast))
+    saturate(var(--d3-display-saturate));
+}
+
+.enemy-indicator {
+  position: fixed;
+  top: 50%;
+  z-index: 1;
+  width: 0;
+  height: 0;
+  opacity: 0;
+  pointer-events: none;
+  filter: drop-shadow(0 0 10px rgba(214, 51, 43, 0.55));
+  transform: translateY(-50%);
+  transition: opacity 90ms linear;
+}
+
+.enemy-indicator.is-visible {
+  opacity: 0.94;
+}
+
+.enemy-indicator-left {
+  left: 10px;
+  border-top: 18px solid transparent;
+  border-bottom: 18px solid transparent;
+  border-right: 24px solid #d6332b;
+}
+
+.enemy-indicator-right {
+  right: 10px;
+  border-top: 18px solid transparent;
+  border-bottom: 18px solid transparent;
+  border-left: 24px solid #d6332b;
+}
+
+.flashlight-indicator {
+  position: fixed;
+  left: 50%;
+  top: 12px;
+  z-index: 2;
+  padding: 2px 10px;
+  border-radius: 10px;
+  font-size: 0.62rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #0a0a0a;
+  background: #f4d35e;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-50%);
+  transition: opacity 120ms ease;
+}
+
+.flashlight-indicator.is-on {
+  opacity: 0.92;
+}
+
+.loading-panel {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  gap: 10px;
+  padding: 24px;
+  background: rgba(4, 4, 4, 0.88);
+  opacity: 1;
+  visibility: visible;
+  pointer-events: none;
+  transition:
+    opacity 180ms ease,
+    visibility 180ms ease;
+}
+
+.loading-panel.is-hidden {
+  opacity: 0;
+  visibility: hidden;
+}
+
+.loading-label {
+  color: #eee3cf;
+  font-size: 0.76rem;
+  line-height: 1;
+}
+
+.loading-track {
+  width: min(280px, 68vw);
+  height: 5px;
+  border: 1px solid #3f3a34;
+  border-radius: 3px;
+  background: #131211;
+  overflow: hidden;
+}
+
+.loading-bar {
+  width: 0;
+  height: 100%;
+  border-radius: 2px;
+  background: #d6332b;
+  transition: width 160ms ease;
+}
+
+.yaw-meter {
+  position: fixed;
+  left: 50%;
+  top: 60%;
+  z-index: 1;
+  width: min(240px, 62vw);
+  height: 24px;
+  transform: translate(-50%, -50%);
+  opacity: 0.86;
+  pointer-events: none;
+  --yaw-offset: 0%;
+}
+
+.yaw-meter::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 11px;
+  height: 2px;
+  background: #6f6a60;
+}
+
+.yaw-meter::after {
+  content: "";
+  position: absolute;
+  left: calc(50% + var(--yaw-offset));
+  top: 3px;
+  width: 4px;
+  height: 18px;
+  border-radius: 2px;
+  background: #8a857b;
+  box-shadow: 0 0 10px rgba(238, 227, 207, 0.24);
+  transform: translateX(-50%);
+  transition:
+    left 80ms linear,
+    background 80ms linear,
+    box-shadow 80ms linear;
+}
+
+.yaw-meter[data-zone="left"]::after {
+  background: #4ba3ff;
+  box-shadow: 0 0 12px rgba(75, 163, 255, 0.48);
+}
+
+.yaw-meter[data-zone="right"]::after {
+  background: #f2a23a;
+  box-shadow: 0 0 12px rgba(242, 162, 58, 0.5);
+}
+
+.yaw-meter::before,
+.yaw-meter::after {
+  will-change: left, background;
+}
+
+.runtime-hidden {
+  position: fixed;
+  top: -10000px;
+  left: -10000px;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  pointer-events: none;
+}

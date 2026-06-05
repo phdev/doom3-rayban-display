@@ -1,0 +1,22 @@
+{
+  "name": "doom3-rayban-display",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "GPL-3.0-or-later",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "check": "npm run build && python3 scripts/pk4tool.py --self-test",
+    "smoke:local": "npm run build && node scripts/smoke-local-browser.mjs",
+    "build:gl4es": "bash scripts/build-gl4es.sh",
+    "build:dhewm3": "bash scripts/build-dhewm3.sh",
+    "install:demo-data": "bash scripts/install-demo-data.sh",
+    "reduce:first-map": "python3 scripts/reduce-d3-map-pk4.py --input dist-pak/base/pak000.pk4 --map game/mars_city1 --output dist-pak/base/pak-display.pk4",
+    "reduce:first-map:wearable": "python3 scripts/reduce-d3-map-pk4.py --input dist-pak/base/pak000.pk4 --map game/mars_city1 --audio-rate 11025 --audio-width 1 --output dist-pak/base/pak-display-wearable.pk4"
+  },
+  "devDependencies": {
+    "vite": "^8.0.14"
+  }
+}
