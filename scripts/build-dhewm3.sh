@@ -15,6 +15,9 @@ DHEWM3_COMMIT="${DHEWM3_COMMIT:-8ebc11260d52638d2aff12ce73fbfccaa70db1b9}"
 PATCH_FILE="$ROOT_DIR/patches/dhewm3-meta-rayban-display.patch"
 PUBLIC_WASM="$ROOT_DIR/public/wasm"
 EMBED_DIR="$BUILD_DIR/neo/sys/wasm/embed"
+# Vendored OpenAL-Soft EFX headers — Emscripten's OpenAL port ships only stub
+# AL/alext.h without the EFX/ALC-extension typedefs dhewm3's sound system needs.
+VENDOR_EFX="$ROOT_DIR/vendor/openal-efx"
 
 if ! command -v emcmake >/dev/null 2>&1; then
   echo "emcmake was not found. Install and activate the Emscripten SDK first." >&2
@@ -68,12 +71,15 @@ emcmake cmake \
   -DD3XP=OFF \
   -DDEDICATED=OFF \
   -DTOOLS=OFF \
+  -DIMGUI=OFF \
+  -DSDL2=ON \
+  -DSDL3=OFF \
   -DHARDLINK_GAME=ON \
   -DONATIVE=OFF \
   -DD3_EMSCRIPTEN_EMBED="$EMBED_DIR" \
   -DCMAKE_EXE_LINKER_FLAGS="-L${GL4ES_PATH}/lib -lGL" \
-  -DCMAKE_C_FLAGS="-I${GL4ES_PATH}/include" \
-  -DCMAKE_CXX_FLAGS="-I${GL4ES_PATH}/include"
+  -DCMAKE_C_FLAGS="-I${GL4ES_PATH}/include -I${VENDOR_EFX}" \
+  -DCMAKE_CXX_FLAGS="-I${GL4ES_PATH}/include -I${VENDOR_EFX}"
 
 cmake --build "$BUILD_DIR/build" --parallel "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 

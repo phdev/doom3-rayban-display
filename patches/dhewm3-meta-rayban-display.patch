@@ -1,8 +1,55 @@
 diff --git a/neo/CMakeLists.txt b/neo/CMakeLists.txt
-index 69f1892..9fb26ba 100644
+index 69f1892..9a00ad0 100644
 --- a/neo/CMakeLists.txt
 +++ b/neo/CMakeLists.txt
-@@ -535,6 +535,38 @@ set(CMAKE_CXX_FLAGS_RELWITHDEBINFO ${CMAKE_C_FLAGS_RELWITHDEBINFO})
+@@ -194,8 +194,15 @@ if(CMAKE_MAJOR_VERSION LESS 3 OR ( CMAKE_MAJOR_VERSION EQUAL 3 AND CMAKE_MINOR_V
+ endif()
+ 
+ # libs
+-find_package(OpenAL REQUIRED)
+-include_directories(${OPENAL_INCLUDE_DIR})
++if(EMSCRIPTEN)
++	# Emscripten ships OpenAL as a built-in port (-lopenal); there is no CMake
++	# package to find and the AL/ headers live in the sysroot.
++	set(OPENAL_LIBRARY "-lopenal")
++	set(OPENAL_INCLUDE_DIR "")
++else()
++	find_package(OpenAL REQUIRED)
++	include_directories(${OPENAL_INCLUDE_DIR})
++endif()
+ 
+ if (SDL3)
+ 	if(SDL2)
+@@ -214,9 +221,14 @@ elseif (SDL2)
+ 	if(APPLE OR WIN32)
+ 		set(SDL2_BUILDING_LIBRARY TRUE)
+ 	endif()
+-	find_package(SDL2 REQUIRED)
+-	include_directories(${SDL2_INCLUDE_DIR})
+-	set(SDLx_LIBRARY ${SDL2_LIBRARY})
++	if(EMSCRIPTEN)
++		# Emscripten's built-in SDL2 port (enabled via -sUSE_SDL=2 in flags).
++		set(SDLx_LIBRARY "")
++	else()
++		find_package(SDL2 REQUIRED)
++		include_directories(${SDL2_INCLUDE_DIR})
++		set(SDLx_LIBRARY ${SDL2_LIBRARY})
++	endif()
+ else()
+ 	# skip SDLmain
+ 	if(APPLE OR WIN32)
+@@ -360,7 +372,9 @@ if(D3_COMPILER_IS_GCC_OR_CLANG)
+ 	add_compile_options(-pipe)
+ 	add_compile_options(-Wall)
+ 
+-	if(NOT CMAKE_CROSSCOMPILING AND ONATIVE)
++	if(EMSCRIPTEN)
++		# wasm32 has no -march; skip CPU arch flags entirely.
++	elseif(NOT CMAKE_CROSSCOMPILING AND ONATIVE)
+ 		add_compile_options(-march=native)
+ 	elseif(NOT APPLE AND cpu STREQUAL "x86")
+ 		add_compile_options(-march=pentium3)
+@@ -535,6 +549,41 @@ set(CMAKE_CXX_FLAGS_RELWITHDEBINFO ${CMAKE_C_FLAGS_RELWITHDEBINFO})
  set(CMAKE_CXX_FLAGS_RELEASE "-DNDEBUG ${CMAKE_C_FLAGS_RELEASE}")
  set(CMAKE_CXX_FLAGS_MINSIZEREL "-DNDEBUG ${CMAKE_C_FLAGS_MINSIZEREL}")
  
@@ -19,29 +66,32 @@ index 69f1892..9fb26ba 100644
 +
 +	set(d3_wasm_exports "[\"_main\",\"_D3_AddViewAngles\",\"_D3_SetViewYaw\",\"_D3_SetWearableAction\",\"_D3_GetEnemyIndicators\",\"_D3_GetEnemyYaw\",\"_D3_RequestEnemyTurn\",\"_D3_SetEnemyIndicators\",\"_D3_SetEnemyIndicatorYaw\",\"_D3_ConsumeEnemyTurn\"]")
 +
++	# The game module is hard-linked (HARDLINK_GAME), so no dynamic linking /
++	# MAIN_MODULE is required. SDL2 comes from Emscripten's built-in port, GL
++	# from GL4ES translated to WebGL2.
 +	set(d3_wasm_ldflags
-+		"-sMAIN_MODULE=2"
++		"-sUSE_SDL=2"
 +		"-sFULL_ES2=1 -sFULL_ES3=1 -sMIN_WEBGL_VERSION=1 -sMAX_WEBGL_VERSION=2"
 +		"-sINITIAL_MEMORY=512MB -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2GB -sSTACK_SIZE=8MB"
 +		"-sEXPORTED_FUNCTIONS=${d3_wasm_exports}"
 +		"-sEXPORTED_RUNTIME_METHODS=[\"ccall\",\"cwrap\",\"FS\",\"callMain\"]"
-+		"-sEXIT_RUNTIME=0 -sINVOKE_RUN=0"
++		"-sEXIT_RUNTIME=0 -sINVOKE_RUN=0 -sERROR_ON_UNDEFINED_SYMBOLS=0"
 +		"--post-js ${CMAKE_SOURCE_DIR}/sys/wasm/d3_runtime_exports.js"
 +		"--preload-file ${D3_EMSCRIPTEN_EMBED}@/"
-+		"-lidbfs.js"
++		"-lidbfs.js -lopenal"
 +	)
 +	string(REPLACE ";" " " d3_wasm_ldflags "${d3_wasm_ldflags}")
 +	set(ldflags "${ldflags} ${d3_wasm_ldflags}")
 +
-+	# DOOM 3 expects an OpenGL context; GL4ES (or Emscripten's GL emulation)
-+	# translates the legacy calls to WebGL. -fPIC keeps MAIN_MODULE happy.
-+	add_compile_options(-fPIC)
++	# SDL2 headers come from the Emscripten port at compile time; GL headers
++	# come from GL4ES (added via -I in the build script).
++	add_compile_options(-sUSE_SDL=2 -fPIC)
 +endif()
 +
  # mingw and msvc
  if(WIN32)
  	add_definitions(-DWINVER=0x0501)
-@@ -699,6 +731,7 @@ set(src_framework
+@@ -699,6 +748,7 @@ set(src_framework
  	framework/FileSystem.cpp
  	framework/KeyInput.cpp
  	framework/UsercmdGen.cpp
@@ -49,7 +99,7 @@ index 69f1892..9fb26ba 100644
  	framework/Session_menu.cpp
  	framework/Session.cpp
  	framework/async/AsyncClient.cpp
-@@ -909,6 +942,7 @@ set(src_game
+@@ -909,6 +959,7 @@ set(src_game
  	game/AF.cpp
  	game/AFEntity.cpp
  	game/Actor.cpp
@@ -57,6 +107,23 @@ index 69f1892..9fb26ba 100644
  	game/Camera.cpp
  	game/Entity.cpp
  	game/BrittleFracture.cpp
+diff --git a/neo/framework/FileSystem.cpp b/neo/framework/FileSystem.cpp
+index 7edeb4d..adae33e 100644
+--- a/neo/framework/FileSystem.cpp
++++ b/neo/framework/FileSystem.cpp
+@@ -3555,6 +3555,12 @@ idFileSystemLocal::StartBackgroundReadThread
+ =================
+ */
+ void idFileSystemLocal::StartBackgroundDownloadThread() {
++#ifdef __EMSCRIPTEN__
++	// No worker threads in the single-threaded browser build; networked
++	// background downloads are unused. Background reads fall back to the
++	// synchronous path.
++	return;
++#endif
+ 	if ( !backgroundThread.threadHandle ) {
+ 		Sys_CreateThread( BackgroundDownloadThread, &backgroundThread_exit, backgroundThread, "backgroundDownload" );
+ 	} else {
 diff --git a/neo/framework/UsercmdGen.cpp b/neo/framework/UsercmdGen.cpp
 index 6bba28f..9f732b9 100644
 --- a/neo/framework/UsercmdGen.cpp
@@ -85,10 +152,10 @@ index 6bba28f..9f732b9 100644
  			viewangles[PITCH] = oldAngles[PITCH] + 90;
 diff --git a/neo/framework/d3_wearable.cpp b/neo/framework/d3_wearable.cpp
 new file mode 100644
-index 0000000..6fd3433
+index 0000000..61a94a6
 --- /dev/null
 +++ b/neo/framework/d3_wearable.cpp
-@@ -0,0 +1,252 @@
+@@ -0,0 +1,253 @@
 +/*
 +===========================================================================
 +
@@ -107,6 +174,7 @@ index 0000000..6fd3433
 +
 +#include "sys/platform.h"
 +#include "idlib/math/Vector.h"
++#include "idlib/math/Angles.h"
 +#include "idlib/Lib.h"
 +#include "framework/UsercmdGen.h"
 +#include "framework/d3_wearable.h"
@@ -736,6 +804,90 @@ index 01b05ab..c89878a 100644
  	if ( gameLocal.inCinematic && gameLocal.skipCinematic ) {
  		return;
  	}
+diff --git a/neo/sound/snd_local.h b/neo/sound/snd_local.h
+index 808faaa..a1f260a 100644
+--- a/neo/sound/snd_local.h
++++ b/neo/sound/snd_local.h
+@@ -42,6 +42,13 @@ If you have questions concerning this license or the applicable additional terms
+ #include <AL/al.h>
+ #include <AL/alc.h>
+ #include <AL/alext.h>
++#ifdef __EMSCRIPTEN__
++// Emscripten's OpenAL port ships only a stub <AL/alext.h> without the EFX
++// LPAL* typedefs. Pull in OpenAL-Soft's efx.h (vendored) so the sound system
++// compiles; the EFX functions stay unresolved but are never called because
++// Emscripten's OpenAL reports no ALC_EXT_EFX at runtime.
++#include <AL/efx.h>
++#endif
+ 
+ // DG: make this code build with older OpenAL headers that don't know about ALC_SOFT_HRTF
+ //     which provides LPALCRESETDEVICESOFT for idSoundSystemLocal::alcResetDeviceSOFT()
+diff --git a/neo/sys/linux/main.cpp b/neo/sys/linux/main.cpp
+index 3468d39..2cefde6 100644
+--- a/neo/sys/linux/main.cpp
++++ b/neo/sys/linux/main.cpp
+@@ -407,9 +407,18 @@ void idSysLocal::OpenURL( const char *url, bool quit ) {
+ main
+ ===============
+ */
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++static void D3_EmscriptenFrame(void) {
++	common->Frame();
++}
++#endif
++
+ int main(int argc, char **argv) {
+ 	// Prevent running Doom 3 as root
+ 	// Borrowed from Yamagi Quake II
++	// (Emscripten reports uid 0 in the browser sandbox, so skip the check there.)
++#ifndef __EMSCRIPTEN__
+ 	if (getuid() == 0) {
+ 		printf("Doom 3 shouldn't be run as root! Backing out to save your ass. If\n");
+ 		printf("you really know what you're doing, edit neo/sys/linux/main.cpp and remove\n");
+@@ -417,6 +426,7 @@ int main(int argc, char **argv) {
+ 
+ 		return 1;
+ 	}
++#endif
+ 	// fallback path to the binary for systems without /proc
+ 	// while not 100% reliable, its good enough
+ 	if (argc > 0) {
+@@ -448,8 +458,16 @@ int main(int argc, char **argv) {
+ 		common->Init( 0, NULL );
+ 	}
+ 
++#ifdef __EMSCRIPTEN__
++	// A blocking while(1) loop never yields to the browser; drive one
++	// common->Frame() per animation frame via the Emscripten main loop instead.
++	// simulate_infinite_loop=1 unwinds the stack and hands control back to the
++	// browser so rendering, input, and timers run.
++	emscripten_set_main_loop( D3_EmscriptenFrame, 0, 1 );
++#else
+ 	while (1) {
+ 		common->Frame();
+ 	}
++#endif
+ 	return 0;
+ }
+diff --git a/neo/sys/posix/posix_net.cpp b/neo/sys/posix/posix_net.cpp
+index 746a945..315c675 100644
+--- a/neo/sys/posix/posix_net.cpp
++++ b/neo/sys/posix/posix_net.cpp
+@@ -277,6 +277,13 @@ void Sys_InitNetworking(void)
+ 
+ 	num_interfaces = 0;
+ 
++#ifdef __EMSCRIPTEN__
++	// The browser sandbox has no network interfaces to enumerate (getifaddrs
++	// is unsupported); networking is unused in the wearable single-player build.
++	common->Printf( "InitNetworking: skipped (Emscripten browser build)\n" );
++	return;
++#endif
++
+ 	if( getifaddrs( &ifap ) < 0 ) {
+ 		common->FatalError( "InitNetworking: SIOCGIFCONF error - %s\n", strerror( errno ) );
+ 		return;
 diff --git a/neo/sys/wasm/d3_runtime_exports.js b/neo/sys/wasm/d3_runtime_exports.js
 new file mode 100644
 index 0000000..2e7755b

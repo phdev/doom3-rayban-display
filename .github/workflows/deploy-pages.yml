@@ -27,13 +27,27 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
-      # NOTE: The DOOM 3 WebAssembly engine build is experimental and requires
-      # the Emscripten SDK plus DOOM 3 game data you own. It is intentionally
-      # NOT run in CI (no proprietary data, long build). To ship a playable
-      # build, run scripts/build-gl4es.sh + scripts/build-dhewm3.sh and
-      # scripts/install-demo-data.sh locally so public/wasm/ is populated before
-      # this workflow runs, or wire those steps in here with your own data
-      # source. The steps below build only the web app shell.
+
+      # Build the DOOM 3 WebAssembly engine (dhewm3 + GL4ES via Emscripten).
+      # These steps are best-effort: if the engine build fails, the web app
+      # shell still deploys (and reports a missing-engine artifact at runtime).
+      # No DOOM 3 game data is included — users supply their own PK4 via ?pk4=.
+      - name: Install Emscripten
+        id: emsdk
+        continue-on-error: true
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git .build/emsdk
+          .build/emsdk/emsdk install latest
+          .build/emsdk/emsdk activate latest
+      - name: Build GL4ES + dhewm3 engine
+        id: engine
+        continue-on-error: true
+        run: |
+          source .build/emsdk/emsdk_env.sh
+          npm run build:gl4es
+          GL4ES_PATH="$PWD/.build/gl4es" npm run build:dhewm3
+          ls -lah public/wasm/dhewm3.js public/wasm/dhewm3.wasm public/wasm/dhewm3.data
+
       - run: npm run build
       - uses: actions/configure-pages@v5
         with:

@@ -379,7 +379,11 @@ function buildArguments(config) {
     // The wearable drives the camera through _D3_AddViewAngles, so disable the
     // engine's own pointer-lock mouse path.
     "+set", "in_mouse", "0",
-    "+set", "g_showPlayerShadow", "1"
+    "+set", "g_showPlayerShadow", "1",
+    // The shell mounts PK4 + config under /base in the Emscripten FS; point the
+    // engine's base path there (default would be the executable dir).
+    "+set", "fs_basepath", "/",
+    "+set", "fs_savepath", "/save"
   ];
 
   const queryArgs = new URLSearchParams(window.location.search).get("args");
@@ -706,9 +710,11 @@ async function readBundledPk4Bytes(onStatus, log, progress) {
         return decompressGzip(compressed);
       }
 
-      progress?.(60, "Loading PK4");
-      log?.(`Using browser-decoded display PK4 (${formatByteCount(compressed.byteLength)})...`);
-      return compressed;
+      if (isPk4Payload(compressed)) {
+        progress?.(60, "Loading PK4");
+        log?.(`Using browser-decoded display PK4 (${formatByteCount(compressed.byteLength)})...`);
+        return compressed;
+      }
     }
     log?.("Compressed display PK4 was not found; trying raw PK4...");
   }
@@ -717,9 +723,13 @@ async function readBundledPk4Bytes(onStatus, log, progress) {
   onStatus?.("Loading display PK4...");
   log?.("Fetching raw display PK4...");
   const bytes = await fetchBytes(BUNDLED_PK4_URL);
-  if (!bytes) {
+  // On a static SPA host an absent file may come back as index.html; only
+  // accept real PK4 (ZIP) or gzip payloads, otherwise report "no PK4" so the
+  // engine still starts (and reports missing game data itself).
+  if (!bytes || (!isPk4Payload(bytes) && !isGzipPayload(bytes))) {
     onStatus?.("No PK4 available");
     log?.("No bundled PK4 was available");
+    return null;
   }
 
   return bytes;
@@ -804,7 +814,15 @@ async function fetchChunkManifest(url) {
       return null;
     }
 
-    return response.json();
+    // A static SPA host may answer an absent manifest with index.html (200).
+    // Guard against that and await here so a parse failure is caught locally
+    // instead of rejecting at the call site.
+    const contentType = response.headers.get("content-type") || "";
+    if (!/json/i.test(contentType)) {
+      return null;
+    }
+
+    return await response.json();
   } catch {
     return null;
   } finally {

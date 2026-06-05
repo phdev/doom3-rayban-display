@@ -10,13 +10,26 @@ It is the DOOM 3 sibling of
 follows the same architecture: a Vite web app shell, an engine source patch, and
 a local packaging workflow.
 
-> **Status — experimental engine.** Unlike Quake II (Qwasm2/Yamagi), dhewm3 does
-> not ship an official Emscripten target. The web app shell, input/assist
-> system, PK4 packaging, and the engine patch are complete and the shell builds
-> and deploys today, but compiling DOOM 3 to WebAssembly and getting it
-> performant on Meta Ray-Ban Display hardware is a work in progress. See
-> [Limitations](#limitations). This repo does not include DOOM 3 game data — you
-> must own DOOM 3 and provide your own `base/*.pk4`.
+> **Status — engine compiles, links, and boots in the browser.** Unlike Quake II
+> (Qwasm2/Yamagi), dhewm3 ships no official Emscripten target, so this repo adds
+> one. The patch + build scripts here have been verified end to end: dhewm3
+> builds to a ~4 MB `dhewm3.wasm` with GL4ES, instantiates in-browser against a
+> WebGL2 context, and runs DOOM 3's own engine init (SDL video, memory,
+> networking, **File System**) up to the point where it needs game data:
+>
+> ```
+> dhewm3 1.5.5 emscripten-x86 ... using SDL v2.32.10
+> SDL video driver: emscripten
+> 2048 MB System Memory
+> ----- Initializing File System -----
+> shutting down: Couldn't load default.cfg
+> ```
+>
+> `default.cfg` lives inside the retail `pak000.pk4`, so that line is the
+> "bring your own data" boundary. This repo does **not** include DOOM 3 game
+> data — you must own DOOM 3 and provide your own `base/*.pk4`. Getting from this
+> boot point to rendered gameplay still needs (a) your data and (b) further
+> runtime iteration; see [Limitations](#limitations).
 
 ## Play URL
 
@@ -162,17 +175,43 @@ npm run build && npm run preview
 The web app shell alone (no engine) builds with `npm run build` and is what CI
 deploys to GitHub Pages.
 
+## What the Emscripten patch does to dhewm3
+
+dhewm3 has no Emscripten target, so the patch adds one. Beyond the wearable
+bridge, it makes these engine changes (all guarded by `#ifdef __EMSCRIPTEN__`)
+that were needed to get DOOM 3 booting in a browser:
+
+- **Build system** (`CMakeLists.txt`): skip `-march`, use Emscripten's built-in
+  SDL2 + OpenAL ports instead of `find_package`, link GL4ES for WebGL, and emit
+  `dhewm3.{js,wasm,data}` with the `D3_*` exports (monolithic `HARDLINK_GAME`).
+- **Sound** (`snd_local.h`): pull in vendored OpenAL-Soft EFX headers, since
+  Emscripten's OpenAL port ships only a stub `alext.h` (see `vendor/openal-efx`).
+- **Startup** (`sys/linux/main.cpp`): skip the anti-root check (the browser
+  sandbox reports uid 0), and **convert the blocking `while(1)` frame loop to
+  `emscripten_set_main_loop`** so frames yield to the browser.
+- **Networking** (`posix_net.cpp`): skip interface enumeration (`getifaddrs` is
+  unsupported in the sandbox; networking is unused for single-player).
+- **Filesystem** (`FileSystem.cpp`): skip the background-download worker thread
+  (no pthreads in the single-threaded build).
+
 ## Limitations
 
-- **No official dhewm3 Emscripten target.** The patch and build script lay out
-  the intended pipeline (GL4ES renderer, `MAIN_MODULE=2`, 512 MB initial memory,
-  hard-linked game), but exact SDL/GL flag tuning against the pinned commit may
-  still need iteration. If you bump `DHEWM3_COMMIT`, regenerate the patch.
-- **Memory & performance.** DOOM 3's renderer (per-pixel lighting, stencil
-  shadows) is heavy for a wearable WebView; expect to disable shadows / bump
-  effects and downsize images for an acceptable frame rate.
+- **Verified up to filesystem init, not yet rendered gameplay.** The engine
+  boots and stops at "Couldn't load default.cfg" without game data. Driving it
+  past that needs your owned `pak000.pk4` (or a reduced `pak-display.pk4`), and
+  then likely further iteration on the items below.
+- **Single-threaded.** SDL thread/condvar creation fails under the current
+  (non-pthread) build — harmless during boot, but the async sound path and any
+  worker threads are stubbed. A full build may want `-pthread` +
+  `-sPROXY_TO_PTHREAD` (the app already sends the COOP/COEP headers that
+  SharedArrayBuffer needs).
+- **Renderer validation pending.** A WebGL2 context is created and GL4ES is
+  linked, but DOOM 3's renderer (per-pixel lighting, stencil shadows) has not
+  yet been exercised end to end in WebGL — and it is heavy for a wearable
+  WebView. Expect to disable shadows / bump effects and downsize images for an
+  acceptable frame rate.
 - **Game data is proprietary.** Nothing here downloads DOOM 3 data; you must own
-  it and reduce it locally.
+  it and reduce it locally. If you bump `DHEWM3_COMMIT`, regenerate the patch.
 
 ## License & Notices
 
