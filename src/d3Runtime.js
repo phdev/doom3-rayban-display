@@ -962,7 +962,12 @@ async function fetchBytes(url, options = {}) {
   try {
     resetStallTimer();
     const response = await fetch(url, {
-      cache: "force-cache",
+      // Bypass the HTTP cache. With "force-cache" a host that served a file as
+      // 404 (e.g. before a deploy) gets that 404 cached, and the stale 404 is
+      // then returned forever even after the file goes live — which black-holed
+      // the bundled PK4 on iOS Safari ("No PK4 available"). The chunk path always
+      // passed no-store, which is why chunks loaded but the single file didn't.
+      cache: "no-store",
       ...fetchOptions,
       signal: controller.signal
     });
