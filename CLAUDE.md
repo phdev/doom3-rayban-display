@@ -50,9 +50,19 @@ EXIT) composites to `#gameCanvas` at ~50–60 fps on real owned data. Boots to t
 menu by default (`D3_AUTO_MAP = false`); `?args=%2Bmap%20game/mars_city1` loads a
 level.
 
-**Remaining:** the menu's central animated logo panel shows grey banding (a
-render-to-texture subview / cinematic; reduced-pak asset/decode detail, not a
-present bug).
+**Remaining:**
+- The menu's central animated logo panel shows grey banding (a render-to-texture
+  subview / cinematic; reduced-pak asset/decode detail, not a present bug).
+- **In-level load.** `?args=+map game/mars_city1` does not fully load on the
+  bundled reduced pak. The patch makes missing moveable/item/camera **collision
+  models** non-fatal (drop the entity, keep loading — `Moveable.cpp`, `Item.cpp`,
+  `SecurityCamera.cpp`), which gets past the first abort, but `mars_city1`'s
+  opening cinematic needs **character** models/anims that the reducer stripped;
+  the empty-defaulted model then trips a fatal `Joint '…' not found for
+  'head_joint'` (`Actor.cpp:676` and siblings). Getting in-level 3D on screen
+  needs a more complete pak (regenerate from owned data incl. character/cinematic
+  deps, or load fuller data via `?pk4=`) — not more engine patching. The engine
+  itself renders (menu is proof).
 
 ## Key learning — the present bug (black canvas)
 

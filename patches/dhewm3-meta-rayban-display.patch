@@ -844,6 +844,49 @@ index 0000000..bd37bff
 +#endif // __EMSCRIPTEN__
 +
 +#endif // __D3_WEARABLE_GAME_H__
+diff --git a/neo/game/Item.cpp b/neo/game/Item.cpp
+index 97ae952..ac0a910 100644
+--- a/neo/game/Item.cpp
++++ b/neo/game/Item.cpp
+@@ -937,8 +937,16 @@ void idMoveableItem::Spawn( void ) {
+ 
+ 	// load the trace model
+ 	if ( !collisionModelManager->TrmFromModel( clipModelName, trm ) ) {
++#ifdef __EMSCRIPTEN__
++		// Reduced browser PK4 may omit a moveable item's collision model — drop
++		// just this item instead of aborting the whole map load.
++		gameLocal.Warning( "idMoveableItem '%s': cannot load collision model %s — removing entity", name.c_str(), clipModelName.c_str() );
++		PostEventMS( &EV_Remove, 0 );
++		return;
++#else
+ 		gameLocal.Error( "idMoveableItem '%s': cannot load collision model %s", name.c_str(), clipModelName.c_str() );
+ 		return;
++#endif
+ 	}
+ 
+ 	// if the model should be shrinked
+diff --git a/neo/game/Moveable.cpp b/neo/game/Moveable.cpp
+index e3458b3..4443dad 100644
+--- a/neo/game/Moveable.cpp
++++ b/neo/game/Moveable.cpp
+@@ -105,8 +105,17 @@ void idMoveable::Spawn( void ) {
+ 	}
+ 
+ 	if ( !collisionModelManager->TrmFromModel( clipModelName, trm ) ) {
++#ifdef __EMSCRIPTEN__
++		// A reduced (single-map) browser PK4 can be missing a prop's collision
++		// model. Don't abort the whole map for one missing moveable — warn and
++		// drop just this entity so the level still loads and renders.
++		gameLocal.Warning( "idMoveable '%s': cannot load collision model %s — removing entity", name.c_str(), clipModelName.c_str() );
++		PostEventMS( &EV_Remove, 0 );
++		return;
++#else
+ 		gameLocal.Error( "idMoveable '%s': cannot load collision model %s", name.c_str(), clipModelName.c_str() );
+ 		return;
++#endif
+ 	}
+ 
+ 	// if the model should be shrinked
 diff --git a/neo/game/Player.cpp b/neo/game/Player.cpp
 index 01b05ab..c89878a 100644
 --- a/neo/game/Player.cpp
@@ -868,6 +911,27 @@ index 01b05ab..c89878a 100644
  	if ( gameLocal.inCinematic && gameLocal.skipCinematic ) {
  		return;
  	}
+diff --git a/neo/game/SecurityCamera.cpp b/neo/game/SecurityCamera.cpp
+index 36a0cbe..58d9a22 100644
+--- a/neo/game/SecurityCamera.cpp
++++ b/neo/game/SecurityCamera.cpp
+@@ -167,8 +167,16 @@ void idSecurityCamera::Spawn( void ) {
+ 	}
+ 
+ 	if ( !collisionModelManager->TrmFromModel( str, trm ) ) {
++#ifdef __EMSCRIPTEN__
++		// Reduced browser PK4 may omit the camera's collision model — drop just
++		// this entity instead of aborting the whole map load.
++		gameLocal.Warning( "idSecurityCamera '%s': cannot load collision model %s — removing entity", name.c_str(), str.c_str() );
++		PostEventMS( &EV_Remove, 0 );
++		return;
++#else
+ 		gameLocal.Error( "idSecurityCamera '%s': cannot load collision model %s", name.c_str(), str.c_str() );
+ 		return;
++#endif
+ 	}
+ 
+ 	GetPhysics()->SetContents( CONTENTS_SOLID );
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
 index 7914093..cf1cac2 100644
 --- a/neo/renderer/RenderSystem_init.cpp

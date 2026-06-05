@@ -223,6 +223,12 @@ that were needed to get DOOM 3 running in a browser:
 - **Networking** (`posix_net.cpp`): skip `getifaddrs` interface enumeration.
 - **Threads** (`FileSystem.cpp`, `Common.cpp`): skip the background-download and
   async worker threads (no pthreads); the async sound tic is simply not run.
+- **Graceful missing-asset handling** (`Moveable.cpp`, `Item.cpp`,
+  `SecurityCamera.cpp`): a reduced single-map PK4 can omit a prop's collision
+  model. Upstream that's a fatal `gameLocal.Error` that aborts the whole map;
+  here it warns and drops just that entity so the level keeps loading. (Missing
+  *character* models still abort later via a fatal joint lookup — see
+  [Limitations](#limitations).)
 
 ## The canvas-selector fix (how DOOM 3 reaches the screen)
 
@@ -262,11 +268,20 @@ and no manual `emscripten_webgl_make_context_current` are needed.
   the menu — fonts, planet, starfield, buttons — composites correctly). Loading
   fuller owned data via `?pk4=` may fill it in. This is the main thing left to
   polish.
-- **Reduced-pak completeness.** `scripts/reduce-d3-map-pk4.py` is a heuristic
-  dependency walker; it can miss entity-referenced models (e.g. a `mars_city1`
-  moveable), which `-fexceptions` now turns into a recoverable drop instead of a
-  crash. A more complete pak, or loading the full owned data via `?pk4=`, avoids
-  this.
+- **Reduced-pak completeness (in-level load).** The menu renders, but loading a
+  full level (e.g. `?args=+map game/mars_city1`) currently fails on the bundled
+  reduced pak. `scripts/reduce-d3-map-pk4.py` is a heuristic dependency walker
+  and strips assets the map needs — first a prop's collision model, then (deeper)
+  `mars_city1`'s opening-cinematic character models/animations. Missing **render**
+  models/materials/sounds already degrade gracefully (default box / silence), and
+  the patch now also makes a missing **moveable/item/camera collision model**
+  non-fatal (drop the entity, keep loading) instead of aborting the map. But a
+  missing **character** model defaults to empty and then a fatal joint lookup
+  (`Joint 'Shoulders' not found for 'head_joint'`) still aborts the cinematic.
+  To actually render a level you need a more complete pak — regenerate it from
+  your owned data including the map's character/cinematic dependencies, or load
+  fuller owned data via `?pk4=`. This is the main thing left to get in-level 3D
+  on screen.
 - **Single-threaded.** SDL thread/condvar creation fails (non-pthread build).
   Harmless for boot, but sound and any worker threads are stubbed. A fuller
   build may want `-pthread` + `-sPROXY_TO_PTHREAD` (the app already sends the
