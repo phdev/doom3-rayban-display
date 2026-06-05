@@ -698,7 +698,12 @@ async function readUrlPk4Bytes(source, onStatus, log, progress) {
 }
 
 async function readBundledPk4Bytes(onStatus, log, progress) {
-  if (isCompactWebViewRuntime()) {
+  // Try the raw chunked manifest first on every runtime (not just the glasses
+  // WebView): a bundled PK4 larger than a host's per-file limit (e.g. GitHub's
+  // 100 MB) has to ship as raw < 100 MB chunks + a manifest, and raw chunks are
+  // cheaper than the gzip path (no decompress copy — easier on mobile memory).
+  // Falls through to the compressed/raw single-file paths if the manifest 404s.
+  {
     progress?.(54, "Fetching PK4");
     onStatus?.("Loading chunked display PK4...");
     log?.("Fetching chunked display PK4...");

@@ -1,0 +1,20 @@
+{
+  "format": "d3-pk4-chunks-v1",
+  "name": "pak-display.pk4",
+  "encoding": "identity",
+  "chunkSize": 94371840,
+  "totalSize": 143392631,
+  "sha256": "77800d1969487fcdddc2a3bfb0bf7f403ca5d2337722122bbcf906398fd660f2",
+  "chunks": [
+    {
+      "path": "pak-display.pk4.part000",
+      "size": 94371840,
+      "sha256": "86b8784b8df0999cd5c217c2573bd1be8d1c2070602b29394438e70ff6a0cd94"
+    },
+    {
+      "path": "pak-display.pk4.part001",
+      "size": 49020791,
+      "sha256": "28eea5ba9f489d0321f74228399b875f680ff3d07bcae4ba2877314a64162526"
+    }
+  ]
+}
