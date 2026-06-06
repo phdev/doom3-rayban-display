@@ -106,6 +106,44 @@ unlit (`0,0,0`) surface — a dark airlock stays dark. Keep it moderate (1.35) s
 the lit areas the player walks into don't blow out. `r_gamma`/`r_brightness`/
 `r_lightScale` are still set (correct intent) but are essentially inert here.
 
+### iPhone-only dark lit world (under investigation, 2026-06)
+
+Symptom: on a physical iPhone the **textured/lit world renders black** while
+emissive surfaces (ceiling lights, sparks, the green hologram) still show. The
+reference (real DOOM 3 "Mars City Hangar") is *dark but readable* — dim red walls,
+crates, an NPC; the iPhone loses all of that dim lighting and keeps only the bright
+point-lights.
+
+What's been **ruled out** (so the next person doesn't re-chase them):
+
+- **Not missing assets.** The reduced pak contains `glprogs/interaction.vfp` (the
+  lit-pass ARB shader) + all 15 glprogs and the light projection/falloff textures
+  (`lights/biground1`, `squarelight1`, `spot01`, …). The *same* pak renders the
+  full lit hangar on desktop.
+- **Not the engine binary.** The deployed `dhewm3.wasm` renders fully lit when run
+  locally — only the iPhone is dark.
+- **Not depth (`GL_EQUAL` vs `LEQUAL`), render passes, light scissor, framebuffer
+  copy, or texture compression.** Verified by A/B on Playwright **WebKit** driving
+  the **M1 Max** (same Apple TBDR GPU family + same WebKit engine as the iPhone):
+  the scene renders ~97% lit in every configuration, *including with S3TC disabled*
+  (GL4ES falls back to uncompressed cleanly). The desktop Apple GPU is simply far
+  more capable than the iPhone's, so the on-device failure does not reproduce there.
+
+Leading hypotheses (need on-device data): the weaker iPhone GPU runs out of
+texture memory (failed uploads → black diffuse), hits a shader/texture **limit**
+the desktop doesn't, or the dim lit output is crushed below the display/photo's
+black point (gamma is dead in this build — see above).
+
+**On-device WebGL probe (`src/main.js`).** Because the failure can't be
+reproduced off-device, the app wraps `HTMLCanvasElement.prototype.getContext`
+(instrumenting the engine's own context instead of stealing it — see the warning
+comment) and surfaces two lines at the top of the `#diag` overlay:
+`caps:` (GPU limits: max texture, texture units, varyings, fragment uniforms) and
+`gpu-tex:` (texture upload count + estimated MB + max dim + **OOM count** + GL
+error count + a context-lost flag). `OOM > 0` or `CTX-LOST` ⇒ memory; clean ⇒ a
+limit/exposure issue. `?noprobe` disables the wrap (A/B). The probe never touches
+draw calls and is try-guarded so it cannot break the engine.
+
 ### Mobile / iOS (hard-won)
 
 - **Stale-404 cache** — `fetchBytes` defaulted to `cache:"force-cache"`; after a

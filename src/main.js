@@ -161,6 +161,9 @@ const diagLines = [];
 const glInfo = [];
 window.__d3GLInfo = glInfo;
 let diagProgLine = "";
+// Live one-liner for the on-device WebGL probe (texture memory + GL errors),
+// declared here so renderDiag can reference it without a temporal-dead-zone error.
+let glProbeLine = "";
 // Lines are always collected so the "show log" button can reveal them even when
 // the overlay started hidden (?nodiag). Visibility is just a CSS toggle.
 let diagHidden = /[?&]nodiag\b/.test(location.search);
@@ -176,9 +179,10 @@ function renderDiag() {
   const tail = diagProgLine ? diagLines.concat(`▸ ${diagProgLine}`) : diagLines;
   // Pin the GL diagnostics at the top (initial scroll position shows them); the
   // live log follows below for anyone who scrolls down.
-  const body = glInfo.length
-    ? ["═══ GL DIAGNOSTICS ═══", ...glInfo, "═══ log ═══", ...tail]
-    : tail;
+  const head = [];
+  if (glInfo.length) head.push("═══ GL DIAGNOSTICS ═══", ...glInfo);
+  if (glProbeLine) head.push(glProbeLine);
+  const body = head.length ? [...head, "═══ log ═══", ...tail] : tail;
   diagEl.textContent = body.join("\n");
   if (atBottom) diagEl.scrollTop = diagEl.scrollHeight;
 }
@@ -205,7 +209,103 @@ diag(`brightness: lightScale=${runtimeConfig.rLightScale} gamma=${runtimeConfig.
 // NOTE: do NOT call canvas.getContext() here — a canvas has a single WebGL
 // context, and probing it would steal it from the engine (SDL3 creates its own).
 // The engine logs its GL renderer ("OpenGL renderer: ...") to the runtime log.
+//
+// ── On-device WebGL probe ────────────────────────────────────────────────────
+// Desktop WebKit (Apple M-series GPU) renders the lit world fully — even with
+// S3TC compression disabled — but the iPhone draws the textured world black
+// while emissive glows/sparks still show. That is the signature of the weaker
+// mobile GPU failing texture uploads (out of memory) or hitting a shader/texture
+// limit the desktop doesn't. The engine log can't surface that, so WRAP
+// getContext (SDL/emscripten calls it on #gameCanvas — wrapping the prototype
+// instruments the engine's own context instead of stealing it), dump the GPU's
+// limits once, and tally texture uploads + GL errors live at the top of the diag.
+const glProbe = { ctx: 0, tex: 0, comp: 0, bytes: 0, maxDim: 0, oom: 0, err: 0, lost: false };
+window.__d3GLProbe = glProbe;
+(function instrumentWebGL() {
+  // Escape hatch: ?noprobe disables the texImage2D wrap entirely (for A/B'ing
+  // whether the instrumentation itself affects load/render).
+  if (/[?&]noprobe\b/.test(location.search)) return;
+  // Kept in a closure (not on glProbe) so JSON.stringify(__d3GLProbe) stays clean.
+  let probeGl = null;
+  const origGetContext = HTMLCanvasElement.prototype.getContext;
+  HTMLCanvasElement.prototype.getContext = function (type, attrs) {
+    const gl = origGetContext.call(this, type, attrs);
+    if (gl && typeof type === "string" && /webgl/i.test(type) && !gl.__d3probe) {
+      try { attach(gl); } catch (_) { /* diagnostics must NEVER break the engine */ }
+    }
+    return gl;
+  };
+  function attach(gl) {
+    gl.__d3probe = true;
+    glProbe.ctx += 1;
+    probeGl = gl;
+    // One-time GPU caps. A limit the iPhone has but the desktop doesn't would
+    // explain a lit/shader path that only collapses on-device.
+    try {
+      const g = (e) => gl.getParameter(e);
+      glInfo.push(
+        `caps: maxTex ${g(gl.MAX_TEXTURE_SIZE)} texUnits ${g(gl.MAX_TEXTURE_IMAGE_UNITS)} ` +
+          `vtxTex ${g(gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS)} varying ${g(gl.MAX_VARYING_VECTORS)} ` +
+          `fragU ${g(gl.MAX_FRAGMENT_UNIFORM_VECTORS)}`
+      );
+    } catch (_) {}
+    // Tally only (no getError) in the hot path — getError forces a sync GPU stall
+    // and the load issues thousands of uploads. Errors are polled on the timer.
+    const origTexImage2D = gl.texImage2D;
+    gl.texImage2D = function () {
+      glProbe.tex += 1;
+      const a = arguments;
+      let w = 0;
+      let h = 0;
+      // texImage2D(target,level,ifmt,width,height,border,fmt,type,pixels) OR
+      // texImage2D(target,level,ifmt,fmt,type,source) — read dims when present.
+      if (typeof a[3] === "number" && typeof a[4] === "number") {
+        w = a[3];
+        h = a[4];
+      } else {
+        const src = a[a.length - 1];
+        if (src && src.width) {
+          w = src.width;
+          h = src.height;
+        }
+      }
+      if (w) {
+        if (w > glProbe.maxDim) glProbe.maxDim = w;
+        if (h > glProbe.maxDim) glProbe.maxDim = h;
+        if (a[1] === 0) glProbe.bytes += w * h * 4; // RGBA8 estimate, base level
+      }
+      return origTexImage2D.apply(this, a);
+    };
+    if (gl.compressedTexImage2D) {
+      const origCompressed = gl.compressedTexImage2D;
+      gl.compressedTexImage2D = function () {
+        glProbe.comp += 1;
+        return origCompressed.apply(this, arguments);
+      };
+    }
+  }
+  setInterval(() => {
+    if (!glProbe.ctx) return;
+    // One getError per tick (cheap) catches a persistent out-of-memory state
+    // without stalling every upload.
+    if (probeGl) {
+      try {
+        const e = probeGl.getError();
+        if (e) {
+          glProbe.err += 1;
+          if (e === probeGl.OUT_OF_MEMORY) glProbe.oom += 1;
+        }
+      } catch (_) {}
+    }
+    glProbeLine =
+      `gpu-tex: ${glProbe.tex} uploads ~${(glProbe.bytes / 1048576).toFixed(0)}MB, ` +
+      `max ${glProbe.maxDim}px, comp ${glProbe.comp}, OOM ${glProbe.oom}, err ${glProbe.err}` +
+      (glProbe.lost ? ", ⚠CTX-LOST" : "");
+    renderDiag();
+  }, 2000);
+})();
 refs.canvas.addEventListener("webglcontextlost", (e) => {
+  glProbe.lost = true;
   diag("⚠ WEBGL CONTEXT LOST — almost certainly out of GPU memory");
   appendRuntimeLog("[gl] webglcontextlost");
 }, false);
