@@ -47,6 +47,7 @@ app.innerHTML = `
     <span id="statusText" class="runtime-hidden" aria-hidden="true"></span>
     <span id="imuStatus" class="runtime-hidden" aria-hidden="true"></span>
     <pre id="diag" style="position:fixed;left:4px;top:4px;right:4px;margin:0;z-index:9999;font:11px/1.35 ui-monospace,Menlo,monospace;color:#7fff7f;background:rgba(0,0,0,.72);padding:5px 6px;white-space:pre-wrap;word-break:break-word;pointer-events:auto;max-height:60vh;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;touch-action:pan-y"></pre>
+    <button id="diagToggle" type="button" aria-label="Toggle debug console" style="position:fixed;right:8px;top:8px;z-index:10000;min-width:44px;min-height:30px;padding:4px 10px;font:600 13px/1 ui-monospace,Menlo,monospace;color:#9effa0;background:rgba(0,0,0,.8);border:1px solid #2f6f30;border-radius:7px;-webkit-appearance:none;cursor:pointer">hide log</button>
   </main>
 `;
 
@@ -74,11 +75,18 @@ refs.canvas.focus({ preventScroll: true });
 // + limits, any WebGL context loss (the classic iOS out-of-GPU-memory failure),
 // and uncaught errors. Add ?nodiag to hide it.
 const diagEl = document.querySelector("#diag");
+const diagToggle = document.querySelector("#diagToggle");
 const diagLines = [];
 let diagProgLine = "";
-const showDiag = !/[?&]nodiag\b/.test(location.search);
+// Lines are always collected so the "show log" button can reveal them even when
+// the overlay started hidden (?nodiag). Visibility is just a CSS toggle.
+let diagHidden = /[?&]nodiag\b/.test(location.search);
+function applyDiagVisibility() {
+  if (diagEl) diagEl.style.display = diagHidden ? "none" : "block";
+  if (diagToggle) diagToggle.textContent = diagHidden ? "show log" : "hide log";
+}
 function renderDiag() {
-  if (!diagEl || !showDiag) return;
+  if (!diagEl || diagHidden) return;
   // Auto-follow the newest lines only when already at the bottom, so a manual
   // scroll-up (to read history) isn't yanked back down by new log lines.
   const atBottom = diagEl.scrollHeight - diagEl.scrollTop - diagEl.clientHeight < 48;
@@ -90,6 +98,12 @@ function diag(line) {
   if (diagLines.length > 500) diagLines.shift();
   renderDiag();
 }
+diagToggle?.addEventListener("click", () => {
+  diagHidden = !diagHidden;
+  applyDiagVisibility();
+  renderDiag();
+});
+applyDiagVisibility();
 // Single in-place line for download/load progress (so it doesn't flood the log).
 function diagProgress(line) {
   diagProgLine = line;
