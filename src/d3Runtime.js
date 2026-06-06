@@ -61,12 +61,15 @@ export function createRuntimeConfig() {
         inputMode: "wearable",
         lowLatencyControls: true,
         audioEnabled: false,
-        displayBrightness: 1.35,
-        displayContrast: 1.1,
+        displayBrightness: 1.3,
+        displayContrast: 1.05,
         displaySaturate: 1.05,
-        // DOOM 3 ships very dark; lift engine gamma/brightness for the display.
-        rGamma: 1.35,
-        rBrightness: 1.2,
+        // DOOM 3 ships very dark and some levels open in near-black spaces (e.g.
+        // admin's elevator); lift engine gamma/brightness for a phone screen.
+        // (Engine gamma/brightness + the CSS displayBrightness compound, so keep
+        // each moderate to avoid blowing out the lit areas.)
+        rGamma: 1.5,
+        rBrightness: 1.35,
         skill: 1,
         yawSensitivity: 2.4,
         turnBurstDegrees: 42,
