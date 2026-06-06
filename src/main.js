@@ -10,6 +10,7 @@ let engine = null;
 let booting = false;
 let headTracking = null;
 let wearableInput = null;
+let autoFlashlightArmed = false;
 let loadingProgress = 0;
 let loadingHideTimer = 0;
 let enemyIndicatorTimer = 0;
@@ -229,10 +230,37 @@ function handleRuntimeLog(text) {
     setLoadingProgress(88, "Loading game");
   } else if (/--- Common Initialization Complete ---/i.test(text)) {
     setLoadingProgress(94, "Starting map");
-  } else if (/spawning server|mars_city1|--- Map Initialization ---/i.test(text)) {
+  } else if (/spawning server|--- Map Initialization ---/i.test(text)) {
     setLoadingProgress(100, "Ready");
     scheduleLoadingHide(400);
   }
+
+  // "...N entities spawned, M inhibited" is the engine's last big map-load line —
+  // the player exists and the game is about to tic. Arm the flashlight just after.
+  if (/entities spawned/i.test(text)) {
+    armAutoFlashlight();
+  }
+}
+
+// DOOM 3 levels open in a deliberately dark transition room (an airlock/elevator),
+// and this WebGL build has no working gamma to lift it (SDL3 dropped hardware gamma;
+// the in-shader path is inert through GL4ES). The flashlight is the only way to see,
+// so switch it on once shortly after the player spawns — the level opens lit instead
+// of pitch black. Fires once; the player long-pinches to toggle it afterward.
+function armAutoFlashlight() {
+  if (autoFlashlightArmed || runtimeConfig.autoFlashlight === false) {
+    return;
+  }
+  autoFlashlightArmed = true;
+  // Small delay so the player has fully spawned and the first frames are ticking
+  // before the latched toggle is sent (an impulse sent pre-spawn would be dropped).
+  window.setTimeout(() => {
+    if (!wearableInput || wearableInput.getState?.().flashlight) {
+      return;
+    }
+    wearableInput.toggleFlashlight();
+    diag("flashlight: auto-enabled for the dark spawn room (long-pinch to toggle)");
+  }, 2600);
 }
 
 function startEnemyIndicatorPolling() {

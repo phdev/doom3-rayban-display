@@ -61,6 +61,11 @@ export function createRuntimeConfig() {
         inputMode: "wearable",
         lowLatencyControls: true,
         audioEnabled: false,
+        // Every DOOM 3 level opens in a deliberately dark transition room (an
+        // airlock/elevator) and WebGL has no working gamma to lift it, so switch
+        // the flashlight on automatically once the player spawns — the level opens
+        // lit instead of pitch black. Long-pinch toggles it afterward.
+        autoFlashlight: true,
         displayBrightness: 1.35,
         displayContrast: 1.05,
         displaySaturate: 1.05,
@@ -88,6 +93,7 @@ export function createRuntimeConfig() {
         inputMode: "desktop",
         lowLatencyControls: false,
         audioEnabled: false,
+        autoFlashlight: true,
         displayBrightness: 1,
         displayContrast: 1,
         displaySaturate: 1,
