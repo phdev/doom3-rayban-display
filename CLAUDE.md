@@ -99,12 +99,24 @@ build there is effectively no working gamma:**
   observable through GL4ES on the maps tested — `r_gamma`/`r_brightness`/
   `r_lightScale` do not visibly change the frame.
 
-So the **only working brightness lever is the CSS `filter: brightness()`** on
-`#gameCanvas` (`config.displayBrightness` → `--d3-display-brightness`). It's a
-compositor multiply, so it lifts the *whole* frame but cannot rescue a truly
-unlit (`0,0,0`) surface — a dark airlock stays dark. Keep it moderate (1.35) so
-the lit areas the player walks into don't blow out. `r_gamma`/`r_brightness`/
-`r_lightScale` are still set (correct intent) but are essentially inert here.
+CSS `filter: brightness()` (`config.displayBrightness` → `--d3-display-brightness`)
+is a compositor *multiply*, so it lifts the whole frame but cannot rescue dark
+surfaces (1.2 × 9 ≈ 11, still black). `r_gamma`/`r_brightness`/`r_lightScale` are
+set (correct intent) but the in-shader gamma is inert on the iPhone GPU.
+
+**The fix — real gamma in the compositor (SVG filter).** The on-device probe
+showed the lit world comes out near-black-but-nonzero (`frame-px avg(9,5,3)`,
+`max 165` — the bright fixtures render, the lit walls don't). A *pow()* curve, not
+a multiply, rescues that: `pow(9/255, 0.45) ≈ 50`, matching real DOOM 3. So
+`#gameCanvas` carries an **SVG `feComponentTransfer type="gamma"` filter
+(`#d3gamma`)** ahead of the linear adjustments in its `filter` chain;
+`applyDisplayTuning` sets the exponent from `config.displayGammaExp` (wearable
+**0.45**, desktop **1.0** = identity), overridable on-device with **`?dgamma=<n>`**
+for quick calibration. This runs in the compositor, so it works regardless of the
+dead engine gamma. Verified on WebKit: exponent 0.45 lifts a near-black frame from
+~19% → ~96% non-black without blowing out. (Note: the `frame-px` probe samples the
+canvas *backing store*, i.e. **before** this filter, so it keeps reporting the raw
+engine output ~9 even when the display is correctly lifted.)
 
 ### iPhone-only dark lit world (under investigation, 2026-06)
 

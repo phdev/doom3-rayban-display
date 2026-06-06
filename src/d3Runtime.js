@@ -71,7 +71,13 @@ export function createRuntimeConfig() {
         // the flashlight on automatically once the player spawns — the level opens
         // lit instead of pitch black. Long-pinch toggles it afterward.
         autoFlashlight: true,
-        displayBrightness: 1.35,
+        // The iPhone's in-shader gamma is dead, so the lit world renders near-black
+        // (frame-px avg ~9). displayGammaExp drives a real pow() curve in the
+        // compositor (#d3gamma SVG filter) — exponent 0.45 lifts ~9 to ~50, matching
+        // real DOOM 3. This is the lever that actually works on-device; keep the
+        // linear brightness modest so the bright fixtures don't clip after the lift.
+        displayGammaExp: 0.45,
+        displayBrightness: 1.2,
         displayContrast: 1.05,
         displaySaturate: 1.05,
         // DOOM 3 ships very dark and some levels open in near-black spaces (e.g.
@@ -105,6 +111,7 @@ export function createRuntimeConfig() {
         lowLatencyControls: false,
         audioEnabled: false,
         autoFlashlight: true,
+        displayGammaExp: 1,
         displayBrightness: 1,
         displayContrast: 1,
         displaySaturate: 1,
@@ -122,6 +129,22 @@ function applyDisplayTuning(canvas, config) {
   canvas.style.setProperty("--d3-display-brightness", String(getNumericConfig(config.displayBrightness, 1)));
   canvas.style.setProperty("--d3-display-contrast", String(getNumericConfig(config.displayContrast, 1)));
   canvas.style.setProperty("--d3-display-saturate", String(getNumericConfig(config.displaySaturate, 1)));
+
+  // Compositor gamma (see the #d3gamma SVG filter). The engine's in-shader gamma is
+  // dead on the iPhone GPU, so the lit world comes out near-black; a real pow() curve
+  // here lifts it. exponent < 1 brightens darks (0.45 ≈ a gamma-2.2 decode); 1.0 is
+  // identity (desktop). Overridable on-device via ?dgamma=<n> for quick calibration.
+  let exponent = getNumericConfig(config.displayGammaExp, 1);
+  try {
+    const override = new URLSearchParams(window.location.search).get("dgamma");
+    if (override !== null && Number.isFinite(Number(override))) {
+      exponent = Number(override);
+    }
+  } catch {}
+  for (const id of ["d3gammaR", "d3gammaG", "d3gammaB"]) {
+    const fn = document.getElementById(id);
+    if (fn) fn.setAttribute("exponent", String(exponent));
+  }
 }
 
 function getNumericConfig(value, fallback) {

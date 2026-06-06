@@ -48,7 +48,12 @@ body {
   --d3-display-brightness: 1;
   --d3-display-contrast: 1;
   --d3-display-saturate: 1;
+  /* url(#d3gamma) applies real pow() gamma first (lifts the near-black lit world
+     the iPhone's dead in-shader gamma leaves behind), then the linear adjustments.
+     The #d3gamma filter is always present in the DOM; its exponent is 1.0 (identity)
+     until applyDisplayTuning sets it per profile. */
   filter:
+    url(#d3gamma)
     brightness(var(--d3-display-brightness))
     contrast(var(--d3-display-contrast))
     saturate(var(--d3-display-saturate));
