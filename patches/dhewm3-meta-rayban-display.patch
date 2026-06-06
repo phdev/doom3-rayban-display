@@ -978,6 +978,36 @@ index a4883b5..095506b 100644
  
  extern idCVar	r_aspectRatio;
  
+diff --git a/neo/renderer/Image_load.cpp b/neo/renderer/Image_load.cpp
+index f9ae002..67d93a5 100644
+--- a/neo/renderer/Image_load.cpp
++++ b/neo/renderer/Image_load.cpp
+@@ -1932,7 +1932,12 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
+ 		uploadWidth = potWidth;
+ 		uploadHeight = potHeight;
+ 		if ( potWidth == imageWidth && potHeight == imageHeight ) {
+-			qglCopyTexImage2D( GL_TEXTURE_2D, 0, GL_RGB8, x, y, imageWidth, imageHeight, 0 );
++			// RGBA8 (not RGB8): _currentRender is an RGBA8 image and the framebuffer is
++			// RGBA, so an RGB8 copy is an "invalid copy texture format combination" that
++			// strict GLES3 drivers (iOS WebKit / Apple GPU) reject — leaving _currentRender
++			// black and (on a tile GPU) corrupting the whole frame -> black scene. ANGLE on
++			// desktop tolerates the mismatch, which is why it only broke on the iPhone.
++			qglCopyTexImage2D( GL_TEXTURE_2D, 0, GL_RGBA8, x, y, imageWidth, imageHeight, 0 );
+ 		} else {
+ 			byte	*junk;
+ 			// we need to create a dummy image with power of two dimensions,
+@@ -1945,7 +1950,10 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
+ 				junk[i+1] = 255;
+ 			}
+ #endif
+-			qglTexImage2D( GL_TEXTURE_2D, 0, GL_RGB, potWidth, potHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, junk );
++			// internalformat must match the RGBA format under GLES3 (RGB+RGBA is invalid and
++			// leaves the texture unallocated -> "offset overflows texture dimensions" on the
++			// CopyTexSubImage2D below). RGBA also matches the framebuffer for the copy.
++			qglTexImage2D( GL_TEXTURE_2D, 0, GL_RGBA, potWidth, potHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, junk );
+ 			Mem_Free( junk );
+ 
+ 			qglCopyTexSubImage2D( GL_TEXTURE_2D, 0, 0, 0, x, y, imageWidth, imageHeight );
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
 index 7914093..492e2b1 100644
 --- a/neo/renderer/RenderSystem_init.cpp
