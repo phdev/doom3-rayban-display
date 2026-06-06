@@ -165,6 +165,9 @@ let diagProgLine = "";
 // Live one-liner for the on-device WebGL probe (texture memory + GL errors),
 // declared here so renderDiag can reference it without a temporal-dead-zone error.
 let glProbeLine = "";
+// Live one-liner for the sampled rendered-frame brightness (engine output before
+// the CSS filter) — tells dark-shader-output apart from a display/exposure issue.
+let framePxLine = "";
 // Lines are always collected so the "show log" button can reveal them even when
 // the overlay started hidden (?nodiag). Visibility is just a CSS toggle.
 let diagHidden = /[?&]nodiag\b/.test(location.search);
@@ -180,6 +183,7 @@ function buildDiagText() {
   const head = [];
   if (glInfo.length) head.push("═══ GL DIAGNOSTICS ═══", ...glInfo);
   if (glProbeLine) head.push(glProbeLine);
+  if (framePxLine) head.push(framePxLine);
   const body = head.length ? [...head, "═══ log ═══", ...tail] : tail;
   return body.join("\n");
 }
@@ -266,10 +270,17 @@ window.__d3GLProbe = glProbe;
   if (/[?&]noprobe\b/.test(location.search)) return;
   // Kept in a closure (not on glProbe) so JSON.stringify(__d3GLProbe) stays clean.
   let probeGl = null;
+  let probeCanvas = null;
   const origGetContext = HTMLCanvasElement.prototype.getContext;
   HTMLCanvasElement.prototype.getContext = function (type, attrs) {
+    if (typeof type === "string" && /webgl/i.test(type)) {
+      // Force preserveDrawingBuffer so the rendered frame stays readable after the
+      // swap — lets us sample the engine's actual output brightness (see interval).
+      attrs = Object.assign({}, attrs, { preserveDrawingBuffer: true });
+    }
     const gl = origGetContext.call(this, type, attrs);
     if (gl && typeof type === "string" && /webgl/i.test(type) && !gl.__d3probe) {
+      probeCanvas = this;
       try { attach(gl); } catch (_) { /* diagnostics must NEVER break the engine */ }
     }
     return gl;
@@ -323,6 +334,8 @@ window.__d3GLProbe = glProbe;
       };
     }
   }
+  let sampleCanvas = null;
+  let sampleCtx = null;
   setInterval(() => {
     if (!glProbe.ctx) return;
     // One getError per tick (cheap) catches a persistent out-of-memory state
@@ -340,6 +353,38 @@ window.__d3GLProbe = glProbe;
       `gpu-tex: ${glProbe.tex} uploads ~${(glProbe.bytes / 1048576).toFixed(0)}MB, ` +
       `max ${glProbe.maxDim}px, comp ${glProbe.comp}, OOM ${glProbe.oom}, err ${glProbe.err}` +
       (glProbe.lost ? ", ⚠CTX-LOST" : "");
+    // Sample the engine's rendered-frame brightness (the canvas backing store,
+    // BEFORE the CSS brightness filter). avg ~ how lit the walls are; max ~ whether
+    // the bright lights render. Near-black avg ⇒ the lit shader output is the
+    // problem; dim-but-present avg ⇒ exposure/display.
+    if (probeCanvas) {
+      try {
+        if (!sampleCanvas) {
+          sampleCanvas = document.createElement("canvas");
+          sampleCanvas.width = 24;
+          sampleCanvas.height = 24;
+          sampleCtx = sampleCanvas.getContext("2d", { willReadFrequently: true });
+        }
+        sampleCtx.drawImage(probeCanvas, 0, 0, 24, 24);
+        const d = sampleCtx.getImageData(0, 0, 24, 24).data;
+        let r = 0;
+        let g = 0;
+        let b = 0;
+        let mx = 0;
+        for (let i = 0; i < d.length; i += 4) {
+          r += d[i];
+          g += d[i + 1];
+          b += d[i + 2];
+          if (d[i] > mx) mx = d[i];
+          if (d[i + 1] > mx) mx = d[i + 1];
+          if (d[i + 2] > mx) mx = d[i + 2];
+        }
+        const n = d.length / 4;
+        framePxLine = `frame-px: avg(${(r / n) | 0},${(g / n) | 0},${(b / n) | 0}) max ${mx}`;
+      } catch (err) {
+        framePxLine = `frame-px: (read failed: ${err && err.message ? err.message : err})`;
+      }
+    }
     renderDiag();
   }, 2000);
 })();

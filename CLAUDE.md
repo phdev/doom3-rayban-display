@@ -129,20 +129,38 @@ What's been **ruled out** (so the next person doesn't re-chase them):
   (GL4ES falls back to uncompressed cleanly). The desktop Apple GPU is simply far
   more capable than the iPhone's, so the on-device failure does not reproduce there.
 
-Leading hypotheses (need on-device data): the weaker iPhone GPU runs out of
-texture memory (failed uploads → black diffuse), hits a shader/texture **limit**
-the desktop doesn't, or the dim lit output is crushed below the display/photo's
-black point (gamma is dead in this build — see above).
+**On-device probe results (2026-06) — memory and limits are ruled out.** The
+iPhone reported `gpu-tex: 15974 uploads ~75MB … OOM 0 … err 6` (no context loss)
+and `caps: maxTex 16384 texUnits 16 vtxTex 16 varying 31 fragU 1024`. So it is
+**not** out of GPU memory and hits **no** limit the desktop doesn't — and all
+75 MB of textures uploaded fine. The engine fully loads the map (`1969 entities`,
+`GenerateAllInteractions`, `28926 interactions`); the only "Couldn't load image"
+warnings are **props / particles / decals / env-cubemaps**, never the wall/floor/
+ceiling architecture. Conclusion: **the lit-pass output is genuinely dimmer on
+the A-series GPU** than on desktop with identical cvars — most likely the
+in-shader gamma/brightness lift (`r_gammaInShader`) is weaker through GL4ES on
+that GPU, so the dim base lighting never gets lifted (and dead hardware gamma
+means nothing else lifts it).
+
+Mitigation in flight: bumped `r_lightScale` (wearable) 3 → 6 — it runs in the
+core interaction path, so it works through GL4ES regardless of the gamma shader.
 
 **On-device WebGL probe (`src/main.js`).** Because the failure can't be
 reproduced off-device, the app wraps `HTMLCanvasElement.prototype.getContext`
 (instrumenting the engine's own context instead of stealing it — see the warning
-comment) and surfaces two lines at the top of the `#diag` overlay:
-`caps:` (GPU limits: max texture, texture units, varyings, fragment uniforms) and
-`gpu-tex:` (texture upload count + estimated MB + max dim + **OOM count** + GL
-error count + a context-lost flag). `OOM > 0` or `CTX-LOST` ⇒ memory; clean ⇒ a
-limit/exposure issue. `?noprobe` disables the wrap (A/B). The probe never touches
-draw calls and is try-guarded so it cannot break the engine.
+comment; it also forces `preserveDrawingBuffer` so the frame is readable) and
+surfaces three lines at the top of the `#diag` overlay:
+- `caps:` — GPU limits (max texture, texture units, varyings, fragment uniforms).
+- `gpu-tex:` — texture upload count + est. MB + max dim + **OOM count** + GL error
+  count + context-lost flag. `OOM > 0` / `CTX-LOST` ⇒ memory (ruled out so far).
+- `frame-px:` — `avg(r,g,b)` + `max` sampled from the **rendered frame** (canvas
+  backing store, before the CSS filter). Near-black `avg` ⇒ the lit-shader output
+  is the problem; dim-but-present `avg` ⇒ exposure/display. `max` shows whether the
+  bright lights render at all.
+
+A **"copy log"** button (next to "hide log") copies the whole overlay to the
+clipboard. `?noprobe` disables the wrap (A/B). The probe never touches draw calls
+and is try-guarded so it cannot break the engine.
 
 ### Mobile / iOS (hard-won)
 

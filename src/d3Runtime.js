@@ -83,7 +83,13 @@ export function createRuntimeConfig() {
         //  - displayBrightness is a final CSS compositor multiply.
         // Gamma is the heavy lifter for near-black surfaces; keep brightness modest
         // so the light fixtures don't blow out.
-        rLightScale: 3,
+        // 2026-06: on-device probe proved the iPhone is NOT out of memory and hits no
+        // GPU limit, yet renders the lit world far darker than desktop with identical
+        // cvars — the lit-pass output is genuinely dimmer on the A-series GPU. Bump
+        // the light multiply (the lever that runs in the core interaction path and so
+        // works through GL4ES regardless of the gamma shader) to compensate; the
+        // diag's frame-px line confirms whether the engine output actually brightens.
+        rLightScale: 6,
         rGamma: 2,
         rBrightness: 1.4,
         skill: 1,
