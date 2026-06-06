@@ -45,11 +45,40 @@ patches/dhewm3-meta-rayban-display.patch`.
 ## State (2026-06)
 
 DOOM 3 **renders the 3D game world in the browser, including on a physical iPhone
-(Mobile Safari).** The app boots straight into `D3_DEFAULT_MAP` (`game/admin`, the
-3rd level) and renders the 3D world to `#gameCanvas`. The bundled pak is reduced
-per-map (`D3_DEFAULT_MAP` must match it). The main menu is bypassed on boot (it
-draws black with the reduced pak — open item). Override the map with
+(Mobile Safari).** The app boots straight into `D3_DEFAULT_MAP` (`game/alphalabs1`,
+Alpha Labs Sector 1) and renders the 3D world to `#gameCanvas`. The bundled pak is
+reduced per-map (`D3_DEFAULT_MAP` must match it). The main menu is bypassed on boot
+(it draws black with the reduced pak — open item). Override the map with
 `?args=%2Bmap%20game/<name>`.
+
+**Lit rendering is confirmed working** (e.g. `game/mars_city1` renders the full
+Mars City Hangar). Note that most DOOM 3 levels *start* in a deliberately dark
+transition room — an airlock or elevator with only a couple of ceiling fixtures
+(`game/admin` opens in a near-black elevator, `game/alphalabs1` in an "AIR LOCK").
+You walk forward a few steps into the lit level proper. The signature **flashlight**
+(hold a long pinch, or `_impulse11`) lights dark areas — the right tool for these
+transition rooms. `game/mars_city1` is the exception that opens directly into a lit
+space, so it's the best "see it running" demo.
+
+### Brightness / gamma (a WebGL dead end)
+
+DOOM 3 is a dark game and relies on gamma correction to lift dim areas. **In this
+build there is effectively no working gamma:**
+
+- **Hardware gamma is gone** — SDL3 dropped `SDL_SetWindowGammaRamp`, so
+  `GLimp_SetGamma` is a no-op (it only warns). `r_gammaInShader 0` therefore does
+  nothing.
+- **In-shader gamma** (`r_gammaInShader 1`, the dhewm3 default) injects
+  `pow(color, 1/gamma)` into every ARB fragment program, but its effect is not
+  observable through GL4ES on the maps tested — `r_gamma`/`r_brightness`/
+  `r_lightScale` do not visibly change the frame.
+
+So the **only working brightness lever is the CSS `filter: brightness()`** on
+`#gameCanvas` (`config.displayBrightness` → `--d3-display-brightness`). It's a
+compositor multiply, so it lifts the *whole* frame but cannot rescue a truly
+unlit (`0,0,0`) surface — a dark airlock stays dark. Keep it moderate (1.35) so
+the lit areas the player walks into don't blow out. `r_gamma`/`r_brightness`/
+`r_lightScale` are still set (correct intent) but are essentially inert here.
 
 ### Mobile / iOS (hard-won)
 
@@ -81,6 +110,26 @@ Getting in-level 3D on screen took three independent fixes:
    weapons/PDA/flashlight; always keep `glprogs/` (ARB shaders the lit path
    needs). Plus the engine drops a missing moveable/item/camera collision model
    instead of aborting the map. `mars_city1` now loads with **zero fatal errors**.
+
+   2b. **Model-material scanning (the big one for "black walls").** The reducer
+   resolved materials for `.md5mesh` models only — but a DOOM 3 map's *environment*
+   (walls, doors, lights, props) is built from `.lwo` (binary) and `.ase` models,
+   ~190 `.lwo` + ~30 `.ase` on `admin` alone. Their materials, and so every
+   diffuse/normal/specular texture they reference, were dropped: **481 missing
+   images** on `admin`, including the elevator's own wall texture
+   (`textures/base_door/delelev1`) and the ceiling lights
+   (`textures/base_light/gottubelight`). **A surface whose diffuse (`_d`) is missing
+   renders pure black**, which read as "the level is unlit". Fix: step 5 of the
+   reducer now scans *all* model formats (`.lwo`/`.ase`/`.ma`/`.md5mesh`) for the
+   material-name strings DOOM 3 embeds in them (ASCII even in binary `.lwo`), and
+   resolves each both explicitly (a `.mtr` block of that name) and **implicitly**
+   (no `.mtr` → derive `<name>_d/_local/_s/_add` by engine convention, which is how
+   `delelev1`/`gottubelight` work). Result: 481 → ~100 missing (the rest are
+   cosmetic — env cubemaps, decals, particles, a few props), pak `78 MB → ~55 MB`
+   (also dropped `--max-texture` to 128 to match the mobile GPU's
+   `image_downSizeLimit`, so it's lossless on-device). **This was the actual cause
+   of the dark walls, not lighting** — see "Brightness / gamma" above for why the
+   *genuinely* dim transition rooms (airlocks/elevators) still look dark.
 3. **ROQ cinematic crash** — the WASM RoQ decoder calls a **null function pointer**
    in `idCinematicLocal::ImageForTime` (reached from `RB_BindVariableStageImage`
    when a video surface is drawn), trapping the render loop → black screen. Config

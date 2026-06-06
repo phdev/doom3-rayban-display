@@ -302,17 +302,33 @@ and no manual `emscripten_webgl_make_context_current` are needed.
   graph to a **fixpoint**, (2) **accumulates** same-named decl blocks (DOOM 3
   names an entityDef and its model def identically, so a naïve overwrite dropped
   body meshes), (3) seeds the **player + default weapons/PDA/flashlight** (no map
-  token references them), and (4) always keeps **`glprogs/`** (the ARB shader
-  programs the lit 3D path needs). The engine also drops a missing
-  **moveable/item/camera collision model** entity instead of aborting the map.
-  With a pak regenerated from owned data this way, `mars_city1` loads with **zero
-  fatal errors** and renders. Regenerate with `scripts/install-demo-data.sh`
-  (point `D3_DATA_DIR` at your owned `base/`).
+  token references them), (4) always keeps **`glprogs/`** (the ARB shader
+  programs the lit 3D path needs), and (5) scans **every model format**
+  (`.lwo`/`.ase`/`.ma`/`.md5mesh`) for the material names DOOM 3 embeds in them and
+  keeps those materials' images — both explicit (`.mtr`) and **implicit**
+  (`<name>_d/_local/_s/_add` by convention). Step 5 is what makes a level *look*
+  right: a map's walls/doors/lights/props are `.lwo`/`.ase` models, and scanning
+  only `.md5mesh` (animated characters) dropped **481 textures** on `admin` —
+  including the elevator's own wall texture — so those surfaces rendered **pure
+  black** (a missing diffuse map = black, which looks like missing lighting). The
+  engine also drops a missing **moveable/item/camera collision model** entity
+  instead of aborting the map. With a pak regenerated from owned data this way,
+  `mars_city1` loads with **zero fatal errors** and renders. Regenerate with
+  `scripts/install-demo-data.sh` (point `D3_DATA_DIR` at your owned `base/`).
 - **Performance / headless.** A full level is far heavier than the menu; under
   headless *software* WebGL (swiftshader) the first frame can take minutes. On
   real GPU hardware (Apple M1 via ANGLE/Metal, and the glasses) it renders
-  promptly. The opening of `mars_city1` is also genuinely dark — bump
-  `r_brightness` / `r_gamma` to see more.
+  promptly.
+- **Darkness / no working gamma.** DOOM 3 is a dark game that leans on gamma
+  correction, and **this build has none that works**: SDL3 removed hardware gamma
+  (`GLimp_SetGamma` is a no-op), and dhewm3's in-shader gamma (`r_gammaInShader 1`)
+  has no observable effect through GL4ES, so `r_gamma`/`r_brightness`/`r_lightScale`
+  don't move the frame. The only working lever is the **CSS `filter: brightness()`**
+  on the canvas (`config.displayBrightness`), a compositor multiply that can't
+  rescue a truly unlit surface. Most levels also *start* in a deliberately dark
+  airlock/elevator transition room (`admin`, `alphalabs1`); walk forward into the
+  lit level, or use the **flashlight** (long pinch). `mars_city1` opens directly
+  into a lit space and is the best demo.
 - **Single-threaded.** SDL thread/condvar creation fails (non-pthread build).
   Harmless for boot, but sound and any worker threads are stubbed. A fuller
   build may want `-pthread` + `-sPROXY_TO_PTHREAD` (the app already sends the

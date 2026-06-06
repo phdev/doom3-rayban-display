@@ -14,6 +14,10 @@ set -euo pipefail
 #
 # Optional:
 #   D3_MAP=game/mars_city1     map to keep (default game/mars_city1)
+#   D3_MAX_TEXTURE=128         downsize in-pak textures to <= N px (0 = full size;
+#                              128 matches the mobile GPU's image_downSizeLimit, so
+#                              it is lossless on-device and keeps the pak small)
+#   D3_NO_AUDIO=yes            drop all audio (smallest pak); overrides D3_AUDIO_RATE
 #   D3_AUDIO_RATE=11025        downsample retained audio (0 to skip)
 #   D3_AUDIO_WIDTH=1           audio sample width in bytes
 #   D3_CHUNK_SIZE=262144       chunk size for the manifest
@@ -56,7 +60,12 @@ if [[ ! -f "$INPUT_PK4" ]]; then
 fi
 
 REDUCE_ARGS=(--input "$INPUT_PK4" --map "$D3_MAP" --output "$REDUCED_PK4")
-if [[ "$D3_AUDIO_RATE" != "0" ]]; then
+if [[ "${D3_MAX_TEXTURE:-128}" != "0" ]]; then
+  REDUCE_ARGS+=(--max-texture "${D3_MAX_TEXTURE:-128}")
+fi
+if [[ "${D3_NO_AUDIO:-}" == "yes" ]]; then
+  REDUCE_ARGS+=(--no-audio)
+elif [[ "$D3_AUDIO_RATE" != "0" ]]; then
   REDUCE_ARGS+=(--audio-rate "$D3_AUDIO_RATE" --audio-width "$D3_AUDIO_WIDTH")
 fi
 

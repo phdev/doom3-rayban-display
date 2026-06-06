@@ -383,18 +383,46 @@ def main(argv=None):
                     continue
                 keep.add(name)
 
-        # 5. Resolve materials referenced inside kept md5mesh models.
+        # 5. Resolve materials referenced inside kept MODELS, then keep their
+        #    images. This is the difference between a lit level and a black one:
+        #    mapobjects (walls, doors, lights, props) are .lwo (binary) and .ase,
+        #    NOT .md5mesh — the admin map alone places ~190 .lwo + ~30 .ase. DOOM 3
+        #    stores each surface's material name as an ASCII string inside the model
+        #    (the .lwo SURF chunk / the .ase MATERIAL list), so a latin-1 scan finds
+        #    them. A scan limited to .md5mesh (animated characters only) dropped
+        #    every mapobject material — 481 missing images on admin, including the
+        #    elevator walls (textures/base_door/delelev1) and the ceiling lights
+        #    (textures/base_light/gottubelight). A surface whose diffuse (_d) is
+        #    missing renders pure black regardless of gamma/brightness/lightScale,
+        #    which is why the elevator looked unlit.
+        #
+        #    Each material name resolves to images two ways:
+        #      - explicit: a `.mtr` block of that name lists the image stages
+        #        (already indexed in `materials`), or
+        #      - implicit: no `.mtr` exists and the engine derives the images from
+        #        the name by convention — <name>_d diffuse, _local bump, _s specular,
+        #        _add glow. delelev1/gottubelight are implicit, so derive the
+        #        variants directly.
         extra_imgs = set()
-        for name in [n for n in keep if n.endswith(".md5mesh")]:
+        IMPLICIT_SUFFIXES = ("", "_d", "_local", "_s", "_add", "_h", "_bmp")
+        model_exts_l = {e.lower() for e in MODEL_EXTS}
+        for name in [n for n in keep
+                     if n[n.rfind("."):].lower() in model_exts_l]:
             zpath, original = entries[name]
-            for t in TOKEN_RE.findall(pool.text(zpath, original)):
-                if t.lower() in materials:
-                    extra_imgs |= materials[t.lower()]
+            for t in asset_tokens(pool.text(zpath, original)):
+                base = strip_ext(t)
+                if base in materials:
+                    extra_imgs |= materials[base]
+                if base.startswith(("textures/", "models/")):
+                    for suf in IMPLICIT_SUFFIXES:
+                        extra_imgs.add(base + suf)
         extra_stripped = {strip_ext(t) for t in extra_imgs}
         for name, (zpath, original) in entries.items():
             if name in keep:
                 continue
             ext = name[name.rfind("."):] if "." in name else ""
+            if args.no_audio and ext in SOUND_EXTS:
+                continue
             if ext in IMAGE_EXTS and strip_ext(name) in extra_stripped:
                 keep.add(name)
 

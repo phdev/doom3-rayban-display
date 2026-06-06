@@ -19,7 +19,7 @@ const D3_AUTO_MAP = true;
 // Boots into DOOM 3's third level (game/admin): the progression is
 // mars_city1 → mars_city2 → admin. The bundled pak is reduced for this map.
 // Override with ?args=%2Bmap%20game/<name>.
-const D3_DEFAULT_MAP = "game/admin";
+const D3_DEFAULT_MAP = "game/alphalabs1";
 const TIMEOUTS = {
   probe: 15000,
   script: 20000,
@@ -61,15 +61,21 @@ export function createRuntimeConfig() {
         inputMode: "wearable",
         lowLatencyControls: true,
         audioEnabled: false,
-        displayBrightness: 1.3,
+        displayBrightness: 1.35,
         displayContrast: 1.05,
         displaySaturate: 1.05,
         // DOOM 3 ships very dark and some levels open in near-black spaces (e.g.
-        // admin's elevator); lift engine gamma/brightness for a phone screen.
-        // (Engine gamma/brightness + the CSS displayBrightness compound, so keep
-        // each moderate to avoid blowing out the lit areas.)
-        rGamma: 1.5,
-        rBrightness: 1.35,
+        // admin's elevator). Three compounding levers lift it for a phone screen:
+        //  - rLightScale multiplies every light's contribution (core lit path, so
+        //    it always works through GL4ES) — brightens the lit walls linearly.
+        //  - rGamma applies pow(color, 1/gamma) in-shader, which lifts the dark
+        //    walls far more than the already-bright light fixtures (nonlinear).
+        //  - displayBrightness is a final CSS compositor multiply.
+        // Gamma is the heavy lifter for near-black surfaces; keep brightness modest
+        // so the light fixtures don't blow out.
+        rLightScale: 3,
+        rGamma: 2,
+        rBrightness: 1.4,
         skill: 1,
         yawSensitivity: 2.4,
         turnBurstDegrees: 42,
@@ -85,6 +91,7 @@ export function createRuntimeConfig() {
         displayBrightness: 1,
         displayContrast: 1,
         displaySaturate: 1,
+        rLightScale: 2,
         rGamma: 1.1,
         rBrightness: 1,
         skill: 1,
@@ -392,6 +399,10 @@ function buildArguments(config) {
     "+set", "r_multiSamples", "0",
     "+set", "r_gamma", String(getNumericConfig(config.rGamma, 1.1)),
     "+set", "r_brightness", String(getNumericConfig(config.rBrightness, 1)),
+    // Multiply every light's intensity (default 2). On a dark, enclosed map like
+    // admin's elevator this lifts the dimly-lit walls; it runs in the core
+    // interaction path so it works through GL4ES regardless of the gamma shader.
+    "+set", "r_lightScale", String(getNumericConfig(config.rLightScale, 2)),
     "+set", "com_skipIntroVideos", "1",
     "+set", "com_showFPS", "0",
     "+set", "s_noSound", config.audioEnabled ? "0" : "1",
@@ -428,8 +439,12 @@ function buildArguments(config) {
     // Load textures synchronously: the single-threaded browser build has no
     // background worker, and the cached path would block forever waiting on it.
     "+set", "image_useCache", "0",
-    // Apply gamma/brightness directly rather than via the shader present pass.
-    "+set", "r_gammaInShader", "0"
+    // Apply r_gamma/r_brightness in the present SHADER. The default path (0) uses
+    // the hardware gamma ramp, which does not exist under WebGL/Emscripten (SDL3
+    // has no hardware gamma), so r_gamma/r_brightness were silently ignored and
+    // dark levels (e.g. admin's elevator) stayed near-black. In-shader gamma works
+    // in WebGL, so the brightness settings actually take effect.
+    "+set", "r_gammaInShader", "1"
   ];
 
   const queryArgs = new URLSearchParams(window.location.search).get("args");
@@ -479,13 +494,14 @@ function buildAutoexecConfig(config) {
     "seta r_swapInterval \"0\"",
     `seta r_gamma "${getNumericConfig(config.rGamma, 1.1)}"`,
     `seta r_brightness "${getNumericConfig(config.rBrightness, 1)}"`,
+    `seta r_lightScale "${getNumericConfig(config.rLightScale, 2)}"`,
     "seta r_skipBump \"0\"",
     "seta image_downSize \"1\"",
     "seta image_useCompression \"1\"",
     `seta g_skill "${getNumericConfig(config.skill, 1)}"`,
     "seta in_mouse \"0\"",
     "seta in_alwaysRun \"0\"",
-    "seta r_gammaInShader \"0\"",
+    "seta r_gammaInShader \"1\"",
     // Skip ROQ video decoding — the WASM RoQ decoder traps on a null function
     // pointer and blacks the whole frame; see buildArguments() / README.
     "seta r_skipROQ \"1\"",

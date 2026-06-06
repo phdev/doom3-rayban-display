@@ -112,6 +112,7 @@ function diagProgress(line) {
 diag(`ua: ${navigator.userAgent.slice(0, 80)}`);
 diag(`screen ${screen.width}x${screen.height} dpr${window.devicePixelRatio} canvas ${runtimeConfig.width}x${runtimeConfig.height} mode=${runtimeConfig.inputMode}`);
 diag(`mem: deviceMemory=${navigator.deviceMemory ?? "?"}GB jsHeapLimit=${(performance.memory?.jsHeapSizeLimit / 1048576 | 0) || "?"}MB`);
+diag(`brightness: lightScale=${runtimeConfig.rLightScale} gamma=${runtimeConfig.rGamma} brightness=${runtimeConfig.rBrightness} cssBright=${runtimeConfig.displayBrightness} gammaInShader=1`);
 // NOTE: do NOT call canvas.getContext() here — a canvas has a single WebGL
 // context, and probing it would steal it from the engine (SDL3 creates its own).
 // The engine logs its GL renderer ("OpenGL renderer: ...") to the runtime log.
@@ -204,8 +205,11 @@ async function startHeadTracking() {
 function appendRuntimeLog(text) {
   runtimeLogs.push(String(text));
 
-  if (runtimeLogs.length > 1500) {
-    runtimeLogs.splice(0, runtimeLogs.length - 1500);
+  // Keep a generous scrollback so the full boot log (GL renderer, ARB program
+  // load, map spawn, missing-asset warnings) stays inspectable on-device via
+  // window.__d3Logs — turns a black phone into a readable diagnostic trace.
+  if (runtimeLogs.length > 4000) {
+    runtimeLogs.splice(0, runtimeLogs.length - 4000);
   }
 }
 
@@ -213,10 +217,9 @@ function handleRuntimeLog(text) {
   appendRuntimeLog(text);
 
   // Surface the engine's milestone/error lines on the on-device diagnostic.
-  // Exclude the repetitive r_gammaInShader warning — it floods the overlay.
-  if (/adjust gamma or brightness/i.test(text)) {
-    // skip noise
-  } else if (/OpenGL renderer|Loaded pk4|ERROR|Error:|Warning:|Game [Mm]ap|Map Initialization|spawn|Missing main|context lost|out of memory|Aborted|alloc|memory|Init Game|interaction|shutdown/i.test(text)) {
+  // (The r_gammaInShader gamma warning is intentionally NOT filtered now — it's a
+  // real signal: it meant the brightness settings were being ignored.)
+  if (/OpenGL renderer|Loaded pk4|gamma|brightness|ERROR|Error:|Warning:|Game [Mm]ap|Map Initialization|spawn|Missing main|context lost|out of memory|Aborted|alloc|memory|Init Game|interaction|shutdown/i.test(text)) {
     diag(text.trim().slice(0, 110));
   }
 
