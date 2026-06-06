@@ -55,6 +55,7 @@ app.innerHTML = `
     <span id="imuStatus" class="runtime-hidden" aria-hidden="true"></span>
     <pre id="diag" style="position:fixed;left:4px;top:4px;right:4px;margin:0;z-index:9999;font:11px/1.35 ui-monospace,Menlo,monospace;color:#7fff7f;background:rgba(0,0,0,.72);padding:5px 6px;white-space:pre-wrap;word-break:break-word;pointer-events:auto;max-height:60vh;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;touch-action:pan-y"></pre>
     <button id="diagToggle" type="button" aria-label="Toggle debug console" style="position:fixed;right:8px;top:8px;z-index:10000;min-width:44px;min-height:30px;padding:4px 10px;font:600 13px/1 ui-monospace,Menlo,monospace;color:#9effa0;background:rgba(0,0,0,.8);border:1px solid #2f6f30;border-radius:7px;-webkit-appearance:none;cursor:pointer">hide log</button>
+    <button id="diagCopy" type="button" aria-label="Copy debug log to clipboard" style="position:fixed;right:100px;top:8px;z-index:10000;min-width:44px;min-height:30px;padding:4px 10px;font:600 13px/1 ui-monospace,Menlo,monospace;color:#9effa0;background:rgba(0,0,0,.8);border:1px solid #2f6f30;border-radius:7px;-webkit-appearance:none;cursor:pointer">copy log</button>
     <div id="glDiag" hidden style="position:fixed;left:8px;top:46px;z-index:10000;max-width:78vw;font:600 11px/1.45 ui-monospace,Menlo,monospace;color:#ffd24a;background:rgba(0,0,0,.85);border:1px solid #8a6a20;border-radius:7px;padding:5px 8px;white-space:pre-wrap;word-break:break-word;pointer-events:none"></div>
   </main>
 `;
@@ -171,19 +172,23 @@ function applyDiagVisibility() {
   if (diagEl) diagEl.style.display = diagHidden ? "none" : "block";
   if (diagToggle) diagToggle.textContent = diagHidden ? "show log" : "hide log";
 }
+// The full overlay text — GL diagnostics + probe pinned on top, live log below.
+// Shared by renderDiag (display) and the copy button so what you copy is exactly
+// what you see (and it works even while the overlay is collapsed).
+function buildDiagText() {
+  const tail = diagProgLine ? diagLines.concat(`▸ ${diagProgLine}`) : diagLines;
+  const head = [];
+  if (glInfo.length) head.push("═══ GL DIAGNOSTICS ═══", ...glInfo);
+  if (glProbeLine) head.push(glProbeLine);
+  const body = head.length ? [...head, "═══ log ═══", ...tail] : tail;
+  return body.join("\n");
+}
 function renderDiag() {
   if (!diagEl || diagHidden) return;
   // Auto-follow the newest lines only when already at the bottom, so a manual
   // scroll-up (to read history) isn't yanked back down by new log lines.
   const atBottom = diagEl.scrollHeight - diagEl.scrollTop - diagEl.clientHeight < 48;
-  const tail = diagProgLine ? diagLines.concat(`▸ ${diagProgLine}`) : diagLines;
-  // Pin the GL diagnostics at the top (initial scroll position shows them); the
-  // live log follows below for anyone who scrolls down.
-  const head = [];
-  if (glInfo.length) head.push("═══ GL DIAGNOSTICS ═══", ...glInfo);
-  if (glProbeLine) head.push(glProbeLine);
-  const body = head.length ? [...head, "═══ log ═══", ...tail] : tail;
-  diagEl.textContent = body.join("\n");
+  diagEl.textContent = buildDiagText();
   if (atBottom) diagEl.scrollTop = diagEl.scrollHeight;
 }
 function diag(line) {
@@ -195,6 +200,40 @@ diagToggle?.addEventListener("click", () => {
   diagHidden = !diagHidden;
   applyDiagVisibility();
   renderDiag();
+});
+const diagCopy = document.querySelector("#diagCopy");
+diagCopy?.addEventListener("click", async () => {
+  const text = buildDiagText();
+  const restore = (msg) => {
+    diagCopy.textContent = msg;
+    window.setTimeout(() => {
+      diagCopy.textContent = "copy log";
+    }, 1600);
+  };
+  // Preferred path: async Clipboard API (needs HTTPS + a user gesture — both hold
+  // here). Falls back to a hidden textarea + execCommand for older iOS WebKit.
+  try {
+    await navigator.clipboard.writeText(text);
+    restore("copied ✓");
+    return;
+  } catch (_) {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.readOnly = true;
+      ta.style.position = "fixed";
+      ta.style.top = "-1000px";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.setSelectionRange(0, text.length);
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      restore(ok ? "copied ✓" : "copy failed");
+    } catch (e) {
+      restore("copy failed");
+    }
+  }
 });
 applyDiagVisibility();
 // Single in-place line for download/load progress (so it doesn't flood the log).
