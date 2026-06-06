@@ -28,21 +28,6 @@ window.__d3Logs = runtimeLogs;
 app.innerHTML = `
   <main class="game-shell" aria-label="DOOM 3 runtime">
     <canvas id="gameCanvas" class="game-canvas" tabindex="-1"></canvas>
-    <!-- Real gamma (pow) applied in the compositor — the engine's in-shader gamma is
-         dead on the iPhone GPU, leaving the lit world near-black (frame-px avg ~9).
-         A linear CSS brightness() can't lift that; this feComponentTransfer gamma
-         curve does (9 -> ~50, matching real DOOM 3). exponent is set per-profile by
-         applyDisplayTuning (1.0 = identity on desktop). color-interpolation-filters
-         must be sRGB so the curve acts on display values, not linearized ones. -->
-    <svg id="d3FilterSvg" width="0" height="0" aria-hidden="true" style="position:absolute;width:0;height:0;pointer-events:none">
-      <filter id="d3gamma" color-interpolation-filters="sRGB" x="0" y="0" width="100%" height="100%">
-        <feComponentTransfer>
-          <feFuncR id="d3gammaR" type="gamma" amplitude="1" exponent="1" offset="0"></feFuncR>
-          <feFuncG id="d3gammaG" type="gamma" amplitude="1" exponent="1" offset="0"></feFuncG>
-          <feFuncB id="d3gammaB" type="gamma" amplitude="1" exponent="1" offset="0"></feFuncB>
-        </feComponentTransfer>
-      </filter>
-    </svg>
     <div id="enemyLeftIndicator" class="enemy-indicator enemy-indicator-left" aria-hidden="true"></div>
     <div id="enemyRightIndicator" class="enemy-indicator enemy-indicator-right" aria-hidden="true"></div>
     <div id="flashlightIndicator" class="flashlight-indicator" aria-hidden="true">Flashlight</div>

@@ -48,12 +48,12 @@ body {
   --d3-display-brightness: 1;
   --d3-display-contrast: 1;
   --d3-display-saturate: 1;
-  /* url(#d3gamma) applies real pow() gamma first (lifts the near-black lit world
-     the iPhone's dead in-shader gamma leaves behind), then the linear adjustments.
-     The #d3gamma filter is always present in the DOM; its exponent is 1.0 (identity)
-     until applyDisplayTuning sets it per profile. */
+  /* The iPhone's in-shader gamma is dead, so the lit world renders near-black.
+     brightness() is a multiply (can't lift near-black); contrast() BELOW 1 raises
+     the black floor (adds a pedestal), which actually reveals the dim walls. Both
+     are native CSS filter functions, reliable on iOS Safari (an SVG url() gamma
+     filter barely applied there). brightness first, then contrast, minimizes wash. */
   filter:
-    url(#d3gamma)
     brightness(var(--d3-display-brightness))
     contrast(var(--d3-display-contrast))
     saturate(var(--d3-display-saturate));

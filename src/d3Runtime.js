@@ -72,14 +72,15 @@ export function createRuntimeConfig() {
         // lit instead of pitch black. Long-pinch toggles it afterward.
         autoFlashlight: true,
         // The iPhone's in-shader gamma is dead, so the lit world renders near-black
-        // (frame-px avg ~9). displayGammaExp drives a real pow() curve in the
-        // compositor (#d3gamma SVG filter) — exponent 0.45 lifts ~9 to ~50, matching
-        // real DOOM 3. This is the lever that actually works on-device; keep the
-        // linear brightness modest so the bright fixtures don't clip after the lift.
-        displayGammaExp: 0.45,
-        displayBrightness: 1.2,
-        displayContrast: 1.05,
-        displaySaturate: 1.05,
+        // (frame-px avg ~9). brightness() alone (a multiply) can't lift that; the
+        // black-floor lift comes from contrast() BELOW 1 (a pedestal that raises dark
+        // pixels), then brightness() scales up. These native filters work reliably on
+        // iOS (an SVG pow() gamma url() barely applied). Lifts walls ~9 -> ~50 to
+        // match real DOOM 3; the cost is slightly milky blacks. Live-tune on-device
+        // with ?dbright= / ?dcontrast= / ?dsat= (no redeploy) — see applyDisplayTuning.
+        displayBrightness: 1.7,
+        displayContrast: 0.7,
+        displaySaturate: 1.15,
         // DOOM 3 ships very dark and some levels open in near-black spaces (e.g.
         // admin's elevator). Three compounding levers lift it for a phone screen:
         //  - rLightScale multiplies every light's contribution (core lit path, so
@@ -111,7 +112,6 @@ export function createRuntimeConfig() {
         lowLatencyControls: false,
         audioEnabled: false,
         autoFlashlight: true,
-        displayGammaExp: 1,
         displayBrightness: 1,
         displayContrast: 1,
         displaySaturate: 1,
@@ -126,25 +126,26 @@ export function createRuntimeConfig() {
 }
 
 function applyDisplayTuning(canvas, config) {
-  canvas.style.setProperty("--d3-display-brightness", String(getNumericConfig(config.displayBrightness, 1)));
-  canvas.style.setProperty("--d3-display-contrast", String(getNumericConfig(config.displayContrast, 1)));
-  canvas.style.setProperty("--d3-display-saturate", String(getNumericConfig(config.displaySaturate, 1)));
-
-  // Compositor gamma (see the #d3gamma SVG filter). The engine's in-shader gamma is
-  // dead on the iPhone GPU, so the lit world comes out near-black; a real pow() curve
-  // here lifts it. exponent < 1 brightens darks (0.45 ≈ a gamma-2.2 decode); 1.0 is
-  // identity (desktop). Overridable on-device via ?dgamma=<n> for quick calibration.
-  let exponent = getNumericConfig(config.displayGammaExp, 1);
+  // The iPhone's in-shader gamma is dead, so the lit world renders near-black and a
+  // brightness() multiply can't lift it. contrast() BELOW 1 raises the black floor,
+  // which reveals the dim walls; brightness() then scales the whole frame. Both are
+  // native CSS filters (reliable on iOS, unlike an SVG gamma url()). Each is live-
+  // tunable on-device via a query param so brightness can be calibrated without a
+  // redeploy: ?dbright= , ?dcontrast= , ?dsat=
+  let params = null;
   try {
-    const override = new URLSearchParams(window.location.search).get("dgamma");
-    if (override !== null && Number.isFinite(Number(override))) {
-      exponent = Number(override);
-    }
+    params = new URLSearchParams(window.location.search);
   } catch {}
-  for (const id of ["d3gammaR", "d3gammaG", "d3gammaB"]) {
-    const fn = document.getElementById(id);
-    if (fn) fn.setAttribute("exponent", String(exponent));
-  }
+  const tuned = (param, key, fallback) => {
+    const override = params && params.get(param);
+    if (override !== null && override !== undefined && Number.isFinite(Number(override))) {
+      return Number(override);
+    }
+    return getNumericConfig(config[key], fallback);
+  };
+  canvas.style.setProperty("--d3-display-brightness", String(tuned("dbright", "displayBrightness", 1)));
+  canvas.style.setProperty("--d3-display-contrast", String(tuned("dcontrast", "displayContrast", 1)));
+  canvas.style.setProperty("--d3-display-saturate", String(tuned("dsat", "displaySaturate", 1)));
 }
 
 function getNumericConfig(value, fallback) {

@@ -104,19 +104,27 @@ is a compositor *multiply*, so it lifts the whole frame but cannot rescue dark
 surfaces (1.2 × 9 ≈ 11, still black). `r_gamma`/`r_brightness`/`r_lightScale` are
 set (correct intent) but the in-shader gamma is inert on the iPhone GPU.
 
-**The fix — real gamma in the compositor (SVG filter).** The on-device probe
-showed the lit world comes out near-black-but-nonzero (`frame-px avg(9,5,3)`,
-`max 165` — the bright fixtures render, the lit walls don't). A *pow()* curve, not
-a multiply, rescues that: `pow(9/255, 0.45) ≈ 50`, matching real DOOM 3. So
-`#gameCanvas` carries an **SVG `feComponentTransfer type="gamma"` filter
-(`#d3gamma`)** ahead of the linear adjustments in its `filter` chain;
-`applyDisplayTuning` sets the exponent from `config.displayGammaExp` (wearable
-**0.45**, desktop **1.0** = identity), overridable on-device with **`?dgamma=<n>`**
-for quick calibration. This runs in the compositor, so it works regardless of the
-dead engine gamma. Verified on WebKit: exponent 0.45 lifts a near-black frame from
-~19% → ~96% non-black without blowing out. (Note: the `frame-px` probe samples the
-canvas *backing store*, i.e. **before** this filter, so it keeps reporting the raw
-engine output ~9 even when the display is correctly lifted.)
+**The fix — raise the black floor with native `contrast()` (compositor).** The
+on-device probe showed the lit world comes out near-black-but-nonzero (`frame-px
+avg(9,5,3)`, `max 165` — the bright fixtures render, the lit walls don't). The
+right tool is a curve that lifts darks, not a multiply.
+
+- First attempt was an **SVG `feComponentTransfer type="gamma"` filter**
+  (`pow(9/255,0.45)≈50`). It works great in Playwright WebKit (~19%→~96% non-black)
+  but **barely applies on real iOS Safari** — the filter runs in a different color
+  space there, so the lit only crept `avg(7,2,1)`→`(11,7,4)`. Abandoned (don't
+  re-try SVG `url()` gamma on iOS).
+- Shipped instead: **native `contrast()` below 1**, which raises the black floor (a
+  pedestal that lifts dark pixels — `brightness()` is a multiply and can't), then
+  `brightness()` scales. Both are native CSS filter functions and reliable on iOS.
+  `applyDisplayTuning` builds the `--d3-display-*` vars; wearable defaults
+  `brightness 1.7 / contrast 0.7 / saturate 1.15` (lifts ~9→~50). Cost: slightly
+  milky blacks. **Live-tunable on-device (no redeploy) via `?dbright=` /
+  `?dcontrast=` / `?dsat=`.**
+
+(Note: the `frame-px` probe samples the canvas *backing store*, i.e. **before** the
+CSS filter, so it keeps reporting the raw engine output ~9 even when the display is
+correctly lifted — judge brightness by eye, not that number.)
 
 ### iPhone-only dark lit world (under investigation, 2026-06)
 
