@@ -46,7 +46,7 @@ app.innerHTML = `
     <div id="yawMeter" class="yaw-meter" data-zone="deadzone" aria-hidden="true"></div>
     <span id="statusText" class="runtime-hidden" aria-hidden="true"></span>
     <span id="imuStatus" class="runtime-hidden" aria-hidden="true"></span>
-    <pre id="diag" style="position:fixed;left:4px;top:4px;right:4px;margin:0;z-index:9999;font:11px/1.35 ui-monospace,Menlo,monospace;color:#7fff7f;background:rgba(0,0,0,.66);padding:5px 6px;white-space:pre-wrap;word-break:break-word;pointer-events:none;max-height:46vh;overflow:hidden"></pre>
+    <pre id="diag" style="position:fixed;left:4px;top:4px;right:4px;margin:0;z-index:9999;font:11px/1.35 ui-monospace,Menlo,monospace;color:#7fff7f;background:rgba(0,0,0,.72);padding:5px 6px;white-space:pre-wrap;word-break:break-word;pointer-events:auto;max-height:60vh;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;touch-action:pan-y"></pre>
   </main>
 `;
 
@@ -79,13 +79,15 @@ let diagProgLine = "";
 const showDiag = !/[?&]nodiag\b/.test(location.search);
 function renderDiag() {
   if (!diagEl || !showDiag) return;
+  // Auto-follow the newest lines only when already at the bottom, so a manual
+  // scroll-up (to read history) isn't yanked back down by new log lines.
+  const atBottom = diagEl.scrollHeight - diagEl.scrollTop - diagEl.clientHeight < 48;
   diagEl.textContent = (diagProgLine ? diagLines.concat(`▸ ${diagProgLine}`) : diagLines).join("\n");
-  // Keep the newest lines (errors land last) visible when the log overflows.
-  diagEl.scrollTop = diagEl.scrollHeight;
+  if (atBottom) diagEl.scrollTop = diagEl.scrollHeight;
 }
 function diag(line) {
   diagLines.push(line);
-  if (diagLines.length > 24) diagLines.shift();
+  if (diagLines.length > 500) diagLines.shift();
   renderDiag();
 }
 // Single in-place line for download/load progress (so it doesn't flood the log).
