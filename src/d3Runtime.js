@@ -6,6 +6,11 @@ import {
 } from "./storage.js";
 
 const ENGINE_BASE = `${import.meta.env.BASE_URL}wasm/`;
+// Per-build cache-buster for the fixed-name engine artifacts (dhewm3.js/.wasm/.data),
+// which iOS Safari otherwise caches across deploys (so engine rebuilds never load).
+// Injected by Vite (define); falls back to a constant in dev.
+const ENGINE_VER = (typeof __ENGINE_VER__ !== "undefined") ? __ENGINE_VER__ : "dev";
+const bustCache = (url) => `${url}${url.includes("?") ? "&" : "?"}v=${ENGINE_VER}`;
 const BUNDLED_PK4_PATH = "base/pak-display.pk4";
 const BUNDLED_PK4_URL = `${ENGINE_BASE}${BUNDLED_PK4_PATH}`;
 const BUNDLED_PK4_GZIP_URL = `${BUNDLED_PK4_URL}.gz`;
@@ -224,7 +229,7 @@ export async function bootDoom3({
     window.Module = module;
 
     log("Loading engine script...");
-    await withTimeout(loadScript(`${ENGINE_BASE}dhewm3.js`), TIMEOUTS.script, "engine script load");
+    await withTimeout(loadScript(bustCache(`${ENGINE_BASE}dhewm3.js`)), TIMEOUTS.script, "engine script load");
 
     progress(28, "Preparing runtime");
     log("Waiting for WebAssembly runtime...");
@@ -352,7 +357,7 @@ function createModule({
       onLog?.(text);
     },
     locateFile(path) {
-      return `${ENGINE_BASE}${GENERATED_FILE_MAP.get(path) ?? path}`;
+      return bustCache(`${ENGINE_BASE}${GENERATED_FILE_MAP.get(path) ?? path}`);
     },
     setStatus(text) {
       if (status) {
@@ -535,7 +540,9 @@ function buildAutoexecConfig(config) {
     `seta g_skill "${getNumericConfig(config.skill, 1)}"`,
     "seta in_mouse \"0\"",
     "seta in_alwaysRun \"0\"",
-    "seta r_gammaInShader \"1\"",
+    // r_gammaInShader is set in buildArguments (default 1), intentionally NOT pinned
+    // here so it can be A/B-tested on-device via ?args=%2Bset%20r_gammaInShader%200
+    // (autoexec runs after the command line and would otherwise override it).
     // Skip ROQ video decoding — the WASM RoQ decoder traps on a null function
     // pointer and blacks the whole frame; see buildArguments() / README.
     "seta r_skipROQ \"1\"",
