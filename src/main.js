@@ -55,6 +55,7 @@ app.innerHTML = `
     <span id="imuStatus" class="runtime-hidden" aria-hidden="true"></span>
     <pre id="diag" style="position:fixed;left:4px;top:4px;right:4px;margin:0;z-index:9999;font:11px/1.35 ui-monospace,Menlo,monospace;color:#7fff7f;background:rgba(0,0,0,.72);padding:5px 6px;white-space:pre-wrap;word-break:break-word;pointer-events:auto;max-height:60vh;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;touch-action:pan-y"></pre>
     <button id="diagToggle" type="button" aria-label="Toggle debug console" style="position:fixed;right:8px;top:8px;z-index:10000;min-width:44px;min-height:30px;padding:4px 10px;font:600 13px/1 ui-monospace,Menlo,monospace;color:#9effa0;background:rgba(0,0,0,.8);border:1px solid #2f6f30;border-radius:7px;-webkit-appearance:none;cursor:pointer">hide log</button>
+    <div id="glDiag" hidden style="position:fixed;left:8px;top:46px;z-index:10000;max-width:78vw;font:600 11px/1.45 ui-monospace,Menlo,monospace;color:#ffd24a;background:rgba(0,0,0,.85);border:1px solid #8a6a20;border-radius:7px;padding:5px 8px;white-space:pre-wrap;word-break:break-word;pointer-events:none"></div>
   </main>
 `;
 
@@ -70,8 +71,29 @@ const refs = {
   yawMeter: document.querySelector("#yawMeter"),
   statusText: document.querySelector("#statusText"),
   imuStatus: document.querySelector("#imuStatus"),
-  moveControls: document.querySelector("#moveControls")
+  moveControls: document.querySelector("#moveControls"),
+  glDiag: document.querySelector("#glDiag")
 };
+
+// Compact, always-visible GPU summary built from the captured GL4ES init lines.
+// The decisive field is "highp FS": a mobile GPU without high-precision floats in
+// fragment shaders underflows DOOM 3's lighting math to ~0 (near-black scene).
+function updateGlDiag() {
+  if (!refs.glDiag || !glInfo.length) return;
+  const find = (re) => glInfo.find((l) => re.test(l)) || "";
+  const has = (re) => glInfo.some((l) => re.test(l));
+  const renderer = (find(/OpenGL renderer:/i).split(/renderer:/i)[1] || "?").trim();
+  const highp = has(/high precision float in fragment shader available/i) ? "YES" : "NO";
+  const floatRT = has(/color_buffer_float +detected/i) ? "yes" : "NO";
+  const halfRT = has(/color_buffer_half_float +detected/i) ? "yes" : "NO";
+  const colorAtt = (find(/Max Color Attachments/i).replace(/^LIBGL:\s*/i, "").trim() || "?");
+  const arb2 = has(/ARB2 renderer: *Available/i) ? "yes" : "NO/missing";
+  const errs = glInfo.filter((l) => /error|: END not found|program is invalid|not available/i.test(l)).length;
+  refs.glDiag.textContent =
+    `GPU: ${renderer}\nhighp FS: ${highp}   floatRT: ${floatRT}   halfRT: ${halfRT}\n` +
+    `ARB2: ${arb2}   ${colorAtt}   shaderErrs: ${errs}`;
+  refs.glDiag.hidden = false;
+}
 
 // On-screen movement pad (mobile/wearable): each button drives the engine's
 // existing w/a/s/d binds via synthetic key events (verified to reach the engine),
@@ -132,6 +154,12 @@ refs.canvas.focus({ preventScroll: true });
 const diagEl = document.querySelector("#diag");
 const diagToggle = document.querySelector("#diagToggle");
 const diagLines = [];
+// GL/renderer init lines, pinned to the top of the overlay so they stay visible
+// (they otherwise scroll out before the level loads). This is the key
+// iPhone-GPU-vs-desktop diagnostic: GPU name + whether high-precision float is
+// available in fragment shaders (mobile GPUs underflow lighting math without it).
+const glInfo = [];
+window.__d3GLInfo = glInfo;
 let diagProgLine = "";
 // Lines are always collected so the "show log" button can reveal them even when
 // the overlay started hidden (?nodiag). Visibility is just a CSS toggle.
@@ -145,7 +173,13 @@ function renderDiag() {
   // Auto-follow the newest lines only when already at the bottom, so a manual
   // scroll-up (to read history) isn't yanked back down by new log lines.
   const atBottom = diagEl.scrollHeight - diagEl.scrollTop - diagEl.clientHeight < 48;
-  diagEl.textContent = (diagProgLine ? diagLines.concat(`▸ ${diagProgLine}`) : diagLines).join("\n");
+  const tail = diagProgLine ? diagLines.concat(`▸ ${diagProgLine}`) : diagLines;
+  // Pin the GL diagnostics at the top (initial scroll position shows them); the
+  // live log follows below for anyone who scrolls down.
+  const body = glInfo.length
+    ? ["═══ GL DIAGNOSTICS ═══", ...glInfo, "═══ log ═══", ...tail]
+    : tail;
+  diagEl.textContent = body.join("\n");
   if (atBottom) diagEl.scrollTop = diagEl.scrollHeight;
 }
 function diag(line) {
@@ -276,6 +310,16 @@ function appendRuntimeLog(text) {
 
 function handleRuntimeLog(text) {
   appendRuntimeLog(text);
+
+  // Capture the GL/renderer init lines into the pinned GL-diagnostics block (the
+  // LIBGL report includes the GPU name and "high precision float in fragment shader
+  // available" — the line that tells us if the iPhone GPU is underflowing lighting).
+  if (/^LIBGL:|OpenGL (renderer|vendor|version)|ARB2 renderer|Will apply r_gamma|: END not found|program is invalid|shader.*not |Error compiling/i.test(text)) {
+    glInfo.push(text.trim().slice(0, 118));
+    if (glInfo.length > 60) glInfo.shift();
+    updateGlDiag();
+    renderDiag();
+  }
 
   // Surface the engine's milestone/error lines on the on-device diagnostic.
   // (The r_gammaInShader gamma warning is intentionally NOT filtered now — it's a
