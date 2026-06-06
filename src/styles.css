@@ -217,3 +217,48 @@ body {
   overflow: hidden;
   pointer-events: none;
 }
+
+/* On-screen movement pad (mobile/wearable profile). Bottom-left diamond so the
+   right side stays clear for head-aiming. Buttons drive the engine's w/a/s/d
+   binds via synthetic key events (see setMove() in main.js). */
+.move-controls {
+  position: fixed;
+  left: max(12px, env(safe-area-inset-left));
+  bottom: max(18px, env(safe-area-inset-bottom));
+  z-index: 6;
+  display: grid;
+  grid-template-columns: repeat(3, 58px);
+  grid-template-rows: repeat(3, 58px);
+  gap: 7px;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.move-controls[hidden] {
+  display: none;
+}
+.move-btn {
+  -webkit-appearance: none;
+  appearance: none;
+  margin: 0;
+  border: 1px solid rgba(120, 200, 120, 0.5);
+  border-radius: 13px;
+  background: rgba(0, 0, 0, 0.42);
+  color: rgba(180, 255, 180, 0.92);
+  font: 600 23px/1 ui-monospace, Menlo, monospace;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+  cursor: pointer;
+}
+.move-btn.is-down {
+  background: rgba(80, 180, 80, 0.55);
+  color: #ffffff;
+  border-color: rgba(180, 255, 180, 0.85);
+}
+.move-fwd { grid-area: 1 / 2 / 2 / 3; }
+.move-left { grid-area: 2 / 1 / 3 / 2; }
+.move-right { grid-area: 2 / 3 / 3 / 4; }
+.move-back { grid-area: 3 / 2 / 4 / 3; }

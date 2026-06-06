@@ -19,7 +19,7 @@ const D3_AUTO_MAP = true;
 // Boots into DOOM 3's third level (game/admin): the progression is
 // mars_city1 → mars_city2 → admin. The bundled pak is reduced for this map.
 // Override with ?args=%2Bmap%20game/<name>.
-const D3_DEFAULT_MAP = "game/alphalabs1";
+const D3_DEFAULT_MAP = "game/mars_city1";
 const TIMEOUTS = {
   probe: 15000,
   script: 20000,
@@ -410,6 +410,10 @@ function buildArguments(config) {
     // interaction path so it works through GL4ES regardless of the gamma shader.
     "+set", "r_lightScale", String(getNumericConfig(config.rLightScale, 2)),
     "+set", "com_skipIntroVideos", "1",
+    // Auto fast-forward in-game cinematics (mars_city1 opens with one). There is no
+    // ESC key on a touchscreen to skip them and they render poorly with the reduced
+    // data set; see the engine patch (idGameLocal::SetCamera, g_skipCinematics).
+    "+set", "g_skipCinematics", "1",
     "+set", "com_showFPS", "0",
     "+set", "s_noSound", config.audioEnabled ? "0" : "1",
     "+set", "g_skill", String(getNumericConfig(config.skill, 1)),
@@ -478,18 +482,42 @@ function installRuntimeConfig(FS, config, log, options = {}) {
   mkdirTree(FS, "/base");
   FS.writeFile("/base/autoexec.cfg", autoexecConfig);
 
+  // The flashlight view model carries effect surfaces (beam1/flare/flare2/bulb)
+  // that the game data never defines a material for, so the engine builds an
+  // implicit OPAQUE material from each texture and the light-beam billboard renders
+  // as a solid white quad stuck to the flashlight. Ship an explicit material decl
+  // for each so the engine uses it instead of the implicit one — additive _black is
+  // a no-op blend that hides the cosmetic surface (the real illumination comes from
+  // the projected flashlight light, not these view-model surfaces). Loaded as a
+  // loose materials/*.mtr the engine's decl scan picks up alongside the pak.
+  mkdirTree(FS, "/base/materials");
+  FS.writeFile("/base/materials/zz_flashlight_fix.mtr", FLASHLIGHT_FIX_MTR);
+
   if (options.writablePath) {
     mkdirTree(FS, "/dhewm3/base");
     FS.writeFile("/dhewm3/base/autoexec.cfg", autoexecConfig);
+    mkdirTree(FS, "/dhewm3/base/materials");
+    FS.writeFile("/dhewm3/base/materials/zz_flashlight_fix.mtr", FLASHLIGHT_FIX_MTR);
   }
 
   log(`Installed runtime config (${config.width}x${config.height})`);
 }
 
+const FLASHLIGHT_FIX_MTR = [
+  "// Hide the flashlight view-model effect surfaces that have no material in the",
+  "// game data (the engine would otherwise render them as opaque white quads).",
+  "models/items/flashlight/beam1  { noShadows noSelfShadow translucent { blend add map _black } }",
+  "models/items/flashlight/flare  { noShadows noSelfShadow translucent { blend add map _black } }",
+  "models/items/flashlight/flare2 { noShadows noSelfShadow translucent { blend add map _black } }",
+  "models/items/flashlight/bulb   { noShadows noSelfShadow translucent { blend add map _black } }",
+  ""
+].join("\n");
+
 function buildAutoexecConfig(config) {
   return [
     "// DOOM 3 Display runtime configuration (auto-executed by id Tech 4)",
     "seta com_skipIntroVideos \"1\"",
+    "seta g_skipCinematics \"1\"",
     "seta sys_lang \"english\"",
     "seta s_volume_dB \"-40\"",
     "seta r_fullscreen \"0\"",
@@ -515,8 +543,12 @@ function buildAutoexecConfig(config) {
     "bind \"s\" \"_back\"",
     "bind \"a\" \"_moveleft\"",
     "bind \"d\" \"_moveright\"",
-    "bind \"MOUSE1\" \"_attack\"",
-    "bind \"MOUSE2\" \"_forward\"",
+    // On a touchscreen SDL maps a tap to the left mouse button, so the default
+    // MOUSE1 -> _attack bind made every tap swing the fists. Clear the mouse binds
+    // on the wearable/mobile profile (attack is the wearable action / on-screen
+    // button instead); keep them on desktop where there's a real mouse.
+    config.inputMode === "wearable" ? "unbind \"mouse1\"" : "bind \"MOUSE1\" \"_attack\"",
+    config.inputMode === "wearable" ? "unbind \"mouse2\"" : "bind \"MOUSE2\" \"_forward\"",
     "bind \"SPACE\" \"_moveup\"",
     "bind \"CTRL\" \"_movedown\"",
     "bind \"e\" \"_use\"",

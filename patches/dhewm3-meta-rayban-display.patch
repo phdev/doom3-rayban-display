@@ -844,6 +844,28 @@ index 0000000..bd37bff
 +#endif // __EMSCRIPTEN__
 +
 +#endif // __D3_WEARABLE_GAME_H__
+diff --git a/neo/game/Game_local.cpp b/neo/game/Game_local.cpp
+index 1fca78f..6357ac5 100644
+--- a/neo/game/Game_local.cpp
++++ b/neo/game/Game_local.cpp
+@@ -3963,6 +3963,17 @@ void idGameLocal::SetCamera( idCamera *cam ) {
+ 	if ( camera ) {
+ 		inCinematic = true;
+ 
++		// Wearable/kiosk build (g_skipCinematics 1): fast-forward every cinematic the
++		// instant it starts, since a touchscreen has no ESC key to skip it and the
++		// reduced data set renders cinematics poorly. Mirrors SkipCinematic()'s
++		// non-disconnect path; the existing 'disconnect' check right below then runs
++		// with skipCinematic already set, so disconnect cameras still behave correctly.
++		if ( g_skipCinematics.GetBool() && !skipCinematic ) {
++			soundSystem->SetMute( true );
++			skipCinematic = true;
++			cinematicMaxSkipTime = time + SEC2MS( g_cinematicMaxSkipTime.GetFloat() );
++		}
++
+ 		if ( skipCinematic && camera->spawnArgs.GetBool( "disconnect" ) ) {
+ 			camera->spawnArgs.SetBool( "disconnect", false );
+ 			cvarSystem->SetCVarFloat( "r_znear", 3.0f );
 diff --git a/neo/game/Item.cpp b/neo/game/Item.cpp
 index 97ae952..ac0a910 100644
 --- a/neo/game/Item.cpp
@@ -932,6 +954,30 @@ index 36a0cbe..58d9a22 100644
  	}
  
  	GetPhysics()->SetContents( CONTENTS_SOLID );
+diff --git a/neo/game/gamesys/SysCvar.cpp b/neo/game/gamesys/SysCvar.cpp
+index 824d9c2..42c0adc 100644
+--- a/neo/game/gamesys/SysCvar.cpp
++++ b/neo/game/gamesys/SysCvar.cpp
+@@ -97,6 +97,7 @@ idCVar r_aspectRatio(				"r_aspectRatio",			"-1",			CVAR_RENDERER | CVAR_INTEGER
+ 
+ idCVar g_cinematic(					"g_cinematic",				"1",			CVAR_GAME | CVAR_BOOL, "skips updating entities that aren't marked 'cinematic' '1' during cinematics" );
+ idCVar g_cinematicMaxSkipTime(		"g_cinematicMaxSkipTime",	"600",			CVAR_GAME | CVAR_FLOAT, "# of seconds to allow game to run when skipping cinematic.  prevents lock-up when cinematic doesn't end.", 0, 3600 );
++idCVar g_skipCinematics(			"g_skipCinematics",			"0",			CVAR_GAME | CVAR_BOOL, "automatically fast-forward every cinematic as it starts (wearable/kiosk build has no ESC key to skip them)" );
+ 
+ idCVar g_muzzleFlash(				"g_muzzleFlash",			"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "show muzzle flashes" );
+ idCVar g_projectileLights(			"g_projectileLights",		"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "show dynamic lights on projectiles" );
+diff --git a/neo/game/gamesys/SysCvar.h b/neo/game/gamesys/SysCvar.h
+index a4883b5..095506b 100644
+--- a/neo/game/gamesys/SysCvar.h
++++ b/neo/game/gamesys/SysCvar.h
+@@ -35,6 +35,7 @@ extern idCVar	developer;
+ 
+ extern idCVar	g_cinematic;
+ extern idCVar	g_cinematicMaxSkipTime;
++extern idCVar	g_skipCinematics;
+ 
+ extern idCVar	r_aspectRatio;
+ 
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
 index 7914093..cf1cac2 100644
 --- a/neo/renderer/RenderSystem_init.cpp

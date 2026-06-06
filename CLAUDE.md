@@ -45,20 +45,46 @@ patches/dhewm3-meta-rayban-display.patch`.
 ## State (2026-06)
 
 DOOM 3 **renders the 3D game world in the browser, including on a physical iPhone
-(Mobile Safari).** The app boots straight into `D3_DEFAULT_MAP` (`game/alphalabs1`,
-Alpha Labs Sector 1) and renders the 3D world to `#gameCanvas`. The bundled pak is
-reduced per-map (`D3_DEFAULT_MAP` must match it). The main menu is bypassed on boot
-(it draws black with the reduced pak — open item). Override the map with
-`?args=%2Bmap%20game/<name>`.
+(Mobile Safari).** The app boots straight into `D3_DEFAULT_MAP` (`game/mars_city1`,
+the iconic Mars City Hangar opening) and renders the 3D world to `#gameCanvas`. The
+bundled pak is reduced per-map (`D3_DEFAULT_MAP` must match it). The main menu is
+bypassed on boot (it draws black with the reduced pak — open item). Override the map
+with `?args=%2Bmap%20game/<name>`.
 
-**Lit rendering is confirmed working** (e.g. `game/mars_city1` renders the full
-Mars City Hangar). Note that most DOOM 3 levels *start* in a deliberately dark
-transition room — an airlock or elevator with only a couple of ceiling fixtures
-(`game/admin` opens in a near-black elevator, `game/alphalabs1` in an "AIR LOCK").
-You walk forward a few steps into the lit level proper. The signature **flashlight**
-(hold a long pinch, or `_impulse11`) lights dark areas — the right tool for these
-transition rooms. `game/mars_city1` is the exception that opens directly into a lit
-space, so it's the best "see it running" demo.
+`mars_city1` opens directly into a lit space (best "see it running" demo). Note that
+most other DOOM 3 levels *start* in a deliberately dark transition room — an airlock
+or elevator with only a couple of ceiling fixtures (`game/admin` → a near-black
+elevator, `game/alphalabs1` → an "AIR LOCK"). You walk forward into the lit level
+proper, and the flashlight (auto-on, see Controls) lights the way.
+
+### Opening cinematic — auto-skipped (engine patch)
+
+`mars_city1` (and most levels) open with a scripted **cinematic** (a `func_cameraview`
+takes the view; HUD/crosshair hidden). On a touchscreen there is no ESC key to skip
+it (`idPlayer::HandleESC` → `SkipCinematic`), and cinematics render poorly with the
+reduced data + `r_skipROQ`. So the engine patch adds **`g_skipCinematics`** (default
+0; the app sets it **1**): in `idGameLocal::SetCamera`, the instant a cinematic
+starts it sets `skipCinematic`/`cinematicMaxSkipTime` (the non-disconnect path of
+`SkipCinematic`), fast-forwarding every cinematic so the player drops straight into
+gameplay. Fast-forward (not abort) means the cinematic's script triggers still fire,
+so progression isn't broken.
+
+### Controls (mobile / wearable profile)
+
+- **Movement pad** — a bottom-left on-screen d-pad (`#moveControls`, forward / back /
+  strafe-left / strafe-right). Each button drives the engine's existing `w/a/s/d`
+  binds via **synthetic `KeyboardEvent`s** (verified to reach the SDL/Emscripten
+  keyboard listener), so no engine change was needed. Head-turning still aims.
+- **No tap-to-melee** — SDL maps a touch tap to the left mouse button, so the default
+  `MOUSE1 -> _attack` bind made every tap swing the fists. The wearable profile now
+  `unbind`s `mouse1`/`mouse2` in the autoexec (desktop keeps them).
+- **Flashlight** — auto-enabled ~2.6 s after spawn (`config.autoFlashlight`) and
+  toggled by a long pinch. Its view-model effect surfaces (`beam1`/`flare`/`flare2`/
+  `bulb`) have **no material in the game data**, so the engine built implicit OPAQUE
+  materials and the light-beam billboard rendered as a **solid white quad** stuck to
+  the flashlight. Fix: the app writes a loose `base/materials/zz_flashlight_fix.mtr`
+  declaring those four as additive-`_black` (invisible) — the real illumination comes
+  from the projected light, not these cosmetic surfaces.
 
 ### Brightness / gamma (a WebGL dead end)
 

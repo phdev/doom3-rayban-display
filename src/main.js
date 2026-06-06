@@ -44,6 +44,12 @@ app.innerHTML = `
         <div id="loadingBar" class="loading-bar"></div>
       </div>
     </section>
+    <div id="moveControls" class="move-controls" aria-label="Movement controls" hidden>
+      <button class="move-btn move-fwd" type="button" data-move="forward" aria-label="Move forward">▲</button>
+      <button class="move-btn move-left" type="button" data-move="left" aria-label="Strafe left">◄</button>
+      <button class="move-btn move-right" type="button" data-move="right" aria-label="Strafe right">►</button>
+      <button class="move-btn move-back" type="button" data-move="back" aria-label="Move backward">▼</button>
+    </div>
     <div id="yawMeter" class="yaw-meter" data-zone="deadzone" aria-hidden="true"></div>
     <span id="statusText" class="runtime-hidden" aria-hidden="true"></span>
     <span id="imuStatus" class="runtime-hidden" aria-hidden="true"></span>
@@ -63,8 +69,56 @@ const refs = {
   loadingBar: document.querySelector("#loadingBar"),
   yawMeter: document.querySelector("#yawMeter"),
   statusText: document.querySelector("#statusText"),
-  imuStatus: document.querySelector("#imuStatus")
+  imuStatus: document.querySelector("#imuStatus"),
+  moveControls: document.querySelector("#moveControls")
 };
+
+// On-screen movement pad (mobile/wearable): each button drives the engine's
+// existing w/a/s/d binds via synthetic key events (verified to reach the engine),
+// so no engine change is needed. Head-turning still aims; this just walks.
+const MOVE_KEYS = {
+  forward: { key: "w", code: "KeyW", keyCode: 87 },
+  back: { key: "s", code: "KeyS", keyCode: 83 },
+  left: { key: "a", code: "KeyA", keyCode: 65 },
+  right: { key: "d", code: "KeyD", keyCode: 68 }
+};
+const moveActive = Object.create(null);
+
+function setMove(dir, down) {
+  const k = MOVE_KEYS[dir];
+  if (!k || Boolean(moveActive[dir]) === Boolean(down)) {
+    return;
+  }
+  moveActive[dir] = Boolean(down);
+  const type = down ? "keydown" : "keyup";
+  // Dispatch a fresh event to each plausible SDL target (window/document/canvas);
+  // whichever the Emscripten keyboard listener is bound to picks it up.
+  for (const target of [window, document, refs.canvas]) {
+    target.dispatchEvent(new KeyboardEvent(type, {
+      key: k.key, code: k.code, keyCode: k.keyCode, which: k.keyCode,
+      bubbles: true, cancelable: true
+    }));
+  }
+}
+
+function wireMoveControls() {
+  if (!refs.moveControls) {
+    return;
+  }
+  for (const btn of refs.moveControls.querySelectorAll(".move-btn")) {
+    const dir = btn.dataset.move;
+    const press = (e) => { e.preventDefault(); e.stopPropagation(); setMove(dir, true); btn.classList.add("is-down"); };
+    const release = (e) => { if (e) { e.preventDefault(); e.stopPropagation(); } setMove(dir, false); btn.classList.remove("is-down"); };
+    btn.addEventListener("pointerdown", press);
+    btn.addEventListener("pointerup", release);
+    btn.addEventListener("pointercancel", release);
+    btn.addEventListener("pointerleave", release);
+    // Belt-and-suspenders for browsers that fire touch before pointer.
+    btn.addEventListener("contextmenu", (e) => e.preventDefault());
+  }
+  // Release everything if the page is hidden/blurred mid-press.
+  window.addEventListener("blur", () => { for (const d of Object.keys(MOVE_KEYS)) setMove(d, false); });
+}
 
 refs.canvas.width = runtimeConfig.width;
 refs.canvas.height = runtimeConfig.height;
@@ -177,6 +231,12 @@ async function start() {
     });
 
     wearableInput.install();
+    wireMoveControls();
+    // Show the on-screen movement pad on the touch/wearable profile (desktop has a
+    // keyboard). It lives on the left so the right stays clear for head-aiming.
+    if (runtimeConfig.inputMode === "wearable" && refs.moveControls) {
+      refs.moveControls.hidden = false;
+    }
     startEnemyIndicatorPolling();
     await startHeadTracking();
     refs.statusText.textContent = "Running";

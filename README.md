@@ -139,6 +139,14 @@ DOOM 3 actions:
 - Swipe down → recenter IMU
 - Swipe left/right → large turn burst
 
+On the **mobile / wearable profile** an on-screen **movement pad** (bottom-left:
+forward / back / strafe-left / strafe-right) drives the engine's `w/a/s/d` binds via
+synthetic key events, and the **flashlight auto-enables** shortly after spawn. A
+touchscreen tap no longer swings the fists (the `MOUSE1 -> _attack` bind is cleared
+on this profile, since SDL maps a tap to the left mouse button). The **opening
+cinematic is auto-skipped** (`g_skipCinematics 1`; see the engine patch) so you drop
+straight into gameplay.
+
 Head turning (`DeviceOrientationEvent` yaw) steers the view through the exported
 C function `D3_AddViewAngles`, with a deadzone and comfort-tuned sensitivity.
 
