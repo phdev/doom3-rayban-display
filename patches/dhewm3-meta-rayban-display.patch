@@ -996,7 +996,7 @@ index 3550256..e81e3cb 100644
  
  	char *s = Sys_ConsoleInput();
 diff --git a/neo/sys/glimp.cpp b/neo/sys/glimp.cpp
-index 7efe196..21c2cb7 100644
+index 7efe196..afa6fe1 100644
 --- a/neo/sys/glimp.cpp
 +++ b/neo/sys/glimp.cpp
 @@ -122,6 +122,22 @@ static SDL_Surface *window = NULL;
@@ -1043,7 +1043,22 @@ index 7efe196..21c2cb7 100644
  	My_SDL_WindowFlags flags = SDL_WINDOW_OPENGL;
  
  	if (parms.fullScreen == 1)
-@@ -315,13 +345,30 @@ try_again:
+@@ -205,7 +235,14 @@ bool GLimp_Init(glimpParms_t parms) {
+ 
+ 	r_windowResizable.ClearModified();
+ #if SDL_VERSION_ATLEAST(2, 0, 0)
++#ifndef __EMSCRIPTEN__
++	// On Emscripten, high-DPI blows the canvas drawable up to css-size * dpr
++	// (e.g. 402pt * 3 = 1206px) while the engine still renders at r_customWidth
++	// (e.g. 448), so the scene draws into a small corner of a big canvas and
++	// looks tiny on a phone. Skip high-DPI so the drawable matches the render
++	// resolution and the scene fills the canvas (which CSS then scales to fit).
+ 	flags |= SDL_WINDOW_ALLOW_HIGHDPI;
++#endif
+ 
+ 	if ( r_windowResizable.GetBool() ) {
+ 		flags |= SDL_WINDOW_RESIZABLE;
+@@ -315,13 +352,30 @@ try_again:
  		SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, tdepthbits);
  		SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, tstencilbits);
  
@@ -1074,7 +1089,7 @@ index 7efe196..21c2cb7 100644
  #if SDL_VERSION_ATLEAST(2, 0, 0) // SDL2 and SDL3 window creation
  
  		if ( r_glDebugContext.GetBool() ) {
-@@ -575,12 +622,42 @@ try_again:
+@@ -575,12 +629,42 @@ try_again:
  
  		context = SDL_GL_CreateContext(window);
  
@@ -1117,7 +1132,7 @@ index 7efe196..21c2cb7 100644
  		SetSDLIcon(); // for SDL2  this must be done after creating the window
  
  		// TODO: also check for fullscreen-desktop?
-@@ -1130,8 +1207,19 @@ void GLimp_Shutdown() {
+@@ -1130,8 +1214,19 @@ void GLimp_Shutdown() {
  GLimp_SwapBuffers
  ===================
  */
@@ -1137,7 +1152,7 @@ index 7efe196..21c2cb7 100644
  #if SDL_VERSION_ATLEAST(2, 0, 0)
  	SDL_GL_SwapWindow(window);
  #else
-@@ -1242,7 +1330,12 @@ GLimp_ExtensionPointer
+@@ -1242,7 +1337,12 @@ GLimp_ExtensionPointer
  GLExtension_t GLimp_ExtensionPointer(const char *name) {
  	assert(SDL_WasInit(SDL_INIT_VIDEO));
  

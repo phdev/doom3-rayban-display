@@ -44,13 +44,33 @@ patches/dhewm3-meta-rayban-display.patch`.
 
 ## State (2026-06)
 
-DOOM 3 **renders the 3D game world in the browser.** The app boots straight into
-`game/mars_city1` (`D3_AUTO_MAP = true`, `D3_DEFAULT_MAP`) and renders the 3D world
-(Mars-base geometry + per-pixel lighting) to `#gameCanvas` at ~50–60 fps on real
-GPU hardware. The main menu is bypassed on boot — it draws black with the reduced
-pak (the GUI cursor renders, so the 2-D pipeline works; the main-page windows
-don't — open item). An earlier capture rendered the full menu, so the present path
-is fine. Override the map with `?args=%2Bmap%20<name>`.
+DOOM 3 **renders the 3D game world in the browser, including on a physical iPhone
+(Mobile Safari).** The app boots straight into `D3_DEFAULT_MAP` (`game/admin`, the
+3rd level) and renders the 3D world to `#gameCanvas`. The bundled pak is reduced
+per-map (`D3_DEFAULT_MAP` must match it). The main menu is bypassed on boot (it
+draws black with the reduced pak — open item). Override the map with
+`?args=%2Bmap%20game/<name>`.
+
+### Mobile / iOS (hard-won)
+
+- **Stale-404 cache** — `fetchBytes` defaulted to `cache:"force-cache"`; after a
+  file 404'd (e.g. a chunked-vs-single-file deploy), Safari served the stale 404
+  forever ("No PK4 available"). Now `cache:"no-store"`.
+- **Lean pak** — `reduce-d3-map-pk4.py --max-texture 256` downsizes in-pak TGAs
+  (the engine still caps GPU textures via `image_downSizeLimit`, set to 128 on the
+  wearable/mobile profile). Keeps the pak < 100 MB (single file, no chunks).
+- **High-DPI tiny render** — Emscripten high-DPI blew the canvas drawable up to
+  css-size × dpr (402pt × 3 = 1206) while the engine rendered at `r_customWidth`
+  (448), so the scene drew into a corner. `glimp.cpp` skips
+  `SDL_WINDOW_ALLOW_HIGHDPI` on `__EMSCRIPTEN__` so the drawable matches the render
+  res and fills the canvas.
+- **On-device diagnostics** — `#diag` overlay (touch-scrollable; `?nodiag` to
+  hide) prints the WebGL renderer, engine milestones/errors, PK4 download
+  progress, and a `webglcontextlost` listener — turns a black phone into a
+  readable boot log.
+- The iOS Simulator (real WebKit, Mac GPU) is a useful proxy: `xcrun simctl boot`
+  + `openurl`. Chrome mobile emulation (`Emulation.setDeviceMetricsOverride`,
+  dpr 3) reproduced the high-DPI tiny render.
 
 Getting in-level 3D on screen took three independent fixes:
 1. **Present** — SDL3 canvas selector (see below); the engine drew to the wrong

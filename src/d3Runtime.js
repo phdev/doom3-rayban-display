@@ -16,7 +16,10 @@ const URL_PK4_PARAM = "pk4";
 // investigation), whereas an in-game map renders correctly. Override the map
 // with ?args=+map <name>, or force the menu with ?args=+disconnect.
 const D3_AUTO_MAP = true;
-const D3_DEFAULT_MAP = "game/mars_city1";
+// Boots into DOOM 3's third level (game/admin): the progression is
+// mars_city1 → mars_city2 → admin. The bundled pak is reduced for this map.
+// Override with ?args=%2Bmap%20game/<name>.
+const D3_DEFAULT_MAP = "game/admin";
 const TIMEOUTS = {
   probe: 15000,
   script: 20000,
