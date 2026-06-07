@@ -262,6 +262,38 @@ diag(`brightness: lightScale=${runtimeConfig.rLightScale} gamma=${runtimeConfig.
 // getContext (SDL/emscripten calls it on #gameCanvas — wrapping the prototype
 // instruments the engine's own context instead of stealing it), dump the GPU's
 // limits once, and tally texture uploads + GL errors live at the top of the diag.
+// Optional ?nomip / ?lodbias=N flags: force GL_LINEAR min filter (kill
+// mipmaps) and/or set explicit LOD bias on all sampled textures. Mipmap LOD
+// selection picks between two mips per fragment based on a screen-space
+// derivative — for pixels near the mip threshold, tiny per-frame precision
+// wobble flips the choice, sampling a pre-filtered (mip+1) vs unfiltered
+// (mip) texel, producing ~1-2% per-pixel oscillation across the whole scene.
+// Disabling mipmaps eliminates that variance source.
+(function fixMipmapJitter() {
+  const noMip = /[?&]nomip\b/.test(location.search);
+  if (!noMip) return;
+  const wrap = (proto) => {
+    if (!proto) return;
+    const orig = proto.texParameteri;
+    if (!orig || orig.__d3NoMip) return;
+    const patched = function (target, pname, param) {
+      if (pname === this.TEXTURE_MIN_FILTER) {
+        // Map all mipmap min filters to non-mipmap equivalents
+        if (param === this.LINEAR_MIPMAP_LINEAR || param === this.LINEAR_MIPMAP_NEAREST) {
+          param = this.LINEAR;
+        } else if (param === this.NEAREST_MIPMAP_LINEAR || param === this.NEAREST_MIPMAP_NEAREST) {
+          param = this.NEAREST;
+        }
+      }
+      return orig.call(this, target, pname, param);
+    };
+    patched.__d3NoMip = true;
+    proto.texParameteri = patched;
+  };
+  wrap(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
+  wrap(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
+})();
+
 // ── WebKit lit-pass fix: splat falloff alpha into RGB ────────────────────────
 // On WebKit (iPhone Safari, Mac Safari, anything that isn't Chrome/ANGLE), the
 // DOOM 3 lit pass renders the world near-black. Bisected with shader debug
@@ -366,23 +398,9 @@ diag(`brightness: lightScale=${runtimeConfig.rLightScale} gamma=${runtimeConfig.
 (function fixShaderSources() {
   const enableFalloff   = !/[?&]nofalloffix\b/.test(location.search);
   const enablePrecision = !/[?&]noprecisionfix\b/.test(location.search);
-  const enableClampNdotL = !/[?&]noclampfix\b/.test(location.search);
-  const enableStripPow   = !/[?&]nostripfix\b/.test(location.search);
-  if (!enableFalloff && !enablePrecision && !enableClampNdotL && !enableStripPow) return;
+  if (!enableFalloff && !enablePrecision) return;
   const FALLOFF_RE = /texture2DProj\(\s*_gl4es_Sampler2D_2\s*,\s*_gl4es_TexCoord_2\s*\)/g;
   const SAMPLER_RE = /\b(uniform\s+)(sampler(?:2D|Cube|3D))\b/g;
-  // The GL4ES translation of interaction.vfp computes light = vec4(dot(...)) on
-  // the N·L dot product without clamping. Negative dot products propagate
-  // through the subsequent multiplies until the final clamp(0,1) — but in the
-  // intermediate `pow()` near low values the precision differences amplify
-  // significantly. Clamp it to [0,1] at the source like d3wasm's shader does,
-  // which is more numerically stable on Apple GPUs.
-  const NDOTL_RE = /light\s*=\s*vec4\(\s*dot\(\s*light\.xyz\s*,\s*localNormal\.xyz\s*\)\s*\)\s*;/;
-  // The final 4 lines apply `pow(dhewm3.x, env_21.w)` per channel for in-shader
-  // gamma. pow() near 0 amplifies tiny precision wobbles into visible per-frame
-  // pixel oscillation. Skip the pow() — gamma 1.1 is barely visible anyway and
-  // the CSS filter handles brightness now.
-  const POW_BLOCK_RE = /dhewm3tmpres\.xyz\s*=\s*clamp\([^;]+\);\s*gl_FragColor\.x\s*=\s*\(pow\([^;]+\);\s*gl_FragColor\.y\s*=\s*\(pow\([^;]+\);\s*gl_FragColor\.z\s*=\s*\(pow\([^;]+\);\s*gl_FragColor\.w\s*=[^;]+;/;
   const wrap = (proto) => {
     if (!proto) return;
     const orig = proto.shaderSource;
@@ -391,32 +409,12 @@ diag(`brightness: lightScale=${runtimeConfig.rLightScale} gamma=${runtimeConfig.
       let s = source == null ? source : String(source);
       try {
         if (typeof s === "string") {
-          // (1) highp samplers
           if (enablePrecision && /\buniform\s+sampler/.test(s) && !/\buniform\s+(?:highp|mediump|lowp)\s+sampler/.test(s)) {
             s = s.replace(SAMPLER_RE, "$1highp $2");
           }
-          // (2) The remaining 3 transformations target the interaction shader
-          // specifically (identified by the DXT5-NM normal swizzle).
-          const isInteraction = s.includes("localNormal.x = localNormal.w");
-          if (isInteraction) {
-            // (2a) Splat falloff .w into RGB
-            if (enableFalloff && FALLOFF_RE.test(s)) {
-              FALLOFF_RE.lastIndex = 0;
-              s = s.replace(FALLOFF_RE, "vec4(texture2DProj(_gl4es_Sampler2D_2, _gl4es_TexCoord_2).w)");
-            }
-            // (2b) Clamp NdotL to [0,1] — kills negative-value precision wobble
-            if (enableClampNdotL) {
-              s = s.replace(NDOTL_RE,
-                "light = vec4(clamp(dot(light.xyz, localNormal.xyz), 0.0, 1.0));");
-            }
-            // (2c) Skip the in-shader gamma pow() — pow() near 0 amplifies
-            // precision noise into visible per-pixel oscillation. Just clamp
-            // and write directly.
-            if (enableStripPow && POW_BLOCK_RE.test(s)) {
-              s = s.replace(POW_BLOCK_RE,
-                "gl_FragColor.xyz = clamp(_gl4es_Fragment_ProgramEnv_21.xyz * dhewm3tmpres.xyz, 0.0, 1.0);\n" +
-                "\tgl_FragColor.w = dhewm3tmpres.w;");
-            }
+          if (enableFalloff && s.includes("localNormal.x = localNormal.w") && FALLOFF_RE.test(s)) {
+            FALLOFF_RE.lastIndex = 0;
+            s = s.replace(FALLOFF_RE, "vec4(texture2DProj(_gl4es_Sampler2D_2, _gl4es_TexCoord_2).w)");
           }
         }
       } catch (_) { /* never break the engine */ }
