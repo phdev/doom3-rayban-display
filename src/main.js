@@ -308,14 +308,18 @@ window.__d3GLProbe = glProbe;
   // Escape hatch: ?noprobe disables the texImage2D wrap entirely (for A/B'ing
   // whether the instrumentation itself affects load/render).
   if (/[?&]noprobe\b/.test(location.search)) return;
+  // The frame-px sampler requires preserveDrawingBuffer so the canvas backing
+  // store stays readable after the swap. On iOS Safari that flag also changes
+  // the WebGL swap path and produces visible ghosting / flicker during camera
+  // motion, so it's OPT-IN now: only enabled when ?probe is in the URL. The diag
+  // overlay still gets the caps + gpu-tex tally; only the frame-px line goes dark.
+  const ENABLE_FRAME_PX = /[?&]probe\b/.test(location.search);
   // Kept in a closure (not on glProbe) so JSON.stringify(__d3GLProbe) stays clean.
   let probeGl = null;
   let probeCanvas = null;
   const origGetContext = HTMLCanvasElement.prototype.getContext;
   HTMLCanvasElement.prototype.getContext = function (type, attrs) {
-    if (typeof type === "string" && /webgl/i.test(type)) {
-      // Force preserveDrawingBuffer so the rendered frame stays readable after the
-      // swap — lets us sample the engine's actual output brightness (see interval).
+    if (ENABLE_FRAME_PX && typeof type === "string" && /webgl/i.test(type)) {
       attrs = Object.assign({}, attrs, { preserveDrawingBuffer: true });
     }
     const gl = origGetContext.call(this, type, attrs);
@@ -396,8 +400,10 @@ window.__d3GLProbe = glProbe;
     // Sample the engine's rendered-frame brightness (the canvas backing store,
     // BEFORE the CSS brightness filter). avg ~ how lit the walls are; max ~ whether
     // the bright lights render. Near-black avg ⇒ the lit shader output is the
-    // problem; dim-but-present avg ⇒ exposure/display.
-    if (probeCanvas) {
+    // problem; dim-but-present avg ⇒ exposure/display. Only runs when ?probe is
+    // set — preserveDrawingBuffer (required for readback) introduces motion
+    // flicker on iOS Safari, so it must be opt-in for normal use.
+    if (probeCanvas && ENABLE_FRAME_PX) {
       try {
         if (!sampleCanvas) {
           sampleCanvas = document.createElement("canvas");
