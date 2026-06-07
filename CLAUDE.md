@@ -126,6 +126,19 @@ right tool is a curve that lifts darks, not a multiply.
 CSS filter, so it keeps reporting the raw engine output ~9 even when the display is
 correctly lifted — judge brightness by eye, not that number.)
 
+**Live engine tuning (`d3cmd`).** Because CSS post-processing can't truly fix a dark
+*engine* output (a multiply amplifies banding; `contrast()<1` adds gray fog), the
+real fix is engine-side — but blind 6-min deploy cycles made that painful. The
+engine patch now exports **`D3_ExecCommand`** (`neo/framework/d3_wearable.cpp`,
+added to the `EXPORTED_FUNCTIONS` list in `neo/CMakeLists.txt`), surfaced as
+**`window.d3cmd(cmd)`** once the runtime is up (`d3Runtime.js`). It runs any DOOM 3
+console command next frame, so the renderer can be tuned **live on-device from the
+Safari Web Inspector console** with no rebuild — e.g. `d3cmd("r_lightScale 20")`,
+`d3cmd("r_gamma 3")`, `d3cmd("r_brightness 2")`, `d3cmd("r_skipInteractions 1")`,
+`d3cmd("reloadARBprograms")`, `d3cmd("vid_restart")`. Use it to find which lever
+actually brightens the lit pass on the A-series GPU, then bake the winners into the
+profile / autoexec.
+
 ### iPhone-only dark lit world (under investigation, 2026-06)
 
 Symptom: on a physical iPhone the **textured/lit world renders black** while

@@ -75,12 +75,14 @@ export function createRuntimeConfig() {
         // (frame-px avg ~9). brightness() alone (a multiply) can't lift that; the
         // black-floor lift comes from contrast() BELOW 1 (a pedestal that raises dark
         // pixels), then brightness() scales up. These native filters work reliably on
-        // iOS (an SVG pow() gamma url() barely applied). Lifts walls ~9 -> ~50 to
-        // match real DOOM 3; the cost is slightly milky blacks. Live-tune on-device
-        // with ?dbright= / ?dcontrast= / ?dsat= (no redeploy) — see applyDisplayTuning.
-        displayBrightness: 1.7,
-        displayContrast: 0.7,
-        displaySaturate: 1.15,
+        // iOS (an SVG pow() gamma url() barely applied). Live-tune on-device with
+        // ?dbright= / ?dcontrast= / ?dsat= (no redeploy) — see applyDisplayTuning.
+        // Kept near-neutral for now: the real lift is being moved into the engine
+        // (the lit output itself is too dark on the A-series GPU), tuned live via
+        // d3cmd("r_lightScale ...") through the new D3_ExecCommand hook.
+        displayBrightness: 1.4,
+        displayContrast: 1,
+        displaySaturate: 1.05,
         // DOOM 3 ships very dark and some levels open in near-black spaces (e.g.
         // admin's elevator). Three compounding levers lift it for a phone screen:
         //  - rLightScale multiplies every light's contribution (core lit path, so
@@ -297,8 +299,26 @@ export async function bootDoom3({
     progress(82, "Starting DOOM 3");
     log("DOOM 3 main started");
 
+    // Live console-command hook for on-device renderer tuning, callable from the
+    // app or straight from the Safari Web Inspector console, e.g.:
+    //   d3cmd("r_lightScale 20"); d3cmd("r_gamma 3"); d3cmd("reloadARBprograms")
+    // Backed by the engine's D3_ExecCommand export (runs the command next frame).
+    const execCommand = (cmd) => {
+      try {
+        if (typeof module.ccall === "function") {
+          module.ccall("D3_ExecCommand", null, ["string"], [String(cmd)]);
+          return true;
+        }
+      } catch (error) {
+        console.warn("d3cmd failed:", error);
+      }
+      return false;
+    };
+    window.d3cmd = execCommand;
+
     return {
       module,
+      execCommand,
       callAddViewAngles(dyaw, dpitch) {
         if (typeof module._D3_AddViewAngles === "function") {
           module._D3_AddViewAngles(dyaw, dpitch);

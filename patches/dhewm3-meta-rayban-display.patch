@@ -1,5 +1,5 @@
 diff --git a/neo/CMakeLists.txt b/neo/CMakeLists.txt
-index 69f1892..8ea002e 100644
+index 69f1892..099eef8 100644
 --- a/neo/CMakeLists.txt
 +++ b/neo/CMakeLists.txt
 @@ -194,29 +194,46 @@ if(CMAKE_MAJOR_VERSION LESS 3 OR ( CMAKE_MAJOR_VERSION EQUAL 3 AND CMAKE_MINOR_V
@@ -86,7 +86,7 @@ index 69f1892..8ea002e 100644
 +		set(D3_EMSCRIPTEN_EMBED "${CMAKE_SOURCE_DIR}/sys/wasm/embed")
 +	endif()
 +
-+	set(d3_wasm_exports "[\"_main\",\"_D3_AddViewAngles\",\"_D3_SetViewYaw\",\"_D3_SetWearableAction\",\"_D3_GetEnemyIndicators\",\"_D3_GetEnemyYaw\",\"_D3_RequestEnemyTurn\",\"_D3_SetEnemyIndicators\",\"_D3_SetEnemyIndicatorYaw\",\"_D3_ConsumeEnemyTurn\"]")
++	set(d3_wasm_exports "[\"_main\",\"_D3_AddViewAngles\",\"_D3_SetViewYaw\",\"_D3_SetWearableAction\",\"_D3_ExecCommand\",\"_D3_GetEnemyIndicators\",\"_D3_GetEnemyYaw\",\"_D3_RequestEnemyTurn\",\"_D3_SetEnemyIndicators\",\"_D3_SetEnemyIndicatorYaw\",\"_D3_ConsumeEnemyTurn\"]")
 +
 +	# The game module is hard-linked (HARDLINK_GAME), so no dynamic linking /
 +	# MAIN_MODULE is required. SDL2 comes from Emscripten's built-in port, GL
@@ -216,10 +216,10 @@ index 6bba28f..9f732b9 100644
  			viewangles[PITCH] = oldAngles[PITCH] + 90;
 diff --git a/neo/framework/d3_wearable.cpp b/neo/framework/d3_wearable.cpp
 new file mode 100644
-index 0000000..61a94a6
+index 0000000..25fe6de
 --- /dev/null
 +++ b/neo/framework/d3_wearable.cpp
-@@ -0,0 +1,253 @@
+@@ -0,0 +1,270 @@
 +/*
 +===========================================================================
 +
@@ -241,6 +241,7 @@ index 0000000..61a94a6
 +#include "idlib/math/Angles.h"
 +#include "idlib/Lib.h"
 +#include "framework/UsercmdGen.h"
++#include "framework/CmdSystem.h"
 +#include "framework/d3_wearable.h"
 +
 +#ifdef __EMSCRIPTEN__
@@ -384,6 +385,22 @@ index 0000000..61a94a6
 +	}
 +}
 +
++EMSCRIPTEN_KEEPALIVE
++void
++D3_ExecCommand( const char* cmd )
++{
++	// Run an arbitrary DOOM 3 console command from JavaScript (e.g. the web app or
++	// the Safari Web Inspector console): "r_lightScale 20", "r_gamma 3",
++	// "vid_restart", etc. APPEND so it executes at the normal point in the next
++	// engine frame (not reentrantly from the JS callback). Enables live on-device
++	// tuning of the renderer without a rebuild/redeploy.
++	if ( cmd && cmd[0] && cmdSystem )
++	{
++		cmdSystem->BufferCommandText( CMD_EXEC_APPEND, cmd );
++		cmdSystem->BufferCommandText( CMD_EXEC_APPEND, "\n" );
++	}
++}
++
 +void
 +D3_NotifyAutoFireStarted( void )
 +{
@@ -475,10 +492,10 @@ index 0000000..61a94a6
 +#endif // __EMSCRIPTEN__
 diff --git a/neo/framework/d3_wearable.h b/neo/framework/d3_wearable.h
 new file mode 100644
-index 0000000..1b43afb
+index 0000000..4b45b72
 --- /dev/null
 +++ b/neo/framework/d3_wearable.h
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,75 @@
 +/*
 +===========================================================================
 +
@@ -521,6 +538,9 @@ index 0000000..1b43afb
 +
 +// Wearable action latch, called from JavaScript gesture input.
 +void	D3_SetWearableAction( int action, int down );
++
++// Run a DOOM 3 console command from JavaScript (live renderer tuning, etc.).
++void	D3_ExecCommand( const char* cmd );
 +
 +// Enemy assist state, written by the game module, read by JavaScript.
 +int		D3_GetEnemyIndicators( void );
@@ -1378,3 +1398,11 @@ index 0000000..2e7755b
 +		Module["removeRunDependency"] = removeRunDependency;
 +	}
 +}());
+diff --git a/neo/sys/wasm/embed/base/autoexec.cfg b/neo/sys/wasm/embed/base/autoexec.cfg
+new file mode 100644
+index 0000000..7c721f0
+--- /dev/null
++++ b/neo/sys/wasm/embed/base/autoexec.cfg
+@@ -0,0 +1,2 @@
++seta com_skipIntroVideos "1"
++seta r_fullscreen "0"
