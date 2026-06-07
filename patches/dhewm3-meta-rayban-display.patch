@@ -1,5 +1,5 @@
 diff --git a/neo/CMakeLists.txt b/neo/CMakeLists.txt
-index 69f1892..099eef8 100644
+index 69f1892..0446b77 100644
 --- a/neo/CMakeLists.txt
 +++ b/neo/CMakeLists.txt
 @@ -194,29 +194,46 @@ if(CMAKE_MAJOR_VERSION LESS 3 OR ( CMAKE_MAJOR_VERSION EQUAL 3 AND CMAKE_MINOR_V
@@ -119,7 +119,15 @@ index 69f1892..099eef8 100644
  # mingw and msvc
  if(WIN32)
  	add_definitions(-DWINVER=0x0501)
-@@ -699,6 +759,7 @@ set(src_framework
+@@ -643,6 +703,7 @@ set(src_renderer
+ 	renderer/VertexCache.cpp
+ 	renderer/draw_arb2.cpp
+ 	renderer/draw_common.cpp
++	renderer/draw_glsl_interaction.cpp
+ 	renderer/tr_backend.cpp
+ 	renderer/tr_deform.cpp
+ 	renderer/tr_font.cpp
+@@ -699,6 +760,7 @@ set(src_framework
  	framework/FileSystem.cpp
  	framework/KeyInput.cpp
  	framework/UsercmdGen.cpp
@@ -127,7 +135,7 @@ index 69f1892..099eef8 100644
  	framework/Session_menu.cpp
  	framework/Session.cpp
  	framework/async/AsyncClient.cpp
-@@ -909,6 +970,7 @@ set(src_game
+@@ -909,6 +971,7 @@ set(src_game
  	game/AF.cpp
  	game/AFEntity.cpp
  	game/Actor.cpp
@@ -135,7 +143,7 @@ index 69f1892..099eef8 100644
  	game/Camera.cpp
  	game/Entity.cpp
  	game/BrittleFracture.cpp
-@@ -1280,7 +1342,7 @@ include_directories(${CMAKE_BINARY_DIR})
+@@ -1280,7 +1343,7 @@ include_directories(${CMAKE_BINARY_DIR})
  include_directories(${CMAKE_SOURCE_DIR})
  
  add_library(idlib STATIC ${src_idlib})
@@ -1062,6 +1070,415 @@ index 7914093..492e2b1 100644
  
  #include "renderer/qgl_proc.h"
  
+diff --git a/neo/renderer/draw_arb2.cpp b/neo/renderer/draw_arb2.cpp
+index c1d0d3e..c9a690d 100644
+--- a/neo/renderer/draw_arb2.cpp
++++ b/neo/renderer/draw_arb2.cpp
+@@ -153,6 +153,16 @@ void RB_ARB2_CreateDrawInteractions( const drawSurf_t *surf ) {
+ 		return;
+ 	}
+ 
++#ifdef __EMSCRIPTEN__
++	// Hand-authored GLSL ES interaction path (see draw_glsl_interaction.cpp).
++	// Bypasses GL4ES's ARB→GLSL translation, which produces per-frame pixel
++	// oscillation on Apple GPUs.
++	if ( r_useGLSL.GetBool() ) {
++		RB_GLSL_CreateDrawInteractions( surf );
++		return;
++	}
++#endif
++
+ 	// perform setup here that will be constant for all interactions
+ 	GL_State( GLS_SRCBLEND_ONE | GLS_DSTBLEND_ONE | GLS_DEPTHMASK | backEnd.depthFunc );
+ 
+@@ -790,4 +800,10 @@ void R_ARB2_Init( void ) {
+ 	common->Printf( "Available.\n" );
+ 
+ 	glConfig.allowARB2Path = true;
++
++#ifdef __EMSCRIPTEN__
++	// Compile the hand-authored GLSL ES interaction shader at the same time the
++	// ARB programs are loaded — keeps the cvar-controlled path always ready.
++	R_GLSL_Init();
++#endif
+ }
+diff --git a/neo/renderer/draw_glsl_interaction.cpp b/neo/renderer/draw_glsl_interaction.cpp
+new file mode 100644
+index 0000000..62a653b
+--- /dev/null
++++ b/neo/renderer/draw_glsl_interaction.cpp
+@@ -0,0 +1,371 @@
++/*
++===========================================================================
++
++Doom 3 GPL Source Code — d3wasm-style GLSL ES interaction path.
++
++This file adds a parallel interaction-pass renderer that uses hand-authored
++GLSL ES 1.00 shaders instead of the ARB vertex/fragment programs (interaction.vfp
++in glprogs/). Adapted from Gabriel Cuvillier's d3wasm
++(https://github.com/gabrielcuvillier/d3wasm, GPL-3.0) to bypass GL4ES's ARB→GLSL
++translation entirely.
++
++Rationale: On Apple GPUs (iOS Safari + macOS Safari) the GL4ES-translated
++interaction shader exhibits per-frame brightness oscillation — small
++distributed per-pixel differences between consecutive renders, even with a
++completely stationary camera. We exhausted every JS-side / cvar-level mitigation
++without eliminating it. d3wasm proves it can be done cleanly with hand-written
++GLSL ES; this is the bypass.
++
++The new path is gated behind the `r_useGLSL` cvar (default 1 — opt-out by
++setting to 0 or appending `?args=%2Bset%20r_useGLSL%200` to the URL).
++
++===========================================================================
++*/
++
++#include "sys/platform.h"
++#include "renderer/tr_local.h"
++
++#ifdef __EMSCRIPTEN__
++
++// Pull in GLES 2 declarations directly so the bare gl* shader-API names (which
++// dhewm3's qgl.h does not wrap) are visible.
++#include <GLES2/gl2.h>
++
++idCVar r_useGLSL( "r_useGLSL", "1", CVAR_RENDERER | CVAR_BOOL,
++                  "use hand-authored GLSL ES interaction shaders instead of "
++                  "the ARB-translated path (kills WebKit per-frame flicker)" );
++
++// ───── shader programs ──────────────────────────────────────────────────────
++// Vertex attribute slots match dhewm3's ARB convention so we can pull from the
++// same vertex buffer layout without re-uploading: 0=position, 8=texcoord,
++// 9=tangent, 10=bitangent, 11=normal, color is via glColorPointer.
++#define ATTR_POSITION   0
++#define ATTR_TEXCOORD   8
++#define ATTR_TANGENT    9
++#define ATTR_BITANGENT  10
++#define ATTR_NORMAL     11
++
++struct shaderProgram_t {
++	GLuint  program;
++	// uniform locations
++	GLint   u_localLightOrigin;
++	GLint   u_localViewOrigin;
++	GLint   u_lightProjectionS;
++	GLint   u_lightProjectionT;
++	GLint   u_lightProjectionQ;
++	GLint   u_lightFalloff;
++	GLint   u_bumpMatrixS;
++	GLint   u_bumpMatrixT;
++	GLint   u_diffuseMatrixS;
++	GLint   u_diffuseMatrixT;
++	GLint   u_specularMatrixS;
++	GLint   u_specularMatrixT;
++	GLint   u_colorModulate;
++	GLint   u_colorAdd;
++	GLint   u_diffuseColor;
++	GLint   u_specularColor;
++	GLint   u_modelViewProjectionMatrix;
++	// texture sampler bindings
++	GLint   u_bumpTexture;
++	GLint   u_lightFalloffTexture;
++	GLint   u_lightProjectionTexture;
++	GLint   u_diffuseTexture;
++	GLint   u_specularTexture;
++};
++
++static shaderProgram_t interactionProgram;
++
++static const char* const interactionVS = R"GLSL(
++#version 100
++precision highp float;
++
++attribute vec4 attr_Vertex;
++attribute vec4 attr_Color;
++attribute vec2 attr_TexCoord;
++attribute vec3 attr_Tangent;
++attribute vec3 attr_Bitangent;
++attribute vec3 attr_Normal;
++
++uniform highp mat4 u_modelViewProjectionMatrix;
++uniform vec4 u_lightProjectionS;
++uniform vec4 u_lightProjectionT;
++uniform vec4 u_lightProjectionQ;
++uniform vec4 u_lightFalloff;
++uniform vec4 u_bumpMatrixS;
++uniform vec4 u_bumpMatrixT;
++uniform vec4 u_diffuseMatrixS;
++uniform vec4 u_diffuseMatrixT;
++uniform vec4 u_specularMatrixS;
++uniform vec4 u_specularMatrixT;
++uniform lowp float u_colorModulate;
++uniform lowp float u_colorAdd;
++uniform vec4 u_localLightOrigin;
++uniform vec4 u_localViewOrigin;
++
++varying vec2 var_TexDiffuse;
++varying vec2 var_TexNormal;
++varying vec2 var_TexSpecular;
++varying vec4 var_TexLight;
++varying lowp vec4 var_Color;
++varying vec3 var_L;
++varying vec3 var_H;
++
++void main(void) {
++	mat3 M = mat3(attr_Tangent, attr_Bitangent, attr_Normal);
++
++	var_TexNormal.x   = dot(u_bumpMatrixS,     vec4(attr_TexCoord, 0.0, 1.0));
++	var_TexNormal.y   = dot(u_bumpMatrixT,     vec4(attr_TexCoord, 0.0, 1.0));
++	var_TexDiffuse.x  = dot(u_diffuseMatrixS,  vec4(attr_TexCoord, 0.0, 1.0));
++	var_TexDiffuse.y  = dot(u_diffuseMatrixT,  vec4(attr_TexCoord, 0.0, 1.0));
++	var_TexSpecular.x = dot(u_specularMatrixS, vec4(attr_TexCoord, 0.0, 1.0));
++	var_TexSpecular.y = dot(u_specularMatrixT, vec4(attr_TexCoord, 0.0, 1.0));
++
++	var_TexLight.x = dot(u_lightProjectionS, attr_Vertex);
++	var_TexLight.y = dot(u_lightProjectionT, attr_Vertex);
++	var_TexLight.z = dot(u_lightFalloff,     attr_Vertex);
++	var_TexLight.w = dot(u_lightProjectionQ, attr_Vertex);
++
++	vec3 L = u_localLightOrigin.xyz - attr_Vertex.xyz;
++	vec3 V = u_localViewOrigin.xyz  - attr_Vertex.xyz;
++	vec3 H = normalize(L) + normalize(V);
++
++	var_L = L * M;
++	var_H = H * M;
++
++	var_Color = (attr_Color * u_colorModulate) + vec4(u_colorAdd);
++
++	gl_Position = u_modelViewProjectionMatrix * attr_Vertex;
++}
++)GLSL";
++
++static const char* const interactionFS = R"GLSL(
++#version 100
++precision highp float;
++
++varying vec2 var_TexDiffuse;
++varying vec2 var_TexNormal;
++varying vec2 var_TexSpecular;
++varying vec4 var_TexLight;
++varying lowp vec4 var_Color;
++varying vec3 var_L;
++varying vec3 var_H;
++
++uniform lowp vec4 u_diffuseColor;
++uniform lowp vec4 u_specularColor;
++uniform highp sampler2D u_bumpTexture;
++uniform highp sampler2D u_lightFalloffTexture;
++uniform highp sampler2D u_lightProjectionTexture;
++uniform highp sampler2D u_diffuseTexture;
++uniform highp sampler2D u_specularTexture;
++
++void main(void) {
++	vec3 L = normalize(var_L);
++	vec3 H = normalize(var_H);
++	// DOOM 3 packs normal X in alpha (DXT5-NM trick); .agb swizzle decodes it.
++	vec3 N = 2.0 * texture2D(u_bumpTexture, var_TexNormal).agb - 1.0;
++
++	float NdotL = clamp(dot(N, L), 0.0, 1.0);
++	float NdotH = clamp(dot(N, H), 0.0, 1.0);
++
++	vec3 lightProjection = texture2DProj(u_lightProjectionTexture, var_TexLight.xyw).rgb;
++	// Falloff: texture is grayscale 1D ramp uploaded as RGBA; on WebKit the
++	// data lands in alpha only, so explicit .a access — same trick as the
++	// runtime falloff fix for the ARB path.
++	float lightFalloff = texture2D(u_lightFalloffTexture, vec2(var_TexLight.z, 0.5)).a;
++
++	vec3 diffuseColor  = texture2D(u_diffuseTexture,  var_TexDiffuse).rgb  * u_diffuseColor.rgb;
++	vec3 specularColor = 2.0 * texture2D(u_specularTexture, var_TexSpecular).rgb * u_specularColor.rgb;
++
++	float specularFalloff = pow(NdotH, 12.0);
++
++	vec3 color = diffuseColor + specularFalloff * specularColor;
++	color *= NdotL * lightProjection;
++	color *= lightFalloff;
++
++	gl_FragColor = vec4(color, 1.0) * var_Color;
++}
++)GLSL";
++
++// ───── shader compile / link helpers ────────────────────────────────────────
++static GLuint R_GLSL_CompileShader( GLenum type, const char* src, const char* name ) {
++	GLuint shader = glCreateShader( type );
++	glShaderSource( shader, 1, &src, NULL );
++	glCompileShader( shader );
++	GLint ok = 0;
++	glGetShaderiv( shader, GL_COMPILE_STATUS, &ok );
++	if ( !ok ) {
++		char log[2048];
++		glGetShaderInfoLog( shader, sizeof( log ), NULL, log );
++		common->Warning( "GLSL %s compile failed (%s):\n%s", name,
++		                 type == GL_VERTEX_SHADER ? "VS" : "FS", log );
++		glDeleteShader( shader );
++		return 0;
++	}
++	return shader;
++}
++
++static bool R_GLSL_LinkInteractionProgram( void ) {
++	GLuint vs = R_GLSL_CompileShader( GL_VERTEX_SHADER, interactionVS, "interaction" );
++	GLuint fs = R_GLSL_CompileShader( GL_FRAGMENT_SHADER, interactionFS, "interaction" );
++	if ( !vs || !fs ) {
++		if ( vs ) glDeleteShader( vs );
++		if ( fs ) glDeleteShader( fs );
++		return false;
++	}
++	GLuint p = glCreateProgram();
++	glAttachShader( p, vs );
++	glAttachShader( p, fs );
++	// Force attribute slots to match dhewm3's ARB convention (qglVertexAttribPointerARB
++	// 0/8/9/10/11). These calls MUST happen before linkProgram.
++	glBindAttribLocation( p, ATTR_POSITION,  "attr_Vertex" );
++	glBindAttribLocation( p, ATTR_TEXCOORD,  "attr_TexCoord" );
++	glBindAttribLocation( p, ATTR_TANGENT,   "attr_Tangent" );
++	glBindAttribLocation( p, ATTR_BITANGENT, "attr_Bitangent" );
++	glBindAttribLocation( p, ATTR_NORMAL,    "attr_Normal" );
++	glLinkProgram( p );
++	glDeleteShader( vs );
++	glDeleteShader( fs );
++	GLint ok = 0;
++	glGetProgramiv( p, GL_LINK_STATUS, &ok );
++	if ( !ok ) {
++		char log[2048];
++		glGetProgramInfoLog( p, sizeof( log ), NULL, log );
++		common->Warning( "GLSL interaction link failed:\n%s", log );
++		glDeleteProgram( p );
++		return false;
++	}
++	interactionProgram.program = p;
++	#define U( name ) interactionProgram.u_##name = glGetUniformLocation( p, "u_" #name )
++	U( localLightOrigin );
++	U( localViewOrigin );
++	U( lightProjectionS );
++	U( lightProjectionT );
++	U( lightProjectionQ );
++	U( lightFalloff );
++	U( bumpMatrixS );
++	U( bumpMatrixT );
++	U( diffuseMatrixS );
++	U( diffuseMatrixT );
++	U( specularMatrixS );
++	U( specularMatrixT );
++	U( colorModulate );
++	U( colorAdd );
++	U( diffuseColor );
++	U( specularColor );
++	U( modelViewProjectionMatrix );
++	U( bumpTexture );
++	U( lightFalloffTexture );
++	U( lightProjectionTexture );
++	U( diffuseTexture );
++	U( specularTexture );
++	#undef U
++	// Bind sampler uniforms to their texture units once at init.
++	glUseProgram( p );
++	glUniform1i( interactionProgram.u_bumpTexture,            1 );
++	glUniform1i( interactionProgram.u_lightFalloffTexture,    2 );
++	glUniform1i( interactionProgram.u_lightProjectionTexture, 3 );
++	glUniform1i( interactionProgram.u_diffuseTexture,         4 );
++	glUniform1i( interactionProgram.u_specularTexture,        5 );
++	glUseProgram( 0 );
++	common->Printf( "GLSL interaction shader compiled and linked (r_useGLSL=%d)\n",
++	                r_useGLSL.GetInteger() );
++	return true;
++}
++
++void R_GLSL_Init( void ) {
++	memset( &interactionProgram, 0, sizeof( interactionProgram ) );
++	R_GLSL_LinkInteractionProgram();
++}
++
++// ───── per-draw interaction ─────────────────────────────────────────────────
++static void RB_GLSL_DrawInteraction( const drawInteraction_t* din ) {
++	const shaderProgram_t& s = interactionProgram;
++	// per-vertex-program parameters
++	glUniform4fv( s.u_localLightOrigin, 1, din->localLightOrigin.ToFloatPtr() );
++	glUniform4fv( s.u_localViewOrigin,  1, din->localViewOrigin.ToFloatPtr() );
++	glUniform4fv( s.u_lightProjectionS, 1, din->lightProjection[0].ToFloatPtr() );
++	glUniform4fv( s.u_lightProjectionT, 1, din->lightProjection[1].ToFloatPtr() );
++	glUniform4fv( s.u_lightProjectionQ, 1, din->lightProjection[2].ToFloatPtr() );
++	glUniform4fv( s.u_lightFalloff,     1, din->lightProjection[3].ToFloatPtr() );
++	glUniform4fv( s.u_bumpMatrixS,      1, din->bumpMatrix[0].ToFloatPtr() );
++	glUniform4fv( s.u_bumpMatrixT,      1, din->bumpMatrix[1].ToFloatPtr() );
++	glUniform4fv( s.u_diffuseMatrixS,   1, din->diffuseMatrix[0].ToFloatPtr() );
++	glUniform4fv( s.u_diffuseMatrixT,   1, din->diffuseMatrix[1].ToFloatPtr() );
++	glUniform4fv( s.u_specularMatrixS,  1, din->specularMatrix[0].ToFloatPtr() );
++	glUniform4fv( s.u_specularMatrixT,  1, din->specularMatrix[1].ToFloatPtr() );
++	// vertex color modulation
++	const float oneScaled    =  1.0f / 255.0f;
++	const float negOneScaled = -1.0f / 255.0f;
++	switch ( din->vertexColor ) {
++		case SVC_IGNORE:
++			glUniform1f( s.u_colorModulate, 0.0f );
++			glUniform1f( s.u_colorAdd,      1.0f );
++			break;
++		case SVC_MODULATE:
++			glUniform1f( s.u_colorModulate, oneScaled );
++			glUniform1f( s.u_colorAdd,      0.0f );
++			break;
++		case SVC_INVERSE_MODULATE:
++			glUniform1f( s.u_colorModulate, negOneScaled );
++			glUniform1f( s.u_colorAdd,      1.0f );
++			break;
++	}
++	// per-light colors
++	glUniform4fv( s.u_diffuseColor,  1, din->diffuseColor.ToFloatPtr() );
++	glUniform4fv( s.u_specularColor, 1, din->specularColor.ToFloatPtr() );
++	// bind textures to slots matching the sampler uniforms set at init
++	GL_SelectTexture( 1 ); din->bumpImage->Bind();
++	GL_SelectTexture( 2 ); din->lightFalloffImage->Bind();
++	GL_SelectTexture( 3 ); din->lightImage->Bind();
++	GL_SelectTexture( 4 ); din->diffuseImage->Bind();
++	GL_SelectTexture( 5 ); din->specularImage->Bind();
++	// draw
++	RB_DrawElementsWithCounters( din->surf->geo );
++}
++
++void RB_GLSL_CreateDrawInteractions( const drawSurf_t* surf ) {
++	if ( !surf || !interactionProgram.program ) {
++		return;
++	}
++	// match dhewm3's ARB blend / depth state for the lit pass
++	GL_State( GLS_SRCBLEND_ONE | GLS_DSTBLEND_ONE | GLS_DEPTHMASK | backEnd.depthFunc );
++	glUseProgram( interactionProgram.program );
++	// Upload the MVP matrix once per call — same for every surface in this batch.
++	float mvp[16];
++	myGlMultMatrix( backEnd.viewDef->worldSpace.modelViewMatrix,
++	                backEnd.viewDef->projectionMatrix, mvp );
++	glUniformMatrix4fv( interactionProgram.u_modelViewProjectionMatrix, 1, GL_FALSE, mvp );
++	// enable the same vertex attrib arrays the ARB path uses
++	qglEnableVertexAttribArrayARB( ATTR_TEXCOORD );
++	qglEnableVertexAttribArrayARB( ATTR_TANGENT );
++	qglEnableVertexAttribArrayARB( ATTR_BITANGENT );
++	qglEnableVertexAttribArrayARB( ATTR_NORMAL );
++	qglEnableClientState( GL_COLOR_ARRAY );
++	for ( ; surf; surf = surf->nextOnLight ) {
++		idDrawVert* ac = ( idDrawVert* )vertexCache.Position( surf->geo->ambientCache );
++		qglColorPointer( 4, GL_UNSIGNED_BYTE, sizeof( idDrawVert ), ac->color );
++		qglVertexAttribPointerARB( ATTR_NORMAL,    3, GL_FLOAT, false, sizeof( idDrawVert ), ac->normal.ToFloatPtr() );
++		qglVertexAttribPointerARB( ATTR_BITANGENT, 3, GL_FLOAT, false, sizeof( idDrawVert ), ac->tangents[1].ToFloatPtr() );
++		qglVertexAttribPointerARB( ATTR_TANGENT,   3, GL_FLOAT, false, sizeof( idDrawVert ), ac->tangents[0].ToFloatPtr() );
++		qglVertexAttribPointerARB( ATTR_TEXCOORD,  2, GL_FLOAT, false, sizeof( idDrawVert ), ac->st.ToFloatPtr() );
++		qglVertexPointer( 3, GL_FLOAT, sizeof( idDrawVert ), ac->xyz.ToFloatPtr() );
++		RB_CreateSingleDrawInteractions( surf, RB_GLSL_DrawInteraction );
++	}
++	qglDisableVertexAttribArrayARB( ATTR_TEXCOORD );
++	qglDisableVertexAttribArrayARB( ATTR_TANGENT );
++	qglDisableVertexAttribArrayARB( ATTR_BITANGENT );
++	qglDisableVertexAttribArrayARB( ATTR_NORMAL );
++	qglDisableClientState( GL_COLOR_ARRAY );
++	glUseProgram( 0 );
++	// restore default texture unit
++	GL_SelectTexture( 0 );
++}
++
++#else  // !__EMSCRIPTEN__
++
++// Stubs for non-Emscripten builds (this path only matters in the WASM target).
++idCVar r_useGLSL( "r_useGLSL", "0", CVAR_RENDERER | CVAR_BOOL | CVAR_ROM, "" );
++void R_GLSL_Init( void ) {}
++void RB_GLSL_CreateDrawInteractions( const drawSurf_t* ) {}
++
++#endif
 diff --git a/neo/renderer/tr_backend.cpp b/neo/renderer/tr_backend.cpp
 index cf1c571..6857970 100644
 --- a/neo/renderer/tr_backend.cpp
@@ -1080,7 +1497,7 @@ index cf1c571..6857970 100644
  			qglDepthFunc( GL_ALWAYS );
  		} else {
 diff --git a/neo/renderer/tr_local.h b/neo/renderer/tr_local.h
-index 0e40f19..e201948 100644
+index 0e40f19..473cea9 100644
 --- a/neo/renderer/tr_local.h
 +++ b/neo/renderer/tr_local.h
 @@ -877,6 +877,7 @@ extern idCVar r_useCachedDynamicModels;	// 1 = cache snapshots of dynamic models
@@ -1091,6 +1508,20 @@ index 0e40f19..e201948 100644
  extern idCVar r_usePortals;				// 1 = use portals to perform area culling, otherwise draw everything
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
+@@ -1315,6 +1316,13 @@ void	RB_ARB2_DrawInteractions( void );
+ void	R_ReloadARBPrograms_f( const idCmdArgs &args );
+ int		R_FindARBProgram( GLenum target, const char *program );
+ 
++// d3wasm-style hand-authored GLSL ES interaction path (see draw_glsl_interaction.cpp).
++// Gated by r_useGLSL; bypasses GL4ES's ARB→GLSL conversion for the lit pass to fix
++// per-frame pixel oscillation on Apple GPUs (iOS Safari, macOS Safari).
++extern idCVar r_useGLSL;
++void	R_GLSL_Init( void );
++void	RB_GLSL_CreateDrawInteractions( const drawSurf_t *surf );
++
+ typedef enum {
+ 	PROG_INVALID,
+ 	VPROG_INTERACTION,
 diff --git a/neo/sound/snd_local.h b/neo/sound/snd_local.h
 index 808faaa..a1f260a 100644
 --- a/neo/sound/snd_local.h
