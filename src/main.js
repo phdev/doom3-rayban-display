@@ -262,6 +262,46 @@ diag(`brightness: lightScale=${runtimeConfig.rLightScale} gamma=${runtimeConfig.
 // getContext (SDL/emscripten calls it on #gameCanvas — wrapping the prototype
 // instruments the engine's own context instead of stealing it), dump the GPU's
 // limits once, and tally texture uploads + GL errors live at the top of the diag.
+// ── WebKit lit-pass fix: splat falloff alpha into RGB ────────────────────────
+// On WebKit (iPhone Safari, Mac Safari, anything that isn't Chrome/ANGLE), the
+// DOOM 3 lit pass renders the world near-black. Bisected with shader debug
+// visualizations: the per-light **falloff** texture (sampler 2 in the interaction
+// shader) has its data only in the .w/alpha channel; .xyz reads as 0. The engine
+// uploads it as a 1-channel texture and the GL_LUMINANCE → WebGL emulation path
+// in GL4ES lands the data in alpha-only on WebKit, while Chrome's ANGLE happens
+// to splat it correctly. The interaction shader reads .xyz, so light *= (0,0,0)
+// → black walls.
+//
+// Fix without touching the engine or GL4ES: wrap shaderSource and, when we see
+// the GL4ES-translated DOOM 3 interaction shader (identified by its DXT5-NM
+// normal swizzle "localNormal.x = localNormal.w"), rewrite the falloff sample
+// from `texture2DProj(_gl4es_Sampler2D_2, _gl4es_TexCoord_2)` to a vec4-splat
+// of its .w. Walls light up; verified to match the reference render.
+// Escape hatch: ?nofalloffix disables it for A/B.
+(function fixFalloffSampling() {
+  if (/[?&]nofalloffix\b/.test(location.search)) return;
+  const FALLOFF_RE = /texture2DProj\(\s*_gl4es_Sampler2D_2\s*,\s*_gl4es_TexCoord_2\s*\)/g;
+  const wrap = (proto) => {
+    if (!proto) return;
+    const orig = proto.shaderSource;
+    if (!orig || orig.__d3FalloffPatched) return;
+    const patched = function (shader, source) {
+      let s = source == null ? source : String(source);
+      try {
+        if (typeof s === "string" && s.includes("localNormal.x = localNormal.w") && FALLOFF_RE.test(s)) {
+          FALLOFF_RE.lastIndex = 0;
+          s = s.replace(FALLOFF_RE, "vec4(texture2DProj(_gl4es_Sampler2D_2, _gl4es_TexCoord_2).w)");
+        }
+      } catch (_) { /* never break the engine */ }
+      return orig.call(this, shader, s);
+    };
+    patched.__d3FalloffPatched = true;
+    proto.shaderSource = patched;
+  };
+  wrap(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
+  wrap(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
+})();
+
 const glProbe = { ctx: 0, tex: 0, comp: 0, bytes: 0, maxDim: 0, oom: 0, err: 0, lost: false };
 window.__d3GLProbe = glProbe;
 (function instrumentWebGL() {

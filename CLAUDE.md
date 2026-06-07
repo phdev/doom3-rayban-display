@@ -99,38 +99,10 @@ build there is effectively no working gamma:**
   observable through GL4ES on the maps tested — `r_gamma`/`r_brightness`/
   `r_lightScale` do not visibly change the frame.
 
-CSS `filter: brightness()` (`config.displayBrightness` → `--d3-display-brightness`)
-is a compositor *multiply*, so it lifts the whole frame but cannot rescue dark
-surfaces (1.2 × 9 ≈ 11, still black). `r_gamma`/`r_brightness`/`r_lightScale` are
-set (correct intent) but the in-shader gamma is inert on the iPhone GPU.
-
-**The fix — raise the black floor with native `contrast()` (compositor).** The
-on-device probe showed the lit world comes out near-black-but-nonzero (`frame-px
-avg(9,5,3)`, `max 165` — the bright fixtures render, the lit walls don't). The
-right tool is a curve that lifts darks, not a multiply.
-
-- First attempt was an **SVG `feComponentTransfer type="gamma"` filter**
-  (`pow(9/255,0.45)≈50`). It works great in Playwright WebKit (~19%→~96% non-black)
-  but **barely applies on real iOS Safari** — the filter runs in a different color
-  space there, so the lit only crept `avg(7,2,1)`→`(11,7,4)`. Abandoned (don't
-  re-try SVG `url()` gamma on iOS).
-- `contrast()` below 1 *does* raise dark pixels, but it adds a uniform gray pedestal
-  that **fogs the whole frame** (verified on-device: `avg(7,1,1)`→`(42,38,34)` flat
-  gray — "trash").
-- **Shipped fix: a strong native `brightness()` MULTIPLY (~5×).** The raw walls are
-  dim *red* `(9,4,1)`, so `×5 → ~(45,20,5)` — visible and warm like real DOOM 3,
-  with **blacks staying black** (`0×5=0`, no fog) and color intact. The earlier
-  brightness attempts failed only because they used `~1.7×` (way too low for an
-  engine output of ~9). Wearable defaults `brightness 5 / contrast 1 / saturate 1.2`.
-  Bright fixtures clip to white (fine). Cost: a fixed multiply over-brightens
-  genuinely well-lit rooms, but DOOM 3 is mostly dark so it's a good global default;
-  **live-tune on-device (no redeploy) via `?dbright=` / `?dcontrast=` / `?dsat=`.**
-  Verified by reproducing the dark scene on desktop WebKit (overlays hidden) and
-  calibrating against the reference — `brightness(5)` matches it.
-
-(Note: the `frame-px` probe samples the canvas *backing store*, i.e. **before** the
-CSS filter, so it keeps reporting the raw engine output ~9 even when the display is
-correctly lifted — judge brightness by eye, not that number.)
+CSS `filter: brightness()` is a compositor *multiply*, so it lifts the whole
+frame but cannot rescue dark surfaces (and `contrast()<1` adds gray fog). With
+the engine fix below, CSS is back to near-unity (wearable `brightness:1.35`)
+and serves only as a small display-size accommodation.
 
 **Live engine tuning (`d3cmd`).** Because CSS post-processing can't truly fix a dark
 *engine* output (a multiply amplifies banding; `contrast()<1` adds gray fog), the
@@ -145,61 +117,72 @@ Safari Web Inspector console** with no rebuild — e.g. `d3cmd("r_lightScale 20"
 actually brightens the lit pass on the A-series GPU, then bake the winners into the
 profile / autoexec.
 
-### iPhone-only dark lit world (under investigation, 2026-06)
+### WebKit-wide dark lit world — root cause + fix (2026-06)
 
-Symptom: on a physical iPhone the **textured/lit world renders black** while
-emissive surfaces (ceiling lights, sparks, the green hologram) still show. The
-reference (real DOOM 3 "Mars City Hangar") is *dark but readable* — dim red walls,
-crates, an NPC; the iPhone loses all of that dim lighting and keeps only the bright
-point-lights.
+For weeks the lit world rendered near-black on every WebKit browser (iPhone
+Safari, Mac Safari, headless WebKit) while emissive surfaces (ceiling lights,
+sparks) showed. The same pak + same engine binary rendered fully lit on Chrome
+(ANGLE). Investigation ruled out: missing assets, the engine binary itself, GPU
+OOM (`OOM 0`, generous caps), GL_EQUAL vs LEQUAL depth, render passes, light
+scissor, framebuffer copy formats, S3TC vs uncompressed. Cvars (`r_lightScale`,
+`r_gamma`, `r_brightness`, `r_skipBump/Specular/Diffuse`, `vid_restart`) moved
+`frame-px` by basically zero. CSS post-processing (gamma `pow()` via SVG,
+contrast pedestal, big brightness multiply) all either failed on real iOS or
+washed the frame out.
 
-What's been **ruled out** (so the next person doesn't re-chase them):
+**Method that cracked it.** Hot-patched the GL4ES-emitted GLSL of the
+interaction shader via `WebGL2RenderingContext.prototype.shaderSource` and
+replaced the final `gl_FragColor` with debug-visualization expressions, then
+read `frame-px` for each. Each intermediate value in the lit math was rendered
+as a color and screenshotted (`/tmp/d3-shader-probe.mjs`):
 
-- **Not missing assets.** The reduced pak contains `glprogs/interaction.vfp` (the
-  lit-pass ARB shader) + all 15 glprogs and the light projection/falloff textures
-  (`lights/biground1`, `squarelight1`, `spot01`, …). The *same* pak renders the
-  full lit hangar on desktop.
-- **Not the engine binary.** The deployed `dhewm3.wasm` renders fully lit when run
-  locally — only the iPhone is dark.
-- **Not depth (`GL_EQUAL` vs `LEQUAL`), render passes, light scissor, framebuffer
-  copy, or texture compression.** Verified by A/B on Playwright **WebKit** driving
-  the **M1 Max** (same Apple TBDR GPU family + same WebKit engine as the iPhone):
-  the scene renders ~97% lit in every configuration, *including with S3TC disabled*
-  (GL4ES falls back to uncompressed cleanly). The desktop Apple GPU is simply far
-  more capable than the iPhone's, so the on-device failure does not reproduce there.
+```
+magenta    avg(135,5,128)  → shader IS running on walls
+ndotl      avg( 99, 95, 92) → N·L positive (~0.4)
+normal     avg( 97, 95,123) → tangent normals decode correctly
+lightcube  avg( 98, 63,109) → normalization cubemap fine
+diffuse    avg( 56, 41, 31) → wall diffuse texture fine
+lightproj  avg(113,108,106) → light projection cookie fine
+envcolor   avg(108,115,114) → diffuseColor uniform fine
+falloff    avg( 13,  8,  6) ★ near-zero — bug ★
+```
 
-**On-device probe results (2026-06) — memory and limits are ruled out.** The
-iPhone reported `gpu-tex: 15974 uploads ~75MB … OOM 0 … err 6` (no context loss)
-and `caps: maxTex 16384 texUnits 16 vtxTex 16 varying 31 fragU 1024`. So it is
-**not** out of GPU memory and hits **no** limit the desktop doesn't — and all
-75 MB of textures uploaded fine. The engine fully loads the map (`1969 entities`,
-`GenerateAllInteractions`, `28926 interactions`); the only "Couldn't load image"
-warnings are **props / particles / decals / env-cubemaps**, never the wall/floor/
-ceiling architecture. Conclusion: **the lit-pass output is genuinely dimmer on
-the A-series GPU** than on desktop with identical cvars — most likely the
-in-shader gamma/brightness lift (`r_gammaInShader`) is weaker through GL4ES on
-that GPU, so the dim base lighting never gets lifted (and dead hardware gamma
-means nothing else lifts it).
+Then probed the falloff sampler at fixed coords and across the full screen —
+**also** near-zero. So it wasn't the texCoord; the texture data itself was
+broken. Final test, swapping the read to `.w`:
 
-Mitigation in flight: bumped `r_lightScale` (wearable) 3 → 6 — it runs in the
-core interaction path, so it works through GL4ES regardless of the gamma shader.
+```
+falloff_xyz     avg( 13,  8,  6)  → .xyz = 0
+falloff_w       avg(134,129,127)  → .w = 0.5  ← data lives here
+falloff_proj_w  avg(132,127,125)  → same via texture2DProj (smooth gradient)
+```
 
-**On-device WebGL probe (`src/main.js`).** Because the failure can't be
-reproduced off-device, the app wraps `HTMLCanvasElement.prototype.getContext`
-(instrumenting the engine's own context instead of stealing it — see the warning
-comment; it also forces `preserveDrawingBuffer` so the frame is readable) and
-surfaces three lines at the top of the `#diag` overlay:
-- `caps:` — GPU limits (max texture, texture units, varyings, fragment uniforms).
-- `gpu-tex:` — texture upload count + est. MB + max dim + **OOM count** + GL error
-  count + context-lost flag. `OOM > 0` / `CTX-LOST` ⇒ memory (ruled out so far).
-- `frame-px:` — `avg(r,g,b)` + `max` sampled from the **rendered frame** (canvas
-  backing store, before the CSS filter). Near-black `avg` ⇒ the lit-shader output
-  is the problem; dim-but-present `avg` ⇒ exposure/display. `max` shows whether the
-  bright lights render at all.
+**Root cause.** DOOM 3's per-light **falloff** ramp is a single-channel texture.
+GL4ES emulates it through WebGL in a way that lands the data in the alpha
+channel only on WebKit (`.xyz` reads as `(0,0,0)`). The interaction shader does
+`light *= texture2DProj(falloff, …)` which collapses to `light *= 0` →
+everything black. Chrome's WebGL (ANGLE) happens to swizzle this correctly,
+which is why it never appeared there.
 
-A **"copy log"** button (next to "hide log") copies the whole overlay to the
-clipboard. `?noprobe` disables the wrap (A/B). The probe never touches draw calls
-and is try-guarded so it cannot break the engine.
+**Fix (`src/main.js`, `fixFalloffSampling`).** Wrap
+`WebGL{,2}RenderingContext.prototype.shaderSource`; when we see the GL4ES
+translation of `interaction.vfp` (identified by its DXT5-NM normal swizzle
+`localNormal.x = localNormal.w`), rewrite
+`texture2DProj(_gl4es_Sampler2D_2, _gl4es_TexCoord_2)` to
+`vec4(texture2DProj(_gl4es_Sampler2D_2, _gl4es_TexCoord_2).w)`. Pure JS — no
+engine or GL4ES rebuild. `?nofalloffix` disables it for A/B. Runs once per
+shader compile, try-guarded so it can never break the engine.
+
+Verified on Mac Safari: baseline `frame-px avg(10,5,3) nonblack 5.6%` → after
+fix `frame-px avg(24,20,15) nonblack 50.9%`, scene matches the reference
+exactly (warm walls, staircase, NPC, crates, floor, gun all clearly lit). With
+this fix in place, the engine output is normal so CSS defaults are back to
+near-unity (`brightness:1.35`, `contrast:1`, `saturate:1.05`).
+
+The earlier WebGL probe (`caps:` + `gpu-tex:` + `frame-px:` in the diag), the
+`window.d3cmd("…")` live console hook (engine `D3_ExecCommand` export), the
+"copy log" button, and the URL overrides (`?dbright=` etc.) all stayed —
+they're how the bug was bisected and remain useful for future on-device work.
 
 ### Mobile / iOS (hard-won)
 

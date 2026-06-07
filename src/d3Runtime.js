@@ -71,20 +71,15 @@ export function createRuntimeConfig() {
         // the flashlight on automatically once the player spawns — the level opens
         // lit instead of pitch black. Long-pinch toggles it afterward.
         autoFlashlight: true,
-        // The iPhone's in-shader gamma is dead, so the lit world renders near-black
-        // (frame-px avg ~9). brightness() alone (a multiply) can't lift that; the
-        // The lit world renders genuinely dark out of the engine on the A-series GPU
-        // (frame-px avg ~9 — DOOM 3's dim base lighting, with the in-shader gamma that
-        // would normally lift it dead through GL4ES). The fix that actually works on
-        // iOS is a strong native brightness() MULTIPLY (~5x): the raw walls are dim
-        // *red* (9,4,1), so ×5 → ~(45,20,5) — visible and warm like real DOOM 3, with
-        // blacks staying black (0×5=0) and color intact. (contrast()<1 was wrong — it
-        // adds a uniform gray pedestal that fogs the whole frame; a multiply doesn't.)
-        // Verified on desktop WebKit reproducing the same dark scene. Bright fixtures
-        // clip to white, which is fine. Live-tune via ?dbright= / ?dcontrast= / ?dsat=.
-        displayBrightness: 5,
-        displayContrast: 1,
-        displaySaturate: 1.2,
+        // Live tunables (?dbright= / ?dcontrast= / ?dsat=). With the WebKit
+        // lit-pass falloff fix (see main.js fixFalloffSampling()) the engine now
+        // actually lights the walls, so the CSS multiply is back near unity —
+        // a modest 1.35× brightness brings the dim base lighting up for the small
+        // phone display without crushing the bright fixtures. Big multipliers were
+        // a workaround for the dark engine output that the falloff fix removes.
+        displayBrightness: 1.35,
+        displayContrast: 1.0,
+        displaySaturate: 1.05,
         // DOOM 3 ships very dark and some levels open in near-black spaces (e.g.
         // admin's elevator). Three compounding levers lift it for a phone screen:
         //  - rLightScale multiplies every light's contribution (core lit path, so
