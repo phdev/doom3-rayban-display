@@ -71,33 +71,20 @@ export function createRuntimeConfig() {
         // the flashlight on automatically once the player spawns — the level opens
         // lit instead of pitch black. Long-pinch toggles it afterward.
         autoFlashlight: true,
-        // Live tunables (?dbright= / ?dcontrast= / ?dsat=). With the WebKit
-        // lit-pass falloff fix (see main.js fixFalloffSampling()) the engine now
-        // actually lights the walls, so the CSS multiply is back near unity —
-        // a modest 1.35× brightness brings the dim base lighting up for the small
-        // phone display without crushing the bright fixtures. Big multipliers were
-        // a workaround for the dark engine output that the falloff fix removes.
-        displayBrightness: 1.35,
+        // With the WebKit lit-pass falloff fix (`main.js` fixFalloffSampling()),
+        // the engine now lights the world correctly, so the wearable cvars are
+        // reset to ~desktop values (they were cranked way up — lightScale 6, gamma
+        // 2, brightness 1.4, CSS 1.35× — to compensate for the dark engine output;
+        // with the fix in place those settings overcooked the scene to look washed-
+        // out on the actual iPhone). A small CSS multiply (1.15) brings the dim
+        // base lighting up for the small phone screen without blowing out fixtures.
+        // Live-tune via ?dbright= / ?dcontrast= / ?dsat=.
+        displayBrightness: 1.15,
         displayContrast: 1.0,
         displaySaturate: 1.05,
-        // DOOM 3 ships very dark and some levels open in near-black spaces (e.g.
-        // admin's elevator). Three compounding levers lift it for a phone screen:
-        //  - rLightScale multiplies every light's contribution (core lit path, so
-        //    it always works through GL4ES) — brightens the lit walls linearly.
-        //  - rGamma applies pow(color, 1/gamma) in-shader, which lifts the dark
-        //    walls far more than the already-bright light fixtures (nonlinear).
-        //  - displayBrightness is a final CSS compositor multiply.
-        // Gamma is the heavy lifter for near-black surfaces; keep brightness modest
-        // so the light fixtures don't blow out.
-        // 2026-06: on-device probe proved the iPhone is NOT out of memory and hits no
-        // GPU limit, yet renders the lit world far darker than desktop with identical
-        // cvars — the lit-pass output is genuinely dimmer on the A-series GPU. Bump
-        // the light multiply (the lever that runs in the core interaction path and so
-        // works through GL4ES regardless of the gamma shader) to compensate; the
-        // diag's frame-px line confirms whether the engine output actually brightens.
-        rLightScale: 6,
-        rGamma: 2,
-        rBrightness: 1.4,
+        rLightScale: 2,
+        rGamma: 1.1,
+        rBrightness: 1.0,
         skill: 1,
         yawSensitivity: 2.4,
         turnBurstDegrees: 42,
