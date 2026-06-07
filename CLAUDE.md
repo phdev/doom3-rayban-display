@@ -114,13 +114,19 @@ right tool is a curve that lifts darks, not a multiply.
   but **barely applies on real iOS Safari** — the filter runs in a different color
   space there, so the lit only crept `avg(7,2,1)`→`(11,7,4)`. Abandoned (don't
   re-try SVG `url()` gamma on iOS).
-- Shipped instead: **native `contrast()` below 1**, which raises the black floor (a
-  pedestal that lifts dark pixels — `brightness()` is a multiply and can't), then
-  `brightness()` scales. Both are native CSS filter functions and reliable on iOS.
-  `applyDisplayTuning` builds the `--d3-display-*` vars; wearable defaults
-  `brightness 1.7 / contrast 0.7 / saturate 1.15` (lifts ~9→~50). Cost: slightly
-  milky blacks. **Live-tunable on-device (no redeploy) via `?dbright=` /
-  `?dcontrast=` / `?dsat=`.**
+- `contrast()` below 1 *does* raise dark pixels, but it adds a uniform gray pedestal
+  that **fogs the whole frame** (verified on-device: `avg(7,1,1)`→`(42,38,34)` flat
+  gray — "trash").
+- **Shipped fix: a strong native `brightness()` MULTIPLY (~5×).** The raw walls are
+  dim *red* `(9,4,1)`, so `×5 → ~(45,20,5)` — visible and warm like real DOOM 3,
+  with **blacks staying black** (`0×5=0`, no fog) and color intact. The earlier
+  brightness attempts failed only because they used `~1.7×` (way too low for an
+  engine output of ~9). Wearable defaults `brightness 5 / contrast 1 / saturate 1.2`.
+  Bright fixtures clip to white (fine). Cost: a fixed multiply over-brightens
+  genuinely well-lit rooms, but DOOM 3 is mostly dark so it's a good global default;
+  **live-tune on-device (no redeploy) via `?dbright=` / `?dcontrast=` / `?dsat=`.**
+  Verified by reproducing the dark scene on desktop WebKit (overlays hidden) and
+  calibrating against the reference — `brightness(5)` matches it.
 
 (Note: the `frame-px` probe samples the canvas *backing store*, i.e. **before** the
 CSS filter, so it keeps reporting the raw engine output ~9 even when the display is

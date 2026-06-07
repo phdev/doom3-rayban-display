@@ -73,16 +73,18 @@ export function createRuntimeConfig() {
         autoFlashlight: true,
         // The iPhone's in-shader gamma is dead, so the lit world renders near-black
         // (frame-px avg ~9). brightness() alone (a multiply) can't lift that; the
-        // black-floor lift comes from contrast() BELOW 1 (a pedestal that raises dark
-        // pixels), then brightness() scales up. These native filters work reliably on
-        // iOS (an SVG pow() gamma url() barely applied). Live-tune on-device with
-        // ?dbright= / ?dcontrast= / ?dsat= (no redeploy) — see applyDisplayTuning.
-        // Kept near-neutral for now: the real lift is being moved into the engine
-        // (the lit output itself is too dark on the A-series GPU), tuned live via
-        // d3cmd("r_lightScale ...") through the new D3_ExecCommand hook.
-        displayBrightness: 1.4,
+        // The lit world renders genuinely dark out of the engine on the A-series GPU
+        // (frame-px avg ~9 — DOOM 3's dim base lighting, with the in-shader gamma that
+        // would normally lift it dead through GL4ES). The fix that actually works on
+        // iOS is a strong native brightness() MULTIPLY (~5x): the raw walls are dim
+        // *red* (9,4,1), so ×5 → ~(45,20,5) — visible and warm like real DOOM 3, with
+        // blacks staying black (0×5=0) and color intact. (contrast()<1 was wrong — it
+        // adds a uniform gray pedestal that fogs the whole frame; a multiply doesn't.)
+        // Verified on desktop WebKit reproducing the same dark scene. Bright fixtures
+        // clip to white, which is fine. Live-tune via ?dbright= / ?dcontrast= / ?dsat=.
+        displayBrightness: 5,
         displayContrast: 1,
-        displaySaturate: 1.05,
+        displaySaturate: 1.2,
         // DOOM 3 ships very dark and some levels open in near-black spaces (e.g.
         // admin's elevator). Three compounding levers lift it for a phone screen:
         //  - rLightScale multiplies every light's contribution (core lit path, so
