@@ -278,6 +278,37 @@ diag(`brightness: lightScale=${runtimeConfig.rLightScale} gamma=${runtimeConfig.
 // from `texture2DProj(_gl4es_Sampler2D_2, _gl4es_TexCoord_2)` to a vec4-splat
 // of its .w. Walls light up; verified to match the reference render.
 // Escape hatch: ?nofalloffix disables it for A/B.
+// ── Force opaque, no-MSAA WebGL context to kill "black flicker" on iOS ───────
+// Default WebGL context attributes on iOS Safari can produce intermittent
+// per-frame black flashes during motion:
+//   alpha:true     → if the engine doesn't write alpha=1 on every pixel, the
+//                    canvas composites with transparency over the page bg.
+//                    Some frames may end up with pixels-with-alpha-0 → black.
+//   antialias:true → iOS does an MSAA resolve at swap; under load that blit
+//                    can miss the frame, leaving the canvas empty (black).
+// We force alpha:false and antialias:false at getContext time, before the
+// engine creates its WebGL context. ?noopaque disables the alpha override and
+// ?msaa re-enables antialias for A/B testing.
+(function fixContextAttrs() {
+  if (/[?&]nocontextattrs\b/.test(location.search)) return;
+  const forceAlpha = !/[?&]noopaque\b/.test(location.search);
+  const forceNoMsaa = !/[?&]msaa\b/.test(location.search);
+  const orig = HTMLCanvasElement.prototype.getContext;
+  if (orig.__d3CtxAttrs) return;
+  const patched = function (type, attrs) {
+    if (typeof type === "string" && /webgl/i.test(type)) {
+      attrs = Object.assign({}, attrs);
+      if (forceAlpha) attrs.alpha = false;
+      if (forceNoMsaa) attrs.antialias = false;
+      // premultipliedAlpha and preserveDrawingBuffer left at their existing
+      // defaults / values from other wraps.
+    }
+    return orig.call(this, type, attrs);
+  };
+  patched.__d3CtxAttrs = true;
+  HTMLCanvasElement.prototype.getContext = patched;
+})();
+
 // ── Force synchronous shader link to avoid mid-gameplay "black flicker" ───────
 // On iOS Safari WebGL, linkProgram() can be asynchronous (KHR_parallel_shader_
 // compile-style). DOOM 3 lazily compiles a fresh GLSL program for each
