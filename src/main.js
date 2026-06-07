@@ -262,6 +262,49 @@ diag(`brightness: lightScale=${runtimeConfig.rLightScale} gamma=${runtimeConfig.
 // getContext (SDL/emscripten calls it on #gameCanvas — wrapping the prototype
 // instruments the engine's own context instead of stealing it), dump the GPU's
 // limits once, and tally texture uploads + GL errors live at the top of the diag.
+// ── TBDR (Apple GPU) optimization: invalidate before every clear ─────────────
+// Apple GPUs are tile-based deferred renderers. Without explicit invalidation,
+// the driver assumes previous-frame depth/stencil/color contents may be needed,
+// so it STORES at end-of-frame and LOADS at start-of-frame for every tile.
+// Under DOOM 3's many-draws-per-frame additive-blend lit pass this load/store
+// pressure can cause adjacent-tile timing inconsistencies producing visible
+// blocky brightness variance (the user reports tile-pattern artifacts in the
+// rendered floor area). The canonical fix: pair gl.clear() with
+// invalidateFramebuffer(), telling the driver "you don't need to load the
+// previous tile contents back, just clear." Apple's Metal docs and Khronos's
+// WebGL best-practices both call this out as the #1 TBDR optimization.
+// Default-on; ?notbdrfix disables for A/B.
+(function fixTBDRClears() {
+  if (/[?&]notbdrfix\b/.test(location.search)) return;
+  const wrap = (proto) => {
+    if (!proto || !proto.clear || proto.clear.__d3TBDR) return;
+    const origClear = proto.clear;
+    const patched = function (mask) {
+      // Tell the driver previous-frame attachments don't need loading. Use the
+      // right attachment enum based on whether the default framebuffer or a
+      // user FBO is bound (different names per WebGL2 spec).
+      try {
+        if (this.invalidateFramebuffer) {
+          const isDefault = this.getParameter(this.FRAMEBUFFER_BINDING) === null;
+          const atts = [];
+          if (mask & this.COLOR_BUFFER_BIT)
+            atts.push(isDefault ? 0x1800 /*COLOR*/    : this.COLOR_ATTACHMENT0);
+          if (mask & this.DEPTH_BUFFER_BIT)
+            atts.push(isDefault ? 0x1801 /*DEPTH*/    : this.DEPTH_ATTACHMENT);
+          if (mask & this.STENCIL_BUFFER_BIT)
+            atts.push(isDefault ? 0x1802 /*STENCIL*/  : this.STENCIL_ATTACHMENT);
+          if (atts.length) this.invalidateFramebuffer(this.FRAMEBUFFER, atts);
+        }
+      } catch (_) { /* never break the engine */ }
+      return origClear.call(this, mask);
+    };
+    patched.__d3TBDR = true;
+    proto.clear = patched;
+  };
+  // invalidateFramebuffer is WebGL2-only — WebGL1 doesn't have it
+  wrap(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
+})();
+
 // Optional ?nomip / ?lodbias=N flags: force GL_LINEAR min filter (kill
 // mipmaps) and/or set explicit LOD bias on all sampled textures. Mipmap LOD
 // selection picks between two mips per fragment based on a screen-space
