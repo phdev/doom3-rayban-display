@@ -278,6 +278,44 @@ diag(`brightness: lightScale=${runtimeConfig.rLightScale} gamma=${runtimeConfig.
 // from `texture2DProj(_gl4es_Sampler2D_2, _gl4es_TexCoord_2)` to a vec4-splat
 // of its .w. Walls light up; verified to match the reference render.
 // Escape hatch: ?nofalloffix disables it for A/B.
+// ── Force synchronous shader link to avoid mid-gameplay "black flicker" ───────
+// On iOS Safari WebGL, linkProgram() can be asynchronous (KHR_parallel_shader_
+// compile-style). DOOM 3 lazily compiles a fresh GLSL program for each
+// material × light interaction combo the first time it's seen — when the player
+// turns and a new surface comes into view, GL4ES emits a new program. If iOS
+// runs the link async, the engine's next draw uses a not-yet-ready program and
+// those surfaces render dark for ONE frame, producing the visible "black
+// flicker" during motion (engine frames vary in brightness depending on which
+// programs are ready that frame). Querying LINK_STATUS / COMPLETION_STATUS_KHR
+// immediately after link forces the GL implementation to finish compile/link
+// synchronously before returning, eliminating the flicker. Cost: a one-time
+// per-program stall the first time it's seen (the user already had this cost
+// distributed as flicker; concentrating it as a brief stutter is much better).
+// ?noflickerfix disables it for A/B.
+(function fixAsyncShaderLink() {
+  if (/[?&]noflickerfix\b/.test(location.search)) return;
+  const wrap = (proto) => {
+    if (!proto) return;
+    const orig = proto.linkProgram;
+    if (!orig || orig.__d3SyncLink) return;
+    const patched = function (program) {
+      const r = orig.call(this, program);
+      try {
+        // Querying LINK_STATUS forces the implementation to complete the link
+        // synchronously before returning — even on impls that would otherwise
+        // continue compiling in the background. This is the canonical "make
+        // shader compilation synchronous" trick.
+        this.getProgramParameter(program, this.LINK_STATUS);
+      } catch (_) { /* never break the engine */ }
+      return r;
+    };
+    patched.__d3SyncLink = true;
+    proto.linkProgram = patched;
+  };
+  wrap(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
+  wrap(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
+})();
+
 (function fixFalloffSampling() {
   if (/[?&]nofalloffix\b/.test(location.search)) return;
   const FALLOFF_RE = /texture2DProj\(\s*_gl4es_Sampler2D_2\s*,\s*_gl4es_TexCoord_2\s*\)/g;
