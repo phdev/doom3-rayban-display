@@ -55,13 +55,13 @@ export function createRuntimeConfig() {
 
   return glassesDetected
     ? {
-        // Low-memory profile (wearable / phone): smaller framebuffer and, more
-        // importantly, a smaller engine texture cap — mobile Safari/WebGL runs
-        // out of GPU memory uploading a full level's textures and drops the
-        // context (3D goes black while the HUD survives). 448px render + a 128px
-        // texture limit quarters the GPU texture memory vs 600/256.
-        width: 448,
-        height: 448,
+        // Low-memory profile (wearable / phone). Tuned for the iPhone:
+        // - 320 px render (~50 % fewer fragments than 448) — wins frame budget
+        //   on the iOS GPU which was rendering ~7 fps at 448 px and stuttering.
+        // - 128 px texture cap (kept) — quarters GPU texture memory vs desktop's
+        //   256 px so mobile Safari/WebGL doesn't drop the GL context on upload.
+        width: 320,
+        height: 320,
         imageDownSizeLimit: 128,
         inputMode: "wearable",
         lowLatencyControls: true,
@@ -568,7 +568,13 @@ function buildAutoexecConfig(config) {
     `seta r_gamma "${getNumericConfig(config.rGamma, 1.1)}"`,
     `seta r_brightness "${getNumericConfig(config.rBrightness, 1)}"`,
     `seta r_lightScale "${getNumericConfig(config.rLightScale, 2)}"`,
-    "seta r_skipBump \"0\"",
+    // Bump + specular are the most expensive per-pixel-per-light samples in the
+    // interaction shader. Skipping them on the wearable profile cuts fragment
+    // cost ~50 % and brings iPhone fps from ~7 to ~playable; visual quality
+    // takes a hit (no per-pixel normal/specular detail) but the silhouette,
+    // diffuse, and lighting are intact. Desktop keeps them on.
+    config.inputMode === "wearable" ? "seta r_skipBump \"1\"" : "seta r_skipBump \"0\"",
+    config.inputMode === "wearable" ? "seta r_skipSpecular \"1\"" : "seta r_skipSpecular \"0\"",
     "seta image_downSize \"1\"",
     "seta image_useCompression \"1\"",
     `seta g_skill "${getNumericConfig(config.skill, 1)}"`,
