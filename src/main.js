@@ -347,24 +347,53 @@ diag(`brightness: lightScale=${runtimeConfig.rLightScale} gamma=${runtimeConfig.
   wrap(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
 })();
 
-(function fixFalloffSampling() {
-  if (/[?&]nofalloffix\b/.test(location.search)) return;
+// Combined shader source wrap: both the falloff fix and the sampler-precision
+// fix run from the same patched shaderSource so they only wrap the prototype
+// once.
+//   1. falloff fix: see comment in the falloff branch — the per-light falloff
+//      texture's data is in .w on WebKit, so splat .w into RGB.
+//   2. sampler precision fix: GL4ES emits `uniform sampler2D foo;` without an
+//      explicit precision qualifier. `precision highp float;` does NOT cover
+//      samplers — GLSL ES 1.00 specifies that samplers have no default
+//      precision in the fragment shader. On iOS Apple GPUs that silently
+//      becomes `lowp sampler2D`, which quantizes texture coordinates and
+//      sampled values. Adjacent frames sampling the same geometry can land on
+//      different texels, producing the distributed per-pixel oscillation we
+//      observed across the whole frame even with the camera stationary (deep-
+//      research finding #5; confirmed by inspection of the captured GLSL).
+//      Inject `highp ` before every sampler{2D,Cube,3D} declaration to force
+//      full precision. ?noprecisionfix disables it for A/B.
+(function fixShaderSources() {
+  if (/[?&]nofalloffix\b/.test(location.search) && /[?&]noprecisionfix\b/.test(location.search)) return;
+  const enableFalloff = !/[?&]nofalloffix\b/.test(location.search);
+  const enablePrecision = !/[?&]noprecisionfix\b/.test(location.search);
   const FALLOFF_RE = /texture2DProj\(\s*_gl4es_Sampler2D_2\s*,\s*_gl4es_TexCoord_2\s*\)/g;
+  // Match `uniform sampler{2D,Cube,3D} name;` not already preceded by a precision
+  // qualifier. Two flavors: with `uniform ` keyword and without, both supported.
+  const SAMPLER_RE = /\b(uniform\s+)(sampler(?:2D|Cube|3D))\b/g;
   const wrap = (proto) => {
     if (!proto) return;
     const orig = proto.shaderSource;
-    if (!orig || orig.__d3FalloffPatched) return;
+    if (!orig || orig.__d3ShaderPatched) return;
     const patched = function (shader, source) {
       let s = source == null ? source : String(source);
       try {
-        if (typeof s === "string" && s.includes("localNormal.x = localNormal.w") && FALLOFF_RE.test(s)) {
-          FALLOFF_RE.lastIndex = 0;
-          s = s.replace(FALLOFF_RE, "vec4(texture2DProj(_gl4es_Sampler2D_2, _gl4es_TexCoord_2).w)");
+        if (typeof s === "string") {
+          // (1) Force highp on every sampler declaration. Skip if already qualified.
+          if (enablePrecision && /\buniform\s+sampler/.test(s) && !/\buniform\s+(?:highp|mediump|lowp)\s+sampler/.test(s)) {
+            s = s.replace(SAMPLER_RE, "$1highp $2");
+          }
+          // (2) Splat falloff alpha into RGB for the interaction shader. Identify
+          // by the DXT5-NM normal-X-from-alpha swizzle and the falloff sampler.
+          if (enableFalloff && s.includes("localNormal.x = localNormal.w") && FALLOFF_RE.test(s)) {
+            FALLOFF_RE.lastIndex = 0;
+            s = s.replace(FALLOFF_RE, "vec4(texture2DProj(_gl4es_Sampler2D_2, _gl4es_TexCoord_2).w)");
+          }
         }
       } catch (_) { /* never break the engine */ }
       return orig.call(this, shader, s);
     };
-    patched.__d3FalloffPatched = true;
+    patched.__d3ShaderPatched = true;
     proto.shaderSource = patched;
   };
   wrap(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
