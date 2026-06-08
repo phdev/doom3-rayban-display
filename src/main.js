@@ -662,7 +662,39 @@ void main(void) {
   // the iPhone "tile flicker" we've been chasing. Mac WebKit (Playwright)
   // apparently bridges them silently. ?rewrite to opt-in for diagnostic use.
   const enableRewrite   = /[?&]rewrite\b/.test(location.search);
-  if (!enableFalloff && !enablePrecision && !enableRewrite) return;
+  // Quantize the interaction FS output to 8-bit before additive blending.
+  // Theory: iPhone tile flicker is FP non-determinism in lit-pass accumulation
+  // across many additive draws (bisect confirmed: r_skipInteractions cuts the
+  // per-frame diff by 88%, r_skipDiffuse by 64%; engine-level cvars do nothing).
+  // Snapping each per-light contribution to a discrete 8-bit value before the
+  // blend collapses the FP noise that otherwise oscillates the framebuffer.
+  // Gated via ?quantize for safety; ?noquantize forces off.
+  const enableQuantize  = /[?&]quantize\b/.test(location.search) && !/[?&]noquantize\b/.test(location.search);
+  // Strip the in-shader gamma pow() that GL4ES emits at the end of the
+  // interaction FS:
+  //   gl_FragColor.x = pow(dhewm3tmpres.x, ProgramEnv_21.w);
+  //   gl_FragColor.y = pow(dhewm3tmpres.y, ProgramEnv_21.w);
+  //   gl_FragColor.z = pow(dhewm3tmpres.z, ProgramEnv_21.w);
+  //   gl_FragColor.w = dhewm3tmpres.w;
+  // pow() with a non-integer exponent compiles to exp(log(x)*y) on Apple's
+  // shader compiler, and log/exp are noisy on TBDR — different invocations of
+  // the same fragment produce slightly different results, manifesting as
+  // per-frame intensity drift. The gamma is already a no-op on this build
+  // (SDL3 dropped SDL_SetWindowGammaRamp; CLAUDE.md confirms). Default ON;
+  // disable with ?nopowfix for A/B.
+  const enablePowFix    = !/[?&]nopowfix\b/.test(location.search);
+  // Also strip the per-frame gamma color modulator `_gl4es_Fragment_ProgramEnv_21.xyz`
+  // multiplied with the lit output. That uniform is DOOM 3's brightness/lightScale
+  // RGB; if it drifts even sub-LSB per frame, every interaction draw multiplies the
+  // whole framebuffer by a slightly different vec3 → whole-scene flicker. ?nogammuni
+  // disables. Independent of pow fix (which kills the gamma exponent on .w).
+  const enableGammaUniFix = !/[?&]nogammuni\b/.test(location.search);
+  const POW_GAMMA_RE = /gl_FragColor\.x\s*=\s*\(pow\(dhewm3tmpres\.x[^;]+;\s*gl_FragColor\.y\s*=\s*\(pow\(dhewm3tmpres\.y[^;]+;\s*gl_FragColor\.z\s*=\s*\(pow\(dhewm3tmpres\.z[^;]+;\s*gl_FragColor\.w\s*=\s*dhewm3tmpres\.w\s*;/;
+  const GAMMA_UNI_RE = /clamp\(\s*_gl4es_Fragment_ProgramEnv_21\.xyz\s*\*\s*dhewm3tmpres\.xyz\s*,\s*0\.00000\s*,\s*1\.00000\s*\)/;
+  if (!enableFalloff && !enablePrecision && !enableRewrite && !enableQuantize && !enablePowFix && !enableGammaUniFix) return;
+  window.__d3InteractionFSPatched = 0;
+  window.__d3PowGammaStripped = 0;
+  window.__d3GammaUniStripped = 0;
   const FALLOFF_RE = /texture2DProj\(\s*_gl4es_Sampler2D_2\s*,\s*_gl4es_TexCoord_2\s*\)/g;
   const SAMPLER_RE = /\b(uniform\s+)(sampler(?:2D|Cube|3D))\b/g;
   const wrap = (proto) => {
@@ -688,6 +720,28 @@ void main(void) {
             if (enableFalloff && isInteractionFS && FALLOFF_RE.test(s)) {
               FALLOFF_RE.lastIndex = 0;
               s = s.replace(FALLOFF_RE, "vec4(texture2DProj(_gl4es_Sampler2D_2, _gl4es_TexCoord_2).w)");
+            }
+            if (enablePowFix && isInteractionFS && POW_GAMMA_RE.test(s)) {
+              s = s.replace(POW_GAMMA_RE, "gl_FragColor = dhewm3tmpres;");
+              window.__d3PowGammaStripped += 1;
+            }
+            if (enableGammaUniFix && isInteractionFS && GAMMA_UNI_RE.test(s)) {
+              s = s.replace(GAMMA_UNI_RE, "clamp(dhewm3tmpres.xyz, 0.00000, 1.00000)");
+              window.__d3GammaUniStripped += 1;
+            }
+          }
+          // (2) 8-bit quantization injection. Insert just before the final
+          // closing `}` of main() so gl_FragColor (already assigned by the
+          // shader's own code or REWRITTEN_INTERACTION_FS above) is snapped
+          // to 8-bit precision before the GL pipeline does the additive blend.
+          // Only the interaction FS — ambient pass and screenspace passes are
+          // not the source of the dither per the bisect.
+          if (enableQuantize && isInteractionFS) {
+            const lastBrace = s.lastIndexOf("}");
+            if (lastBrace > -1) {
+              const inject = "  gl_FragColor.rgb = floor(gl_FragColor.rgb * 255.0 + 0.5) / 255.0;\n";
+              s = s.substring(0, lastBrace) + inject + s.substring(lastBrace);
+              window.__d3InteractionFSPatched += 1;
             }
           }
         }
