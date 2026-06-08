@@ -405,6 +405,79 @@ diag(`brightness: lightScale=${runtimeConfig.rLightScale} gamma=${runtimeConfig.
 // per-program stall the first time it's seen (the user already had this cost
 // distributed as flicker; concentrating it as a brief stutter is much better).
 // ?noflickerfix disables it for A/B.
+// ── iOS 18 immutable-texture workaround ────────────────────────────────────
+// iOS 18 introduced a regression: offscreen rendering with MUTABLE textures
+// (created via glTexImage2D) breaks unpredictably — produces undefined frame
+// contents that manifest as "fixed dotted pixel-grid pattern" / per-tile
+// brightness variance / our tile flicker. Documented in bgfx#3352 (2024-09-11);
+// also matches the unsolved threejs forum #89164 (2026-01-16) symptom EXACTLY.
+// Workaround: allocate texture storage via IMMUTABLE glTexStorage2D, then
+// upload pixel data via glTexSubImage2D. Wraps gl.texImage2D so the engine
+// never has to know.
+// ?nottexstorage disables for A/B. Opt-IN to start (default off) until we
+// confirm the unsized→sized format mapping is complete.
+const FORMAT_TO_SIZED = {
+  // base-format → sized internal format mappings (WebGL2 spec table)
+  [0x1908 /*RGBA*/]:   0x8058 /*RGBA8*/,
+  [0x1907 /*RGB*/]:    0x8051 /*RGB8*/,
+  [0x1906 /*ALPHA*/]:  0x803C /*ALPHA8 (gl ext)*/, // may not be valid in WebGL2 — fallback to R8
+  [0x1909 /*LUMINANCE*/]: 0x8229 /*R8*/, // approximated
+  [0x190A /*LUMINANCE_ALPHA*/]: 0x822B /*RG8*/,
+  [0x1902 /*DEPTH_COMPONENT*/]: 0x81A6 /*DEPTH_COMPONENT24*/,
+  [0x84F9 /*DEPTH_STENCIL*/]:   0x88F0 /*DEPTH24_STENCIL8*/,
+};
+const __d3ImmutableTextures = new WeakSet();
+window.__d3TexStorageStats = { upgraded: 0, skipped_remap: 0, skipped_immutable: 0, fallthrough: 0, errors: 0 };
+(function fixIOS18TextureStorage() {
+  if (!/[?&]immutable\b/.test(location.search)) return;  // opt-in for safety
+  const wrap = (proto) => {
+    if (!proto || !proto.texImage2D || proto.texImage2D.__d3Immutable) return;
+    const orig = proto.texImage2D;
+    const patched = function (target, level, internalformat, widthOrFormat, heightOrType, borderOrSource, format, type, pixels) {
+      // Only intercept the 9-arg variant for level-0 TEXTURE_2D — the form used
+      // for FBO render-target allocation. The 6-arg DOM-source variant + non-zero
+      // mip levels we pass through untouched.
+      const is9arg = arguments.length >= 7;
+      try {
+        if (is9arg && target === this.TEXTURE_2D && level === 0) {
+          const tex = this.getParameter(this.TEXTURE_BINDING_2D);
+          if (!tex) {
+            window.__d3TexStorageStats.fallthrough += 1;
+            return orig.apply(this, arguments);
+          }
+          if (__d3ImmutableTextures.has(tex)) {
+            // Already immutable — can only update via subImage2D
+            window.__d3TexStorageStats.skipped_immutable += 1;
+            if (pixels !== null && pixels !== undefined) {
+              this.texSubImage2D(target, 0, 0, 0, widthOrFormat, heightOrType, format, type, pixels);
+            }
+            return;
+          }
+          const sized = FORMAT_TO_SIZED[internalformat] || internalformat;
+          // Only redirect when we know how to map the format
+          if (FORMAT_TO_SIZED[internalformat]) {
+            this.texStorage2D(target, 1, sized, widthOrFormat, heightOrType);
+            __d3ImmutableTextures.add(tex);
+            if (pixels !== null && pixels !== undefined) {
+              this.texSubImage2D(target, 0, 0, 0, widthOrFormat, heightOrType, format, type, pixels);
+            }
+            window.__d3TexStorageStats.upgraded += 1;
+            return;
+          }
+          window.__d3TexStorageStats.skipped_remap += 1;
+        }
+      } catch (e) {
+        window.__d3TexStorageStats.errors += 1;
+        if (window.__d3TexStorageStats.errors <= 3) console.warn("[d3 immutable tex] fallback:", e.message);
+      }
+      return orig.apply(this, arguments);
+    };
+    patched.__d3Immutable = true;
+    proto.texImage2D = patched;
+  };
+  wrap(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
+})();
+
 // IMPORTANT diagnostic: iPhone Safari throws "useProgram: program not valid"
 // every frame in the render loop, meaning the engine binds a program that
 // failed to link. Track every linkProgram (with shader source captured) and

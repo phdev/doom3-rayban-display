@@ -1,0 +1,133 @@
+diff --git a/src/gl/texture.c b/src/gl/texture.c
+index c0d479a..8a0c109 100644
+--- a/src/gl/texture.c
++++ b/src/gl/texture.c
+@@ -903,6 +903,65 @@ GLenum minmag_float(GLenum filt) {
+     }
+ }
+ 
++// ─── iOS 18 immutable-storage workaround ────────────────────────────────────
++// iOS 18+ Safari: textures allocated via glTexImage2D and used as offscreen
++// render targets produce undefined contents — manifests as "dotted pixel-grid"
++// tile flicker (bgfx#3352, threejs forum #89164, both unsolved publicly).
++// Fix: allocate via immutable glTexStorage2D + upload via glTexSubImage2D.
++// Applied opportunistically for safe TEXTURE_2D level-0 first-alloc case.
++// LIBGL_IMMUTABLE_TEXTURES=0 env var to disable.
++#ifdef __EMSCRIPTEN__
++// Forward-decl raw GL ES 3.0 entry points. Emscripten exports these at link
++// time when -sFULL_ES3=1 (which the dhewm3 build uses).
++extern void glTexStorage2D(GLenum target, GLsizei levels, GLenum internalformat,
++                           GLsizei width, GLsizei height);
++extern void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset,
++                            GLsizei width, GLsizei height, GLenum format,
++                            GLenum type, const void *pixels);
++
++static int d3_immutable_disabled = -1;
++static GLenum d3_sized_format(GLenum internalformat) {
++    // Map only enums reliably present in our GL ES 2.0 headers; ES3-only enums
++    // (RG8, RG16F, DEPTH_COMPONENT32F, DEPTH32F_STENCIL8) we don't handle —
++    // caller falls back to the legacy mutable path for those.
++    switch (internalformat) {
++        case GL_RGBA: case 4:                   return GL_RGBA8;
++        case GL_RGB:  case 3:                   return GL_RGB8;
++        case GL_LUMINANCE:                      return GL_R8;
++        case GL_ALPHA:                          return GL_R8;
++        case GL_DEPTH_COMPONENT:                return GL_DEPTH_COMPONENT24;
++        case GL_DEPTH_STENCIL:                  return GL_DEPTH24_STENCIL8;
++        case GL_RGBA8: case GL_RGB8: case GL_R8:
++        case GL_RGBA16F: case GL_RGB16F: case GL_R16F:
++        case GL_DEPTH_COMPONENT16: case GL_DEPTH_COMPONENT24:
++        case GL_DEPTH24_STENCIL8:
++            return internalformat;
++    }
++    return 0;
++}
++static int d3_should_use_immutable(GLenum target, GLint level, GLsizei width, GLsizei height,
++                                   GLint internalformat, gltexture_t *bound) {
++    if (d3_immutable_disabled < 0) {
++        const char *env = getenv("LIBGL_IMMUTABLE_TEXTURES");
++        d3_immutable_disabled = (env && env[0] == '0') ? 1 : 0;
++    }
++    if (d3_immutable_disabled) return 0;
++    if (target != GL_TEXTURE_2D) return 0;
++    if (level != 0) return 0;
++    if (!bound) return 0;
++    if (bound->immutable) return 0;
++    if (width <= 0 || height <= 0) return 0;
++    if (!d3_sized_format(internalformat)) return 0;
++    return 1;
++}
++static int d3_max_mip_levels(GLsizei width, GLsizei height) {
++    int m = width > height ? width : height;
++    int n = 0;
++    while (m > 0) { n++; m >>= 1; }
++    return n;
++}
++#endif
++
+ void APIENTRY_GL4ES gl4es_glTexImage2D(GLenum target, GLint level, GLint internalformat,
+                   GLsizei width, GLsizei height, GLint border,
+                   GLenum format, GLenum type, const GLvoid *data) {
+@@ -971,6 +1030,50 @@ void APIENTRY_GL4ES gl4es_glTexImage2D(GLenum target, GLint level, GLint interna
+ 
+     gltexture_t *bound = glstate->texture.bound[glstate->texture.active][itarget];
+ 
++#ifdef __EMSCRIPTEN__
++    // iOS 18 immutable-storage fast-path (see d3_should_use_immutable above).
++    // We call the GL ES 3.0 raw entry points directly (forward-declared above
++    // — Emscripten provides them when -sFULL_ES3=1).
++    if (d3_should_use_immutable(target, level, width, height, internalformat, bound)) {
++        GLenum sized = d3_sized_format(internalformat);
++        int mips = d3_max_mip_levels(width, height);
++        bound->width = width; bound->height = height;
++        bound->nwidth = width; bound->nheight = height;
++        bound->format = (format == GL_BGRA) ? GL_RGBA : format;
++        bound->type = type;
++        bound->internalformat = sized;
++        bound->wanted_internal = sized;
++        bound->orig_internal = internalformat;
++        bound->npot = 0;
++        bound->compressed = 0;
++        bound->valid = 1;
++        bound->immutable = GL_TRUE;
++        errorGL();
++        glTexStorage2D(rtarget, mips, sized, width, height);
++        if (pixels) {
++            glTexSubImage2D(rtarget, 0, 0, 0, width, height,
++                            bound->format, type, pixels);
++        }
++        noerrorShim();
++        return;
++    }
++    // Texture already immutable: redirect glTexImage2D to glTexSubImage2D so
++    // mip uploads + content refreshes don't fail with "Texture is immutable".
++    if (bound && bound->immutable && target == GL_TEXTURE_2D && pixels) {
++        glTexSubImage2D(rtarget, level, 0, 0, width, height,
++                        (format == GL_BGRA) ? GL_RGBA : format, type, pixels);
++        noerrorShim();
++        return;
++    }
++    // Re-allocation request on immutable texture (size change) — silently no-op
++    // rather than crash. Engine should be using a fresh texture object.
++    if (bound && bound->immutable && target == GL_TEXTURE_2D && !pixels &&
++        (width != bound->width || height != bound->height)) {
++        noerrorShim();
++        return;
++    }
++#endif
++
+     //Special case when resizing an attached to FBO texture, that is attached to depth and/or stencil => resizing is specific then
+     if(bound->binded_fbo && (bound->binded_attachment==GL_DEPTH_ATTACHMENT || bound->binded_attachment==GL_STENCIL_ATTACHMENT || bound->binded_attachment==GL_DEPTH_STENCIL_ATTACHMENT))
+     {
+diff --git a/src/gl/texture.h b/src/gl/texture.h
+index 33e140a..12adafe 100644
+--- a/src/gl/texture.h
++++ b/src/gl/texture.h
+@@ -156,6 +156,7 @@ typedef struct {
+     glsampler_t sampler;    // internal sampler if not superseded by glBindSampler
+     glsampler_t actual;     // actual sampler
+     float fbtex_ratio; // Lower rendering resolution
++    GLboolean immutable; // iOS 18 workaround: texture allocated via glTexStorage2D
+ } gltexture_t;
+ 
+ KHASH_MAP_DECLARE_INT(tex, gltexture_t *);

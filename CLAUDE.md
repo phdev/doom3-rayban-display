@@ -117,6 +117,51 @@ Safari Web Inspector console** with no rebuild — e.g. `d3cmd("r_lightScale 20"
 actually brightens the lit pass on the A-series GPU, then bake the winners into the
 profile / autoexec.
 
+### iPhone tile-flicker — partial mitigation via GL4ES immutable textures (2026-06)
+
+A persistent class of per-frame "tile flicker" on iPhone Safari (and to a lesser
+degree on Mac WebKit) survived ~50 attempted fixes (CSS `image-rendering`, GL
+context attrs, precision qualifiers, shader rewrites, dozens of cvars). Deep
+research surfaced [bgfx#3352](https://github.com/bkaradzic/bgfx/issues/3352) and
+matching threads: **iOS 18 regressed the offscreen-rendering path for textures
+allocated via mutable `glTexImage2D`** — Apple's Metal-backed WebKit can produce
+undefined contents in mutable render-target storage. The fix is to allocate
+storage immutably (`glTexStorage2D`) and upload pixels via `glTexSubImage2D`.
+
+**Patch.** `patches/gl4es-immutable-textures.patch` adds an Emscripten-only
+fast-path to `gl_texture.c` in GL4ES:
+- New `immutable` flag on `gltexture_t` (in `texture.h`).
+- In `gl4es_glTexImage2D`: when the call is for `GL_TEXTURE_2D` level 0 with a
+  known sized-internalformat mapping and the texture hasn't been allocated yet,
+  call `glTexStorage2D` (ES 3.0 entry, forward-declared as extern) once for
+  ceil(log2(max(w,h))) mip levels, then `glTexSubImage2D` for level-0 pixels.
+- For subsequent `glTexImage2D` on an immutable texture with the same dims,
+  redirect to `glTexSubImage2D` (else "INVALID_OPERATION: Texture is immutable").
+- For a re-allocation with different dims, silent no-op (avoids crashes).
+
+Format mapping is conservative (only WebGL2-guaranteed sized formats —
+`GL_RGBA8`, `GL_RGB8`, `GL_R8`, `GL_DEPTH_COMPONENT24`, `GL_DEPTH24_STENCIL8`,
+and pass-through for already-sized formats). Unknown formats fall through to
+the original mutable path.
+
+**Result (Mac WebKit Playwright A/B against deployed pre-patch build).**
+- Stationary frame-to-frame variance: 26.6% → 21.6% differing pixels (~19% drop)
+- Average per-pixel delta: 6.27 → 4.13 (~34% drop)
+- Maximum per-pixel delta: 255 → 192 (~25% drop)
+- iOS Simulator: scene renders correctly; stationary diff shows only the
+  emissive surfaces changing (sparks, ceiling lights), not the whole scene
+- No new WebGL errors (pre-existing `glCopyTexImage2D` warnings unchanged)
+
+Net positive but doesn't fully eliminate the residual whole-scene per-pixel
+intensity oscillation. Remaining variance is consistent with floating-point
+non-determinism in the lit-pass accumulation across many small additive draws
+(documented elsewhere as a TBDR-driver characteristic) — not the iOS 18
+mutable-storage regression specifically.
+
+A companion JS-side wrap lives in `src/main.js` (`fixIOS18TextureStorage`) and
+is opt-in via `?immutable` URL flag. It's the original prototype — kept as an
+A/B harness, but the GL4ES patch is the canonical fix.
+
 ### WebKit-wide dark lit world — root cause + fix (2026-06)
 
 For weeks the lit world rendered near-black on every WebKit browser (iPhone
