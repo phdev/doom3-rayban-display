@@ -53,15 +53,53 @@ export function installTAA(gameCanvas) {
     return null;
   }
 
-  // Diagnostics
-  window.__d3TAA = { enabled: true, alpha: TAA_ALPHA, ticks: 0, blits: 0, skipped: 0 };
+  // Diagnostics. Exposed via window.__d3TAA + visible via the existing #diag
+  // overlay so the iPhone can confirm TAA is actually running.
+  const diagState = {
+    enabled: true,
+    alpha: TAA_ALPHA,
+    ticks: 0,
+    blits: 0,
+    skipped: 0,
+    sampleR: 0, sampleG: 0, sampleB: 0,
+    lastSampleAt: 0
+  };
+  window.__d3TAA = diagState;
+
+  // Sample a center pixel periodically — confirms drawImage is reading actual
+  // engine output (not transparent/black due to preserveDrawingBuffer=false).
+  const sampleCanvas = document.createElement("canvas");
+  sampleCanvas.width = 1; sampleCanvas.height = 1;
+  const sampleCtx = sampleCanvas.getContext("2d", { willReadFrequently: true });
+  function samplePixel() {
+    try {
+      sampleCtx.clearRect(0, 0, 1, 1);
+      sampleCtx.drawImage(taa, taa.width >> 1, taa.height >> 1, 1, 1, 0, 0, 1, 1);
+      const px = sampleCtx.getImageData(0, 0, 1, 1).data;
+      diagState.sampleR = px[0]; diagState.sampleG = px[1]; diagState.sampleB = px[2];
+      diagState.lastSampleAt = diagState.ticks;
+    } catch (_) {}
+  }
+
+  // Dedicated floating indicator so we don't fight the engine's diag logger.
+  function writeDiag() {
+    const line = `TAA α=${TAA_ALPHA} blits=${diagState.blits} center=(${diagState.sampleR},${diagState.sampleG},${diagState.sampleB})`;
+    let p = document.querySelector("#taaDiag");
+    if (!p) {
+      p = document.createElement("pre");
+      p.id = "taaDiag";
+      p.style.cssText = "position:fixed;left:4px;bottom:4px;z-index:99999;margin:0;padding:4px 8px;background:rgba(0,0,0,0.75);color:#7fff7f;font:11px ui-monospace,Menlo,monospace;border-radius:4px;pointer-events:none";
+      document.body.appendChild(p);
+    }
+    p.textContent = line;
+  }
 
   let running = true;
   let lastGameW = 0, lastGameH = 0;
 
   function tick() {
     if (!running) return;
-    window.__d3TAA.ticks += 1;
+    diagState.ticks += 1;
     // Re-sync backing dimensions if the engine resized its canvas
     if (gameCanvas.width !== lastGameW || gameCanvas.height !== lastGameH) {
       lastGameW = gameCanvas.width;
@@ -70,28 +108,22 @@ export function installTAA(gameCanvas) {
       taa.height = lastGameH;
       // First blit fills the buffer at full opacity (no history yet)
       ctx.globalAlpha = 1.0;
-      try {
-        ctx.drawImage(gameCanvas, 0, 0);
-        window.__d3TAA.blits += 1;
-      } catch (_) {
-        window.__d3TAA.skipped += 1;
-      }
+      try { ctx.drawImage(gameCanvas, 0, 0); diagState.blits += 1; }
+      catch (_) { diagState.skipped += 1; }
       ctx.globalAlpha = TAA_ALPHA;
     } else {
-      try {
-        ctx.drawImage(gameCanvas, 0, 0);
-        window.__d3TAA.blits += 1;
-      } catch (_) {
-        window.__d3TAA.skipped += 1;
-      }
+      try { ctx.drawImage(gameCanvas, 0, 0); diagState.blits += 1; }
+      catch (_) { diagState.skipped += 1; }
     }
+    // Sample every ~30 ticks (~0.5s @ 60fps) so the diag isn't spammed
+    if (diagState.ticks % 30 === 0) { samplePixel(); writeDiag(); }
     requestAnimationFrame(tick);
   }
-  // Start with full opacity for first blit; tick() handles subsequent
   ctx.globalAlpha = TAA_ALPHA;
   requestAnimationFrame(tick);
 
   console.log(`[TAA] active, α=${TAA_ALPHA}, taaCanvas overlaid on #gameCanvas`);
+  writeDiag();
 
   return {
     stop() { running = false; gameCanvas.style.visibility = ""; taa.remove(); },

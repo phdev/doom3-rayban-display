@@ -382,11 +382,17 @@ diag(`brightness: lightScale=${runtimeConfig.rLightScale} gamma=${runtimeConfig.
   const forceNoDither = !/[?&]dither\b/.test(location.search);
   const orig = HTMLCanvasElement.prototype.getContext;
   if (orig.__d3CtxAttrs) return;
+  // TAA requires the WebGL backbuffer to remain readable after the engine
+  // presents — i.e. preserveDrawingBuffer:true. Without it, drawImage(webgl)
+  // from outside the render loop reads transparent on iOS Safari. Force it
+  // ONLY when ?taa is active so we don't pay the cost otherwise.
+  const forcePreserveBuffer = /[?&]taa\b/.test(location.search);
   const patched = function (type, attrs) {
     if (typeof type === "string" && /webgl/i.test(type)) {
       attrs = Object.assign({}, attrs);
       if (forceAlpha) attrs.alpha = false;
       if (forceNoMsaa) attrs.antialias = false;
+      if (forcePreserveBuffer) attrs.preserveDrawingBuffer = true;
     }
     const gl = orig.call(this, type, attrs);
     if (gl && forceNoDither && typeof type === "string" && /webgl/i.test(type)) {
