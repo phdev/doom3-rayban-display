@@ -368,6 +368,11 @@ diag(`brightness: lightScale=${runtimeConfig.rLightScale} gamma=${runtimeConfig.
   if (/[?&]nocontextattrs\b/.test(location.search)) return;
   const forceAlpha = !/[?&]noopaque\b/.test(location.search);
   const forceNoMsaa = !/[?&]msaa\b/.test(location.search);
+  // GL_DITHER is ENABLED by default in WebGL2. On Apple's tile-based GPUs the
+  // dither pattern can manifest as per-tile blocky brightness variance — the
+  // exact symptom of the iPhone "tile flicker" the user reports. Disable it
+  // for the engine's context right after creation. ?dither re-enables for A/B.
+  const forceNoDither = !/[?&]dither\b/.test(location.search);
   const orig = HTMLCanvasElement.prototype.getContext;
   if (orig.__d3CtxAttrs) return;
   const patched = function (type, attrs) {
@@ -375,10 +380,12 @@ diag(`brightness: lightScale=${runtimeConfig.rLightScale} gamma=${runtimeConfig.
       attrs = Object.assign({}, attrs);
       if (forceAlpha) attrs.alpha = false;
       if (forceNoMsaa) attrs.antialias = false;
-      // premultipliedAlpha and preserveDrawingBuffer left at their existing
-      // defaults / values from other wraps.
     }
-    return orig.call(this, type, attrs);
+    const gl = orig.call(this, type, attrs);
+    if (gl && forceNoDither && typeof type === "string" && /webgl/i.test(type)) {
+      try { gl.disable(gl.DITHER); } catch (_) {}
+    }
+    return gl;
   };
   patched.__d3CtxAttrs = true;
   HTMLCanvasElement.prototype.getContext = patched;
@@ -398,25 +405,106 @@ diag(`brightness: lightScale=${runtimeConfig.rLightScale} gamma=${runtimeConfig.
 // per-program stall the first time it's seen (the user already had this cost
 // distributed as flicker; concentrating it as a brief stutter is much better).
 // ?noflickerfix disables it for A/B.
+// IMPORTANT diagnostic: iPhone Safari throws "useProgram: program not valid"
+// every frame in the render loop, meaning the engine binds a program that
+// failed to link. Track every linkProgram (with shader source captured) and
+// every useProgram, expose via window.__d3LinkErrors / __d3UseProgramErrors.
+window.__d3LinkLog = [];
+window.__d3UseProgramErrors = [];
+window.__d3ShaderSourceByShader = new WeakMap();
+window.__d3SourcesByProgram = new Map();
 (function fixAsyncShaderLink() {
   if (/[?&]noflickerfix\b/.test(location.search)) return;
   const wrap = (proto) => {
     if (!proto) return;
+
+    // Capture every shader's source so we can dump the failing program's source.
+    const origShaderSource = proto.shaderSource;
+    if (origShaderSource && !origShaderSource.__d3LogSource) {
+      const wrappedSrc = function (shader, source) {
+        try { window.__d3ShaderSourceByShader.set(shader, String(source)); } catch (_) {}
+        return origShaderSource.call(this, shader, source);
+      };
+      wrappedSrc.__d3LogSource = true;
+      proto.shaderSource = wrappedSrc;
+    }
+
+    // Attach: collect attached shaders per program for later dump.
+    const origAttach = proto.attachShader;
+    if (origAttach && !origAttach.__d3LogAttach) {
+      const wrappedAttach = function (program, shader) {
+        try {
+          let arr = window.__d3SourcesByProgram.get(program);
+          if (!arr) { arr = []; window.__d3SourcesByProgram.set(program, arr); }
+          arr.push({ shader, source: window.__d3ShaderSourceByShader.get(shader) || "(no source captured)" });
+        } catch (_) {}
+        return origAttach.call(this, program, shader);
+      };
+      wrappedAttach.__d3LogAttach = true;
+      proto.attachShader = wrappedAttach;
+    }
+
+    // Link: force sync via LINK_STATUS, and log failures with full info.
     const orig = proto.linkProgram;
-    if (!orig || orig.__d3SyncLink) return;
-    const patched = function (program) {
-      const r = orig.call(this, program);
-      try {
-        // Querying LINK_STATUS forces the implementation to complete the link
-        // synchronously before returning — even on impls that would otherwise
-        // continue compiling in the background. This is the canonical "make
-        // shader compilation synchronous" trick.
-        this.getProgramParameter(program, this.LINK_STATUS);
-      } catch (_) { /* never break the engine */ }
-      return r;
-    };
-    patched.__d3SyncLink = true;
-    proto.linkProgram = patched;
+    if (orig && !orig.__d3SyncLink) {
+      const patched = function (program) {
+        const r = orig.call(this, program);
+        try {
+          const ok = this.getProgramParameter(program, this.LINK_STATUS);
+          if (!ok) {
+            const log = this.getProgramInfoLog(program);
+            const sources = window.__d3SourcesByProgram.get(program) || [];
+            const entry = { ok: false, log: String(log || ""), shaderCount: sources.length };
+            // also include shader compile statuses + infologs
+            entry.shaders = sources.map((s) => {
+              const shaderOk = this.getShaderParameter(s.shader, this.COMPILE_STATUS);
+              return {
+                ok: !!shaderOk,
+                infoLog: String(this.getShaderInfoLog(s.shader) || ""),
+                sourcePreview: (s.source || "").slice(0, 400),
+              };
+            });
+            window.__d3LinkLog.push(entry);
+            console.error("[d3] linkProgram FAILED", entry);
+          } else {
+            window.__d3LinkLog.push({ ok: true });
+          }
+        } catch (e) { console.warn("[d3] link probe threw", e); }
+        return r;
+      };
+      patched.__d3SyncLink = true;
+      proto.linkProgram = patched;
+    }
+
+    // useProgram: log calls with invalid programs (matches the iPhone error).
+    const origUse = proto.useProgram;
+    if (origUse && !origUse.__d3UseProbe) {
+      const wrappedUse = function (program) {
+        try {
+          if (program) {
+            const validLink = this.getProgramParameter(program, this.LINK_STATUS);
+            if (!validLink && window.__d3UseProgramErrors.length < 5) {
+              const sources = window.__d3SourcesByProgram.get(program) || [];
+              window.__d3UseProgramErrors.push({
+                program: program.toString ? program.toString() : String(program),
+                link_status: validLink,
+                info_log: String(this.getProgramInfoLog(program) || ""),
+                shaderCount: sources.length,
+                shaders: sources.map((s) => ({
+                  compile: !!this.getShaderParameter(s.shader, this.COMPILE_STATUS),
+                  info: String(this.getShaderInfoLog(s.shader) || ""),
+                  src_head: (s.source || "").slice(0, 600),
+                })),
+              });
+              console.error("[d3] useProgram with INVALID PROGRAM", window.__d3UseProgramErrors[window.__d3UseProgramErrors.length - 1]);
+            }
+          }
+        } catch (_) {}
+        return origUse.call(this, program);
+      };
+      wrappedUse.__d3UseProbe = true;
+      proto.useProgram = wrappedUse;
+    }
   };
   wrap(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
   wrap(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
@@ -493,7 +581,14 @@ void main(void) {
 (function fixShaderSources() {
   const enableFalloff   = !/[?&]nofalloffix\b/.test(location.search);
   const enablePrecision = !/[?&]noprecisionfix\b/.test(location.search);
-  const enableRewrite   = !/[?&]norewrite\b/.test(location.search);
+  // DEFAULT OFF: the rewrite uses individual `_gl4es_TexCoord_5` varying names
+  // but GL4ES emits the matching vertex shader with array form
+  // `_gl4es_TexCoord[5]`. iOS Safari (strict) treats these as different names
+  // and the program fails to link — the engine then calls glUseProgram with an
+  // invalid program every frame, render fails for those surfaces, and we get
+  // the iPhone "tile flicker" we've been chasing. Mac WebKit (Playwright)
+  // apparently bridges them silently. ?rewrite to opt-in for diagnostic use.
+  const enableRewrite   = /[?&]rewrite\b/.test(location.search);
   if (!enableFalloff && !enablePrecision && !enableRewrite) return;
   const FALLOFF_RE = /texture2DProj\(\s*_gl4es_Sampler2D_2\s*,\s*_gl4es_TexCoord_2\s*\)/g;
   const SAMPLER_RE = /\b(uniform\s+)(sampler(?:2D|Cube|3D))\b/g;

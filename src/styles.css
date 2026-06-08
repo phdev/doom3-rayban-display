@@ -44,7 +44,15 @@ body {
   border: 0;
   outline: none;
   background: #040404;
-  image-rendering: auto;
+  /* Canvas backing is 448x448, browser composites it at the canvas's CSS size
+     (~412 css px) and devicePixelRatio (3 on iPhone) = 1236 device px. iOS
+     Safari's default bilinear interpolation can produce visible per-tile
+     blocky artifacts during camera motion (the "tile flicker" we've been
+     chasing). `pixelated` = nearest-neighbor: 1:1 source-to-destination mapping
+     per pixel-block, no interpolation noise. Trades slightly crisper-but-jagged
+     edges for elimination of the interpolation flicker. */
+  image-rendering: pixelated;
+  image-rendering: -webkit-optimize-contrast; /* fallback for older WebKit */
   --d3-display-brightness: 1;
   --d3-display-contrast: 1;
   --d3-display-saturate: 1;
