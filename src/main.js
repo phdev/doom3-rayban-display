@@ -651,6 +651,99 @@ void main(void) {
 }
 `;
 
+// Quest-inspired interaction FS — adapted from DrBeef/Doom3Quest's
+// renderer/glsl/interactionShaderFP.cpp. Key change from REWRITTEN_INTERACTION_FS
+// above: SKIPS the normalization cubemap (textureCube → normalize() of unpacked
+// _gl4es_TexCoord_0). Apple's TBDR cubemap sampling has been theorized as a
+// per-frame noise source (mipmap LOD on a cube is computed differently than
+// on a 2D texture; ANGLE/Metal layer in WebKit). Doom3Quest doesn't use the
+// normalization cubemap because modern GPUs have fast normalize() — it was a
+// late-90s optimization, and on Apple's compiler the cubemap detour may
+// actively cost determinism.
+//
+// Interface preserved: same _gl4es_* uniform and varying names so GL4ES uniform
+// binding still works. The cubemap sampler binding still exists (engine binds
+// it via the same texture unit) but our shader doesn't sample it — that's fine,
+// it's just an unused uniform.
+const QUEST_INTERACTION_FS = `#version 100
+precision highp float;
+#define GL4ES
+varying lowp  vec4 _gl4es_FrontColor;
+varying highp vec4 _gl4es_TexCoord_0;
+varying highp vec4 _gl4es_TexCoord_1;
+varying highp vec4 _gl4es_TexCoord_2;
+varying highp vec4 _gl4es_TexCoord_3;
+varying highp vec4 _gl4es_TexCoord_4;
+varying highp vec4 _gl4es_TexCoord_5;
+varying highp vec4 _gl4es_TexCoord_6;
+uniform lowp vec4 _gl4es_Fragment_ProgramEnv_0;
+uniform lowp vec4 _gl4es_Fragment_ProgramEnv_1;
+uniform highp sampler2D   _gl4es_Sampler2D_1;
+uniform highp sampler2D   _gl4es_Sampler2D_2;
+uniform highp sampler2D   _gl4es_Sampler2D_3;
+uniform highp sampler2D   _gl4es_Sampler2D_4;
+uniform highp sampler2D   _gl4es_Sampler2D_5;
+uniform highp sampler2D   _gl4es_Sampler2D_6;
+uniform highp samplerCube _gl4es_SamplerCube_0;
+void main(void) {
+\t// Light direction — skip the normalization cubemap. _gl4es_TexCoord_0 is
+\t// packed in [0,1]; unpack and normalize directly.
+\thighp vec3 L = normalize(_gl4es_TexCoord_0.xyz * 2.0 - 1.0);
+\t// Half-vector — direct normalize (no precomputed inversesqrt detour).
+\thighp vec3 H = normalize(_gl4es_TexCoord_6.xyz);
+\t// Normal from bump map (DXT5-NM swizzle: X in alpha). Normalize so the
+\t// dot products give clean values; the .agb*2-1 unpack alone leaves the
+\t// vector slightly off-unit after texture filtering.
+\thighp vec3 N = normalize(texture2D(_gl4es_Sampler2D_1, _gl4es_TexCoord_1.xy).agb * 2.0 - 1.0);
+\thighp float NdotL = clamp(dot(N, L), 0.0, 1.0);
+\thighp float NdotH = clamp(dot(N, H), 0.0, 1.0);
+\thighp vec3 lightProj = texture2DProj(_gl4es_Sampler2D_3, _gl4es_TexCoord_3).rgb;
+\t// Falloff lives in .w on WebKit (single-channel emulation quirk, see
+\t// existing falloffix). Use it directly.
+\thighp float lightFall = texture2DProj(_gl4es_Sampler2D_2, _gl4es_TexCoord_2).w;
+\thighp vec3 diffuse  = texture2D(_gl4es_Sampler2D_4, _gl4es_TexCoord_4.xy).rgb * _gl4es_Fragment_ProgramEnv_0.rgb;
+\thighp vec3 specCurve = texture2D(_gl4es_Sampler2D_6, vec2(NdotH, 0.5)).rgb * _gl4es_Fragment_ProgramEnv_1.rgb;
+\thighp vec3 specMap   = texture2D(_gl4es_Sampler2D_5, _gl4es_TexCoord_5.xy).rgb * 2.0;
+\thighp vec3 color = (diffuse + specCurve * specMap) * NdotL * lightProj * lightFall;
+\tgl_FragColor = vec4(color, 1.0) * _gl4es_FrontColor;
+}
+`;
+
+// For each call-site matched by `nameRe` (e.g. /\btexture2DLodEXT\s*\(/g),
+// walk to the matching `)` and insert `, 0.0` before it. Handles nested
+// parens in the argument list (e.g. `vec2(a, b)` as a coord).
+function injectLodArg(src, nameRe) {
+  let out = "";
+  let i = 0;
+  while (i < src.length) {
+    nameRe.lastIndex = i;
+    const m = nameRe.exec(src);
+    if (!m) { out += src.substring(i); break; }
+    out += src.substring(i, m.index + m[0].length);
+    let depth = 1, j = m.index + m[0].length;
+    while (j < src.length && depth > 0) {
+      const c = src[j];
+      if (c === "(") depth++;
+      else if (c === ")") {
+        depth--;
+        if (depth === 0) {
+          out += src.substring(m.index + m[0].length, j) + ", 0.0)";
+          j++;
+          break;
+        }
+      }
+      j++;
+    }
+    if (depth !== 0) {
+      // unbalanced; bail to safe passthrough
+      out += src.substring(m.index + m[0].length);
+      break;
+    }
+    i = j;
+  }
+  return out;
+}
+
 (function fixShaderSources() {
   const enableFalloff   = !/[?&]nofalloffix\b/.test(location.search);
   const enablePrecision = !/[?&]noprecisionfix\b/.test(location.search);
@@ -662,6 +755,15 @@ void main(void) {
   // the iPhone "tile flicker" we've been chasing. Mac WebKit (Playwright)
   // apparently bridges them silently. ?rewrite to opt-in for diagnostic use.
   const enableRewrite   = /[?&]rewrite\b/.test(location.search);
+  // Quest-inspired FS body rewrite (adapted from DrBeef/Doom3Quest
+  // renderer/glsl/interactionShaderFP.cpp). Replaces ONLY the body of
+  // main() in full-spec interaction shaders that declare all required
+  // varyings/samplers; leaves diffuse-only and partial variants untouched
+  // so we don't break their link. Drops the per-frame noisy ops (pow gamma,
+  // _gl4es_Fragment_ProgramEnv_21.xyz multiply, vec4(scalar) broadcasts);
+  // uses direct normalize() like Doom3Quest does. Default ON; ?noquestfs
+  // disables for A/B.
+  const enableQuestFS   = !/[?&]noquestfs\b/.test(location.search);
   // Quantize the interaction FS output to 8-bit before additive blending.
   // Theory: iPhone tile flicker is FP non-determinism in lit-pass accumulation
   // across many additive draws (bisect confirmed: r_skipInteractions cuts the
@@ -689,12 +791,30 @@ void main(void) {
   // whole framebuffer by a slightly different vec3 → whole-scene flicker. ?nogammuni
   // disables. Independent of pow fix (which kills the gamma exponent on .w).
   const enableGammaUniFix = !/[?&]nogammuni\b/.test(location.search);
-  const POW_GAMMA_RE = /gl_FragColor\.x\s*=\s*\(pow\(dhewm3tmpres\.x[^;]+;\s*gl_FragColor\.y\s*=\s*\(pow\(dhewm3tmpres\.y[^;]+;\s*gl_FragColor\.z\s*=\s*\(pow\(dhewm3tmpres\.z[^;]+;\s*gl_FragColor\.w\s*=\s*dhewm3tmpres\.w\s*;/;
+  // Diagnostic: replace the entire interaction FS body with a constant output.
+  // If per-frame variance still ~47%, bug is upstream (VS, varying interp,
+  // texture-binding state) or downstream (blend hardware, draw scheduling).
+  // If variance drops to ~6% (the r_skipInteractions floor), bug is in the
+  // per-pixel math. Strictly diagnostic, off unless ?constfs requested.
+  const enableConstFS   = /[?&]constfs\b/.test(location.search);
+  // Force LOD 0 on every texture sample in the interaction FS. Apple TBDR
+  // computes mip LOD from implicit derivatives (this fragment's UV minus its
+  // neighbors), and neighbors are shaded in tile-dependent order — across
+  // frames the LOD value drifts for the SAME geometric fragment. Pinning to
+  // LOD 0 eliminates that noise path at the cost of some distant-surface
+  // aliasing (acceptable for the wearable form factor). ?nolod0 disables.
+  const enableLOD0      = /[?&]lod0\b/.test(location.search) && !/[?&]nolod0\b/.test(location.search);
+  // Note on LOD0: tried adding `#extension GL_EXT_shader_texture_lod : enable`
+  // + textureLodEXT calls — fails because WebKit doesn't expose that extension
+  // on WebGL1 GLSL 100 shaders (even on a WebGL2 context). Kept for future.
   const GAMMA_UNI_RE = /clamp\(\s*_gl4es_Fragment_ProgramEnv_21\.xyz\s*\*\s*dhewm3tmpres\.xyz\s*,\s*0\.00000\s*,\s*1\.00000\s*\)/;
-  if (!enableFalloff && !enablePrecision && !enableRewrite && !enableQuantize && !enablePowFix && !enableGammaUniFix) return;
+  if (!enableFalloff && !enablePrecision && !enableRewrite && !enableQuantize && !enablePowFix && !enableGammaUniFix && !enableConstFS && !enableLOD0 && !enableQuestFS) return;
   window.__d3InteractionFSPatched = 0;
   window.__d3PowGammaStripped = 0;
   window.__d3GammaUniStripped = 0;
+  window.__d3ConstFSReplaced = 0;
+  window.__d3LOD0Applied = 0;
+  window.__d3QuestFSReplaced = 0;
   const FALLOFF_RE = /texture2DProj\(\s*_gl4es_Sampler2D_2\s*,\s*_gl4es_TexCoord_2\s*\)/g;
   const SAMPLER_RE = /\b(uniform\s+)(sampler(?:2D|Cube|3D))\b/g;
   const wrap = (proto) => {
@@ -711,7 +831,49 @@ void main(void) {
           // (d3wasm-style clamp + pow specular + no in-shader gamma) eliminates
           // many precision-sensitive intermediate steps. Takes precedence over
           // the per-line patches below for this specific shader.
-          if (enableRewrite && isInteractionFS) {
+          if (enableConstFS && isInteractionFS) {
+            const header = s.substring(0, s.indexOf("void main"));
+            s = header + "void main() { gl_FragColor = vec4(0.5, 0.5, 0.5, 1.0); }\n";
+            window.__d3ConstFSReplaced += 1;
+          } else if (enableQuestFS && isInteractionFS) {
+            // Body-only replacement. GL4ES emits many FS variants that all
+            // contain "localNormal.x = localNormal.w" (any DXT5-NM unpack).
+            // Only rewrite when the FS declares ALL of the varyings and
+            // samplers our new body references. Otherwise leave the original
+            // FS untouched — it'll keep the upstream noise but won't fail to
+            // compile.
+            const mainStart = s.indexOf("void main");
+            // Full-spec interaction: bump + diffuse + specular + cubemap
+            const isFullSpec =
+              s.includes("_gl4es_TexCoord_0") && s.includes("_gl4es_TexCoord_1") &&
+              s.includes("_gl4es_TexCoord_2") && s.includes("_gl4es_TexCoord_3") &&
+              s.includes("_gl4es_TexCoord_4") && s.includes("_gl4es_TexCoord_5") &&
+              s.includes("_gl4es_TexCoord_6") && s.includes("_gl4es_Sampler2D_1") &&
+              s.includes("_gl4es_Sampler2D_2") && s.includes("_gl4es_Sampler2D_3") &&
+              s.includes("_gl4es_Sampler2D_4") && s.includes("_gl4es_Sampler2D_5") &&
+              s.includes("_gl4es_Sampler2D_6") && s.includes("_gl4es_SamplerCube_0");
+            const hasFrontColor = s.includes("_gl4es_FrontColor");
+            const frontColorMul = hasFrontColor ? " * _gl4es_FrontColor" : "";
+            if (mainStart !== -1 && isFullSpec) {
+              const newMain = `void main(void) {
+\thighp vec3 L = normalize(textureCube(_gl4es_SamplerCube_0, _gl4es_TexCoord_0.xyz).xyz * 2.0 - 1.0);
+\thighp vec3 H = normalize(_gl4es_TexCoord_6.xyz);
+\thighp vec3 N = normalize(texture2D(_gl4es_Sampler2D_1, _gl4es_TexCoord_1.xy).agb * 2.0 - 1.0);
+\thighp float NdotL = clamp(dot(N, L), 0.0, 1.0);
+\thighp float NdotH = clamp(dot(N, H), 0.0, 1.0);
+\thighp vec3 lightProj = texture2DProj(_gl4es_Sampler2D_3, _gl4es_TexCoord_3).rgb;
+\thighp float lightFall = texture2DProj(_gl4es_Sampler2D_2, _gl4es_TexCoord_2).w;
+\thighp vec3 diffuse  = texture2D(_gl4es_Sampler2D_4, _gl4es_TexCoord_4.xy).rgb * _gl4es_Fragment_ProgramEnv_0.rgb;
+\thighp vec3 specCurve = texture2D(_gl4es_Sampler2D_6, vec2(NdotH, 0.5)).rgb * _gl4es_Fragment_ProgramEnv_1.rgb;
+\thighp vec3 specMap   = texture2D(_gl4es_Sampler2D_5, _gl4es_TexCoord_5.xy).rgb * 2.0;
+\thighp vec3 color = (diffuse + specCurve * specMap) * NdotL * lightProj * lightFall;
+\tgl_FragColor = vec4(color, 1.0)${frontColorMul};
+}
+`;
+              s = s.substring(0, mainStart) + newMain;
+              window.__d3QuestFSReplaced += 1;
+            }
+          } else if (enableRewrite && isInteractionFS) {
             s = REWRITTEN_INTERACTION_FS;
           } else {
             if (enablePrecision && /\buniform\s+sampler/.test(s) && !/\buniform\s+(?:highp|mediump|lowp)\s+sampler/.test(s)) {
@@ -728,6 +890,31 @@ void main(void) {
             if (enableGammaUniFix && isInteractionFS && GAMMA_UNI_RE.test(s)) {
               s = s.replace(GAMMA_UNI_RE, "clamp(dhewm3tmpres.xyz, 0.00000, 1.00000)");
               window.__d3GammaUniStripped += 1;
+            }
+            if (enableLOD0 && isInteractionFS) {
+              // Add #extension for texture2DLodEXT if absent
+              if (!s.includes("GL_EXT_shader_texture_lod")) {
+                s = s.replace(/(#version[^\n]*\n)?/, (m) =>
+                  (m || "") + "#extension GL_EXT_shader_texture_lod : enable\n"
+                );
+              }
+              // Rewrite each texture2D / texture2DProj / textureCube call to its
+              // LOD-explicit equivalent at LOD 0. textureCube doesn't have a Lod
+              // variant in EXT_shader_texture_lod (it's in EXT_shader_texture_lod
+              // for cubes too actually — textureCubeLodEXT).
+              const before = s.length;
+              s = s.replace(/\btexture2DProj\s*\(/g, "texture2DProjLodEXT(LOD0_INSERT_");
+              s = s.replace(/\btexture2D\s*\(/g, "texture2DLodEXT(LOD0_INSERT_");
+              s = s.replace(/\btextureCube\s*\(/g, "textureCubeLodEXT(LOD0_INSERT_");
+              // Now we need to add the `, 0.0` argument at the matching close
+              // paren of each LOD0_INSERT_ marker. Walk through manually.
+              s = s.replace(/LOD0_INSERT_/g, "");
+              // Strategy: find each call site marker and insert `, 0.0` before
+              // its matching `)`. Simpler: identify by name and do balanced-paren.
+              s = injectLodArg(s, /\btexture2DLodEXT\s*\(/g);
+              s = injectLodArg(s, /\btexture2DProjLodEXT\s*\(/g);
+              s = injectLodArg(s, /\btextureCubeLodEXT\s*\(/g);
+              if (s.length !== before) window.__d3LOD0Applied += 1;
             }
           }
           // (2) 8-bit quantization injection. Insert just before the final
@@ -750,6 +937,45 @@ void main(void) {
     };
     patched.__d3ShaderPatched = true;
     proto.shaderSource = patched;
+  };
+  wrap(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
+  wrap(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
+})();
+
+// JS-side mipmap kill: wrap glTexParameteri to convert any MIPMAP-based min
+// filter to plain LINEAR / NEAREST. The engine cvar (image_lodbias etc.)
+// didn't actually propagate to WebGL state. Mipmap LOD on Apple TBDR is
+// computed from implicit derivatives of neighbor pixels — neighbors are
+// tile-ordered, so the LOD value drifts per-frame for the same fragment.
+// Opt-in via ?minfix.
+(function fixMinFilter() {
+  const enableMin = /[?&]minfix\b/.test(location.search);
+  const enableAllNearest = /[?&]allnearest\b/.test(location.search);
+  if (!enableMin && !enableAllNearest) return;
+  window.__d3MinFilterStats = { coerced: 0, total: 0 };
+  const MIPMAP_FILTERS = new Set([
+    0x2700, 0x2701, 0x2702, 0x2703
+    // GL_NEAREST_MIPMAP_NEAREST, GL_LINEAR_MIPMAP_NEAREST,
+    // GL_NEAREST_MIPMAP_LINEAR, GL_LINEAR_MIPMAP_LINEAR
+  ]);
+  const LINEAR_FILTERS = new Set([0x2601, ...MIPMAP_FILTERS]);
+  const wrap = (proto) => {
+    if (!proto || !proto.texParameteri || proto.texParameteri.__d3Min) return;
+    const orig = proto.texParameteri;
+    proto.texParameteri = function (target, pname, param) {
+      window.__d3MinFilterStats.total += 1;
+      if (enableAllNearest && (pname === 0x2801 /*MIN*/ || pname === 0x2800 /*MAG*/) && LINEAR_FILTERS.has(param)) {
+        window.__d3MinFilterStats.coerced += 1;
+        return orig.call(this, target, pname, 0x2600 /*NEAREST*/);
+      }
+      if (enableMin && pname === 0x2801 && MIPMAP_FILTERS.has(param)) {
+        const coerced = (param === 0x2701 || param === 0x2703) ? 0x2601 /*LINEAR*/ : 0x2600 /*NEAREST*/;
+        window.__d3MinFilterStats.coerced += 1;
+        return orig.call(this, target, pname, coerced);
+      }
+      return orig.call(this, target, pname, param);
+    };
+    proto.texParameteri.__d3Min = true;
   };
   wrap(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
   wrap(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
