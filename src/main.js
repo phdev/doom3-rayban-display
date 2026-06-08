@@ -756,12 +756,17 @@ function injectLodArg(src, nameRe) {
   // apparently bridges them silently. ?rewrite to opt-in for diagnostic use.
   const enableRewrite   = /[?&]rewrite\b/.test(location.search);
   // Quest-inspired FS body rewrite (adapted from DrBeef/Doom3Quest
-  // renderer/glsl/interactionShaderFP.cpp). Replaces ONLY the body of
-  // main() in full-spec interaction shaders that declare all required
-  // varyings/samplers; leaves diffuse-only and partial variants untouched
-  // so we don't break their link. Reverted to opt-in: didn't reduce
-  // perceived iPhone flicker per user test. ?questfs to enable.
+  // renderer/glsl/interactionShaderFP.cpp). Body-only — keeps GL4ES's
+  // emitted header. ?questfs to enable.
   const enableQuestFS   = /[?&]questfs\b/.test(location.search);
+  // No-cubemap variant of the Quest body. Drops the textureCube() call
+  // for L-vector normalization (a known [SPIRV-Cross commit 7ef52b0,
+  // MoltenVK #2068] Apple-Silicon bug where one partial derivative of
+  // cubemap gradients is silently ignored — manifests as per-pixel
+  // intensity drift). Uses `normalize(_gl4es_TexCoord_0.xyz * 2 - 1)`
+  // directly. Same shader-link risk as ?questfs but bigger upside.
+  // ?nocubefs to enable.
+  const enableNoCubeFS  = /[?&]nocubefs\b/.test(location.search);
   // Quantize the interaction FS output to 8-bit before additive blending.
   // Theory: iPhone tile flicker is FP non-determinism in lit-pass accumulation
   // across many additive draws (bisect confirmed: r_skipInteractions cuts the
@@ -806,13 +811,14 @@ function injectLodArg(src, nameRe) {
   // + textureLodEXT calls — fails because WebKit doesn't expose that extension
   // on WebGL1 GLSL 100 shaders (even on a WebGL2 context). Kept for future.
   const GAMMA_UNI_RE = /clamp\(\s*_gl4es_Fragment_ProgramEnv_21\.xyz\s*\*\s*dhewm3tmpres\.xyz\s*,\s*0\.00000\s*,\s*1\.00000\s*\)/;
-  if (!enableFalloff && !enablePrecision && !enableRewrite && !enableQuantize && !enablePowFix && !enableGammaUniFix && !enableConstFS && !enableLOD0 && !enableQuestFS) return;
+  if (!enableFalloff && !enablePrecision && !enableRewrite && !enableQuantize && !enablePowFix && !enableGammaUniFix && !enableConstFS && !enableLOD0 && !enableQuestFS && !enableNoCubeFS) return;
   window.__d3InteractionFSPatched = 0;
   window.__d3PowGammaStripped = 0;
   window.__d3GammaUniStripped = 0;
   window.__d3ConstFSReplaced = 0;
   window.__d3LOD0Applied = 0;
   window.__d3QuestFSReplaced = 0;
+  window.__d3NoCubeFSReplaced = 0;
   const FALLOFF_RE = /texture2DProj\(\s*_gl4es_Sampler2D_2\s*,\s*_gl4es_TexCoord_2\s*\)/g;
   const SAMPLER_RE = /\b(uniform\s+)(sampler(?:2D|Cube|3D))\b/g;
   const wrap = (proto) => {
@@ -833,7 +839,7 @@ function injectLodArg(src, nameRe) {
             const header = s.substring(0, s.indexOf("void main"));
             s = header + "void main() { gl_FragColor = vec4(0.5, 0.5, 0.5, 1.0); }\n";
             window.__d3ConstFSReplaced += 1;
-          } else if (enableQuestFS && isInteractionFS) {
+          } else if ((enableQuestFS || enableNoCubeFS) && isInteractionFS) {
             // Body-only replacement. GL4ES emits many FS variants that all
             // contain "localNormal.x = localNormal.w" (any DXT5-NM unpack).
             // Only rewrite when the FS declares ALL of the varyings and
@@ -841,7 +847,8 @@ function injectLodArg(src, nameRe) {
             // FS untouched — it'll keep the upstream noise but won't fail to
             // compile.
             const mainStart = s.indexOf("void main");
-            // Full-spec interaction: bump + diffuse + specular + cubemap
+            // Full-spec interaction: bump + diffuse + specular + (cubemap or
+            // not — for ?nocubefs we don't require the cubemap sampler).
             const isFullSpec =
               s.includes("_gl4es_TexCoord_0") && s.includes("_gl4es_TexCoord_1") &&
               s.includes("_gl4es_TexCoord_2") && s.includes("_gl4es_TexCoord_3") &&
@@ -849,12 +856,23 @@ function injectLodArg(src, nameRe) {
               s.includes("_gl4es_TexCoord_6") && s.includes("_gl4es_Sampler2D_1") &&
               s.includes("_gl4es_Sampler2D_2") && s.includes("_gl4es_Sampler2D_3") &&
               s.includes("_gl4es_Sampler2D_4") && s.includes("_gl4es_Sampler2D_5") &&
-              s.includes("_gl4es_Sampler2D_6") && s.includes("_gl4es_SamplerCube_0");
+              s.includes("_gl4es_Sampler2D_6") &&
+              (enableNoCubeFS || s.includes("_gl4es_SamplerCube_0"));
             const hasFrontColor = s.includes("_gl4es_FrontColor");
             const frontColorMul = hasFrontColor ? " * _gl4es_FrontColor" : "";
+            // The L-vector path is the bug we're chasing: Apple Silicon GPUs
+            // ignore one of three partial derivatives in cubemap textureGrad
+            // (SPIRV-Cross commit 7ef52b0, MoltenVK #2068). textureCube uses
+            // implicit derivatives but the same bug class manifests as
+            // per-pixel intensity drift across frames. Quest-style direct
+            // normalize() of the unpacked light-direction varying avoids the
+            // entire cubemap codepath.
+            const Lexpr = enableNoCubeFS
+              ? "normalize(_gl4es_TexCoord_0.xyz * 2.0 - 1.0)"
+              : "normalize(textureCube(_gl4es_SamplerCube_0, _gl4es_TexCoord_0.xyz).xyz * 2.0 - 1.0)";
             if (mainStart !== -1 && isFullSpec) {
               const newMain = `void main(void) {
-\thighp vec3 L = normalize(textureCube(_gl4es_SamplerCube_0, _gl4es_TexCoord_0.xyz).xyz * 2.0 - 1.0);
+\thighp vec3 L = ${Lexpr};
 \thighp vec3 H = normalize(_gl4es_TexCoord_6.xyz);
 \thighp vec3 N = normalize(texture2D(_gl4es_Sampler2D_1, _gl4es_TexCoord_1.xy).agb * 2.0 - 1.0);
 \thighp float NdotL = clamp(dot(N, L), 0.0, 1.0);
@@ -869,7 +887,8 @@ function injectLodArg(src, nameRe) {
 }
 `;
               s = s.substring(0, mainStart) + newMain;
-              window.__d3QuestFSReplaced += 1;
+              if (enableNoCubeFS) window.__d3NoCubeFSReplaced += 1;
+              else                window.__d3QuestFSReplaced += 1;
             }
           } else if (enableRewrite && isInteractionFS) {
             s = REWRITTEN_INTERACTION_FS;
@@ -949,8 +968,17 @@ function injectLodArg(src, nameRe) {
 (function fixMinFilter() {
   const enableMin = /[?&]minfix\b/.test(location.search);
   const enableAllNearest = /[?&]allnearest\b/.test(location.search);
-  if (!enableMin && !enableAllNearest) return;
-  window.__d3MinFilterStats = { coerced: 0, total: 0 };
+  // Force min+mag filter to NEAREST on GL_TEXTURE_CUBE_MAP specifically.
+  // Targets the Apple-Silicon cubemap-gradient bug (SPIRV-Cross 7ef52b0):
+  // one of three partial derivatives is silently ignored. NEAREST sampling
+  // bypasses the LINEAR-weighted neighbor averaging that the bug corrupts,
+  // and removes the per-frame mip-selection noise on the cubemap. Visual
+  // cost: hard-edged cube-face transitions on the normalization cubemap
+  // (probably invisible since DOOM 3 reads it for a single texel per
+  // fragment). ?cubenearest to enable.
+  const enableCubeNearest = /[?&]cubenearest\b/.test(location.search);
+  if (!enableMin && !enableAllNearest && !enableCubeNearest) return;
+  window.__d3MinFilterStats = { coerced: 0, total: 0, cubeCoerced: 0, cubeSeen: 0 };
   const MIPMAP_FILTERS = new Set([
     0x2700, 0x2701, 0x2702, 0x2703
     // GL_NEAREST_MIPMAP_NEAREST, GL_LINEAR_MIPMAP_NEAREST,
@@ -962,9 +990,15 @@ function injectLodArg(src, nameRe) {
     const orig = proto.texParameteri;
     proto.texParameteri = function (target, pname, param) {
       window.__d3MinFilterStats.total += 1;
-      if (enableAllNearest && (pname === 0x2801 /*MIN*/ || pname === 0x2800 /*MAG*/) && LINEAR_FILTERS.has(param)) {
-        window.__d3MinFilterStats.coerced += 1;
+      const isCube = target === 0x8513 /*GL_TEXTURE_CUBE_MAP*/;
+      if (isCube) window.__d3MinFilterStats.cubeSeen += 1;
+      if (enableCubeNearest && isCube && (pname === 0x2801 /*MIN*/ || pname === 0x2800 /*MAG*/)) {
+        window.__d3MinFilterStats.cubeCoerced += 1;
         return orig.call(this, target, pname, 0x2600 /*NEAREST*/);
+      }
+      if (enableAllNearest && (pname === 0x2801 || pname === 0x2800) && LINEAR_FILTERS.has(param)) {
+        window.__d3MinFilterStats.coerced += 1;
+        return orig.call(this, target, pname, 0x2600);
       }
       if (enableMin && pname === 0x2801 && MIPMAP_FILTERS.has(param)) {
         const coerced = (param === 0x2701 || param === 0x2703) ? 0x2601 /*LINEAR*/ : 0x2600 /*NEAREST*/;

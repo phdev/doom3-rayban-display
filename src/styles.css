@@ -56,12 +56,20 @@ body {
   --d3-display-brightness: 1;
   --d3-display-contrast: 1;
   --d3-display-saturate: 1;
+  /* Perceptual mask: slight CSS blur to average neighbor pixels at composite
+     time. Doesn't fix the source FP non-determinism but spreads it across
+     adjacent pixels so the per-frame strobing reads as a soft haze instead
+     of a tile-flicker. Default 0px (off); ?dblur=0.4 to enable, ?dblur=1
+     for heavier mask. Composes with the existing brightness/contrast/sat
+     CSS filter chain. */
+  --d3-display-blur: 0px;
   /* The iPhone's in-shader gamma is dead, so the lit world renders near-black.
      brightness() is a multiply (can't lift near-black); contrast() BELOW 1 raises
      the black floor (adds a pedestal), which actually reveals the dim walls. Both
      are native CSS filter functions, reliable on iOS Safari (an SVG url() gamma
      filter barely applied there). brightness first, then contrast, minimizes wash. */
   filter:
+    blur(var(--d3-display-blur))
     brightness(var(--d3-display-brightness))
     contrast(var(--d3-display-contrast))
     saturate(var(--d3-display-saturate));

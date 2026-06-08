@@ -53,7 +53,17 @@ export function createRuntimeConfig() {
     /Android.*wv/.test(navigator.userAgent)
     || screen.width <= 640;
 
-  return glassesDetected
+  // Render-at-Nx perceptual mask (didn't actually take effect — engine resets
+  // canvas backing on SDL3 init regardless of our pre-boot setting). Kept as
+  // an opt-in to revisit later.
+  let renderScale = 1;
+  try {
+    const qs = window.location.search;
+    if (/[?&]render4x\b/.test(qs)) renderScale = 4;
+    else if (/[?&]render2x\b/.test(qs)) renderScale = 2;
+  } catch {}
+
+  const config = glassesDetected
     ? {
         // Low-memory profile (wearable / phone): smaller framebuffer and, more
         // importantly, a smaller engine texture cap — mobile Safari/WebGL runs
@@ -109,6 +119,14 @@ export function createRuntimeConfig() {
         turnBurstDegrees: 36,
         headTickMs: 50
       };
+
+  if (renderScale > 1) {
+    config.width = Math.round(config.width * renderScale);
+    config.height = Math.round(config.height * renderScale);
+    config.renderScale = renderScale;
+  }
+  try { window.__d3RuntimeConfig = config; } catch {}
+  return config;
 }
 
 function applyDisplayTuning(canvas, config) {
@@ -132,6 +150,12 @@ function applyDisplayTuning(canvas, config) {
   canvas.style.setProperty("--d3-display-brightness", String(tuned("dbright", "displayBrightness", 1)));
   canvas.style.setProperty("--d3-display-contrast", String(tuned("dcontrast", "displayContrast", 1)));
   canvas.style.setProperty("--d3-display-saturate", String(tuned("dsat", "displaySaturate", 1)));
+  // Perceptual mask: CSS blur to smooth per-frame FP non-determinism (the iPhone
+  // tile flicker in the additive lit pass). Live-tune via ?dblur= (px).
+  const blur = params && params.get("dblur");
+  if (blur !== null && blur !== undefined && Number.isFinite(Number(blur))) {
+    canvas.style.setProperty("--d3-display-blur", `${Number(blur)}px`);
+  }
 }
 
 function getNumericConfig(value, fallback) {
