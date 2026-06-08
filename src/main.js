@@ -759,11 +759,9 @@ function injectLodArg(src, nameRe) {
   // renderer/glsl/interactionShaderFP.cpp). Replaces ONLY the body of
   // main() in full-spec interaction shaders that declare all required
   // varyings/samplers; leaves diffuse-only and partial variants untouched
-  // so we don't break their link. Drops the per-frame noisy ops (pow gamma,
-  // _gl4es_Fragment_ProgramEnv_21.xyz multiply, vec4(scalar) broadcasts);
-  // uses direct normalize() like Doom3Quest does. Default ON; ?noquestfs
-  // disables for A/B.
-  const enableQuestFS   = !/[?&]noquestfs\b/.test(location.search);
+  // so we don't break their link. Reverted to opt-in: didn't reduce
+  // perceived iPhone flicker per user test. ?questfs to enable.
+  const enableQuestFS   = /[?&]questfs\b/.test(location.search);
   // Quantize the interaction FS output to 8-bit before additive blending.
   // Theory: iPhone tile flicker is FP non-determinism in lit-pass accumulation
   // across many additive draws (bisect confirmed: r_skipInteractions cuts the
