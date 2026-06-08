@@ -117,50 +117,29 @@ Safari Web Inspector console** with no rebuild — e.g. `d3cmd("r_lightScale 20"
 actually brightens the lit pass on the A-series GPU, then bake the winners into the
 profile / autoexec.
 
-### iPhone tile-flicker — partial mitigation via GL4ES immutable textures (2026-06)
+### iPhone tile-flicker — attempted immutable-texture fix REVERTED (2026-06)
 
-A persistent class of per-frame "tile flicker" on iPhone Safari (and to a lesser
-degree on Mac WebKit) survived ~50 attempted fixes (CSS `image-rendering`, GL
-context attrs, precision qualifiers, shader rewrites, dozens of cvars). Deep
-research surfaced [bgfx#3352](https://github.com/bkaradzic/bgfx/issues/3352) and
-matching threads: **iOS 18 regressed the offscreen-rendering path for textures
-allocated via mutable `glTexImage2D`** — Apple's Metal-backed WebKit can produce
-undefined contents in mutable render-target storage. The fix is to allocate
-storage immutably (`glTexStorage2D`) and upload pixels via `glTexSubImage2D`.
+Tried `patches/gl4es-immutable-textures.patch` (a GL4ES fast path routing
+`glTexImage2D` through `glTexStorage2D` + `glTexSubImage2D`, per the
+[bgfx#3352](https://github.com/bkaradzic/bgfx/issues/3352) iOS 18 workaround).
+On Mac WebKit (Playwright) the A/B looked positive — stationary variance
+26.6% → 21.6%, no visible regressions. iOS Simulator rendered cleanly.
 
-**Patch.** `patches/gl4es-immutable-textures.patch` adds an Emscripten-only
-fast-path to `gl_texture.c` in GL4ES:
-- New `immutable` flag on `gltexture_t` (in `texture.h`).
-- In `gl4es_glTexImage2D`: when the call is for `GL_TEXTURE_2D` level 0 with a
-  known sized-internalformat mapping and the texture hasn't been allocated yet,
-  call `glTexStorage2D` (ES 3.0 entry, forward-declared as extern) once for
-  ceil(log2(max(w,h))) mip levels, then `glTexSubImage2D` for level-0 pixels.
-- For subsequent `glTexImage2D` on an immutable texture with the same dims,
-  redirect to `glTexSubImage2D` (else "INVALID_OPERATION: Texture is immutable").
-- For a re-allocation with different dims, silent no-op (avoids crashes).
+**But on real iPhone Safari it caused large rectangular black artifacts during
+motion** (mid-scene tile-sized blocks of stale/missing content). Root cause:
+DOOM 3 makes render-target textures via `glCopyTexImage2D` from the framebuffer
+(mirror/portal/post buffers). When my patch had previously frozen a texture
+into immutable `GL_RGBA8` storage, a later `glCopyTexImage2D` from a
+differently-formatted source FBO failed with `INVALID_OPERATION: Invalid copy
+texture format combination` — which Mac WebKit silently absorbed (showing
+acceptable stale contents) but mobile Metal manifested as the black-block
+artifacts visible in IMG_2467. Patch deleted; engine rebuilt to original
+behaviour. Residual iPhone flicker is back to its prior baseline (per-frame
+intensity oscillation, deep-research file points at FP non-determinism in the
+lit-pass accumulation — not the iOS 18 mutable-storage class).
 
-Format mapping is conservative (only WebGL2-guaranteed sized formats —
-`GL_RGBA8`, `GL_RGB8`, `GL_R8`, `GL_DEPTH_COMPONENT24`, `GL_DEPTH24_STENCIL8`,
-and pass-through for already-sized formats). Unknown formats fall through to
-the original mutable path.
-
-**Result (Mac WebKit Playwright A/B against deployed pre-patch build).**
-- Stationary frame-to-frame variance: 26.6% → 21.6% differing pixels (~19% drop)
-- Average per-pixel delta: 6.27 → 4.13 (~34% drop)
-- Maximum per-pixel delta: 255 → 192 (~25% drop)
-- iOS Simulator: scene renders correctly; stationary diff shows only the
-  emissive surfaces changing (sparks, ceiling lights), not the whole scene
-- No new WebGL errors (pre-existing `glCopyTexImage2D` warnings unchanged)
-
-Net positive but doesn't fully eliminate the residual whole-scene per-pixel
-intensity oscillation. Remaining variance is consistent with floating-point
-non-determinism in the lit-pass accumulation across many small additive draws
-(documented elsewhere as a TBDR-driver characteristic) — not the iOS 18
-mutable-storage regression specifically.
-
-A companion JS-side wrap lives in `src/main.js` (`fixIOS18TextureStorage`) and
-is opt-in via `?immutable` URL flag. It's the original prototype — kept as an
-A/B harness, but the GL4ES patch is the canonical fix.
+A companion JS-side wrap lives in `src/main.js` (`fixIOS18TextureStorage`),
+opt-in via `?immutable` URL flag. Kept as an A/B harness; same risks apply.
 
 ### WebKit-wide dark lit world — root cause + fix (2026-06)
 
