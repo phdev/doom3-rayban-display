@@ -438,10 +438,63 @@ diag(`brightness: lightScale=${runtimeConfig.rLightScale} gamma=${runtimeConfig.
 //      research finding #5; confirmed by inspection of the captured GLSL).
 //      Inject `highp ` before every sampler{2D,Cube,3D} declaration to force
 //      full precision. ?noprecisionfix disables it for A/B.
+// d3wasm-inspired clean interaction FS body (replaces the GL4ES-translated one).
+// The GL4ES-emitted shader has been a moving target for per-frame oscillation —
+// many intermediate `vec4(scalar)` broadcasts and a pow() gamma block at the end
+// are precision-sensitive on Apple GPUs. This rewrite keeps the GL4ES uniform/
+// varying interface unchanged (so the existing binding code Just Works) but
+// streamlines the math into a single expression with d3wasm's clamp + pow(NdotH)
+// + no in-shader gamma. Same texture-unit bindings GL4ES already does.
+//
+// Identified by the unique signature of the GL4ES interaction shader (the DXT5-NM
+// alpha-to-X swizzle line). ?norewrite disables it for A/B.
+const REWRITTEN_INTERACTION_FS = `#version 100
+#extension GL_EXT_shader_non_constant_global_initializers : enable
+precision highp float;
+#define GL4ES
+varying lowp  vec4 _gl4es_FrontColor;
+varying highp vec4 _gl4es_TexCoord_0;
+varying highp vec4 _gl4es_TexCoord_1;
+varying highp vec4 _gl4es_TexCoord_2;
+varying highp vec4 _gl4es_TexCoord_3;
+varying highp vec4 _gl4es_TexCoord_4;
+varying highp vec4 _gl4es_TexCoord_5;
+varying highp vec4 _gl4es_TexCoord_6;
+uniform lowp vec4 _gl4es_Fragment_ProgramEnv_0;
+uniform lowp vec4 _gl4es_Fragment_ProgramEnv_1;
+uniform vec4 _gl4es_Fragment_ProgramEnv_21;
+uniform highp sampler2D   _gl4es_Sampler2D_1;
+uniform highp sampler2D   _gl4es_Sampler2D_2;
+uniform highp sampler2D   _gl4es_Sampler2D_3;
+uniform highp sampler2D   _gl4es_Sampler2D_4;
+uniform highp sampler2D   _gl4es_Sampler2D_5;
+uniform highp sampler2D   _gl4es_Sampler2D_6;
+uniform highp samplerCube _gl4es_SamplerCube_0;
+void main(void) {
+\t// Light direction (tangent space) from normalization cubemap. We keep the
+\t// existing cubemap binding so we don't need a new vertex pipeline.
+\thighp vec3 L = normalize(textureCube(_gl4es_SamplerCube_0, _gl4es_TexCoord_0.xyz).xyz * 2.0 - 1.0);
+\t// Half-vector (tangent space) — VS produces it un-normalized via TexCoord_6.
+\thighp vec3 H = normalize(_gl4es_TexCoord_6.xyz);
+\t// Normal: bump map, DXT5-NM swizzle (X in alpha).
+\thighp vec3 N = texture2D(_gl4es_Sampler2D_1, _gl4es_TexCoord_1.xy).agb * 2.0 - 1.0;
+\thighp float NdotL = clamp(dot(N, L), 0.0, 1.0);
+\thighp float NdotH = clamp(dot(N, H), 0.0, 1.0);
+\thighp vec3 lightProjection = texture2DProj(_gl4es_Sampler2D_3, _gl4es_TexCoord_3).rgb;
+\thighp float lightFalloff = texture2DProj(_gl4es_Sampler2D_2, _gl4es_TexCoord_2).a;
+\tlowp vec3 diffuse  = texture2D(_gl4es_Sampler2D_4, _gl4es_TexCoord_4.xy).rgb * _gl4es_Fragment_ProgramEnv_0.rgb;
+\tlowp vec3 specular = 2.0 * texture2D(_gl4es_Sampler2D_5, _gl4es_TexCoord_5.xy).rgb * _gl4es_Fragment_ProgramEnv_1.rgb;
+\thighp float specFalloff = pow(NdotH, 12.0);
+\thighp vec3 color = (diffuse + specFalloff * specular) * NdotL * lightProjection * lightFalloff;
+\tgl_FragColor = vec4(color, 1.0) * _gl4es_FrontColor;
+}
+`;
+
 (function fixShaderSources() {
   const enableFalloff   = !/[?&]nofalloffix\b/.test(location.search);
   const enablePrecision = !/[?&]noprecisionfix\b/.test(location.search);
-  if (!enableFalloff && !enablePrecision) return;
+  const enableRewrite   = !/[?&]norewrite\b/.test(location.search);
+  if (!enableFalloff && !enablePrecision && !enableRewrite) return;
   const FALLOFF_RE = /texture2DProj\(\s*_gl4es_Sampler2D_2\s*,\s*_gl4es_TexCoord_2\s*\)/g;
   const SAMPLER_RE = /\b(uniform\s+)(sampler(?:2D|Cube|3D))\b/g;
   const wrap = (proto) => {
@@ -452,12 +505,22 @@ diag(`brightness: lightScale=${runtimeConfig.rLightScale} gamma=${runtimeConfig.
       let s = source == null ? source : String(source);
       try {
         if (typeof s === "string") {
-          if (enablePrecision && /\buniform\s+sampler/.test(s) && !/\buniform\s+(?:highp|mediump|lowp)\s+sampler/.test(s)) {
-            s = s.replace(SAMPLER_RE, "$1highp $2");
-          }
-          if (enableFalloff && s.includes("localNormal.x = localNormal.w") && FALLOFF_RE.test(s)) {
-            FALLOFF_RE.lastIndex = 0;
-            s = s.replace(FALLOFF_RE, "vec4(texture2DProj(_gl4es_Sampler2D_2, _gl4es_TexCoord_2).w)");
+          const isInteractionFS = s.includes("localNormal.x = localNormal.w");
+          // (1) Full rewrite of the interaction fragment shader body. Same
+          // uniform/varying interface so GL4ES binding still works; cleaner math
+          // (d3wasm-style clamp + pow specular + no in-shader gamma) eliminates
+          // many precision-sensitive intermediate steps. Takes precedence over
+          // the per-line patches below for this specific shader.
+          if (enableRewrite && isInteractionFS) {
+            s = REWRITTEN_INTERACTION_FS;
+          } else {
+            if (enablePrecision && /\buniform\s+sampler/.test(s) && !/\buniform\s+(?:highp|mediump|lowp)\s+sampler/.test(s)) {
+              s = s.replace(SAMPLER_RE, "$1highp $2");
+            }
+            if (enableFalloff && isInteractionFS && FALLOFF_RE.test(s)) {
+              FALLOFF_RE.lastIndex = 0;
+              s = s.replace(FALLOFF_RE, "vec4(texture2DProj(_gl4es_Sampler2D_2, _gl4es_TexCoord_2).w)");
+            }
           }
         }
       } catch (_) { /* never break the engine */ }
