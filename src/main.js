@@ -1,4 +1,6 @@
 import "./styles.css";
+import "./webgl-record.js";
+import { installTAA } from "./taa.js";
 import { createHeadTracking } from "./headTracking.js";
 import { createRuntimeConfig, bootDoom3 } from "./d3Runtime.js";
 import { createWearableInput } from "./wearableInput.js";
@@ -147,6 +149,11 @@ refs.canvas.width = runtimeConfig.width;
 refs.canvas.height = runtimeConfig.height;
 refs.canvas.style.aspectRatio = `${runtimeConfig.width} / ${runtimeConfig.height}`;
 refs.canvas.focus({ preventScroll: true });
+
+// Per-pixel temporal accumulation (opt-in via ?taa[=α]). Masks Apple Metal's
+// per-frame FP non-determinism by blending consecutive frames at the
+// composite layer. See src/taa.js for the math.
+installTAA(refs.canvas);
 
 // On-device diagnostics (the loading panel hides the canvas; this overlay stays
 // on top so a black-screened phone still shows WHY). Reports the WebGL renderer
