@@ -296,12 +296,14 @@ export async function bootDoom3({
     // architecture changes inside the engine. Failures are silent — engine
     // still boots, just falls back to GL backend if r_backend "webgpu" was
     // requested.
+    let webgpuAcquired = false;
     if (navigator.gpu) {
       try {
         const adapter = await navigator.gpu.requestAdapter();
         if (adapter) {
           const device = await adapter.requestDevice();
           module.preinitializedWebGPUDevice = device;
+          webgpuAcquired = true;
           log(`WebGPU device pre-acquired (${(device.label || adapter.info?.vendor || "anon")})`);
         } else {
           log("WebGPU adapter request returned null; engine will use GL");
@@ -311,6 +313,21 @@ export async function bootDoom3({
       }
     } else {
       log("navigator.gpu unavailable; engine will use GL");
+    }
+    // If the URL asked for r_backend=webgpu but we couldn't acquire a device,
+    // demote r_backend to "gl" so the engine doesn't call
+    // emscripten_webgpu_get_device() and crash on a null device.queue access
+    // (emdawnwebgpu's importJsDevice trusts preinitializedWebGPUDevice exists).
+    if (!webgpuAcquired && Array.isArray(module.arguments)) {
+      for (let i = 0; i + 2 < module.arguments.length; ++i) {
+        if (module.arguments[i] === "+set" &&
+            module.arguments[i + 1] === "r_backend" &&
+            module.arguments[i + 2] === "webgpu") {
+          module.arguments[i + 2] = "gl";
+          log("Forced r_backend=gl (no WebGPU device available)");
+          break;
+        }
+      }
     }
     window.Module = module;
 
