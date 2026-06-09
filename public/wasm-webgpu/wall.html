@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no" />
+  <title>WebGPU Wall — D3 Phase 3 validation</title>
+  <style>
+    html, body { margin: 0; padding: 0; background: #000; color: #cfc; height: 100%; font: 11px ui-monospace, Menlo, monospace; }
+    .shell { display: grid; place-items: center; width: 100vw; height: 100vh; gap: 8px; }
+    #gameCanvas { width: 600px; height: 600px; background: #111; border: 1px solid #2a2a2a; max-width: 90vw; max-height: 90vh; }
+    #status { white-space: pre-wrap; max-width: 90vw; color: #7fff7f; background: rgba(0,0,0,.6); padding: 6px 10px; border-radius: 4px; max-height: 25vh; overflow: auto; }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <canvas id="gameCanvas" width="600" height="600"></canvas>
+    <pre id="status">WebGPU wall — Phase 3 validation. Booting…</pre>
+  </div>
+  <script type="module">
+    const s = document.querySelector('#status');
+    const append = (line) => { s.textContent += '\n' + line; s.scrollTop = s.scrollHeight; };
+    if (!('gpu' in navigator)) {
+      s.textContent = 'navigator.gpu unavailable. Need iOS Safari 26+ or Mac Safari 18+ on a secure (HTTPS) context.';
+    } else {
+      append('navigator.gpu present. Loading wall WASM…');
+      try {
+        const mod = await import('./wall.js');
+        await mod.default({
+          canvas: document.querySelector('#gameCanvas'),
+          print: append,
+          printErr: append
+        });
+        append('WASM loaded.');
+      } catch (e) {
+        append('Boot failed: ' + (e?.message ?? e));
+      }
+    }
+  </script>
+</body>
+</html>
