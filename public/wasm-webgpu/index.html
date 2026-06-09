@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no" />
+  <title>WebGPU Triangle — D3 foundation</title>
+  <style>
+    html, body { margin: 0; padding: 0; background: #000; color: #cfc; height: 100%; font: 11px ui-monospace, Menlo, monospace; }
+    .shell { display: grid; place-items: center; width: 100vw; height: 100vh; gap: 8px; }
+    #gameCanvas { width: 600px; height: 600px; background: #111; border: 1px solid #2a2a2a; max-width: 90vw; max-height: 90vh; }
+    #status { white-space: pre-wrap; max-width: 90vw; color: #7fff7f; background: rgba(0,0,0,.6); padding: 6px 10px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <canvas id="gameCanvas" width="600" height="600"></canvas>
+    <pre id="status">WebGPU Triangle — booting…</pre>
+  </div>
+  <script type="module">
+    const s = document.querySelector('#status');
+    const append = (line) => { s.textContent += '\n' + line; };
+    if (!('gpu' in navigator)) {
+      s.textContent = 'navigator.gpu not available — WebGPU disabled in this browser. Try Mac Safari 18+, iOS Safari 18+, Chrome 121+, Firefox 141+.';
+    } else {
+      append('navigator.gpu present. Loading WASM…');
+      try {
+        const mod = await import('./triangle.js');
+        const log = (line) => append(line);
+        await mod.default({
+          canvas: document.querySelector('#gameCanvas'),
+          print: log,
+          printErr: log
+        });
+        append('WASM loaded.');
+      } catch (e) {
+        append('Boot failed: ' + (e?.message ?? e));
+      }
+    }
+  </script>
+</body>
+</html>
