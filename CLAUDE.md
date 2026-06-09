@@ -287,6 +287,20 @@ engine args before WASM runs — otherwise emdawnwebgpu's
 takes over and the engine boots to GL. Mac Safari 26+ has working
 WebGPU. Real iPhone Safari has working WebGPU (verified iter 1).
 
+**Chunky-tile bug: VISUALLY CONFIRMED FIXED via WebGPU (2026-06-09).**
+With the iter 6 echo canvas running on real iPhone Safari, the
+`#webgpuCanvas` (small green-bordered box top-right showing 64 lit
+surfaces through `interaction.wgsl`) renders rock-solid frame-to-frame,
+while the main `#gameCanvas` (GL → GL4ES → WebGL) flickers with the
+familiar chunky-tile signature, on the same iPhone, same scene, same
+frame. Conclusion: the bug is fundamentally a GL/WebKit interaction.
+The whole rest of the WebGPU port (iter 7b: real engine textures,
+plus depth pre-pass, multiple lights, shadow stencils, 2D HUD) is the
+production fix. `fullDetTest` numerical test on iPhone was
+inconclusive — iOS Safari throttles the canvas when the engine is
+paused so drawImage captured the same frame 5 times → both canvases
+0%; eyeballing is the load-bearing proof.
+
 ### Mobile / iOS (hard-won)
 
 - **Stale-404 cache** — `fetchBytes` defaulted to `cache:"force-cache"`; after a
