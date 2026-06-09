@@ -1788,10 +1788,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..5625bae
+index 0000000..026469b
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,1378 @@
+@@ -0,0 +1,1362 @@
 +/*
 +================================================================================
 +
@@ -2113,35 +2113,19 @@ index 0000000..5625bae
 +                rpd.colorAttachmentCount = 1;
 +                rpd.colorAttachments = &ca;
 +                rpd.depthStencilAttachment = depthView ? &da : nullptr;
-+                // Iter 6: try multi-surface first; on no records this frame,
-+                // fall back to iter 4 single-surface, then iter 1 demo quad.
-+                uint32_t multiCount = 0;
-+                bool multiOk = recordSlotsReady && interactionPipeline &&
-+                               uploadCapturedRecords(multiCount) && multiCount > 0;
-+
++                // DIAGNOSTIC (iter 6.5): force iter 1 demo quad path so we
++                // can isolate which layer broke. Reading order:
++                //   - sees green checker quad → basic pipeline works,
++                //     iter 4/6 captured-geometry path is the bug
++                //   - still pure teal → basic pipeline broken on iPhone
++                //     (surface format / depth attach / quad geometry itself)
++                // Once isolated, restore the cascade below.
++                (void)recordSlotsReady; (void)capturedReady; (void)interactionPipeline;
 +                WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
-+                if (multiOk) {
-+                    extern Rec g_capRecords[];
-+                    wgpuRenderPassEncoderSetPipeline(rp, interactionPipeline);
-+                    for (uint32_t i = 0; i < multiCount; ++i) {
-+                        const Rec& r = g_capRecords[i];
-+                        wgpuRenderPassEncoderSetBindGroup(rp, 0, recordBindGroups[i], 0, nullptr);
-+                        wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
-+                        wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
-+                        wgpuRenderPassEncoderDrawIndexed(rp, r.indexCount, 1, 0, 0, 0);
-+                    }
-+                } else if (capturedReady && interactionPipeline) {
-+                    wgpuRenderPassEncoderSetPipeline(rp, interactionPipeline);
-+                    wgpuRenderPassEncoderSetBindGroup(rp, 0, interactionBindGroup, 0, nullptr);
-+                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, capturedVertexBuf, 0, WGPU_WHOLE_SIZE);
-+                    wgpuRenderPassEncoderSetIndexBuffer(rp, capturedIndexBuf, WGPUIndexFormat_Uint16, 0, WGPU_WHOLE_SIZE);
-+                    wgpuRenderPassEncoderDrawIndexed(rp, capturedIndexCount, 1, 0, 0, 0);
-+                } else {
-+                    wgpuRenderPassEncoderSetPipeline(rp, demoPipeline);
-+                    wgpuRenderPassEncoderSetBindGroup(rp, 0, demoBindGroup, 0, nullptr);
-+                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, demoVertexBuf, 0, WGPU_WHOLE_SIZE);
-+                    wgpuRenderPassEncoderDraw(rp, 6, 1, 0, 0);
-+                }
++                wgpuRenderPassEncoderSetPipeline(rp, demoPipeline);
++                wgpuRenderPassEncoderSetBindGroup(rp, 0, demoBindGroup, 0, nullptr);
++                wgpuRenderPassEncoderSetVertexBuffer(rp, 0, demoVertexBuf, 0, WGPU_WHOLE_SIZE);
++                wgpuRenderPassEncoderDraw(rp, 6, 1, 0, 0);
 +                wgpuRenderPassEncoderEnd(rp);
 +                wgpuRenderPassEncoderRelease(rp);
 +
