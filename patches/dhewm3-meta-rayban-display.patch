@@ -1468,10 +1468,10 @@ index 0000000..324decc
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..191dd16
+index 0000000..fa42732
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,430 @@
+@@ -0,0 +1,632 @@
 +/*
 +================================================================================
 +
@@ -1701,14 +1701,197 @@ index 0000000..191dd16
 +#endif
 +    }
 +
-+    // ─── Pipeline / bind group — TODO Phase 5c ──────────────────────────────
++    // ─── Pipeline / bind group — IMPLEMENTED (Phase 5c) ─────────────────────
 +
-+    idGpuPipeline CreatePipeline(const idGpuPipelineDesc&) override { WGPU_NOT_YET("CreatePipeline"); return {}; }
-+    void          DestroyPipeline(idGpuPipeline) override           { WGPU_NOT_YET("DestroyPipeline"); }
-+    void          BindPipeline(idGpuPipeline) override              { WGPU_NOT_YET("BindPipeline"); }
-+    idGpuBindGroup CreateBindGroup(idGpuPipeline, const idGpuTexture*, int, const idGpuSampler*, int, const idGpuBuffer*, int) override { WGPU_NOT_YET("CreateBindGroup"); return {}; }
-+    void          DestroyBindGroup(idGpuBindGroup) override         { WGPU_NOT_YET("DestroyBindGroup"); }
-+    void          BindBindGroup(uint32_t, idGpuBindGroup) override  { WGPU_NOT_YET("BindBindGroup"); }
++    idGpuPipeline CreatePipeline(const idGpuPipelineDesc& desc) override {
++#if D3_WEBGPU_AVAILABLE
++        if (!device || !desc.wgsl) return {};
++
++        // Shader module
++        WGPUShaderSourceWGSL wgsl = {};
++        wgsl.chain.sType = WGPUSType_ShaderSourceWGSL;
++        wgsl.code = { desc.wgsl, WGPU_STRLEN };
++        WGPUShaderModuleDescriptor smd = {};
++        smd.nextInChain = &wgsl.chain;
++        if (desc.name) smd.label = { desc.name, WGPU_STRLEN };
++        WGPUShaderModule module = wgpuDeviceCreateShaderModule(device, &smd);
++        if (!module) return {};
++
++        // Vertex layout: assume idDrawVert (the engine's primary vertex
++        // struct: 60 bytes — xyz / st / normal / tangents[2] / color).
++        // Variants can come later by switching desc, but most of dhewm3 uses
++        // this single layout.
++        static const WGPUVertexAttribute kIdDrawVertAttrs[] = {
++            { nullptr, WGPUVertexFormat_Float32x3, 0,  0 },  // xyz       (loc 0)
++            { nullptr, WGPUVertexFormat_Float32x2, 12, 1 },  // st        (loc 1)
++            { nullptr, WGPUVertexFormat_Float32x3, 20, 2 },  // normal    (loc 2)
++            { nullptr, WGPUVertexFormat_Float32x3, 32, 3 },  // tangent   (loc 3)
++            { nullptr, WGPUVertexFormat_Float32x3, 44, 4 },  // bitangent (loc 4)
++            { nullptr, WGPUVertexFormat_Unorm8x4,  56, 5 },  // color     (loc 5)
++        };
++        WGPUVertexBufferLayout vbl = {};
++        vbl.stepMode = WGPUVertexStepMode_Vertex;
++        vbl.arrayStride = 60;
++        vbl.attributeCount = sizeof(kIdDrawVertAttrs) / sizeof(kIdDrawVertAttrs[0]);
++        vbl.attributes = kIdDrawVertAttrs;
++
++        // Color target + blend state
++        WGPUColorTargetState target = {};
++        WGPUBlendState blend = {};
++        if (desc.hasColorTarget) {
++            target.format = toWGPUFormat(desc.color.format);
++            target.writeMask = desc.color.writeMask;
++            if (desc.color.blendEnabled) {
++                blend.color.srcFactor = (WGPUBlendFactor)desc.color.srcColor;
++                blend.color.dstFactor = (WGPUBlendFactor)desc.color.dstColor;
++                blend.color.operation = (WGPUBlendOperation)desc.color.colorOp;
++                blend.alpha.srcFactor = (WGPUBlendFactor)desc.color.srcAlpha;
++                blend.alpha.dstFactor = (WGPUBlendFactor)desc.color.dstAlpha;
++                blend.alpha.operation = (WGPUBlendOperation)desc.color.alphaOp;
++                target.blend = &blend;
++            }
++        }
++
++        // Depth-stencil
++        WGPUDepthStencilState ds = {};
++        if (desc.hasDepthStencil) {
++            ds.format = toWGPUFormat(desc.depthStencil.format);
++            ds.depthWriteEnabled = desc.depthStencil.depthWriteEnabled ? WGPUOptionalBool_True : WGPUOptionalBool_False;
++            ds.depthCompare = (WGPUCompareFunction)desc.depthStencil.depthCompare;
++            ds.stencilFront.compare = (WGPUCompareFunction)desc.depthStencil.stencilFrontCompare;
++            ds.stencilFront.failOp = (WGPUStencilOperation)desc.depthStencil.stencilFrontFail;
++            ds.stencilFront.depthFailOp = (WGPUStencilOperation)desc.depthStencil.stencilFrontDepthFail;
++            ds.stencilFront.passOp = (WGPUStencilOperation)desc.depthStencil.stencilFrontPass;
++            ds.stencilBack.compare = (WGPUCompareFunction)desc.depthStencil.stencilBackCompare;
++            ds.stencilBack.failOp = (WGPUStencilOperation)desc.depthStencil.stencilBackFail;
++            ds.stencilBack.depthFailOp = (WGPUStencilOperation)desc.depthStencil.stencilBackDepthFail;
++            ds.stencilBack.passOp = (WGPUStencilOperation)desc.depthStencil.stencilBackPass;
++            ds.stencilReadMask = desc.depthStencil.stencilReadMask;
++            ds.stencilWriteMask = desc.depthStencil.stencilWriteMask;
++        }
++
++        // Fragment state
++        WGPUFragmentState frag = {};
++        frag.module = module;
++        frag.entryPoint = { desc.fsEntryPoint ? desc.fsEntryPoint : "fs_main", WGPU_STRLEN };
++        frag.targetCount = desc.hasColorTarget ? 1 : 0;
++        frag.targets = desc.hasColorTarget ? &target : nullptr;
++
++        WGPURenderPipelineDescriptor pd = {};
++        if (desc.name) pd.label = { desc.name, WGPU_STRLEN };
++        pd.layout = nullptr;  // auto layout — bind group layouts derived from WGSL
++        pd.vertex.module = module;
++        pd.vertex.entryPoint = { desc.vsEntryPoint ? desc.vsEntryPoint : "vs_main", WGPU_STRLEN };
++        pd.vertex.bufferCount = 1;
++        pd.vertex.buffers = &vbl;
++        pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
++        pd.primitive.cullMode = (WGPUCullMode)desc.cull;
++        pd.primitive.frontFace = (desc.frontFace == idGpuFrontFace::CCW)
++                                   ? WGPUFrontFace_CCW : WGPUFrontFace_CW;
++        pd.depthStencil = desc.hasDepthStencil ? &ds : nullptr;
++        pd.multisample.count = 1;
++        pd.multisample.mask = 0xFFFFFFFF;
++        pd.fragment = &frag;
++
++        WGPURenderPipeline pipeline = wgpuDeviceCreateRenderPipeline(device, &pd);
++        wgpuShaderModuleRelease(module);
++        return { (uint64_t)pipeline };
++#else
++        (void)desc;
++        return {};
++#endif
++    }
++
++    void DestroyPipeline(idGpuPipeline p) override {
++#if D3_WEBGPU_AVAILABLE
++        if (p.id) wgpuRenderPipelineRelease((WGPURenderPipeline)p.id);
++#else
++        (void)p;
++#endif
++    }
++
++    void BindPipeline(idGpuPipeline p) override {
++#if D3_WEBGPU_AVAILABLE
++        if (!renderPass || !p.id) return;
++        currentPipeline = (WGPURenderPipeline)p.id;
++        wgpuRenderPassEncoderSetPipeline(renderPass, currentPipeline);
++#else
++        (void)p;
++#endif
++    }
++
++    idGpuBindGroup CreateBindGroup(idGpuPipeline pipeline,
++                                     const idGpuTexture* textures, int textureCount,
++                                     const idGpuSampler* samplers, int samplerCount,
++                                     const idGpuBuffer* uniforms, int uniformCount) override {
++#if D3_WEBGPU_AVAILABLE
++        if (!device || !pipeline.id) return {};
++        // Auto-derived bind group layout (slot 0)
++        WGPUBindGroupLayout bgl = wgpuRenderPipelineGetBindGroupLayout(
++            (WGPURenderPipeline)pipeline.id, 0);
++
++        // Entries: uniforms first (binding 0..), then samplers, then textures.
++        // This is a convention; can be parameterized per-pipeline later.
++        int total = uniformCount + samplerCount + textureCount;
++        WGPUBindGroupEntry entries[16] = {};   // 16 is generous; idTech 4 uses ≤9
++        int idx = 0;
++        uint32_t binding = 0;
++        for (int i = 0; i < uniformCount; ++i) {
++            entries[idx].binding = binding++;
++            entries[idx].buffer = (WGPUBuffer)uniforms[i].id;
++            entries[idx].offset = 0;
++            entries[idx].size = WGPU_WHOLE_SIZE;
++            idx++;
++        }
++        for (int i = 0; i < samplerCount; ++i) {
++            entries[idx].binding = binding++;
++            entries[idx].sampler = (WGPUSampler)samplers[i].id;
++            idx++;
++        }
++        // Texture views — create them inline; the bind group holds a ref.
++        WGPUTextureView views[16] = {};
++        for (int i = 0; i < textureCount; ++i) {
++            views[i] = wgpuTextureCreateView((WGPUTexture)textures[i].id, nullptr);
++            entries[idx].binding = binding++;
++            entries[idx].textureView = views[i];
++            idx++;
++        }
++
++        WGPUBindGroupDescriptor bgd = {};
++        bgd.layout = bgl;
++        bgd.entryCount = (uint32_t)total;
++        bgd.entries = entries;
++        WGPUBindGroup bg = wgpuDeviceCreateBindGroup(device, &bgd);
++
++        // Bind group keeps refs to views; we release our local handles.
++        for (int i = 0; i < textureCount; ++i) {
++            if (views[i]) wgpuTextureViewRelease(views[i]);
++        }
++        wgpuBindGroupLayoutRelease(bgl);
++        return { (uint64_t)bg };
++#else
++        (void)pipeline; (void)textures; (void)textureCount;
++        (void)samplers; (void)samplerCount; (void)uniforms; (void)uniformCount;
++        return {};
++#endif
++    }
++
++    void DestroyBindGroup(idGpuBindGroup bg) override {
++#if D3_WEBGPU_AVAILABLE
++        if (bg.id) wgpuBindGroupRelease((WGPUBindGroup)bg.id);
++#else
++        (void)bg;
++#endif
++    }
++
++    void BindBindGroup(uint32_t slot, idGpuBindGroup bg) override {
++#if D3_WEBGPU_AVAILABLE
++        if (!renderPass || !bg.id) return;
++        wgpuRenderPassEncoderSetBindGroup(renderPass, slot, (WGPUBindGroup)bg.id, 0, nullptr);
++#else
++        (void)slot; (void)bg;
++#endif
++    }
 +
 +    // ─── Buffer resources — IMPLEMENTED ─────────────────────────────────────
 +
@@ -1743,8 +1926,26 @@ index 0000000..191dd16
 +#endif
 +    }
 +
-+    void BindVertexBuffer(uint32_t, idGpuBuffer, size_t) override { WGPU_NOT_YET("BindVertexBuffer"); }
-+    void BindIndexBuffer(idGpuBuffer, size_t, bool) override      { WGPU_NOT_YET("BindIndexBuffer"); }
++    void BindVertexBuffer(uint32_t slot, idGpuBuffer buf, size_t offset) override {
++#if D3_WEBGPU_AVAILABLE
++        if (!renderPass || !buf.id) return;
++        wgpuRenderPassEncoderSetVertexBuffer(renderPass, slot, (WGPUBuffer)buf.id,
++                                              offset, WGPU_WHOLE_SIZE);
++#else
++        (void)slot; (void)buf; (void)offset;
++#endif
++    }
++
++    void BindIndexBuffer(idGpuBuffer buf, size_t offset, bool isUint32) override {
++#if D3_WEBGPU_AVAILABLE
++        if (!renderPass || !buf.id) return;
++        wgpuRenderPassEncoderSetIndexBuffer(renderPass, (WGPUBuffer)buf.id,
++                                             isUint32 ? WGPUIndexFormat_Uint32 : WGPUIndexFormat_Uint16,
++                                             offset, WGPU_WHOLE_SIZE);
++#else
++        (void)buf; (void)offset; (void)isUint32;
++#endif
++    }
 +
 +    // ─── Texture resources — IMPLEMENTED ────────────────────────────────────
 +
@@ -1892,10 +2093,11 @@ index 0000000..191dd16
 +
 +private:
 +#if D3_WEBGPU_AVAILABLE
-+    WGPUDevice              device     = nullptr;
-+    WGPUQueue               queue      = nullptr;
-+    WGPUCommandEncoder      cmdEncoder = nullptr;
-+    WGPURenderPassEncoder   renderPass = nullptr;
++    WGPUDevice              device           = nullptr;
++    WGPUQueue               queue            = nullptr;
++    WGPUCommandEncoder      cmdEncoder       = nullptr;
++    WGPURenderPassEncoder   renderPass       = nullptr;
++    WGPURenderPipeline      currentPipeline  = nullptr;
 +#endif
 +};
 +
