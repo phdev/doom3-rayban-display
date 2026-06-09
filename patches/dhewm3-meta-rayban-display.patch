@@ -1468,44 +1468,41 @@ index 0000000..324decc
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..ea4bcb2
+index 0000000..10453cc
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,296 @@
 +/*
 +================================================================================
 +
-+RenderBackend_WebGPU.cpp — Skeleton WebGPU backend (Phase 4 stub).
++RenderBackend_WebGPU.cpp — WebGPU backend (Phase 5 partial).
 +
 +STATUS
 +------
-+SKELETON ONLY. Every operation is stubbed to fail-loud (assert or print).
-+The structure is in place; the implementations get filled in across the
-+phases listed in WEBGPU_PORT_PLAN.md.
++Phase 5 partial: Init() picks up the JS-preinitialized device. Buffer /
++Texture / Sampler resource ops implemented against the real Dawn C API.
++Pipeline / BindGroup / RenderPass / Draw still stubbed (the remaining
++~70% of Phase 5).
 +
-+The stub deliberately fails (instead of silently no-op) so that any GL
-+call site that hasn't been migrated yet causes an immediate visible
-+failure during the cutover — rather than a hard-to-diagnose missing-
-+work bug downstream.
++Build: requires --use-port=emdawnwebgpu (set in scripts/build-dhewm3.sh)
++and -DD3_WEBGPU_BACKEND=1 (also set).
 +
-+DEPENDENCIES
-+------------
-+emdawnwebgpu (via Emscripten --use-port=emdawnwebgpu). Same Dawn snapshot
-+already used by webgpu-test/wall.cpp. The WGPUInstance / WGPUDevice
-+lifecycle is managed here (created during Init, destroyed on Shutdown).
++ID SCHEME
++---------
++Backend resource handles (idGpuBuffer etc.) store the raw WGPU object
++pointer cast to uint64_t. Avoids a separate handle table; works because
++emscripten's pointer width fits in 64 bits. Zero id == null/invalid.
 +
 +================================================================================
 +*/
 +
 +#include "RenderBackend.h"
 +
-+// Phase 4a: WebGPU port is OFF by default. The engine build doesn't yet
-+// pull in emdawnwebgpu — that integration is Phase 5. For now this file
-+// compiles as a pure stub on every target. Define D3_WEBGPU_BACKEND=1 in
-+// the CMake flags (and add --use-port=emdawnwebgpu to emcc link args) to
-+// enable the real backend.
 +#if defined(D3_WEBGPU_BACKEND) && defined(__EMSCRIPTEN__)
 +#include <emscripten.h>
++// emdawnwebgpu exposes emscripten_webgpu_get_device() directly from webgpu.h
++// (no separate html5_webgpu.h header any more — that was removed in the
++// transition away from -sUSE_WEBGPU=1).
 +#include <webgpu/webgpu.h>
 +#define D3_WEBGPU_AVAILABLE 1
 +#else
@@ -1519,91 +1516,255 @@ index 0000000..ea4bcb2
 +#define WGPU_NOT_YET(name) do { \
 +    static bool warned = false; \
 +    if (!warned) { fprintf(stderr, "[WebGPU stub] %s not implemented\n", name); warned = true; } \
-+    assert(!"WebGPU backend not implemented for " name); \
 +} while (0)
++
++#if D3_WEBGPU_AVAILABLE
++
++// ─── Format / usage mapping helpers ─────────────────────────────────────────
++
++static WGPUTextureFormat toWGPUFormat(idGpuTextureFormat f) {
++    switch (f) {
++        case idGpuTextureFormat::R8:               return WGPUTextureFormat_R8Unorm;
++        case idGpuTextureFormat::RG8:              return WGPUTextureFormat_RG8Unorm;
++        case idGpuTextureFormat::RGBA8:            return WGPUTextureFormat_RGBA8Unorm;
++        case idGpuTextureFormat::RGBA8Srgb:        return WGPUTextureFormat_RGBA8UnormSrgb;
++        case idGpuTextureFormat::RGB10A2:          return WGPUTextureFormat_RGB10A2Unorm;
++        case idGpuTextureFormat::R11G11B10F:       return WGPUTextureFormat_RG11B10Ufloat;
++        case idGpuTextureFormat::R16F:             return WGPUTextureFormat_R16Float;
++        case idGpuTextureFormat::RGBA16F:          return WGPUTextureFormat_RGBA16Float;
++        case idGpuTextureFormat::R32F:             return WGPUTextureFormat_R32Float;
++        case idGpuTextureFormat::Depth16:          return WGPUTextureFormat_Depth16Unorm;
++        case idGpuTextureFormat::Depth24:          return WGPUTextureFormat_Depth24Plus;
++        case idGpuTextureFormat::Depth24Stencil8:  return WGPUTextureFormat_Depth24PlusStencil8;
++        case idGpuTextureFormat::Depth32F:         return WGPUTextureFormat_Depth32Float;
++        case idGpuTextureFormat::BC1:              return WGPUTextureFormat_BC1RGBAUnorm;
++        case idGpuTextureFormat::BC3:              return WGPUTextureFormat_BC3RGBAUnorm;
++        case idGpuTextureFormat::BC7:              return WGPUTextureFormat_BC7RGBAUnorm;
++        case idGpuTextureFormat::ASTC4x4:          return WGPUTextureFormat_ASTC4x4Unorm;
++        default:                                   return WGPUTextureFormat_Undefined;
++    }
++}
++
++static WGPUBufferUsage toWGPUBufferUsage(uint32_t usage) {
++    uint32_t out = 0;
++    if (usage & (uint32_t)idGpuBufferUsage::Vertex)    out |= WGPUBufferUsage_Vertex;
++    if (usage & (uint32_t)idGpuBufferUsage::Index)     out |= WGPUBufferUsage_Index;
++    if (usage & (uint32_t)idGpuBufferUsage::Uniform)   out |= WGPUBufferUsage_Uniform;
++    if (usage & (uint32_t)idGpuBufferUsage::Storage)   out |= WGPUBufferUsage_Storage;
++    if (usage & (uint32_t)idGpuBufferUsage::CopySrc)   out |= WGPUBufferUsage_CopySrc;
++    if (usage & (uint32_t)idGpuBufferUsage::CopyDst)   out |= WGPUBufferUsage_CopyDst;
++    if (usage & (uint32_t)idGpuBufferUsage::MapWrite)  out |= WGPUBufferUsage_MapWrite;
++    if (usage & (uint32_t)idGpuBufferUsage::MapRead)   out |= WGPUBufferUsage_MapRead;
++    return (WGPUBufferUsage)out;
++}
++
++static WGPUTextureUsage toWGPUTextureUsage(uint32_t usage) {
++    uint32_t out = 0;
++    if (usage & (uint32_t)idGpuTextureUsage::Sampled)      out |= WGPUTextureUsage_TextureBinding;
++    if (usage & (uint32_t)idGpuTextureUsage::Storage)      out |= WGPUTextureUsage_StorageBinding;
++    if (usage & (uint32_t)idGpuTextureUsage::RenderTarget) out |= WGPUTextureUsage_RenderAttachment;
++    if (usage & (uint32_t)idGpuTextureUsage::CopySrc)      out |= WGPUTextureUsage_CopySrc;
++    if (usage & (uint32_t)idGpuTextureUsage::CopyDst)      out |= WGPUTextureUsage_CopyDst;
++    return (WGPUTextureUsage)out;
++}
++
++#endif // D3_WEBGPU_AVAILABLE
++
++// ─── Backend class ──────────────────────────────────────────────────────────
 +
 +class idRenderBackend_WebGPU : public idRenderBackend {
 +public:
-+    idRenderBackend_WebGPU() = default;
-+    ~idRenderBackend_WebGPU() override = default;
-+
 +    idGpuBackendKind GetKind() const override { return idGpuBackendKind::WebGPU; }
 +
 +    bool Init(void* /*nativeWindow*/, int /*w*/, int /*h*/) override {
 +#if D3_WEBGPU_AVAILABLE
-+        // Phase 5: create the WGPUInstance + WGPUAdapter + WGPUDevice
-+        // and stash them. Surface creation follows once we actually own
-+        // the canvas (currently still owned by SDL3 + GL4ES during cutover).
-+        WGPUInstanceDescriptor id = {};
-+        instance = wgpuCreateInstance(&id);
-+        if (!instance) { fprintf(stderr, "[WebGPU] no instance\n"); return false; }
-+        fprintf(stderr, "[WebGPU] Init: instance created (adapter/device async TBD)\n");
++        // The JS shell pre-acquires the WGPUDevice and stashes it in
++        // Module.preinitializedWebGPUDevice (see src/d3Runtime.js). The
++        // Emscripten WebGPU port exposes it synchronously here.
++        device = emscripten_webgpu_get_device();
++        if (!device) {
++            fprintf(stderr, "[WebGPU] emscripten_webgpu_get_device returned null. "
++                            "JS pre-acquire likely failed (no navigator.gpu or "
++                            "device request rejected).\n");
++            return false;
++        }
++        queue = wgpuDeviceGetQueue(device);
++        fprintf(stderr, "[WebGPU] device + queue acquired\n");
 +        return true;
 +#else
-+        fprintf(stderr, "[WebGPU] stub Init — backend not compiled in. "
-+                        "Define D3_WEBGPU_BACKEND in CMake to enable.\n");
++        fprintf(stderr, "[WebGPU] not compiled in (D3_WEBGPU_BACKEND not set)\n");
 +        return false;
 +#endif
 +    }
 +
 +    void Shutdown() override {
 +#if D3_WEBGPU_AVAILABLE
-+        if (device)   { wgpuDeviceRelease(device);   device = nullptr; }
-+        if (adapter)  { wgpuAdapterRelease(adapter); adapter = nullptr; }
-+        if (instance) { wgpuInstanceRelease(instance); instance = nullptr; }
++        if (queue)  { wgpuQueueRelease(queue);   queue = nullptr; }
++        if (device) { wgpuDeviceRelease(device); device = nullptr; }
 +#endif
 +    }
 +
-+    void Resize(int /*w*/, int /*h*/) override { WGPU_NOT_YET("Resize"); }
++    void Resize(int /*w*/, int /*h*/) override {
++        // Surface reconfiguration goes here in Phase 5b.
++    }
 +
-+    void BeginFrame() override                            { WGPU_NOT_YET("BeginFrame"); }
-+    void EndFrame() override                              { WGPU_NOT_YET("EndFrame"); }
++    // ─── Frame / render pass — TODO Phase 5b ────────────────────────────────
++
++    void BeginFrame() override                                { WGPU_NOT_YET("BeginFrame"); }
++    void EndFrame() override                                  { WGPU_NOT_YET("EndFrame"); }
 +    void BeginRenderPass(const idGpuRenderPassDesc&) override { WGPU_NOT_YET("BeginRenderPass"); }
-+    void EndRenderPass() override                         { WGPU_NOT_YET("EndRenderPass"); }
++    void EndRenderPass() override                             { WGPU_NOT_YET("EndRenderPass"); }
++
++    // ─── Pipeline / bind group — TODO Phase 5c ──────────────────────────────
 +
 +    idGpuPipeline CreatePipeline(const idGpuPipelineDesc&) override { WGPU_NOT_YET("CreatePipeline"); return {}; }
-+    void DestroyPipeline(idGpuPipeline) override          { WGPU_NOT_YET("DestroyPipeline"); }
-+    void BindPipeline(idGpuPipeline) override             { WGPU_NOT_YET("BindPipeline"); }
-+
-+    idGpuBuffer CreateBuffer(size_t, uint32_t, const char*) override { WGPU_NOT_YET("CreateBuffer"); return {}; }
-+    void UpdateBuffer(idGpuBuffer, size_t, size_t, const void*) override { WGPU_NOT_YET("UpdateBuffer"); }
-+    void DestroyBuffer(idGpuBuffer) override              { WGPU_NOT_YET("DestroyBuffer"); }
-+    void BindVertexBuffer(uint32_t, idGpuBuffer, size_t) override { WGPU_NOT_YET("BindVertexBuffer"); }
-+    void BindIndexBuffer(idGpuBuffer, size_t, bool) override { WGPU_NOT_YET("BindIndexBuffer"); }
-+
-+    idGpuTexture CreateTexture(int, int, int, idGpuTextureFormat, uint32_t, const char*) override { WGPU_NOT_YET("CreateTexture"); return {}; }
-+    void UploadTexture(idGpuTexture, int, int, int, int, int, const void*, size_t) override { WGPU_NOT_YET("UploadTexture"); }
-+    void DestroyTexture(idGpuTexture) override            { WGPU_NOT_YET("DestroyTexture"); }
-+
-+    idGpuSampler CreateSampler(bool, bool, bool, bool, bool) override { WGPU_NOT_YET("CreateSampler"); return {}; }
-+    void DestroySampler(idGpuSampler) override            { WGPU_NOT_YET("DestroySampler"); }
-+
++    void          DestroyPipeline(idGpuPipeline) override           { WGPU_NOT_YET("DestroyPipeline"); }
++    void          BindPipeline(idGpuPipeline) override              { WGPU_NOT_YET("BindPipeline"); }
 +    idGpuBindGroup CreateBindGroup(idGpuPipeline, const idGpuTexture*, int, const idGpuSampler*, int, const idGpuBuffer*, int) override { WGPU_NOT_YET("CreateBindGroup"); return {}; }
-+    void DestroyBindGroup(idGpuBindGroup) override        { WGPU_NOT_YET("DestroyBindGroup"); }
-+    void BindBindGroup(uint32_t, idGpuBindGroup) override { WGPU_NOT_YET("BindBindGroup"); }
++    void          DestroyBindGroup(idGpuBindGroup) override         { WGPU_NOT_YET("DestroyBindGroup"); }
++    void          BindBindGroup(uint32_t, idGpuBindGroup) override  { WGPU_NOT_YET("BindBindGroup"); }
 +
-+    void Draw(uint32_t, uint32_t, uint32_t, uint32_t) override { WGPU_NOT_YET("Draw"); }
-+    void DrawIndexed(uint32_t, uint32_t, uint32_t, int32_t, uint32_t) override { WGPU_NOT_YET("DrawIndexed"); }
++    // ─── Buffer resources — IMPLEMENTED ─────────────────────────────────────
 +
-+    void SetViewport(int, int, int, int, float, float) override { WGPU_NOT_YET("SetViewport"); }
-+    void SetScissor(int, int, int, int) override          { WGPU_NOT_YET("SetScissor"); }
-+    void SetStencilReference(uint32_t) override           { WGPU_NOT_YET("SetStencilReference"); }
++    idGpuBuffer CreateBuffer(size_t bytes, uint32_t usage, const char* label) override {
++#if D3_WEBGPU_AVAILABLE
++        WGPUBufferDescriptor bd = {};
++        bd.size = (uint64_t)bytes;
++        bd.usage = toWGPUBufferUsage(usage);
++        if (label) { bd.label = { label, WGPU_STRLEN }; }
++        WGPUBuffer buf = wgpuDeviceCreateBuffer(device, &bd);
++        return { (uint64_t)buf };
++#else
++        (void)bytes; (void)usage; (void)label;
++        return {};
++#endif
++    }
 +
-+    const char* GetDeviceName() const override { return "WebGPU (stub)"; }
++    void UpdateBuffer(idGpuBuffer buf, size_t offset, size_t bytes, const void* data) override {
++#if D3_WEBGPU_AVAILABLE
++        if (!buf.id) return;
++        wgpuQueueWriteBuffer(queue, (WGPUBuffer)buf.id, (uint64_t)offset, data, bytes);
++#else
++        (void)buf; (void)offset; (void)bytes; (void)data;
++#endif
++    }
++
++    void DestroyBuffer(idGpuBuffer buf) override {
++#if D3_WEBGPU_AVAILABLE
++        if (buf.id) wgpuBufferRelease((WGPUBuffer)buf.id);
++#else
++        (void)buf;
++#endif
++    }
++
++    void BindVertexBuffer(uint32_t, idGpuBuffer, size_t) override { WGPU_NOT_YET("BindVertexBuffer"); }
++    void BindIndexBuffer(idGpuBuffer, size_t, bool) override      { WGPU_NOT_YET("BindIndexBuffer"); }
++
++    // ─── Texture resources — IMPLEMENTED ────────────────────────────────────
++
++    idGpuTexture CreateTexture(int width, int height, int mipCount,
++                                idGpuTextureFormat format, uint32_t usage,
++                                const char* label) override {
++#if D3_WEBGPU_AVAILABLE
++        WGPUTextureDescriptor td = {};
++        td.size = { (uint32_t)width, (uint32_t)height, 1 };
++        td.mipLevelCount = (uint32_t)mipCount > 0 ? (uint32_t)mipCount : 1;
++        td.sampleCount = 1;
++        td.dimension = WGPUTextureDimension_2D;
++        td.format = toWGPUFormat(format);
++        td.usage = toWGPUTextureUsage(usage);
++        if (label) { td.label = { label, WGPU_STRLEN }; }
++        WGPUTexture tex = wgpuDeviceCreateTexture(device, &td);
++        return { (uint64_t)tex };
++#else
++        (void)width; (void)height; (void)mipCount; (void)format; (void)usage; (void)label;
++        return {};
++#endif
++    }
++
++    void UploadTexture(idGpuTexture tex, int mip, int x, int y, int width, int height,
++                        const void* pixels, size_t bytesPerRow) override {
++#if D3_WEBGPU_AVAILABLE
++        if (!tex.id) return;
++        WGPUTexelCopyTextureInfo dst = {};
++        dst.texture = (WGPUTexture)tex.id;
++        dst.mipLevel = (uint32_t)mip;
++        dst.origin = { (uint32_t)x, (uint32_t)y, 0 };
++        dst.aspect = WGPUTextureAspect_All;
++        WGPUTexelCopyBufferLayout layout = {};
++        layout.bytesPerRow = (uint32_t)bytesPerRow;
++        layout.rowsPerImage = (uint32_t)height;
++        WGPUExtent3D extent = { (uint32_t)width, (uint32_t)height, 1 };
++        // dataSize: rough estimate of total bytes — bytesPerRow * height
++        wgpuQueueWriteTexture(queue, &dst, pixels, bytesPerRow * (size_t)height,
++                              &layout, &extent);
++#else
++        (void)tex; (void)mip; (void)x; (void)y; (void)width; (void)height;
++        (void)pixels; (void)bytesPerRow;
++#endif
++    }
++
++    void DestroyTexture(idGpuTexture tex) override {
++#if D3_WEBGPU_AVAILABLE
++        if (tex.id) wgpuTextureRelease((WGPUTexture)tex.id);
++#else
++        (void)tex;
++#endif
++    }
++
++    // ─── Samplers — IMPLEMENTED ─────────────────────────────────────────────
++
++    idGpuSampler CreateSampler(bool linearMin, bool linearMag, bool linearMip,
++                                 bool repeatU, bool repeatV) override {
++#if D3_WEBGPU_AVAILABLE
++        WGPUSamplerDescriptor sd = {};
++        sd.minFilter = linearMin ? WGPUFilterMode_Linear : WGPUFilterMode_Nearest;
++        sd.magFilter = linearMag ? WGPUFilterMode_Linear : WGPUFilterMode_Nearest;
++        sd.mipmapFilter = linearMip ? WGPUMipmapFilterMode_Linear : WGPUMipmapFilterMode_Nearest;
++        sd.addressModeU = repeatU ? WGPUAddressMode_Repeat : WGPUAddressMode_ClampToEdge;
++        sd.addressModeV = repeatV ? WGPUAddressMode_Repeat : WGPUAddressMode_ClampToEdge;
++        sd.addressModeW = WGPUAddressMode_ClampToEdge;
++        sd.maxAnisotropy = 1;
++        sd.lodMaxClamp = 32.0f;
++        WGPUSampler s = wgpuDeviceCreateSampler(device, &sd);
++        return { (uint64_t)s };
++#else
++        (void)linearMin; (void)linearMag; (void)linearMip; (void)repeatU; (void)repeatV;
++        return {};
++#endif
++    }
++
++    void DestroySampler(idGpuSampler s) override {
++#if D3_WEBGPU_AVAILABLE
++        if (s.id) wgpuSamplerRelease((WGPUSampler)s.id);
++#else
++        (void)s;
++#endif
++    }
++
++    // ─── Draw / dynamic state — TODO Phase 5b ───────────────────────────────
++
++    void Draw(uint32_t, uint32_t, uint32_t, uint32_t) override                            { WGPU_NOT_YET("Draw"); }
++    void DrawIndexed(uint32_t, uint32_t, uint32_t, int32_t, uint32_t) override            { WGPU_NOT_YET("DrawIndexed"); }
++    void SetViewport(int, int, int, int, float, float) override                           { WGPU_NOT_YET("SetViewport"); }
++    void SetScissor(int, int, int, int) override                                          { WGPU_NOT_YET("SetScissor"); }
++    void SetStencilReference(uint32_t) override                                           { WGPU_NOT_YET("SetStencilReference"); }
++
++    const char* GetDeviceName() const override {
++#if D3_WEBGPU_AVAILABLE
++        return "WebGPU (Dawn via emdawnwebgpu)";
++#else
++        return "WebGPU (not compiled in)";
++#endif
++    }
 +
 +private:
 +#if D3_WEBGPU_AVAILABLE
-+    WGPUInstance instance = nullptr;
-+    WGPUAdapter  adapter  = nullptr;
-+    WGPUDevice   device   = nullptr;
-+    WGPUQueue    queue    = nullptr;
-+    WGPUSurface  surface  = nullptr;
++    WGPUDevice device = nullptr;
++    WGPUQueue  queue  = nullptr;
 +#endif
 +};
 +
-+// Factory glue. The full factory lives in RenderBackend_factory.cpp; this
-+// stub is exposed so the linker doesn't have to know which backend is
-+// being built.
 +idRenderBackend* CreateRenderBackend_WebGPU() {
 +    return new idRenderBackend_WebGPU();
 +}

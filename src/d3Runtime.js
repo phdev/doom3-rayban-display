@@ -289,6 +289,29 @@ export async function bootDoom3({
       module.onRuntimeInitialized = () => resolve();
       module.onAbort = (reason) => reject(new Error(String(reason || "DOOM 3 aborted")));
     });
+    // Phase 5: pre-acquire a WGPU adapter+device on the JS side and hand it
+    // to the WASM via Module.preinitializedWebGPUDevice. The engine's
+    // RenderBackend_WebGPU::Init grabs it synchronously via
+    // emscripten_webgpu_get_device(). This sidesteps async-device-acquisition
+    // architecture changes inside the engine. Failures are silent — engine
+    // still boots, just falls back to GL backend if r_backend "webgpu" was
+    // requested.
+    if (navigator.gpu) {
+      try {
+        const adapter = await navigator.gpu.requestAdapter();
+        if (adapter) {
+          const device = await adapter.requestDevice();
+          module.preinitializedWebGPUDevice = device;
+          log(`WebGPU device pre-acquired (${(device.label || adapter.info?.vendor || "anon")})`);
+        } else {
+          log("WebGPU adapter request returned null; engine will use GL");
+        }
+      } catch (e) {
+        log(`WebGPU pre-acquire failed: ${e.message ?? e}`);
+      }
+    } else {
+      log("navigator.gpu unavailable; engine will use GL");
+    }
     window.Module = module;
 
     log("Loading engine script...");
