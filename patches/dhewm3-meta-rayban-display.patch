@@ -1763,10 +1763,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..4084a03
+index 0000000..2c9be05
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,894 @@
+@@ -0,0 +1,970 @@
 +/*
 +================================================================================
 +
@@ -1978,47 +1978,45 @@ index 0000000..4084a03
 +                WGPUCommandEncoderDescriptor cd = {};
 +                WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(device, &cd);
 +
-+                // Iter 2: pull the engine's last view+proj matrices and compose
-+                // MVP = proj * view * (small world-space transform). The quad
-+                // is at world origin, slightly in front of the camera.
++                // Iter 3: if the engine captured a triangle surface this frame,
++                // upload its verts+indexes and draw with MVP = proj * view * model.
++                // Otherwise fall back to the demo quad (identity MVP, full coverage).
 +                extern float g_lastViewMatrix[16];
 +                extern float g_lastProjMatrix[16];
-+                static uint32_t tick = 0; tick++;
-+                float a = 0.7f + 0.3f * (float)((tick / 30) % 4) / 4.0f;
-+                // Build a model matrix: translate to (0, 0, -200) in view space
-+                // so the quad floats in front of the camera regardless of view.
-+                // Simpler for visibility: use identity MVP with tint cycling so
-+                // we ensure the textured quad is visible; full transform comes
-+                // when we have a depth buffer + world placement.
-+                // For now: write the engine's projection*view as the MVP. The
-+                // quad in NDC (-1..1) will get re-projected — if the camera is
-+                // looking down +z it'll be roughly visible.
-+                float mvp[16];
-+                // mvp = proj * view (column-major mul)
-+                for (int r = 0; r < 4; ++r) {
-+                    for (int c = 0; c < 4; ++c) {
-+                        float s = 0;
-+                        for (int k = 0; k < 4; ++k) {
-+                            s += g_lastProjMatrix[k*4 + r] * g_lastViewMatrix[c*4 + k];
-+                        }
-+                        mvp[c*4 + r] = s;
-+                    }
++                extern float g_lastModelMatrix[16];
++                extern uint8_t  g_lastSurfVerts[];
++                extern uint16_t g_lastSurfIndexes16[];
++                extern int      g_lastSurfNumVerts;
++                extern int      g_lastSurfNumIndexes;
++                extern uint32_t g_lastSurfFrameId;
++
++                bool drawSurface = false;
++                if (g_lastSurfNumVerts > 0 && g_lastSurfNumIndexes > 0 &&
++                    g_lastSurfFrameId != lastUploadedFrameId) {
++                    drawSurface = uploadCapturedSurface();
 +                }
-+                // For initial visual confirmation, use identity MVP — full
-+                // transform would clip the NDC quad away. Tinted with engine
-+                // tick so we see it react to the engine being alive.
++
++                // Compose MVP. For captured-surface path: proj * view * model.
++                // For demo-quad fallback: identity (NDC quad). Column-major.
++                float mvp[16] = {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
++                if (capturedReady) {
++                    float mv[16];
++                    matMul4(mv,  g_lastViewMatrix, g_lastModelMatrix);
++                    matMul4(mvp, g_lastProjMatrix, mv);
++                }
 +                float ub[20] = {
-+                    1,0,0,0,  0,1,0,0,  0,0,1,0,  0,0,0,1,
-+                    a, a, a, 1.0f
++                    mvp[0],mvp[1],mvp[2],mvp[3], mvp[4],mvp[5],mvp[6],mvp[7],
++                    mvp[8],mvp[9],mvp[10],mvp[11], mvp[12],mvp[13],mvp[14],mvp[15],
++                    1.0f, 1.0f, 1.0f, 1.0f
 +                };
-+                (void)mvp;   // computed, currently unused; iter 3 will use it
 +                wgpuQueueWriteBuffer(queue, demoUniformBuf, 0, ub, sizeof(ub));
++                (void)drawSurface;
 +
 +                WGPURenderPassColorAttachment ca = {};
 +                ca.view = v;
 +                ca.loadOp = WGPULoadOp_Clear;
 +                ca.storeOp = WGPUStoreOp_Store;
-+                ca.clearValue = { 0.0, 0.0, 0.0, 1.0 };
++                ca.clearValue = { 0.05, 0.0, 0.05, 1.0 };  // tiny purple tint = "WebGPU pass ran"
 +                ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
 +                WGPURenderPassDescriptor rpd = {};
 +                rpd.colorAttachmentCount = 1;
@@ -2026,8 +2024,14 @@ index 0000000..4084a03
 +                WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
 +                wgpuRenderPassEncoderSetPipeline(rp, demoPipeline);
 +                wgpuRenderPassEncoderSetBindGroup(rp, 0, demoBindGroup, 0, nullptr);
-+                wgpuRenderPassEncoderSetVertexBuffer(rp, 0, demoVertexBuf, 0, WGPU_WHOLE_SIZE);
-+                wgpuRenderPassEncoderDraw(rp, 6, 1, 0, 0);
++                if (capturedReady) {
++                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, capturedVertexBuf, 0, WGPU_WHOLE_SIZE);
++                    wgpuRenderPassEncoderSetIndexBuffer(rp, capturedIndexBuf, WGPUIndexFormat_Uint16, 0, WGPU_WHOLE_SIZE);
++                    wgpuRenderPassEncoderDrawIndexed(rp, capturedIndexCount, 1, 0, 0, 0);
++                } else {
++                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, demoVertexBuf, 0, WGPU_WHOLE_SIZE);
++                    wgpuRenderPassEncoderDraw(rp, 6, 1, 0, 0);
++                }
 +                wgpuRenderPassEncoderEnd(rp);
 +                wgpuRenderPassEncoderRelease(rp);
 +
@@ -2052,6 +2056,70 @@ index 0000000..4084a03
 +    }
 +
 +#if D3_WEBGPU_AVAILABLE
++    // Iter 3: column-major 4x4 matrix multiply (a = b * c). Matches the
++    // OpenGL convention DOOM 3 stores matrices in.
++    static void matMul4(float* out, const float* lhs, const float* rhs) {
++        for (int c = 0; c < 4; ++c) {
++            for (int r = 0; r < 4; ++r) {
++                float s = 0;
++                for (int k = 0; k < 4; ++k) {
++                    s += lhs[k*4 + r] * rhs[c*4 + k];
++                }
++                out[c*4 + r] = s;
++            }
++        }
++    }
++
++    // Iter 3: copy captured surface from CPU globals to GPU buffers. Grows
++    // buffers on first need or when size exceeded; otherwise reuses them.
++    // Returns true once capturedReady reflects a valid GPU mirror.
++    bool uploadCapturedSurface() {
++        extern uint8_t  g_lastSurfVerts[];
++        extern uint16_t g_lastSurfIndexes16[];
++        extern int      g_lastSurfNumVerts;
++        extern int      g_lastSurfNumIndexes;
++        extern uint32_t g_lastSurfFrameId;
++
++        const uint32_t vbytes = (uint32_t)g_lastSurfNumVerts * 60u;
++        // WebGPU buffer sizes must be 4-byte multiples; round index byte size up.
++        const uint32_t ibytesRaw = (uint32_t)g_lastSurfNumIndexes * 2u;
++        const uint32_t ibytes = (ibytesRaw + 3u) & ~3u;
++
++        if (vbytes > capturedVertexCap) {
++            if (capturedVertexBuf) wgpuBufferRelease(capturedVertexBuf);
++            uint32_t cap = vbytes; if (cap < 16384) cap = 16384;
++            cap = (cap + 3u) & ~3u;
++            WGPUBufferDescriptor vd = {};
++            vd.size = cap;
++            vd.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
++            capturedVertexBuf = wgpuDeviceCreateBuffer(device, &vd);
++            capturedVertexCap = cap;
++        }
++        if (ibytes > capturedIndexCap) {
++            if (capturedIndexBuf) wgpuBufferRelease(capturedIndexBuf);
++            uint32_t cap = ibytes; if (cap < 16384) cap = 16384;
++            cap = (cap + 3u) & ~3u;
++            WGPUBufferDescriptor id = {};
++            id.size = cap;
++            id.usage = WGPUBufferUsage_Index | WGPUBufferUsage_CopyDst;
++            capturedIndexBuf = wgpuDeviceCreateBuffer(device, &id);
++            capturedIndexCap = cap;
++        }
++        if (!capturedVertexBuf || !capturedIndexBuf) return false;
++        // Write rounded sizes: trailing pad bytes don't matter since draw uses
++        // capturedIndexCount which reflects the real index count.
++        wgpuQueueWriteBuffer(queue, capturedVertexBuf, 0, g_lastSurfVerts, (vbytes + 3u) & ~3u);
++        wgpuQueueWriteBuffer(queue, capturedIndexBuf,  0, g_lastSurfIndexes16, ibytes);
++        capturedIndexCount = (uint32_t)g_lastSurfNumIndexes;
++        lastUploadedFrameId = g_lastSurfFrameId;
++        if (!capturedReady) {
++            capturedReady = true;
++            EM_ASM_({ console.info("[d3] WebGPU captured first DOOM 3 surface verts=" + $0 + " idx=" + $1); },
++                    g_lastSurfNumVerts, g_lastSurfNumIndexes);
++        }
++        return true;
++    }
++
 +    // Iter 1: build a pipeline using texture.wgsl + a procedural diffuse
 +    // texture + a sampler + a quad vertex buffer + a uniform buffer.
 +    void initDemoQuad() {
@@ -2655,6 +2723,14 @@ index 0000000..4084a03
 +    WGPUTexture             demoTexture      = nullptr;
 +    WGPUSampler             demoSampler      = nullptr;
 +    WGPUBindGroup           demoBindGroup    = nullptr;
++    // Iter 3: captured-surface GPU mirror
++    WGPUBuffer              capturedVertexBuf = nullptr;
++    WGPUBuffer              capturedIndexBuf  = nullptr;
++    uint32_t                capturedVertexCap = 0;  // bytes
++    uint32_t                capturedIndexCap  = 0;  // bytes
++    uint32_t                capturedIndexCount = 0;
++    uint32_t                lastUploadedFrameId = 0;
++    bool                    capturedReady    = false;
 +#endif
 +};
 +
@@ -2998,7 +3074,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..0094153 100644
+index c83ebb5..b166be2 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -3009,25 +3085,69 @@ index c83ebb5..0094153 100644
  
  /*
  
-@@ -553,26 +554,46 @@ Any mirrored or portaled views have already been drawn, so prepare
- to actually render the visible surfaces for this view
- =================
+@@ -38,6 +39,23 @@ If you have questions concerning this license or the applicable additional terms
+ 
  */
-+// Iter 2: capture engine view + projection each frame so the WebGPU
-+// backend can show a demo quad transformed by the player's view. Two
-+// flat float[16]s, no atomic — the engine is single-threaded.
-+extern "C" float g_lastViewMatrix[16];
-+extern "C" float g_lastProjMatrix[16];
-+float g_lastViewMatrix[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
-+float g_lastProjMatrix[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+ 
++// Iter 2/3: capture engine view+projection AND the first triangle surface each
++// frame so the WebGPU backend can render real DOOM 3 geometry alongside the
++// GL path. All flat C globals — engine is single-threaded. Defined here at
++// file scope so RB_T_RenderTriangleSurface (above RB_BeginDrawingView) sees them.
++enum { kWGPUMaxCaptureVerts = 8192, kWGPUMaxCaptureIndexes = 32768 };
++extern "C" {
++    float    g_lastViewMatrix[16]  = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
++    float    g_lastProjMatrix[16]  = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
++    float    g_lastModelMatrix[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
++    uint8_t  g_lastSurfVerts[kWGPUMaxCaptureVerts * 60];   // idDrawVert = 60 bytes
++    uint16_t g_lastSurfIndexes16[kWGPUMaxCaptureIndexes];  // downcast to u16 for WebGPU
++    int      g_lastSurfNumVerts   = 0;
++    int      g_lastSurfNumIndexes = 0;
++    uint32_t g_lastSurfFrameId    = 0;  // bumped each capture; WebGPU compares to detect newness
++    int      g_captureSlotUsedThisFrame = 0;  // reset by RB_BeginDrawingView
++}
 +
- void RB_BeginDrawingView (void) {
+ 
+ /*
+ =================
+@@ -166,6 +184,30 @@ RB_T_RenderTriangleSurface
+ ===============
+ */
+ void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
++	// Iter 3: capture first qualifying surface this frame for WebGPU echo
++	if ( !g_captureSlotUsedThisFrame && surf && surf->geo
++		 && surf->geo->verts && surf->geo->indexes
++		 && surf->geo->numVerts > 0 && surf->geo->numIndexes > 0
++		 && surf->geo->numVerts   <= kWGPUMaxCaptureVerts
++		 && surf->geo->numIndexes <= kWGPUMaxCaptureIndexes ) {
++		// idDrawVert is 60 bytes — copy raw to avoid pulling its definition here
++		memcpy( g_lastSurfVerts, surf->geo->verts, surf->geo->numVerts * 60 );
++		// DOOM 3's GL_INDEX_TYPE is glIndex_t (int on dhewm3). WebGPU wants u16/u32;
++		// downcast to u16 (8192-vert ceiling above guarantees no truncation).
++		for ( int i = 0; i < surf->geo->numIndexes; ++i ) {
++			g_lastSurfIndexes16[i] = (uint16_t)surf->geo->indexes[i];
++		}
++		g_lastSurfNumVerts   = surf->geo->numVerts;
++		g_lastSurfNumIndexes = surf->geo->numIndexes;
++		if ( surf->space ) {
++			memcpy( g_lastModelMatrix, surf->space->modelMatrix, sizeof(g_lastModelMatrix) );
++		} else {
++			static const float kIdent[16] = {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
++			memcpy( g_lastModelMatrix, kIdent, sizeof(g_lastModelMatrix) );
++		}
++		g_lastSurfFrameId++;
++		g_captureSlotUsedThisFrame = 1;
++	}
+ 	RB_RenderTriangleSurface( surf->geo );
+ }
+ 
+@@ -557,22 +599,35 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
 +	// Iter 2 capture: stash matrices for the WebGPU backend demo render
 +	memcpy(g_lastProjMatrix, viewDef->projectionMatrix, sizeof(g_lastProjMatrix));
 +	memcpy(g_lastViewMatrix, viewDef->worldSpace.modelViewMatrix, sizeof(g_lastViewMatrix));
++	g_captureSlotUsedThisFrame = 0;   // re-arm per-frame surface capture
 +
  	// set the modelview matrix for the viewer
  	qglMatrixMode(GL_PROJECTION);
