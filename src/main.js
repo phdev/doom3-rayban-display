@@ -154,6 +154,46 @@ window.detTest = async function detTest(selector = "#webgpuCanvas", frameCount =
   return { selector, w, h, meanDiffPct: Number(meanDiffPct), maxDelta, perFrame };
 };
 
+// One-shot full determinism A/B: pauses the engine (so animated lights and
+// sparks don't dominate the diff), waits for it to settle, runs detTest on
+// both canvases at the same delay, prints a side-by-side summary. This is
+// THE test for the chunky-tile bug: with the engine paused, ANY frame-to-
+// frame diff is rendering-side non-determinism. On iPhone GL we expect
+// ~1-7% (the bug). On WebGPU we expect 0%.
+//
+// Usage:
+//   await window.fullDetTest()         // 5 frames, 250ms delay
+//   await window.fullDetTest(10, 300)  // 10 frames, 300ms delay
+window.fullDetTest = async function fullDetTest(frameCount = 5, delayMs = 250) {
+  if (typeof window.d3cmd !== "function") {
+    console.warn("fullDetTest: d3cmd not available; engine may not have booted");
+    return null;
+  }
+  console.info("[fullDetTest] pausing engine for fair comparison...");
+  window.d3cmd("g_stopTime 1");
+  window.d3cmd("pause");
+  // Wait for the engine to settle (a couple of frames of "engine still running
+  // its last frame" then idle).
+  await new Promise((r) => setTimeout(r, 1500));
+  console.info("[fullDetTest] running detTest on #webgpuCanvas...");
+  const wgpu = await window.detTest("#webgpuCanvas", frameCount, delayMs);
+  console.info("[fullDetTest] running detTest on #gameCanvas...");
+  const gl   = await window.detTest("#gameCanvas",   frameCount, delayMs);
+  console.info("[fullDetTest] resuming engine...");
+  window.d3cmd("g_stopTime 0");
+  window.d3cmd("pause");
+  const verdict =
+    `\n┌─ WebGPU port determinism A/B (engine paused) ─\n` +
+    `│ #webgpuCanvas: meanDiff=${wgpu?.meanDiffPct ?? "?"}% maxDelta=${wgpu?.maxDelta ?? "?"}\n` +
+    `│ #gameCanvas:   meanDiff=${gl?.meanDiffPct   ?? "?"}% maxDelta=${gl?.maxDelta   ?? "?"}\n` +
+    `└── If GL > 0.5% and WebGPU = 0%, WebGPU port fixes the chunky-tile bug.\n`;
+  console.info(verdict);
+  if (typeof appendRuntimeLog === "function") {
+    appendRuntimeLog(`[fullDetTest] WebGPU=${wgpu?.meanDiffPct}% / GL=${gl?.meanDiffPct}%`);
+  }
+  return { wgpu, gl };
+};
+
 // Compact, always-visible GPU summary built from the captured GL4ES init lines.
 // The decisive field is "highp FS": a mobile GPU without high-precision floats in
 // fragment shaders underflows DOOM 3's lighting math to ~0 (near-black scene).
