@@ -1788,10 +1788,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..96791a6
+index 0000000..ed5c2ea
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,1585 @@
+@@ -0,0 +1,1601 @@
 +/*
 +================================================================================
 +
@@ -2592,7 +2592,23 @@ index 0000000..96791a6
 +        wgpuQueueWriteBuffer(queue, recordVertexBuf, 0, g_capVertsAccum,    vNeed);
 +        wgpuQueueWriteBuffer(queue, recordIndexBuf,  0, g_capIndexesAccum,  iNeed);
 +
-+        const uint32_t n = (g_capRecordCount < kMaxRecordSlots) ? g_capRecordCount : kMaxRecordSlots;
++        uint32_t total = (g_capRecordCount < kMaxRecordSlots) ? g_capRecordCount : kMaxRecordSlots;
++        // Keep only the MAIN view's records. Subviews (mirrors, security
++        // monitors) render FIRST in idTech4, so the last record's view tag
++        // identifies the main view; records from other views would draw
++        // ghost geometry with alien projections. Compact in place.
++        uint32_t n = 0;
++        if (total > 0) {
++            const uint32_t mainView = g_capRecords[total - 1].pad0;
++            for (uint32_t i = 0; i < total; ++i) {
++                if (g_capRecords[i].pad0 != mainView) continue;
++                if (n != i) {
++                    g_capRecords[n] = g_capRecords[i];
++                    memcpy(g_capImagePtrs[n], g_capImagePtrs[i], sizeof(void*) * 5);
++                }
++                n++;
++            }
++        }
 +        // Per-slot uniform writes. r.modelMatrix holds the FULL MVP, baked
 +        // at capture time in draw_arb2.cpp where this view's projection and
 +        // this surface's modelView are both in scope. Use verbatim.
@@ -3526,10 +3542,10 @@ index 7914093..eed2277 100644
  	GLimp_Shutdown();
  
 diff --git a/neo/renderer/draw_arb2.cpp b/neo/renderer/draw_arb2.cpp
-index c1d0d3e..5f273f7 100644
+index c1d0d3e..322be8b 100644
 --- a/neo/renderer/draw_arb2.cpp
 +++ b/neo/renderer/draw_arb2.cpp
-@@ -62,7 +62,136 @@ static void GL_SelectTextureNoClient( int unit ) {
+@@ -62,7 +62,141 @@ static void GL_SelectTextureNoClient( int unit ) {
  RB_ARB2_DrawInteraction
  ==================
  */
@@ -3626,6 +3642,11 @@ index c1d0d3e..5f273f7 100644
 +			r.vertCount   = (uint32_t)din->surf->geo->numVerts;
 +			r.indexOffset = g_capIndexBytes;
 +			r.indexCount  = (uint32_t)din->surf->geo->numIndexes;
++			// Tag with the owning view so the backend can keep only the main
++			// view's records (subviews — mirrors, security monitors — render
++			// FIRST in idTech4, with their own projections; drawing their
++			// records into the echo produces ghost geometry).
++			r.pad0 = (uint32_t)(uintptr_t)backEnd.viewDef;
 +			static const float kIdent[16] = {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
 +			// Bake the FULL MVP (projection * modelView) at capture time —
 +			// both matrices are in scope here with the correct values for
