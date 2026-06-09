@@ -357,6 +357,42 @@ completing the WebGPU port is the production fix. (The multi-surface
 echo also rendered on iPhone: `records=43` upload logged, lit
 green-checker geometry tracking the camera.)
 
+**Iter 7b/7c — REAL textures + the missing-falloff pak find
+(2026-06-09).** The echo now renders the actual game scene:
+- Engine image pipeline: `D3_WebGPU_CacheImage` (tr_render.cpp,
+  called from `GenerateImage` pre-rxgb-swap, with image names,
+  nearest-downsample >256) → per-idImage GPU texture cache → material
+  bind groups cached per 5-image tuple. `interaction.wgsl` bindings
+  split: @group(0) per-record uniforms, @group(1) material textures.
+- Record cap 256 (drops counted+logged), accumulators 8MB/2MB.
+  Subview records filtered out via viewDef tag (monitors/mirrors
+  render first with alien projections — would ghost).
+- z-fill pre-pass pipeline exists but is DISABLED (kUsePrePass=false):
+  cross-pipeline clip-z invariance unverified; lit pass is additive
+  One/One with depthWrite ON as interim (slight light bleed possible
+  on unsorted overlaps).
+- **THE BIG FIND: `makeintensity(lights/squarelight1a)` — the falloff
+  for nearly every point light — was MISSING from the reduced pak.**
+  The engine substituted a black default → falloff multiplied every
+  interaction to ~0 → most point lights have been silently OFF in
+  the GL build all along (flashlight + emissives did the lighting,
+  which is part of why the game read so dark). Bisected with shader
+  probes (R=falloff/G=NdotL/B=cookie, then fixed-coordinate content
+  probe, then a named per-image cache inventory). Fixed by injecting
+  all 53 missing `lights/*.tga` into the bundled pak and adding
+  `lights/` to the reducer's ALWAYS_KEEP_PREFIXES. **GL is visibly
+  better lit too.**
+- `interaction.wgsl` falloff now multiplies the sample's RGB (vanilla
+  interaction.vfp convention); `.a` was a GL4ES-on-WebKit artifact.
+  Normal maps decode from RGB (cache is pre-rxgb-swap). depth.wgsl
+  carries the same clip-z remap as interaction.wgsl (must stay
+  bit-identical for the future pre-pass).
+- Verified headed Chrome: echo shows the real corridor (floor grate,
+  walls, fixtures, real lighting); determinism self-test IDENTICAL
+  with 256 surfaces + real textures. Echo runs brighter than GL
+  (no gamma term, ambient-light approximation, no specular LUT) —
+  fidelity polish is future work.
+
 ### Mobile / iOS (hard-won)
 
 - **Stale-404 cache** — `fetchBytes` defaulted to `cache:"force-cache"`; after a
