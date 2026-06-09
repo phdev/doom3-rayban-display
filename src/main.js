@@ -93,11 +93,18 @@ if (/[?&]backend=webgpu\b/.test(location.search) && refs.webgpuCanvas) {
 // scene with max delta up to 192/255. WebGPU should produce 0% / 0. Use this
 // to A/B the two backends.
 //
-// Usage from Safari Web Inspector (Mac):
+// Usage from Safari Web Inspector (Mac/iPhone):
 //   await window.detTest("#webgpuCanvas", 5)
 //   await window.detTest("#gameCanvas",   5)
-// Returns: { meanDiffPct, maxDelta, perFrame: [...] }
-window.detTest = async function detTest(selector = "#webgpuCanvas", frameCount = 5) {
+//   await window.detTest("#gameCanvas",   5, 250)  // 250ms between captures
+//
+// `delayMs` controls how long we wait between captures. The default 200ms
+// handles low-fps mobile (iPhone hits ~7 fps = 140ms/frame); on Chrome/desktop
+// pass a smaller number. If too small, consecutive captures may both read
+// the same engine frame and trivially diff to zero — that's NOT proof of
+// determinism. To validate the harness, run detTest on something with
+// expected motion (with camera input) — it should report >0% diff.
+window.detTest = async function detTest(selector = "#webgpuCanvas", frameCount = 5, delayMs = 200) {
   const canvas = document.querySelector(selector);
   if (!canvas) { console.warn("detTest: no canvas", selector); return null; }
   const w = canvas.width, h = canvas.height;
@@ -107,6 +114,10 @@ window.detTest = async function detTest(selector = "#webgpuCanvas", frameCount =
   const ctx2d = tmp.getContext("2d", { willReadFrequently: true });
   const frames = [];
   for (let i = 0; i < frameCount; ++i) {
+    if (i > 0) {
+      // Wait a full engine frame to give the renderer time to redraw.
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
     await new Promise((r) => requestAnimationFrame(r));
     try {
       ctx2d.clearRect(0, 0, w, h);
