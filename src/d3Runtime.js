@@ -528,6 +528,19 @@ function buildArguments(config) {
     // renders. (This is also why the menu's animated logo panel shows a
     // placeholder.) See README "Limitations".
     "+set", "r_skipROQ", "1",
+    // Skip the _currentRender postprocess pass (heat-haze, refraction effects).
+    // The iPhone Instruments Metal trace showed ~12,564 Blit Command encoders
+    // per 7s recording = ~1,800/sec — almost all of them are the per-surface
+    // glCopyTexImage2D into _currentRender that heat-haze materials sample.
+    // Each blit is its own Metal command buffer in WebKit's WebGL→Metal path
+    // (no batching), adding massive submission overhead. r_skipPostProcess 1
+    // discards both the framebuffer copy AND the heat-haze surface itself
+    // (the surface is auto-sorted to SS_POST_PROCESS when it references
+    // _currentRender per Material.cpp:2223). Net effect: massive WebKit GPU
+    // pressure drop, slightly-flat-looking heat sources (no waver behind hot
+    // pipes/vents). ?heathaze re-enables for A/B.
+    "+set", "r_skipPostProcess",
+        (/[?&]heathaze\b/.test(typeof window !== "undefined" ? window.location.search : "")) ? "0" : "1",
     // image_downSize=0 disables the downsize pass entirely (full-resolution
     // texture uploads). Set when ?dsl=0 explicitly chosen via runtime config.
     "+set", "image_downSize", config.imageDownSizeLimit === 0 ? "0" : "1",
