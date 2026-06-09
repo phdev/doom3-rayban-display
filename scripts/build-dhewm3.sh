@@ -46,6 +46,14 @@ else
   echo "dhewm3 patch is already applied or does not match this checkout; continuing." >&2
 fi
 
+# Generate embedded WGSL header from webgpu-port/shaders/*.wgsl. The patch's
+# RenderBackend_WebGPU.cpp #includes wgsl/embedded_shaders.h which lives
+# outside the patch (regenerated each build so shader edits don't require
+# re-patching).
+WGSL_DIR="$BUILD_DIR/neo/renderer/wgsl"
+mkdir -p "$WGSL_DIR"
+python3 "$ROOT_DIR/scripts/embed_wgsl.py" "$WGSL_DIR" "$ROOT_DIR/webgpu-port/shaders"
+
 # Files baked into dhewm3.data. The web app shell still installs the user PK4
 # and config at runtime; this just guarantees a writable /base exists.
 install -d "$EMBED_DIR/base"
