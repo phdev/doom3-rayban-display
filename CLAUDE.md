@@ -330,6 +330,25 @@ mars_city1. **The chunky-tile A/B on iPhone is NOT yet concluded** —
 the earlier "confirmed fixed" claim was premature (black canvas can't
 flicker). Re-run the eyeball test now that content renders.
 
+**Iter 6.8 — in-engine determinism self-test (2026-06-09).** Because
+WebGPU canvases read back as cleared and the iOS Simulator has neither
+working WebGPU nor the chunky-tile bug, the only honest instruments
+were eyeballs — until this. The backend now periodically (frame 90,
+then every 240 frames, 6 rounds max) renders the IDENTICAL lastRecords
+set twice into two offscreen BGRA8 textures (same pipeline + bind
+groups as the on-screen echo), copies both to MapRead buffers
+(bytesPerRow 256-aligned), maps them async
+(WGPUCallbackMode_AllowSpontaneous), and byte-compares row-by-row
+(skipping row padding). Verdict logs as
+`[d3] WebGPU DETERMINISM round N: IDENTICAL [WxH, S surfaces]` (or
+`X px differ (p%), maxDelta=D`) and accumulates in
+`window.__d3WgpuDet`. If a GPU produces different bytes for identical
+command buffers, that's exactly the chunky-tile class of
+non-determinism. Chrome verified: rounds 1-2 IDENTICAL, 64 surfaces,
+600x600. The load-bearing run is iPhone Safari: IDENTICAL there +
+visibly flickering GL = the WebGPU port fixes the bug, measured
+on-device with no eyeballs needed.
+
 ### Mobile / iOS (hard-won)
 
 - **Stale-404 cache** — `fetchBytes` defaulted to `cache:"force-cache"`; after a

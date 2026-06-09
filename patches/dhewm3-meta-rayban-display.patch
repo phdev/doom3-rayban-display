@@ -1788,10 +1788,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..aee47e3
+index 0000000..c3d8e4d
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,1376 @@
+@@ -0,0 +1,1547 @@
 +/*
 +================================================================================
 +
@@ -2137,6 +2137,18 @@ index 0000000..aee47e3
 +                wgpuCommandBufferRelease(cb);
 +                wgpuTextureViewRelease(v);
 +                wgpuTextureRelease(st.texture);
++
++                // Iter 6.8: determinism self-test — once real records render,
++                // periodically draw the identical set twice offscreen and
++                // byte-compare the readbacks. ~6 rounds, spaced out so the
++                // engine is in different scenes across rounds.
++                if (multiOk && lastRecordCount > 0) {
++                    detFrameCounter++;
++                    if (detMapsPending == 0 && detRoundsDone < kDetMaxRounds &&
++                        detFrameCounter >= 90 && (detFrameCounter - 90) % 240 == 0) {
++                        runDeterminismRound();
++                    }
++                }
 +            }
 +        }
 +
@@ -2651,6 +2663,148 @@ index 0000000..aee47e3
 +        }
 +        return true;
 +    }
++
++    // ─── Iter 6.8: determinism self-test ────────────────────────────────────
++
++    // Encode one render pass drawing all lastRecords into the given color
++    // view (same pipeline + bind groups the on-screen echo uses).
++    void encodeRecordsPass(WGPUCommandEncoder enc, WGPUTextureView color, WGPUTextureView depth) {
++        WGPURenderPassColorAttachment ca = {};
++        ca.view = color;
++        ca.loadOp = WGPULoadOp_Clear;
++        ca.storeOp = WGPUStoreOp_Store;
++        ca.clearValue = { 0.0, 0.4, 0.6, 1.0 };
++        ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
++        WGPURenderPassDepthStencilAttachment da = {};
++        da.view = depth;
++        da.depthLoadOp = WGPULoadOp_Clear;
++        da.depthStoreOp = WGPUStoreOp_Store;
++        da.depthClearValue = 1.0f;
++        da.stencilLoadOp = WGPULoadOp_Undefined;
++        da.stencilStoreOp = WGPUStoreOp_Undefined;
++        WGPURenderPassDescriptor rpd = {};
++        rpd.colorAttachmentCount = 1;
++        rpd.colorAttachments = &ca;
++        rpd.depthStencilAttachment = &da;
++        WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
++        wgpuRenderPassEncoderSetPipeline(rp, interactionPipeline);
++        for (uint32_t i = 0; i < lastRecordCount; ++i) {
++            const Rec& r = lastRecords[i];
++            wgpuRenderPassEncoderSetBindGroup(rp, 0, recordBindGroups[i], 0, nullptr);
++            wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
++            wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
++            wgpuRenderPassEncoderDrawIndexed(rp, r.indexCount, 1, 0, 0, 0);
++        }
++        wgpuRenderPassEncoderEnd(rp);
++        wgpuRenderPassEncoderRelease(rp);
++    }
++
++    static void detMapCallback(WGPUMapAsyncStatus status, WGPUStringView /*msg*/, void* ud1, void* /*ud2*/) {
++        idRenderBackend_WebGPU* self = (idRenderBackend_WebGPU*)ud1;
++        if (status != WGPUMapAsyncStatus_Success) self->detMapFailed = true;
++        if (--self->detMapsPending > 0) return;
++
++        // Both buffers settled — compare (skip row padding bytes).
++        if (self->detMapFailed) {
++            EM_ASM({ console.warn("[d3] WebGPU det self-test: buffer map FAILED — round skipped"); });
++        } else {
++            const int w = self->depthW, h = self->depthH;
++            const uint32_t bpr = self->detBytesPerRow;
++            const size_t total = (size_t)bpr * (size_t)h;
++            const uint8_t* a = (const uint8_t*)wgpuBufferGetConstMappedRange(self->detBufA, 0, total);
++            const uint8_t* b = (const uint8_t*)wgpuBufferGetConstMappedRange(self->detBufB, 0, total);
++            uint32_t diffPx = 0; int maxDelta = 0;
++            if (a && b) {
++                for (int y = 0; y < h; ++y) {
++                    const uint8_t* ra = a + (size_t)y * bpr;
++                    const uint8_t* rb = b + (size_t)y * bpr;
++                    for (int x = 0; x < w * 4; x += 4) {
++                        int d0 = ra[x]-rb[x]; if (d0 < 0) d0 = -d0;
++                        int d1 = ra[x+1]-rb[x+1]; if (d1 < 0) d1 = -d1;
++                        int d2 = ra[x+2]-rb[x+2]; if (d2 < 0) d2 = -d2;
++                        int d = d0 > d1 ? d0 : d1; if (d2 > d) d = d2;
++                        if (d > 0) { diffPx++; if (d > maxDelta) maxDelta = d; }
++                    }
++                }
++                EM_ASM_({
++                    var pct = ($0 / ($2 * $3) * 100).toFixed(4);
++                    console.info("[d3] WebGPU DETERMINISM round " + $4 + ": " +
++                        ($0 === 0 ? "IDENTICAL" : ($0 + " px differ (" + pct + "%), maxDelta=" + $1)) +
++                        " [" + $2 + "x" + $3 + ", " + $5 + " surfaces]");
++                    window.__d3WgpuDet = window.__d3WgpuDet || [];
++                    window.__d3WgpuDet.push({ round: $4, diffPx: $0, maxDelta: $1, w: $2, h: $3, surfaces: $5 });
++                }, diffPx, maxDelta, w, h, (int)self->detRoundsDone + 1, (int)self->lastRecordCount);
++            } else {
++                EM_ASM({ console.warn("[d3] WebGPU det self-test: mapped range null — round skipped"); });
++            }
++        }
++        wgpuBufferUnmap(self->detBufA);
++        wgpuBufferUnmap(self->detBufB);
++        self->detRoundsDone++;
++        self->detMapFailed = false;
++        // detMapsPending == 0 → idle; next round arms on the frame cadence.
++    }
++
++    // Run one self-test round: two identical passes → two readback buffers
++    // → async compare. Called from EndFrame on a frame cadence.
++    void runDeterminismRound() {
++        const int w = depthW, h = depthH;
++        if (w <= 0 || h <= 0) return;
++        if (!detTexA) {
++            WGPUTextureDescriptor td = {};
++            td.size = { (uint32_t)w, (uint32_t)h, 1 };
++            td.mipLevelCount = 1;
++            td.sampleCount = 1;
++            td.dimension = WGPUTextureDimension_2D;
++            td.format = surfaceFormat;   // must match interactionPipeline target
++            td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc;
++            detTexA = wgpuDeviceCreateTexture(device, &td);
++            detTexB = wgpuDeviceCreateTexture(device, &td);
++            WGPUTextureDescriptor dd = td;
++            dd.format = WGPUTextureFormat_Depth24Plus;
++            dd.usage = WGPUTextureUsage_RenderAttachment;
++            detDepthTex = wgpuDeviceCreateTexture(device, &dd);
++            detViewA = detTexA ? wgpuTextureCreateView(detTexA, nullptr) : nullptr;
++            detViewB = detTexB ? wgpuTextureCreateView(detTexB, nullptr) : nullptr;
++            detDepthView = detDepthTex ? wgpuTextureCreateView(detDepthTex, nullptr) : nullptr;
++            detBytesPerRow = ((uint32_t)w * 4u + 255u) & ~255u;
++            WGPUBufferDescriptor bd = {};
++            bd.size = (uint64_t)detBytesPerRow * (uint64_t)h;
++            bd.usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst;
++            detBufA = wgpuDeviceCreateBuffer(device, &bd);
++            detBufB = wgpuDeviceCreateBuffer(device, &bd);
++        }
++        if (!detViewA || !detViewB || !detDepthView || !detBufA || !detBufB) return;
++
++        WGPUCommandEncoderDescriptor cd = {};
++        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(device, &cd);
++        encodeRecordsPass(enc, detViewA, detDepthView);
++        encodeRecordsPass(enc, detViewB, detDepthView);
++        WGPUTexelCopyTextureInfo srcA = {}; srcA.texture = detTexA;
++        WGPUTexelCopyTextureInfo srcB = {}; srcB.texture = detTexB;
++        WGPUTexelCopyBufferInfo dstA = {};
++        dstA.layout.bytesPerRow = detBytesPerRow;
++        dstA.layout.rowsPerImage = (uint32_t)h;
++        dstA.buffer = detBufA;
++        WGPUTexelCopyBufferInfo dstB = dstA;
++        dstB.buffer = detBufB;
++        WGPUExtent3D ext = { (uint32_t)w, (uint32_t)h, 1 };
++        wgpuCommandEncoderCopyTextureToBuffer(enc, &srcA, &dstA, &ext);
++        wgpuCommandEncoderCopyTextureToBuffer(enc, &srcB, &dstB, &ext);
++        WGPUCommandBuffer cb = wgpuCommandEncoderFinish(enc, nullptr);
++        wgpuCommandEncoderRelease(enc);
++        wgpuQueueSubmit(queue, 1, &cb);
++        wgpuCommandBufferRelease(cb);
++
++        detMapsPending = 2;
++        detMapFailed = false;
++        WGPUBufferMapCallbackInfo cbi = {};
++        cbi.mode = WGPUCallbackMode_AllowSpontaneous;
++        cbi.callback = &idRenderBackend_WebGPU::detMapCallback;
++        cbi.userdata1 = this;
++        wgpuBufferMapAsync(detBufA, WGPUMapMode_Read, 0, (size_t)detBytesPerRow * (size_t)depthH, cbi);
++        wgpuBufferMapAsync(detBufB, WGPUMapMode_Read, 0, (size_t)detBytesPerRow * (size_t)depthH, cbi);
++    }
 +#endif
 +
 +    void BeginRenderPass(const idGpuRenderPassDesc& desc) override {
@@ -3162,6 +3316,23 @@ index 0000000..aee47e3
 +    // (GUI-only frames) redraw this set.
 +    Rec                     lastRecords[kMaxRecordSlots] = {};
 +    uint32_t                lastRecordCount = 0;
++    // Iter 6.8: on-device determinism self-test. Renders the identical
++    // record set twice into two offscreen textures, reads both back,
++    // byte-compares. Sidesteps the canvas-readback trap (WebGPU canvases
++    // read back as cleared) — the quantitative replacement for the
++    // eyeball test. If a GPU produces different bytes for identical
++    // command buffers, that's the chunky-tile class of non-determinism.
++    WGPUTexture             detTexA = nullptr, detTexB = nullptr;
++    WGPUTextureView         detViewA = nullptr, detViewB = nullptr;
++    WGPUTexture             detDepthTex = nullptr;
++    WGPUTextureView         detDepthView = nullptr;
++    WGPUBuffer              detBufA = nullptr, detBufB = nullptr;
++    uint32_t                detBytesPerRow = 0;
++    int                     detMapsPending = 0;     // >0 while maps in flight
++    bool                    detMapFailed = false;
++    uint32_t                detFrameCounter = 0;
++    uint32_t                detRoundsDone = 0;
++    static constexpr uint32_t kDetMaxRounds = 6;
 +#endif
 +};
 +
