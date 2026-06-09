@@ -1788,10 +1788,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..c3d8e4d
+index 0000000..96791a6
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,1547 @@
+@@ -0,0 +1,1585 @@
 +/*
 +================================================================================
 +
@@ -1904,6 +1904,10 @@ index 0000000..c3d8e4d
 +    float lightProjS[4], lightProjT[4], lightProjQ[4], lightFalloffS[4];
 +    float diffuseColor[4], specularColor[4];
 +};
++
++// Iter 7b: mirrors WGPUImageSlot in tr_render.cpp (C linkage, layout-stable).
++struct ImgSlot { const void* ptr; int w, h; uint8_t* pixels; char name[64]; };
++extern "C" const ImgSlot* D3_WebGPU_LookupCachedImage(const void* img);
 +
 +// ─── Backend class ──────────────────────────────────────────────────────────
 +
@@ -2021,6 +2025,7 @@ index 0000000..c3d8e4d
 +            demoInit = true;
 +            initDemoQuad();
 +            initInteractionPipeline();
++            initDepthPipeline();
 +            initRecordSlots();
 +        }
 +        if (surface && demoPipeline) {
@@ -2032,104 +2037,52 @@ index 0000000..c3d8e4d
 +                WGPUCommandEncoderDescriptor cd = {};
 +                WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(device, &cd);
 +
-+                // Iter 6.6: pull the engine's per-frame surface records.
++                // Iter 6.6/7b: pull the engine's per-frame surface records.
 +                // uploadCapturedRecords CONSUMES the CPU accumulator (the
-+                // engine appends across all views in a frame — main view,
-+                // lightgem, subviews — and we drain here, so a later
-+                // RB_BeginDrawingView can't wipe records before we read them,
-+                // which is what made the multi path silently produce 0).
-+                extern float g_lastProjMatrix[16];
-+                extern float g_lastModelMatrix[16];
-+                extern uint8_t  g_lastSurfVerts[];
-+                extern uint16_t g_lastSurfIndexes16[];
-+                extern int      g_lastSurfNumVerts;
-+                extern int      g_lastSurfNumIndexes;
-+                extern uint32_t g_lastSurfFrameId;
-+                extern float    g_lastDinLocalLightOrigin[4];
-+                extern float    g_lastDinLocalViewOrigin[4];
-+                extern float    g_lastDinLightProjS[4];
-+                extern float    g_lastDinLightProjT[4];
-+                extern float    g_lastDinLightProjQ[4];
-+                extern float    g_lastDinLightFalloffS[4];
-+                extern float    g_lastDinDiffuseColor[4];
-+                extern float    g_lastDinSpecularColor[4];
-+
++                // engine appends across all views in a frame; draining here
++                // means a later RB_BeginDrawingView can't wipe records before
++                // we read them) and resolves per-record material bind groups
++                // from the engine image cache.
 +                uint32_t multiCount = 0;
-+                bool multiOk = recordSlotsReady && interactionPipeline &&
++                bool multiOk = recordSlotsReady && interactionPipeline && depthPipeline &&
 +                               uploadCapturedRecords(multiCount) && multiCount > 0;
 +
-+                if (!multiOk) {
-+                    // Single-record fallback (iter 4). g_lastModelMatrix now
-+                    // holds the FULL MVP baked at capture time in draw_arb2.
-+                    if (g_lastSurfNumVerts > 0 && g_lastSurfNumIndexes > 0 &&
-+                        g_lastSurfFrameId != lastUploadedFrameId) {
-+                        uploadCapturedSurface();
-+                    }
-+                    if (capturedReady && interactionPipeline) {
-+                        float full[48];
-+                        memcpy(full +  0, g_lastModelMatrix, 64);
-+                        memcpy(full + 16, g_lastDinLocalLightOrigin, 16);
-+                        memcpy(full + 20, g_lastDinLocalViewOrigin,  16);
-+                        memcpy(full + 24, g_lastDinDiffuseColor,     16);
-+                        memcpy(full + 28, g_lastDinSpecularColor,    16);
-+                        memcpy(full + 32, g_lastDinLightProjS,       16);
-+                        memcpy(full + 36, g_lastDinLightProjT,       16);
-+                        memcpy(full + 40, g_lastDinLightProjQ,       16);
-+                        memcpy(full + 44, g_lastDinLightFalloffS,    16);
-+                        wgpuQueueWriteBuffer(queue, interactionUniformBuf, 0, full, sizeof(full));
-+                    } else {
-+                        float ub[20] = {
-+                            1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1,
-+                            1.0f, 1.0f, 1.0f, 1.0f
-+                        };
-+                        wgpuQueueWriteBuffer(queue, demoUniformBuf, 0, ub, sizeof(ub));
-+                    }
-+                }
-+
-+                WGPURenderPassColorAttachment ca = {};
-+                ca.view = v;
-+                ca.loadOp = WGPULoadOp_Clear;
-+                ca.storeOp = WGPUStoreOp_Store;
-+                ca.clearValue = { 0.0, 0.4, 0.6, 1.0 };  // BRIGHT TEAL clear so we can tell "is the pass running at all?"
-+                ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
-+                WGPURenderPassDepthStencilAttachment da = {};
-+                da.view = depthView;
-+                da.depthLoadOp = WGPULoadOp_Clear;
-+                da.depthStoreOp = WGPUStoreOp_Store;
-+                da.depthClearValue = 1.0f;
-+                da.stencilLoadOp = WGPULoadOp_Undefined;
-+                da.stencilStoreOp = WGPUStoreOp_Undefined;
-+                WGPURenderPassDescriptor rpd = {};
-+                rpd.colorAttachmentCount = 1;
-+                rpd.colorAttachments = &ca;
-+                rpd.depthStencilAttachment = depthView ? &da : nullptr;
-+                // Draw cascade: multi-record → single-record → demo quad.
-+                // (Demo-quad-only diagnostic confirmed the base pipeline works
-+                // on iPhone — green checker visible, 2026-06-09.)
-+                WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
 +                if (multiOk) {
-+                    wgpuRenderPassEncoderSetPipeline(rp, interactionPipeline);
-+                    for (uint32_t i = 0; i < multiCount; ++i) {
-+                        const Rec& r = lastRecords[i];
-+                        wgpuRenderPassEncoderSetBindGroup(rp, 0, recordBindGroups[i], 0, nullptr);
-+                        wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
-+                        wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
-+                        wgpuRenderPassEncoderDrawIndexed(rp, r.indexCount, 1, 0, 0, 0);
-+                    }
-+                } else if (capturedReady && interactionPipeline) {
-+                    wgpuRenderPassEncoderSetPipeline(rp, interactionPipeline);
-+                    wgpuRenderPassEncoderSetBindGroup(rp, 0, interactionBindGroup, 0, nullptr);
-+                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, capturedVertexBuf, 0, WGPU_WHOLE_SIZE);
-+                    wgpuRenderPassEncoderSetIndexBuffer(rp, capturedIndexBuf, WGPUIndexFormat_Uint16, 0, WGPU_WHOLE_SIZE);
-+                    wgpuRenderPassEncoderDrawIndexed(rp, capturedIndexCount, 1, 0, 0, 0);
++                    // Full echo: depth pre-pass + additive lit pass, exactly
++                    // the structure the determinism self-test exercises.
++                    encodeRecordsPass(enc, v, depthView);
 +                } else {
++                    // Boot/fallback: teal clear + textured demo quad.
++                    float ub[20] = {
++                        1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1,
++                        1.0f, 1.0f, 1.0f, 1.0f
++                    };
++                    wgpuQueueWriteBuffer(queue, demoUniformBuf, 0, ub, sizeof(ub));
++                    WGPURenderPassColorAttachment ca = {};
++                    ca.view = v;
++                    ca.loadOp = WGPULoadOp_Clear;
++                    ca.storeOp = WGPUStoreOp_Store;
++                    ca.clearValue = { 0.0, 0.4, 0.6, 1.0 };  // teal = "no records yet"
++                    ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
++                    WGPURenderPassDepthStencilAttachment da = {};
++                    da.view = depthView;
++                    da.depthLoadOp = WGPULoadOp_Clear;
++                    da.depthStoreOp = WGPUStoreOp_Store;
++                    da.depthClearValue = 1.0f;
++                    da.stencilLoadOp = WGPULoadOp_Undefined;
++                    da.stencilStoreOp = WGPUStoreOp_Undefined;
++                    WGPURenderPassDescriptor rpd = {};
++                    rpd.colorAttachmentCount = 1;
++                    rpd.colorAttachments = &ca;
++                    rpd.depthStencilAttachment = depthView ? &da : nullptr;
++                    WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
 +                    wgpuRenderPassEncoderSetPipeline(rp, demoPipeline);
 +                    wgpuRenderPassEncoderSetBindGroup(rp, 0, demoBindGroup, 0, nullptr);
 +                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, demoVertexBuf, 0, WGPU_WHOLE_SIZE);
 +                    wgpuRenderPassEncoderDraw(rp, 6, 1, 0, 0);
++                    wgpuRenderPassEncoderEnd(rp);
++                    wgpuRenderPassEncoderRelease(rp);
 +                }
-+                wgpuRenderPassEncoderEnd(rp);
-+                wgpuRenderPassEncoderRelease(rp);
 +
 +                WGPUCommandBuffer cb = wgpuCommandEncoderFinish(enc, nullptr);
 +                wgpuCommandEncoderRelease(enc);
@@ -2164,69 +2117,9 @@ index 0000000..c3d8e4d
 +    }
 +
 +#if D3_WEBGPU_AVAILABLE
-+    // Iter 3: column-major 4x4 matrix multiply (a = b * c). Matches the
-+    // OpenGL convention DOOM 3 stores matrices in.
-+    static void matMul4(float* out, const float* lhs, const float* rhs) {
-+        for (int c = 0; c < 4; ++c) {
-+            for (int r = 0; r < 4; ++r) {
-+                float s = 0;
-+                for (int k = 0; k < 4; ++k) {
-+                    s += lhs[k*4 + r] * rhs[c*4 + k];
-+                }
-+                out[c*4 + r] = s;
-+            }
-+        }
-+    }
-+
-+    // Iter 3: copy captured surface from CPU globals to GPU buffers. Grows
-+    // buffers on first need or when size exceeded; otherwise reuses them.
-+    // Returns true once capturedReady reflects a valid GPU mirror.
-+    bool uploadCapturedSurface() {
-+        extern uint8_t  g_lastSurfVerts[];
-+        extern uint16_t g_lastSurfIndexes16[];
-+        extern int      g_lastSurfNumVerts;
-+        extern int      g_lastSurfNumIndexes;
-+        extern uint32_t g_lastSurfFrameId;
-+
-+        const uint32_t vbytes = (uint32_t)g_lastSurfNumVerts * 60u;
-+        // WebGPU buffer sizes must be 4-byte multiples; round index byte size up.
-+        const uint32_t ibytesRaw = (uint32_t)g_lastSurfNumIndexes * 2u;
-+        const uint32_t ibytes = (ibytesRaw + 3u) & ~3u;
-+
-+        if (vbytes > capturedVertexCap) {
-+            if (capturedVertexBuf) wgpuBufferRelease(capturedVertexBuf);
-+            uint32_t cap = vbytes; if (cap < 16384) cap = 16384;
-+            cap = (cap + 3u) & ~3u;
-+            WGPUBufferDescriptor vd = {};
-+            vd.size = cap;
-+            vd.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
-+            capturedVertexBuf = wgpuDeviceCreateBuffer(device, &vd);
-+            capturedVertexCap = cap;
-+        }
-+        if (ibytes > capturedIndexCap) {
-+            if (capturedIndexBuf) wgpuBufferRelease(capturedIndexBuf);
-+            uint32_t cap = ibytes; if (cap < 16384) cap = 16384;
-+            cap = (cap + 3u) & ~3u;
-+            WGPUBufferDescriptor id = {};
-+            id.size = cap;
-+            id.usage = WGPUBufferUsage_Index | WGPUBufferUsage_CopyDst;
-+            capturedIndexBuf = wgpuDeviceCreateBuffer(device, &id);
-+            capturedIndexCap = cap;
-+        }
-+        if (!capturedVertexBuf || !capturedIndexBuf) return false;
-+        // Write rounded sizes: trailing pad bytes don't matter since draw uses
-+        // capturedIndexCount which reflects the real index count.
-+        wgpuQueueWriteBuffer(queue, capturedVertexBuf, 0, g_lastSurfVerts, (vbytes + 3u) & ~3u);
-+        wgpuQueueWriteBuffer(queue, capturedIndexBuf,  0, g_lastSurfIndexes16, ibytes);
-+        capturedIndexCount = (uint32_t)g_lastSurfNumIndexes;
-+        lastUploadedFrameId = g_lastSurfFrameId;
-+        if (!capturedReady) {
-+            capturedReady = true;
-+            EM_ASM_({ console.info("[d3] WebGPU captured first DOOM 3 surface verts=" + $0 + " idx=" + $1); },
-+                    g_lastSurfNumVerts, g_lastSurfNumIndexes);
-+        }
-+        return true;
-+    }
++    // (The iter-3/4 single-surface capture machinery — matMul4 +
++    // uploadCapturedSurface — was removed in iter 7b; the multi-record path
++    // is proven on-device and MVPs are baked engine-side at capture.)
 +
 +    // Iter 1: build a pipeline using texture.wgsl + a procedural diffuse
 +    // texture + a sampler + a quad vertex buffer + a uniform buffer.
@@ -2372,26 +2265,9 @@ index 0000000..c3d8e4d
 +        EM_ASM({ console.info("[d3] WebGPU demo quad initialized"); });
 +    }
 +
-+    // Iter 4: interaction.wgsl pipeline — real DOOM 3 lit pass.
-+    // Bindings (matches interaction.wgsl @group(0)):
-+    //   0 uniform   (mvp + light/view/colors/proj/falloff = 192 bytes)
-+    //   1 sampler   s_material
-+    //   2 sampler   s_lighting
-+    //   3 texture   t_normal   (DXT5-NM neutral: alpha=0.5, g=0.5 → flat normal)
-+    //   4 texture   t_specular (white)
-+    //   5 texture   t_diffuse  (DOOM-3 green checker so we can see geometry)
-+    //   6 texture   t_lightFalloff (white = no attenuation along light axis)
-+    //   7 texture   t_lightProj    (white = no projection cookie)
-+    // All procedural — real engine texture capture is iter 5.
-+    void initInteractionPipeline() {
-+        WGPUShaderSourceWGSL wgsl = {};
-+        wgsl.chain.sType = WGPUSType_ShaderSourceWGSL;
-+        wgsl.code = { kWGSL_interaction, WGPU_STRLEN };
-+        WGPUShaderModuleDescriptor smd = {};
-+        smd.nextInChain = &wgsl.chain;
-+        WGPUShaderModule mod = wgpuDeviceCreateShaderModule(device, &smd);
-+        if (!mod) { fprintf(stderr, "[WebGPU iter4] interaction.wgsl create FAILED\n"); return; }
-+
++    // Shared idDrawVert vertex layout (60 bytes) for all engine-geometry
++    // pipelines.
++    static const WGPUVertexBufferLayout* drawVertLayout() {
 +        static const WGPUVertexAttribute attrs[] = {
 +            { nullptr, WGPUVertexFormat_Float32x3, 0,  0 },
 +            { nullptr, WGPUVertexFormat_Float32x2, 12, 1 },
@@ -2400,18 +2276,37 @@ index 0000000..c3d8e4d
 +            { nullptr, WGPUVertexFormat_Float32x3, 44, 4 },
 +            { nullptr, WGPUVertexFormat_Unorm8x4,  56, 5 },
 +        };
-+        WGPUVertexBufferLayout vbl = {};
++        static WGPUVertexBufferLayout vbl = {};
 +        vbl.stepMode = WGPUVertexStepMode_Vertex;
 +        vbl.arrayStride = 60;
 +        vbl.attributeCount = 6;
 +        vbl.attributes = attrs;
++        return &vbl;
++    }
++
++    // Iter 7b: interaction.wgsl pipeline — DOOM 3 lit pass, ADDITIVE.
++    // DOOM 3 renders one pass per surface×light interaction and sums them
++    // (GLS_SRCBLEND_ONE | GLS_DSTBLEND_ONE); depth comes from the z-fill
++    // pre-pass (depthPipeline below), so the lit pass tests LessEqual and
++    // does NOT write depth. Bindings are split:
++    //   @group(0) binding 0: per-record uniforms (one bind group per slot)
++    //   @group(1): samplers + the 5 material/light textures (one bind
++    //              group per unique texture tuple, cached)
++    void initInteractionPipeline() {
++        WGPUShaderSourceWGSL wgsl = {};
++        wgsl.chain.sType = WGPUSType_ShaderSourceWGSL;
++        wgsl.code = { kWGSL_interaction, WGPU_STRLEN };
++        WGPUShaderModuleDescriptor smd = {};
++        smd.nextInChain = &wgsl.chain;
++        WGPUShaderModule mod = wgpuDeviceCreateShaderModule(device, &smd);
++        if (!mod) { fprintf(stderr, "[WebGPU] interaction.wgsl create FAILED\n"); return; }
 +
 +        WGPUColorTargetState target = {};
 +        target.format = surfaceFormat;
 +        target.writeMask = WGPUColorWriteMask_All;
 +        WGPUBlendState blend = {};
-+        blend.color.srcFactor = WGPUBlendFactor_One; blend.color.dstFactor = WGPUBlendFactor_Zero;
-+        blend.alpha.srcFactor = WGPUBlendFactor_One; blend.alpha.dstFactor = WGPUBlendFactor_Zero;
++        blend.color.srcFactor = WGPUBlendFactor_One; blend.color.dstFactor = WGPUBlendFactor_One;
++        blend.alpha.srcFactor = WGPUBlendFactor_One; blend.alpha.dstFactor = WGPUBlendFactor_One;
 +        target.blend = &blend;
 +        WGPUFragmentState frag = {};
 +        frag.module = mod;
@@ -2420,7 +2315,7 @@ index 0000000..c3d8e4d
 +        frag.targets = &target;
 +        WGPUDepthStencilState dss = {};
 +        dss.format = WGPUTextureFormat_Depth24Plus;
-+        dss.depthWriteEnabled = WGPUOptionalBool_True;
++        dss.depthWriteEnabled = WGPUOptionalBool_False;   // z comes from the pre-pass
 +        dss.depthCompare = WGPUCompareFunction_LessEqual;
 +        dss.stencilFront.compare = WGPUCompareFunction_Always;
 +        dss.stencilBack.compare  = WGPUCompareFunction_Always;
@@ -2432,7 +2327,7 @@ index 0000000..c3d8e4d
 +        pd.vertex.module = mod;
 +        pd.vertex.entryPoint = { "vs_main", WGPU_STRLEN };
 +        pd.vertex.bufferCount = 1;
-+        pd.vertex.buffers = &vbl;
++        pd.vertex.buffers = drawVertLayout();
 +        pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
 +        pd.primitive.cullMode = WGPUCullMode_None;  // no front/back yet
 +        pd.multisample.count = 1;
@@ -2441,13 +2336,7 @@ index 0000000..c3d8e4d
 +        pd.depthStencil = &dss;
 +        interactionPipeline = wgpuDeviceCreateRenderPipeline(device, &pd);
 +        wgpuShaderModuleRelease(mod);
-+        if (!interactionPipeline) { fprintf(stderr, "[WebGPU iter4] interaction pipeline FAILED\n"); return; }
-+
-+        // Uniform buffer (mvp + 7 vec4 + 1 pad-vec4 = 192 bytes; we write 192)
-+        WGPUBufferDescriptor ubd = {};
-+        ubd.size = 192;
-+        ubd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
-+        interactionUniformBuf = wgpuDeviceCreateBuffer(device, &ubd);
++        if (!interactionPipeline) { fprintf(stderr, "[WebGPU] interaction pipeline FAILED\n"); return; }
 +
 +        // 2 samplers
 +        WGPUSamplerDescriptor msd = {};
@@ -2463,120 +2352,194 @@ index 0000000..c3d8e4d
 +        lsd.addressModeV = WGPUAddressMode_ClampToEdge;
 +        interactionLightSampler = wgpuDeviceCreateSampler(device, &lsd);
 +
-+        // 5 procedural textures (all 4x4 — small, cheap, illustrative)
-+        auto makeTex = [&](uint32_t fill, const char* label) -> WGPUTextureView {
-+            const int M = 4;
-+            uint32_t pixels[M*M];
-+            for (int i = 0; i < M*M; ++i) pixels[i] = fill;
-+            WGPUTextureDescriptor td = {};
-+            td.size = { (uint32_t)M, (uint32_t)M, 1 };
-+            td.mipLevelCount = 1;
-+            td.sampleCount = 1;
-+            td.dimension = WGPUTextureDimension_2D;
-+            td.format = WGPUTextureFormat_RGBA8Unorm;
-+            td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
-+            td.label = { label, WGPU_STRLEN };
-+            WGPUTexture tex = wgpuDeviceCreateTexture(device, &td);
-+            WGPUTexelCopyTextureInfo dst = {};
-+            dst.texture = tex;
-+            WGPUTexelCopyBufferLayout layout = {};
-+            layout.bytesPerRow = M * 4; layout.rowsPerImage = M;
-+            WGPUExtent3D extent = { (uint32_t)M, (uint32_t)M, 1 };
-+            wgpuQueueWriteTexture(queue, &dst, pixels, sizeof(pixels), &layout, &extent);
-+            // Keep the texture handle so it isn't freed; we don't need a per-texture
-+            // field — leaking 5 4x4 textures for the lifetime of the backend is fine.
-+            return wgpuTextureCreateView(tex, nullptr);
-+        };
-+        // DXT5-NM neutral normal: alpha=0x80 (0.5), green=0x80 (0.5) → (0,0,1) in TS
-+        WGPUTextureView vNormal   = makeTex(0x80808080u, "interactionNormal");
-+        WGPUTextureView vSpecular = makeTex(0xffffffffu, "interactionSpecular");
-+        WGPUTextureView vDiffuse  = makeTex(0xff80c080u, "interactionDiffuse");
-+        WGPUTextureView vFalloff  = makeTex(0xffffffffu, "interactionFalloff");
-+        WGPUTextureView vProj     = makeTex(0xffffffffu, "interactionProj");
-+
-+        WGPUBindGroupLayout bgl = wgpuRenderPipelineGetBindGroupLayout(interactionPipeline, 0);
-+        WGPUBindGroupEntry e[8] = {};
-+        e[0].binding = 0; e[0].buffer = interactionUniformBuf; e[0].size = 192;
-+        e[1].binding = 1; e[1].sampler = interactionMaterialSampler;
-+        e[2].binding = 2; e[2].sampler = interactionLightSampler;
-+        e[3].binding = 3; e[3].textureView = vNormal;
-+        e[4].binding = 4; e[4].textureView = vSpecular;
-+        e[5].binding = 5; e[5].textureView = vDiffuse;
-+        e[6].binding = 6; e[6].textureView = vFalloff;
-+        e[7].binding = 7; e[7].textureView = vProj;
-+        WGPUBindGroupDescriptor bgd = {};
-+        bgd.layout = bgl;
-+        bgd.entryCount = 8;
-+        bgd.entries = e;
-+        interactionBindGroup = wgpuDeviceCreateBindGroup(device, &bgd);
-+        wgpuTextureViewRelease(vNormal);
-+        wgpuTextureViewRelease(vSpecular);
-+        wgpuTextureViewRelease(vDiffuse);
-+        wgpuTextureViewRelease(vFalloff);
-+        wgpuTextureViewRelease(vProj);
-+        wgpuBindGroupLayoutRelease(bgl);
 +        EM_ASM({ console.info("[d3] WebGPU interaction pipeline initialized"); });
 +    }
 +
-+    // Iter 6: pre-build N per-record uniform buffers + bind groups so
-+    // EndFrame can write+draw per record without recreating bind groups.
-+    // Reuses interactionMaterialSampler/LightSampler + the procedural
-+    // textures embedded in the single-record bind group; per-record
-+    // uniforms (matrices + light state) are per-slot.
++    // Iter 7b: z-fill pre-pass pipeline (depth.wgsl). No fragment stage, no
++    // color targets — writes depth only. The lit pass then tests LessEqual
++    // with depth writes off, giving correct occlusion AND letting multiple
++    // light passes of the same surface accumulate at equal depth.
++    void initDepthPipeline() {
++        WGPUShaderSourceWGSL wgsl = {};
++        wgsl.chain.sType = WGPUSType_ShaderSourceWGSL;
++        wgsl.code = { kWGSL_depth, WGPU_STRLEN };
++        WGPUShaderModuleDescriptor smd = {};
++        smd.nextInChain = &wgsl.chain;
++        WGPUShaderModule mod = wgpuDeviceCreateShaderModule(device, &smd);
++        if (!mod) { fprintf(stderr, "[WebGPU] depth.wgsl create FAILED\n"); return; }
++
++        WGPUDepthStencilState dss = {};
++        dss.format = WGPUTextureFormat_Depth24Plus;
++        dss.depthWriteEnabled = WGPUOptionalBool_True;
++        dss.depthCompare = WGPUCompareFunction_LessEqual;
++        dss.stencilFront.compare = WGPUCompareFunction_Always;
++        dss.stencilBack.compare  = WGPUCompareFunction_Always;
++        dss.stencilFront.failOp = dss.stencilFront.depthFailOp = dss.stencilFront.passOp = WGPUStencilOperation_Keep;
++        dss.stencilBack.failOp  = dss.stencilBack.depthFailOp  = dss.stencilBack.passOp  = WGPUStencilOperation_Keep;
++
++        WGPURenderPipelineDescriptor pd = {};
++        pd.label = { "depthPrepass", WGPU_STRLEN };
++        pd.vertex.module = mod;
++        pd.vertex.entryPoint = { "vs_main", WGPU_STRLEN };
++        pd.vertex.bufferCount = 1;
++        pd.vertex.buffers = drawVertLayout();
++        pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
++        pd.primitive.cullMode = WGPUCullMode_None;
++        pd.multisample.count = 1;
++        pd.multisample.mask = 0xFFFFFFFF;
++        pd.fragment = nullptr;          // depth-only
++        pd.depthStencil = &dss;
++        depthPipeline = wgpuDeviceCreateRenderPipeline(device, &pd);
++        wgpuShaderModuleRelease(mod);
++        if (!depthPipeline) { fprintf(stderr, "[WebGPU] depth pipeline FAILED\n"); return; }
++    }
++
++    // Iter 7b: small procedural texture helper (fallbacks for images that
++    // aren't in the CPU cache).
++    WGPUTextureView makeFillTex(uint32_t fill, const char* label) {
++        const int M = 4;
++        uint32_t pixels[M*M];
++        for (int i = 0; i < M*M; ++i) pixels[i] = fill;
++        WGPUTextureDescriptor td = {};
++        td.size = { (uint32_t)M, (uint32_t)M, 1 };
++        td.mipLevelCount = 1;
++        td.sampleCount = 1;
++        td.dimension = WGPUTextureDimension_2D;
++        td.format = WGPUTextureFormat_RGBA8Unorm;
++        td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
++        td.label = { label, WGPU_STRLEN };
++        WGPUTexture tex = wgpuDeviceCreateTexture(device, &td);
++        WGPUTexelCopyTextureInfo dst = {};
++        dst.texture = tex;
++        WGPUTexelCopyBufferLayout layout = {};
++        layout.bytesPerRow = M * 4; layout.rowsPerImage = M;
++        WGPUExtent3D extent = { (uint32_t)M, (uint32_t)M, 1 };
++        wgpuQueueWriteTexture(queue, &dst, pixels, sizeof(pixels), &layout, &extent);
++        // Texture handle intentionally not stored — lives for the session.
++        return wgpuTextureCreateView(tex, nullptr);
++    }
++
++    // Iter 7b: GPU mirror of the engine's CPU image cache. One texture per
++    // idImage pointer, created+uploaded on first use.
++    WGPUTextureView getEngineTextureView(const void* imgPtr, WGPUTextureView fallback) {
++        if (!imgPtr) return fallback;
++        for (int i = 0; i < texCacheCount; ++i) {
++            if (texCache[i].ptr == imgPtr) return texCache[i].view;
++        }
++        const ImgSlot* slot = D3_WebGPU_LookupCachedImage(imgPtr);
++        if (!slot || !slot->pixels || slot->w <= 0 || slot->h <= 0) return fallback;
++        if (texCacheCount >= (int)kTexCacheSize) return fallback;
++
++        WGPUTextureDescriptor td = {};
++        td.size = { (uint32_t)slot->w, (uint32_t)slot->h, 1 };
++        td.mipLevelCount = 1;
++        td.sampleCount = 1;
++        td.dimension = WGPUTextureDimension_2D;
++        td.format = WGPUTextureFormat_RGBA8Unorm;
++        td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
++        WGPUTexture tex = wgpuDeviceCreateTexture(device, &td);
++        if (!tex) return fallback;
++        WGPUTexelCopyTextureInfo dst = {};
++        dst.texture = tex;
++        WGPUTexelCopyBufferLayout layout = {};
++        layout.bytesPerRow = (uint32_t)slot->w * 4u;
++        layout.rowsPerImage = (uint32_t)slot->h;
++        WGPUExtent3D extent = { (uint32_t)slot->w, (uint32_t)slot->h, 1 };
++        wgpuQueueWriteTexture(queue, &dst, slot->pixels,
++                              (size_t)slot->w * (size_t)slot->h * 4u, &layout, &extent);
++        WGPUTextureView view = wgpuTextureCreateView(tex, nullptr);
++        texCache[texCacheCount].ptr = imgPtr;
++        texCache[texCacheCount].view = view;
++        texCacheCount++;
++        // Diagnostic inventory: name, size, mid-pixel RGBA (first 12 uploads
++        // only — enough to validate the cache without flooding the console).
++        if (texCacheCount <= 12) {
++            const int mx = slot->w / 2, my = slot->h / 2;
++            const uint8_t* p = slot->pixels + ((size_t)my * slot->w + mx) * 4u;
++            EM_ASM_({
++                console.info("[d3] texUpload '" + UTF8ToString($0) + "' " + $1 + "x" + $2 +
++                             " mid=(" + $3 + "," + $4 + "," + $5 + "," + $6 + ")");
++            }, slot->name, slot->w, slot->h, p[0], p[1], p[2], p[3]);
++        }
++        return view;
++    }
++
++    // Iter 7b: material bind group (@group(1)) per unique 5-image tuple.
++    // imgs order matches the capture in draw_arb2.cpp:
++    //   [0]=bump [1]=lightFalloff [2]=lightProj [3]=diffuse [4]=specular
++    WGPUBindGroup getMaterialBindGroup(void* const imgs[5]) {
++        for (int i = 0; i < matCacheCount; ++i) {
++            if (memcmp(matCache[i].key, imgs, sizeof(void*) * 5) == 0) {
++                return matCache[i].group;
++            }
++        }
++        WGPUTextureView vNormal   = getEngineTextureView(imgs[0], fbFlatNormalView);
++        WGPUTextureView vFalloff  = getEngineTextureView(imgs[1], fbWhiteView);
++        WGPUTextureView vProj     = getEngineTextureView(imgs[2], fbWhiteView);
++        WGPUTextureView vDiffuse  = getEngineTextureView(imgs[3], fbCheckerView);
++        WGPUTextureView vSpecular = getEngineTextureView(imgs[4], fbWhiteView);
++
++        WGPUBindGroupLayout bgl = wgpuRenderPipelineGetBindGroupLayout(interactionPipeline, 1);
++        WGPUBindGroupEntry e[7] = {};
++        e[0].binding = 0; e[0].sampler = interactionMaterialSampler;
++        e[1].binding = 1; e[1].sampler = interactionLightSampler;
++        e[2].binding = 2; e[2].textureView = vNormal;
++        e[3].binding = 3; e[3].textureView = vSpecular;
++        e[4].binding = 4; e[4].textureView = vDiffuse;
++        e[5].binding = 5; e[5].textureView = vFalloff;
++        e[6].binding = 6; e[6].textureView = vProj;
++        WGPUBindGroupDescriptor bgd = {};
++        bgd.layout = bgl;
++        bgd.entryCount = 7;
++        bgd.entries = e;
++        WGPUBindGroup group = wgpuDeviceCreateBindGroup(device, &bgd);
++        wgpuBindGroupLayoutRelease(bgl);
++        if (matCacheCount < (int)kMatCacheSize) {
++            memcpy(matCache[matCacheCount].key, imgs, sizeof(void*) * 5);
++            matCache[matCacheCount].group = group;
++            matCacheCount++;
++        } else if (!matCacheOverflowWarned) {
++            matCacheOverflowWarned = true;
++            EM_ASM({ console.warn("[d3] WebGPU material bind-group cache full; transient groups will leak"); });
++        }
++        return group;
++    }
++
++    // Iter 7b: per-record slot resources. Each slot gets one 192-byte
++    // uniform buffer plus TWO group(0) bind groups over it: one for the
++    // interaction pipeline's layout, one for the depth pre-pass pipeline's
++    // layout (depth.wgsl only declares the mat4, so its auto layout has a
++    // smaller minBindingSize — entry.size 192 satisfies both). Fallback
++    // texture views are created here too.
 +    void initRecordSlots() {
 +        if (recordSlotsReady) return;
-+        if (!interactionPipeline) return;
-+        WGPUBindGroupLayout bgl = wgpuRenderPipelineGetBindGroupLayout(interactionPipeline, 0);
++        if (!interactionPipeline || !depthPipeline) return;
 +
-+        // Procedural textures shared with the single-record bind group are
-+        // already released; rebuild here.
-+        auto makeTex = [&](uint32_t fill) -> WGPUTextureView {
-+            const int M = 4; uint32_t px[M*M]; for (int i = 0; i < M*M; ++i) px[i] = fill;
-+            WGPUTextureDescriptor td = {};
-+            td.size = { (uint32_t)M, (uint32_t)M, 1 };
-+            td.mipLevelCount = 1; td.sampleCount = 1;
-+            td.dimension = WGPUTextureDimension_2D;
-+            td.format = WGPUTextureFormat_RGBA8Unorm;
-+            td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
-+            WGPUTexture tex = wgpuDeviceCreateTexture(device, &td);
-+            WGPUTexelCopyTextureInfo dst = {}; dst.texture = tex;
-+            WGPUTexelCopyBufferLayout layout = {}; layout.bytesPerRow = M*4; layout.rowsPerImage = M;
-+            WGPUExtent3D ext = { (uint32_t)M, (uint32_t)M, 1 };
-+            wgpuQueueWriteTexture(queue, &dst, px, sizeof(px), &layout, &ext);
-+            return wgpuTextureCreateView(tex, nullptr);
-+        };
-+        WGPUTextureView vNormal = makeTex(0x80808080u);
-+        WGPUTextureView vSpec   = makeTex(0xffffffffu);
-+        WGPUTextureView vDiff   = makeTex(0xff80c080u);
-+        WGPUTextureView vFall   = makeTex(0xffffffffu);
-+        WGPUTextureView vProj   = makeTex(0xffffffffu);
++        // Standard tangent-space flat normal (0,0,1) = RGB(128,128,255).
++        // Little-endian RGBA8 bytes R=0x80 G=0x80 B=0xFF A=0xFF.
++        fbFlatNormalView = makeFillTex(0xffff8080u, "fbFlatNormal");
++        fbWhiteView      = makeFillTex(0xffffffffu, "fbWhite");
++        fbCheckerView    = makeFillTex(0xff80c080u, "fbChecker");
 +
++        WGPUBindGroupLayout bglInteraction = wgpuRenderPipelineGetBindGroupLayout(interactionPipeline, 0);
++        WGPUBindGroupLayout bglDepth       = wgpuRenderPipelineGetBindGroupLayout(depthPipeline, 0);
 +        for (uint32_t i = 0; i < kMaxRecordSlots; ++i) {
 +            WGPUBufferDescriptor ubd = {};
 +            ubd.size = 192;
 +            ubd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
 +            recordUniformBufs[i] = wgpuDeviceCreateBuffer(device, &ubd);
-+            WGPUBindGroupEntry e[8] = {};
-+            e[0].binding = 0; e[0].buffer = recordUniformBufs[i]; e[0].size = 192;
-+            e[1].binding = 1; e[1].sampler = interactionMaterialSampler;
-+            e[2].binding = 2; e[2].sampler = interactionLightSampler;
-+            e[3].binding = 3; e[3].textureView = vNormal;
-+            e[4].binding = 4; e[4].textureView = vSpec;
-+            e[5].binding = 5; e[5].textureView = vDiff;
-+            e[6].binding = 6; e[6].textureView = vFall;
-+            e[7].binding = 7; e[7].textureView = vProj;
++            WGPUBindGroupEntry e = {};
++            e.binding = 0; e.buffer = recordUniformBufs[i]; e.size = 192;
 +            WGPUBindGroupDescriptor bgd = {};
-+            bgd.layout = bgl;
-+            bgd.entryCount = 8;
-+            bgd.entries = e;
++            bgd.entryCount = 1;
++            bgd.entries = &e;
++            bgd.layout = bglInteraction;
 +            recordBindGroups[i] = wgpuDeviceCreateBindGroup(device, &bgd);
++            bgd.layout = bglDepth;
++            recordDepthBindGroups[i] = wgpuDeviceCreateBindGroup(device, &bgd);
 +        }
-+        wgpuTextureViewRelease(vNormal);
-+        wgpuTextureViewRelease(vSpec);
-+        wgpuTextureViewRelease(vDiff);
-+        wgpuTextureViewRelease(vFall);
-+        wgpuTextureViewRelease(vProj);
-+        wgpuBindGroupLayoutRelease(bgl);
++        wgpuBindGroupLayoutRelease(bglInteraction);
++        wgpuBindGroupLayoutRelease(bglDepth);
 +        recordSlotsReady = true;
 +        EM_ASM_({ console.info("[d3] WebGPU record slots ready: " + $0); }, kMaxRecordSlots);
 +    }
@@ -2595,6 +2558,8 @@ index 0000000..c3d8e4d
 +        extern uint32_t g_capVertBytes;
 +        extern uint32_t g_capIndexBytes;
 +        extern uint32_t g_capFrameId;
++        extern uint32_t g_capDropped;
++        extern void* g_capImagePtrs[][5];
 +
 +        outCount = 0;
 +        if (g_capRecordCount == 0) {
@@ -2644,6 +2609,21 @@ index 0000000..c3d8e4d
 +            memcpy(ub + 40, r.lightProjQ,       16);
 +            memcpy(ub + 44, r.lightFalloffS,    16);
 +            wgpuQueueWriteBuffer(queue, recordUniformBufs[i], 0, ub, 192);
++            // Iter 7b: resolve the material bind group (creates GPU textures
++            // from the CPU image cache on first sight of each image).
++            lastMatGroups[i] = getMaterialBindGroup(g_capImagePtrs[i]);
++            // Diagnostic: name the falloff image feeding each record (once).
++            static bool falloffDumped = false;
++            if (!falloffDumped && i + 1 == n) {
++                falloffDumped = true;
++                for (uint32_t k = 0; k < n && k < 12; ++k) {
++                    const ImgSlot* fs = D3_WebGPU_LookupCachedImage(g_capImagePtrs[k][1]);
++                    EM_ASM_({
++                        console.info("[d3] rec" + $0 + " falloff=" +
++                                     ($1 ? UTF8ToString($1) : "<not cached>"));
++                    }, k, fs ? (intptr_t)fs->name : 0);
++                }
++            }
 +        }
 +        // Keep a backend-local copy of the consumed records (the draw loop
 +        // reads offsets/counts from here, and no-capture frames redraw it).
@@ -2658,45 +2638,96 @@ index 0000000..c3d8e4d
 +        static bool announcedOnce = false;
 +        if (!announcedOnce) {
 +            announcedOnce = true;
-+            EM_ASM_({ console.info("[d3] WebGPU multi-surface upload: records=" + $0 + " vbytes=" + $1 + " ibytes=" + $2); },
-+                    n, vNeed, iNeed);
++            EM_ASM_({ console.info("[d3] WebGPU multi-surface upload: records=" + $0 + " vbytes=" + $1 + " ibytes=" + $2 + " texCache=" + $3); },
++                    n, vNeed, iNeed, texCacheCount);
++        }
++        // Drop accounting — log once if a frame overflowed the caps, so a
++        // truncated scene reads as "truncated", not "covered".
++        if (g_capDropped) {
++            static uint32_t lastDropReport = 0;
++            if (detFrameCounter - lastDropReport > 600 || lastDropReport == 0) {
++                lastDropReport = detFrameCounter ? detFrameCounter : 1;
++                EM_ASM_({ console.info("[d3] WebGPU records dropped this frame (cap hit): " + $0); }, g_capDropped);
++            }
++            g_capDropped = 0;
 +        }
 +        return true;
 +    }
 +
 +    // ─── Iter 6.8: determinism self-test ────────────────────────────────────
 +
-+    // Encode one render pass drawing all lastRecords into the given color
-+    // view (same pipeline + bind groups the on-screen echo uses).
++    // Encode the full record draw — depth pre-pass then additive lit pass —
++    // into the given color/depth views. Used by both the on-screen echo and
++    // the determinism self-test so the two stay structurally identical.
 +    void encodeRecordsPass(WGPUCommandEncoder enc, WGPUTextureView color, WGPUTextureView depth) {
-+        WGPURenderPassColorAttachment ca = {};
-+        ca.view = color;
-+        ca.loadOp = WGPULoadOp_Clear;
-+        ca.storeOp = WGPUStoreOp_Store;
-+        ca.clearValue = { 0.0, 0.4, 0.6, 1.0 };
-+        ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
-+        WGPURenderPassDepthStencilAttachment da = {};
-+        da.view = depth;
-+        da.depthLoadOp = WGPULoadOp_Clear;
-+        da.depthStoreOp = WGPUStoreOp_Store;
-+        da.depthClearValue = 1.0f;
-+        da.stencilLoadOp = WGPULoadOp_Undefined;
-+        da.stencilStoreOp = WGPUStoreOp_Undefined;
-+        WGPURenderPassDescriptor rpd = {};
-+        rpd.colorAttachmentCount = 1;
-+        rpd.colorAttachments = &ca;
-+        rpd.depthStencilAttachment = &da;
-+        WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
-+        wgpuRenderPassEncoderSetPipeline(rp, interactionPipeline);
-+        for (uint32_t i = 0; i < lastRecordCount; ++i) {
-+            const Rec& r = lastRecords[i];
-+            wgpuRenderPassEncoderSetBindGroup(rp, 0, recordBindGroups[i], 0, nullptr);
-+            wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
-+            wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
-+            wgpuRenderPassEncoderDrawIndexed(rp, r.indexCount, 1, 0, 0, 0);
++        // DIAGNOSTIC: skip the z pre-pass to test whether the lit pass is
++        // being depth-rejected by cross-pipeline clip-z mismatch.
++        const bool kUsePrePass = false;
++        // Pass 1: z-fill (no color attachments)
++        if (kUsePrePass) {
++            WGPURenderPassDepthStencilAttachment da = {};
++            da.view = depth;
++            da.depthLoadOp = WGPULoadOp_Clear;
++            da.depthStoreOp = WGPUStoreOp_Store;
++            da.depthClearValue = 1.0f;
++            da.stencilLoadOp = WGPULoadOp_Undefined;
++            da.stencilStoreOp = WGPUStoreOp_Undefined;
++            WGPURenderPassDescriptor rpd = {};
++            rpd.colorAttachmentCount = 0;
++            rpd.depthStencilAttachment = &da;
++            WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
++            wgpuRenderPassEncoderSetPipeline(rp, depthPipeline);
++            for (uint32_t i = 0; i < lastRecordCount; ++i) {
++                const Rec& r = lastRecords[i];
++                wgpuRenderPassEncoderSetBindGroup(rp, 0, recordDepthBindGroups[i], 0, nullptr);
++                wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
++                wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
++                wgpuRenderPassEncoderDrawIndexed(rp, r.indexCount, 1, 0, 0, 0);
++            }
++            wgpuRenderPassEncoderEnd(rp);
++            wgpuRenderPassEncoderRelease(rp);
 +        }
-+        wgpuRenderPassEncoderEnd(rp);
-+        wgpuRenderPassEncoderRelease(rp);
++        // Pass 2: additive lit pass (clear to black, depth from pass 1)
++        {
++            WGPURenderPassColorAttachment ca = {};
++            ca.view = color;
++            ca.loadOp = WGPULoadOp_Clear;
++            ca.storeOp = WGPUStoreOp_Store;
++            ca.clearValue = { 0.0, 0.0, 0.0, 1.0 };
++            ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
++            WGPURenderPassDepthStencilAttachment da = {};
++            da.view = depth;
++            da.depthLoadOp = kUsePrePass ? WGPULoadOp_Load : WGPULoadOp_Clear;
++            da.depthStoreOp = WGPUStoreOp_Store;
++            da.depthClearValue = 1.0f;
++            da.stencilLoadOp = WGPULoadOp_Undefined;
++            da.stencilStoreOp = WGPUStoreOp_Undefined;
++            WGPURenderPassDescriptor rpd = {};
++            rpd.colorAttachmentCount = 1;
++            rpd.colorAttachments = &ca;
++            rpd.depthStencilAttachment = &da;
++            WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
++            wgpuRenderPassEncoderSetPipeline(rp, interactionPipeline);
++            for (uint32_t i = 0; i < lastRecordCount; ++i) {
++                const Rec& r = lastRecords[i];
++                wgpuRenderPassEncoderSetBindGroup(rp, 0, recordBindGroups[i], 0, nullptr);
++                wgpuRenderPassEncoderSetBindGroup(rp, 1, lastMatGroups[i] ? lastMatGroups[i] : fallbackMatGroup(), 0, nullptr);
++                wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
++                wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
++                wgpuRenderPassEncoderDrawIndexed(rp, r.indexCount, 1, 0, 0, 0);
++            }
++            wgpuRenderPassEncoderEnd(rp);
++            wgpuRenderPassEncoderRelease(rp);
++        }
++    }
++
++    // All-fallback material group for records whose resolve failed.
++    WGPUBindGroup fallbackMatGroup() {
++        if (!fbMatGroup) {
++            void* nulls[5] = { nullptr, nullptr, nullptr, nullptr, nullptr };
++            fbMatGroup = getMaterialBindGroup(nulls);
++        }
++        return fbMatGroup;
 +    }
 +
 +    static void detMapCallback(WGPUMapAsyncStatus status, WGPUStringView /*msg*/, void* ud1, void* /*ud2*/) {
@@ -3277,38 +3308,29 @@ index 0000000..c3d8e4d
 +    WGPUTexture             demoTexture      = nullptr;
 +    WGPUSampler             demoSampler      = nullptr;
 +    WGPUBindGroup           demoBindGroup    = nullptr;
-+    // Iter 3: captured-surface GPU mirror
-+    WGPUBuffer              capturedVertexBuf = nullptr;
-+    WGPUBuffer              capturedIndexBuf  = nullptr;
-+    uint32_t                capturedVertexCap = 0;  // bytes
-+    uint32_t                capturedIndexCap  = 0;  // bytes
-+    uint32_t                capturedIndexCount = 0;
-+    uint32_t                lastUploadedFrameId = 0;
-+    bool                    capturedReady    = false;
-+    // Iter 4: interaction.wgsl pipeline (real DOOM 3 lit pass)
++    // Iter 4/7b: interaction.wgsl pipeline (DOOM 3 lit pass, additive)
 +    WGPURenderPipeline      interactionPipeline = nullptr;
-+    WGPUBuffer              interactionUniformBuf = nullptr;
 +    WGPUSampler             interactionMaterialSampler = nullptr;
 +    WGPUSampler             interactionLightSampler = nullptr;
-+    WGPUBindGroup           interactionBindGroup = nullptr;
-+    // Iter 5: depth buffer (proper occlusion for the captured DOOM 3 surface)
++    // Iter 7b: z-fill pre-pass pipeline (depth.wgsl, no fragment stage)
++    WGPURenderPipeline      depthPipeline = nullptr;
++    // Iter 5: depth buffer (canvas-sized; shared by pre-pass + lit pass)
 +    WGPUTexture             depthTexture = nullptr;
 +    WGPUTextureView         depthView    = nullptr;
 +    int                     depthW = 0, depthH = 0;
-+    // Iter 6: multi-surface mirror — one big GPU vertex/index buffer holds
-+    // the engine's per-frame accumulated geometry; 64 small uniform buffers
-+    // + 64 bind groups give per-record material/light state without the
-+    // complexity of dynamic-offset bind groups. Each frame the engine
-+    // appends up to kMaxRecordSlots records into the CPU-side accumulator
-+    // (tr_render.cpp); uploadCapturedRecords mirrors them into the GPU
-+    // buffers, then EndFrame iterates and draws each.
-+    static constexpr uint32_t kMaxRecordSlots = 64;
++    // Iter 6/7b: multi-surface mirror — one big GPU vertex/index buffer
++    // holds the engine's per-frame accumulated geometry; per-slot uniform
++    // buffers + per-slot group(0) bind groups (one set for the interaction
++    // pipeline layout, one for the depth pipeline layout). Material
++    // textures live in group(1), cached per unique 5-image tuple.
++    static constexpr uint32_t kMaxRecordSlots = 256;
 +    WGPUBuffer              recordVertexBuf = nullptr;
 +    WGPUBuffer              recordIndexBuf  = nullptr;
 +    uint32_t                recordVertexCap = 0;   // bytes
 +    uint32_t                recordIndexCap  = 0;   // bytes
 +    WGPUBuffer              recordUniformBufs[kMaxRecordSlots] = {nullptr};
 +    WGPUBindGroup           recordBindGroups[kMaxRecordSlots]  = {nullptr};
++    WGPUBindGroup           recordDepthBindGroups[kMaxRecordSlots] = {nullptr};
 +    bool                    recordSlotsReady = false;
 +    uint32_t                lastUploadedCapFrameId = 0;
 +    // Iter 6.6: backend-local copy of the last consumed records — the draw
@@ -3316,6 +3338,22 @@ index 0000000..c3d8e4d
 +    // (GUI-only frames) redraw this set.
 +    Rec                     lastRecords[kMaxRecordSlots] = {};
 +    uint32_t                lastRecordCount = 0;
++    WGPUBindGroup           lastMatGroups[kMaxRecordSlots] = {nullptr};
++    // Iter 7b: GPU texture cache (engine idImage ptr → WGPUTextureView) and
++    // material bind-group cache (5-image tuple → group(1) bind group).
++    static constexpr uint32_t kTexCacheSize = 512;
++    static constexpr uint32_t kMatCacheSize = 512;
++    struct TexCacheEntry { const void* ptr; WGPUTextureView view; };
++    struct MatCacheEntry { void* key[5]; WGPUBindGroup group; };
++    TexCacheEntry           texCache[kTexCacheSize] = {};
++    MatCacheEntry           matCache[kMatCacheSize] = {};
++    int                     texCacheCount = 0;
++    int                     matCacheCount = 0;
++    bool                    matCacheOverflowWarned = false;
++    WGPUTextureView         fbFlatNormalView = nullptr;
++    WGPUTextureView         fbWhiteView      = nullptr;
++    WGPUTextureView         fbCheckerView    = nullptr;
++    WGPUBindGroup           fbMatGroup       = nullptr;
 +    // Iter 6.8: on-device determinism self-test. Renders the identical
 +    // record set twice into two offscreen textures, reads both back,
 +    // byte-compares. Sidesteps the canvas-readback trap (WebGPU canvases
@@ -3488,10 +3526,10 @@ index 7914093..eed2277 100644
  	GLimp_Shutdown();
  
 diff --git a/neo/renderer/draw_arb2.cpp b/neo/renderer/draw_arb2.cpp
-index c1d0d3e..a840d8b 100644
+index c1d0d3e..5f273f7 100644
 --- a/neo/renderer/draw_arb2.cpp
 +++ b/neo/renderer/draw_arb2.cpp
-@@ -62,7 +62,157 @@ static void GL_SelectTextureNoClient( int unit ) {
+@@ -62,7 +62,136 @@ static void GL_SelectTextureNoClient( int unit ) {
  RB_ARB2_DrawInteraction
  ==================
  */
@@ -3535,10 +3573,11 @@ index c1d0d3e..a840d8b 100644
 +    extern uint32_t g_capVertBytes;
 +    extern uint32_t g_capIndexBytes;
 +    extern uint32_t g_capFrameId;
++    extern uint32_t g_capDropped;
 +    extern void* g_capImagePtrs[][5];
 +}
 +enum { kWGPUMaxCapV = 8192, kWGPUMaxCapI = 32768 };
-+enum { kWGPUMaxRec = 64, kWGPUVertCap = 4*1024*1024, kWGPUIdxCap = 1*1024*1024 };
++enum { kWGPUMaxRec = 256, kWGPUVertCap = 8*1024*1024, kWGPUIdxCap = 2*1024*1024 };
 +
 +// Column-major 4x4 multiply (out = lhs * rhs), matching OpenGL storage.
 +// Used to bake the full MVP per record at capture time — records can span
@@ -3613,38 +3652,16 @@ index c1d0d3e..a840d8b 100644
 +			g_capIndexBytes += ibytesRound;
 +			g_capRecordCount++;
 +			g_capFrameId++;
++		} else {
++			g_capDropped++;   // accumulator full
 +		}
++	} else if ( wgpuViewBigEnough && din && din->surf && din->surf->geo
++	            && g_capRecordCount >= (uint32_t)kWGPUMaxRec ) {
++		g_capDropped++;       // record cap hit
 +	}
-+	// Iter 4 single-surface compat (used by WebGPU fallback path when record
-+	// count is 0). Capture once on the first qualifying interaction.
-+	if ( !g_captureSlotUsedThisFrame && din && din->surf && din->surf->geo
-+		 && din->surf->geo->verts && din->surf->geo->indexes
-+		 && din->surf->geo->numVerts > 0 && din->surf->geo->numIndexes > 0
-+		 && din->surf->geo->numVerts   <= kWGPUMaxCapV
-+		 && din->surf->geo->numIndexes <= kWGPUMaxCapI ) {
-+		memcpy( g_lastSurfVerts, din->surf->geo->verts, din->surf->geo->numVerts * 60 );
-+		for ( int i = 0; i < din->surf->geo->numIndexes; ++i ) {
-+			g_lastSurfIndexes16[i] = (uint16_t)din->surf->geo->indexes[i];
-+		}
-+		g_lastSurfNumVerts   = din->surf->geo->numVerts;
-+		g_lastSurfNumIndexes = din->surf->geo->numIndexes;
-+		if ( din->surf->space && backEnd.viewDef ) {
-+			// Full MVP baked at capture (see multi-record comment above)
-+			WGPU_MatMul4( g_lastModelMatrix,
-+			              backEnd.viewDef->projectionMatrix,
-+			              din->surf->space->modelViewMatrix );
-+		}
-+		memcpy( g_lastDinLocalLightOrigin, din->localLightOrigin.ToFloatPtr(), 16 );
-+		memcpy( g_lastDinLocalViewOrigin,  din->localViewOrigin.ToFloatPtr(),  16 );
-+		memcpy( g_lastDinLightProjS,       din->lightProjection[0].ToFloatPtr(), 16 );
-+		memcpy( g_lastDinLightProjT,       din->lightProjection[1].ToFloatPtr(), 16 );
-+		memcpy( g_lastDinLightProjQ,       din->lightProjection[2].ToFloatPtr(), 16 );
-+		memcpy( g_lastDinLightFalloffS,    din->lightProjection[3].ToFloatPtr(), 16 );
-+		memcpy( g_lastDinDiffuseColor,     din->diffuseColor.ToFloatPtr(),       16 );
-+		memcpy( g_lastDinSpecularColor,    din->specularColor.ToFloatPtr(),      16 );
-+		g_lastSurfFrameId++;
-+		g_captureSlotUsedThisFrame = 1;
-+	}
++	// (The iter-4 single-surface capture path was removed in iter 7b — the
++	// multi-record path is proven on-device and the single path's bind-group
++	// layout no longer matches the two-group interaction.wgsl.)
 +
  	// load all the vertex program parameters
  	qglProgramEnvParameter4fvARB( GL_VERTEX_PROGRAM_ARB, PP_LIGHT_ORIGIN, din->localLightOrigin.ToFloatPtr() );
@@ -3838,7 +3855,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..7ee4438 100644
+index c83ebb5..360f1c4 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -3849,7 +3866,7 @@ index c83ebb5..7ee4438 100644
  
  /*
  
-@@ -38,6 +39,121 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +39,145 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -3861,9 +3878,9 @@ index c83ebb5..7ee4438 100644
 +// by RB_BeginDrawingView.
 +enum { kWGPUMaxCaptureVerts = 8192, kWGPUMaxCaptureIndexes = 32768 };
 +enum {
-+    kWGPUMaxRecords      = 64,                  // hard cap on per-frame draws
-+    kWGPUVertAccumBytes  = 4 * 1024 * 1024,     // 4MB vertex accumulator
-+    kWGPUIndexAccumBytes = 1 * 1024 * 1024,     // 1MB u16 index accumulator
++    kWGPUMaxRecords      = 256,                 // hard cap on per-frame draws
++    kWGPUVertAccumBytes  = 8 * 1024 * 1024,     // 8MB vertex accumulator
++    kWGPUIndexAccumBytes = 2 * 1024 * 1024,     // 2MB u16 index accumulator
 +};
 +struct WGPUInteractionRecord {
 +    uint32_t vertOffset;
@@ -3915,6 +3932,7 @@ index c83ebb5..7ee4438 100644
 +    uint32_t g_capVertBytes   = 0;
 +    uint32_t g_capIndexBytes  = 0;
 +    uint32_t g_capFrameId     = 0;   // bumped at BeginDrawingView once we have records
++    uint32_t g_capDropped     = 0;   // records skipped because a cap was hit (reset on consume)
 +}
 +
 +// Iter 7: CPU image cache for the WebGPU backend. Image_load.cpp calls
@@ -3927,6 +3945,7 @@ index c83ebb5..7ee4438 100644
 +    const void* ptr;        // idImage* (opaque void* to avoid the include)
 +    int         w, h;
 +    uint8_t*    pixels;     // malloc'd RGBA8 buffer, owned
++    char        name[64];   // imgName for diagnostics
 +};
 +extern "C" {
 +    enum { kWGPUImageCacheSize = 512 };
@@ -3936,7 +3955,14 @@ index c83ebb5..7ee4438 100644
 +
 +
 +extern "C" void D3_WebGPU_CacheImage( const class idImage* img, const unsigned char* rgba, int w, int h ) {
-+    if ( !img || !rgba || w <= 0 || h <= 0 || w > 1024 || h > 1024 ) return;
++    if ( !img || !rgba || w <= 0 || h <= 0 || w > 4096 || h > 4096 ) return;
++    // Nearest-downsample anything above 256 so the cache RAM stays bounded
++    // even on desktop profiles with no image_downSizeLimit (the wearable
++    // profile already caps GPU textures at 128 so this is a no-op there).
++    int step = 1;
++    while ( (w / step) > 256 || (h / step) > 256 ) step <<= 1;
++    const int dw = w / step, dh = h / step;
++    if ( dw <= 0 || dh <= 0 ) return;
 +    // Find existing slot or allocate
 +    int slot = -1;
 +    for ( int i = 0; i < g_imgCacheCount; ++i ) {
@@ -3947,17 +3973,32 @@ index c83ebb5..7ee4438 100644
 +        slot = g_imgCacheCount++;
 +        g_imgCache[slot].ptr = (const void*)img;
 +        g_imgCache[slot].pixels = nullptr;
++        const char* nm = img->imgName.c_str();
++        size_t nl = strlen( nm ); if ( nl > 63 ) nl = 63;
++        memcpy( g_imgCache[slot].name, nm, nl );
++        g_imgCache[slot].name[nl] = 0;
 +    }
 +    // Reallocate if size changed (e.g. reloaded at different mip level)
-+    const size_t bytes = (size_t)w * (size_t)h * 4u;
-+    if ( !g_imgCache[slot].pixels || g_imgCache[slot].w != w || g_imgCache[slot].h != h ) {
++    const size_t bytes = (size_t)dw * (size_t)dh * 4u;
++    if ( !g_imgCache[slot].pixels || g_imgCache[slot].w != dw || g_imgCache[slot].h != dh ) {
 +        free( g_imgCache[slot].pixels );
 +        g_imgCache[slot].pixels = (uint8_t*)malloc( bytes );
 +        if ( !g_imgCache[slot].pixels ) { g_imgCache[slot].ptr = nullptr; return; }
-+        g_imgCache[slot].w = w;
-+        g_imgCache[slot].h = h;
++        g_imgCache[slot].w = dw;
++        g_imgCache[slot].h = dh;
 +    }
-+    memcpy( g_imgCache[slot].pixels, rgba, bytes );
++    if ( step == 1 ) {
++        memcpy( g_imgCache[slot].pixels, rgba, bytes );
++    } else {
++        uint8_t* dst = g_imgCache[slot].pixels;
++        for ( int y = 0; y < dh; ++y ) {
++            const unsigned char* srcRow = rgba + (size_t)(y * step) * (size_t)w * 4u;
++            for ( int x = 0; x < dw; ++x ) {
++                const unsigned char* s = srcRow + (size_t)(x * step) * 4u;
++                *dst++ = s[0]; *dst++ = s[1]; *dst++ = s[2]; *dst++ = s[3];
++            }
++        }
++    }
 +}
 +
 +extern "C" const WGPUImageSlot* D3_WebGPU_LookupCachedImage( const void* img ) {
@@ -3971,7 +4012,7 @@ index c83ebb5..7ee4438 100644
  
  /*
  =================
-@@ -166,6 +282,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +306,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -3979,7 +4020,7 @@ index c83ebb5..7ee4438 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -557,22 +674,41 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +698,41 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
@@ -4033,10 +4074,10 @@ index c83ebb5..7ee4438 100644
  	// ensures that depth writes are enabled for the depth clear
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..faa5194
+index 0000000..0d0eeec
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,336 @@
+@@ -0,0 +1,349 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -4156,7 +4197,11 @@ index 0000000..faa5194
 +"@vertex\n"
 +"fn vs_main(in: VSIn) -> VSOut {\n"
 +"    var out: VSOut;\n"
-+"    out.clip_pos = u.mvp * vec4<f32>(in.position, 1.0);\n"
++"    let cp = u.mvp * vec4<f32>(in.position, 1.0);\n"
++"    // GL [-w, w] → WebGPU [0, w] clip-z remap. MUST match interaction.wgsl\n"
++"    // exactly — the depth pre-pass and the lit pass need bit-identical\n"
++"    // positions or the LessEqual test rejects lit fragments.\n"
++"    out.clip_pos = vec4<f32>(cp.x, cp.y, (cp.z + cp.w) * 0.5, cp.w);\n"
 +"    return out;\n"
 +"}\n"
 +"\n"
@@ -4180,15 +4225,18 @@ index 0000000..faa5194
 +"// Vertex format: idDrawVert (60 bytes — defined in tr_local.h, matches the\n"
 +"// vertex layout RenderBackend_WebGPU::CreatePipeline assumes).\n"
 +"//\n"
-+"// Bindings (matches abstraction convention):\n"
++"// Bindings (split into two groups so per-record uniforms and per-material\n"
++"// texture sets can be cached and rebound independently — group(0) is one\n"
++"// fixed bind group per record slot, group(1) is cached per unique\n"
++"// 5-texture tuple):\n"
 +"//   @group(0) @binding(0)  uniforms (Uniforms struct below)\n"
-+"//   @group(0) @binding(1)  s_material   sampler\n"
-+"//   @group(0) @binding(2)  s_lighting   sampler\n"
-+"//   @group(0) @binding(3)  t_normal       Texture2D  (bump map, DXT5-NM)\n"
-+"//   @group(0) @binding(4)  t_specular     Texture2D\n"
-+"//   @group(0) @binding(5)  t_diffuse      Texture2D\n"
-+"//   @group(0) @binding(6)  t_lightFalloff Texture2D\n"
-+"//   @group(0) @binding(7)  t_lightProj    Texture2D\n"
++"//   @group(1) @binding(0)  s_material   sampler\n"
++"//   @group(1) @binding(1)  s_lighting   sampler\n"
++"//   @group(1) @binding(2)  t_normal       Texture2D  (tangent-space RGB)\n"
++"//   @group(1) @binding(3)  t_specular     Texture2D\n"
++"//   @group(1) @binding(4)  t_diffuse      Texture2D\n"
++"//   @group(1) @binding(5)  t_lightFalloff Texture2D\n"
++"//   @group(1) @binding(6)  t_lightProj    Texture2D\n"
 +"//\n"
 +"// Crucially: NO cubemap. The cubemap detour in the original ARB program was\n"
 +"// for old fixed-function GPUs that lacked fast normalize(). We compute L\n"
@@ -4210,13 +4258,13 @@ index 0000000..faa5194
 +"};\n"
 +"\n"
 +"@group(0) @binding(0) var<uniform> u: Uniforms;\n"
-+"@group(0) @binding(1) var s_material: sampler;\n"
-+"@group(0) @binding(2) var s_lighting: sampler;\n"
-+"@group(0) @binding(3) var t_normal: texture_2d<f32>;\n"
-+"@group(0) @binding(4) var t_specular: texture_2d<f32>;\n"
-+"@group(0) @binding(5) var t_diffuse: texture_2d<f32>;\n"
-+"@group(0) @binding(6) var t_lightFalloff: texture_2d<f32>;\n"
-+"@group(0) @binding(7) var t_lightProj: texture_2d<f32>;\n"
++"@group(1) @binding(0) var s_material: sampler;\n"
++"@group(1) @binding(1) var s_lighting: sampler;\n"
++"@group(1) @binding(2) var t_normal: texture_2d<f32>;\n"
++"@group(1) @binding(3) var t_specular: texture_2d<f32>;\n"
++"@group(1) @binding(4) var t_diffuse: texture_2d<f32>;\n"
++"@group(1) @binding(5) var t_lightFalloff: texture_2d<f32>;\n"
++"@group(1) @binding(6) var t_lightProj: texture_2d<f32>;\n"
 +"\n"
 +"struct VSIn {\n"
 +"    @location(0) position:  vec3<f32>,\n"
@@ -4282,10 +4330,12 @@ index 0000000..faa5194
 +"    let V = normalize(in.view_tangent);\n"
 +"    let H = normalize(L + V);\n"
 +"\n"
-+"    // Normal map: DXT5-NM has X in alpha, Y in green. Z derived.\n"
++"    // Normal map: standard tangent-space RGB encoding (XYZ in RGB). The\n"
++"    // engine's CPU image cache captures normal maps BEFORE the rxgb\n"
++"    // red↔alpha swap in GenerateImage, so RGB is the right decode here\n"
++"    // (NOT DXT5-NM alpha/green). Normalize to absorb 8-bit quantization.\n"
 +"    let nm = textureSample(t_normal, s_material, in.tex_bump);\n"
-+"    var N = vec3<f32>(nm.a, nm.g, 0.0) * 2.0 - vec3<f32>(1.0, 1.0, 0.0);\n"
-+"    N.z = sqrt(max(0.0, 1.0 - dot(N.xy, N.xy)));\n"
++"    let N = normalize(nm.rgb * 2.0 - vec3<f32>(1.0, 1.0, 1.0));\n"
 +"\n"
 +"    let NdotL = clamp(dot(N, L), 0.0, 1.0);\n"
 +"    let NdotH = clamp(dot(N, H), 0.0, 1.0);\n"
@@ -4293,8 +4343,12 @@ index 0000000..faa5194
 +"    // Light projection cookie (perspective-corrected projection)\n"
 +"    let proj_uv = in.light_proj_uvw.xy / max(in.light_proj_uvw.z, 0.001);\n"
 +"    let light_proj_color = textureSample(t_lightProj, s_lighting, proj_uv).rgb;\n"
++"    // Falloff ramp: vanilla interaction.vfp does `MUL light, light, falloff`\n"
++"    // with the full RGBA sample — the ramp lives in RGB (TGA / makeintensity\n"
++"    // images replicate intensity across channels). Sampling .a here was a\n"
++"    // GL4ES-on-WebKit artifact, not the engine convention.\n"
 +"    let light_falloff = textureSample(t_lightFalloff, s_lighting,\n"
-+"                                       vec2<f32>(in.light_falloff_u, 0.5)).a;\n"
++"                                       vec2<f32>(in.light_falloff_u, 0.5)).rgb;\n"
 +"\n"
 +"    // Material lookups\n"
 +"    let diffuse = textureSample(t_diffuse, s_material, in.tex_diffuse).rgb\n"

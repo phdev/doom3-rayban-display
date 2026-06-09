@@ -278,7 +278,14 @@ def main(argv=None):
         #   ui/assets/    - the GUI device context (idDeviceContext::Init) loads
         #                   the cursor + scrollbar images from here; every GUI,
         #                   including the main menu, needs them to render.
-        ALWAYS_KEEP_PREFIXES = ("glprogs/", "fonts/", "guis/assets/", "ui/assets/")
+        #   lights/       - light projection cookies + falloff ramps. Light
+        #                   materials reference these through image programs
+        #                   (makeintensity(lights/squarelight1a) etc.) that the
+        #                   def-graph walk doesn't resolve; a missing falloff
+        #                   defaults to a black image, which multiplies every
+        #                   interaction of that light to zero — point lights
+        #                   silently turn OFF. ~3MB for the whole dir.
+        ALWAYS_KEEP_PREFIXES = ("glprogs/", "fonts/", "guis/assets/", "ui/assets/", "lights/")
         decl_text = []
         for name, (zpath, original) in entries.items():
             ext = name[name.rfind("."):] if "." in name else ""

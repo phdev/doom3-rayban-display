@@ -9,15 +9,18 @@
 // Vertex format: idDrawVert (60 bytes — defined in tr_local.h, matches the
 // vertex layout RenderBackend_WebGPU::CreatePipeline assumes).
 //
-// Bindings (matches abstraction convention):
+// Bindings (split into two groups so per-record uniforms and per-material
+// texture sets can be cached and rebound independently — group(0) is one
+// fixed bind group per record slot, group(1) is cached per unique
+// 5-texture tuple):
 //   @group(0) @binding(0)  uniforms (Uniforms struct below)
-//   @group(0) @binding(1)  s_material   sampler
-//   @group(0) @binding(2)  s_lighting   sampler
-//   @group(0) @binding(3)  t_normal       Texture2D  (bump map, DXT5-NM)
-//   @group(0) @binding(4)  t_specular     Texture2D
-//   @group(0) @binding(5)  t_diffuse      Texture2D
-//   @group(0) @binding(6)  t_lightFalloff Texture2D
-//   @group(0) @binding(7)  t_lightProj    Texture2D
+//   @group(1) @binding(0)  s_material   sampler
+//   @group(1) @binding(1)  s_lighting   sampler
+//   @group(1) @binding(2)  t_normal       Texture2D  (tangent-space RGB)
+//   @group(1) @binding(3)  t_specular     Texture2D
+//   @group(1) @binding(4)  t_diffuse      Texture2D
+//   @group(1) @binding(5)  t_lightFalloff Texture2D
+//   @group(1) @binding(6)  t_lightProj    Texture2D
 //
 // Crucially: NO cubemap. The cubemap detour in the original ARB program was
 // for old fixed-function GPUs that lacked fast normalize(). We compute L
@@ -39,13 +42,13 @@ struct Uniforms {
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var s_material: sampler;
-@group(0) @binding(2) var s_lighting: sampler;
-@group(0) @binding(3) var t_normal: texture_2d<f32>;
-@group(0) @binding(4) var t_specular: texture_2d<f32>;
-@group(0) @binding(5) var t_diffuse: texture_2d<f32>;
-@group(0) @binding(6) var t_lightFalloff: texture_2d<f32>;
-@group(0) @binding(7) var t_lightProj: texture_2d<f32>;
+@group(1) @binding(0) var s_material: sampler;
+@group(1) @binding(1) var s_lighting: sampler;
+@group(1) @binding(2) var t_normal: texture_2d<f32>;
+@group(1) @binding(3) var t_specular: texture_2d<f32>;
+@group(1) @binding(4) var t_diffuse: texture_2d<f32>;
+@group(1) @binding(5) var t_lightFalloff: texture_2d<f32>;
+@group(1) @binding(6) var t_lightProj: texture_2d<f32>;
 
 struct VSIn {
     @location(0) position:  vec3<f32>,
@@ -111,10 +114,12 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let V = normalize(in.view_tangent);
     let H = normalize(L + V);
 
-    // Normal map: DXT5-NM has X in alpha, Y in green. Z derived.
+    // Normal map: standard tangent-space RGB encoding (XYZ in RGB). The
+    // engine's CPU image cache captures normal maps BEFORE the rxgb
+    // red↔alpha swap in GenerateImage, so RGB is the right decode here
+    // (NOT DXT5-NM alpha/green). Normalize to absorb 8-bit quantization.
     let nm = textureSample(t_normal, s_material, in.tex_bump);
-    var N = vec3<f32>(nm.a, nm.g, 0.0) * 2.0 - vec3<f32>(1.0, 1.0, 0.0);
-    N.z = sqrt(max(0.0, 1.0 - dot(N.xy, N.xy)));
+    let N = normalize(nm.rgb * 2.0 - vec3<f32>(1.0, 1.0, 1.0));
 
     let NdotL = clamp(dot(N, L), 0.0, 1.0);
     let NdotH = clamp(dot(N, H), 0.0, 1.0);
@@ -122,8 +127,12 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     // Light projection cookie (perspective-corrected projection)
     let proj_uv = in.light_proj_uvw.xy / max(in.light_proj_uvw.z, 0.001);
     let light_proj_color = textureSample(t_lightProj, s_lighting, proj_uv).rgb;
+    // Falloff ramp: vanilla interaction.vfp does `MUL light, light, falloff`
+    // with the full RGBA sample — the ramp lives in RGB (TGA / makeintensity
+    // images replicate intensity across channels). Sampling .a here was a
+    // GL4ES-on-WebKit artifact, not the engine convention.
     let light_falloff = textureSample(t_lightFalloff, s_lighting,
-                                       vec2<f32>(in.light_falloff_u, 0.5)).a;
+                                       vec2<f32>(in.light_falloff_u, 0.5)).rgb;
 
     // Material lookups
     let diffuse = textureSample(t_diffuse, s_material, in.tex_diffuse).rgb
