@@ -1763,10 +1763,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..6eb9621
+index 0000000..67ac677
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,1145 @@
+@@ -0,0 +1,1195 @@
 +/*
 +================================================================================
 +
@@ -1920,6 +1920,20 @@ index 0000000..6eb9621
 +            cfg.presentMode = WGPUPresentMode_Fifo;
 +            wgpuSurfaceConfigure(surface, &cfg);
 +            fprintf(stderr, "[WebGPU] surface configured %dx%d\n", w, h);
++
++            // Iter 5: depth attachment for proper occlusion when drawing the
++            // captured DOOM 3 surface. Depth24Plus is the minimum spec format.
++            WGPUTextureDescriptor dd = {};
++            dd.size = { (uint32_t)w, (uint32_t)h, 1 };
++            dd.mipLevelCount = 1;
++            dd.sampleCount = 1;
++            dd.dimension = WGPUTextureDimension_2D;
++            dd.format = WGPUTextureFormat_Depth24Plus;
++            dd.usage = WGPUTextureUsage_RenderAttachment;
++            dd.label = { "webgpuDepth", WGPU_STRLEN };
++            depthTexture = wgpuDeviceCreateTexture(device, &dd);
++            depthView = depthTexture ? wgpuTextureCreateView(depthTexture, nullptr) : nullptr;
++            depthW = w; depthH = h;
 +        }
 +        return true;
 +#else
@@ -1931,6 +1945,8 @@ index 0000000..6eb9621
 +
 +    void Shutdown() override {
 +#if D3_WEBGPU_AVAILABLE
++        if (depthView)    { wgpuTextureViewRelease(depthView); depthView = nullptr; }
++        if (depthTexture) { wgpuTextureRelease(depthTexture); depthTexture = nullptr; }
 +        if (surface) { wgpuSurfaceUnconfigure(surface); wgpuSurfaceRelease(surface); surface = nullptr; }
 +        if (queue)   { wgpuQueueRelease(queue);   queue = nullptr; }
 +        if (device)  { wgpuDeviceRelease(device); device = nullptr; }
@@ -2049,9 +2065,17 @@ index 0000000..6eb9621
 +                ca.storeOp = WGPUStoreOp_Store;
 +                ca.clearValue = { 0.05, 0.0, 0.05, 1.0 };  // tiny purple tint = "WebGPU pass ran"
 +                ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
++                WGPURenderPassDepthStencilAttachment da = {};
++                da.view = depthView;
++                da.depthLoadOp = WGPULoadOp_Clear;
++                da.depthStoreOp = WGPUStoreOp_Store;
++                da.depthClearValue = 1.0f;
++                da.stencilLoadOp = WGPULoadOp_Undefined;
++                da.stencilStoreOp = WGPUStoreOp_Undefined;
 +                WGPURenderPassDescriptor rpd = {};
 +                rpd.colorAttachmentCount = 1;
 +                rpd.colorAttachments = &ca;
++                rpd.depthStencilAttachment = depthView ? &da : nullptr;
 +                WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
 +                if (capturedReady && interactionPipeline) {
 +                    wgpuRenderPassEncoderSetPipeline(rp, interactionPipeline);
@@ -2190,6 +2214,17 @@ index 0000000..6eb9621
 +        frag.entryPoint = { "fs_main", WGPU_STRLEN };
 +        frag.targetCount = 1;
 +        frag.targets = &target;
++        // Iter 5: depth-stencil state so the pipeline is compatible with the
++        // depth attachment added in Init. LessEqual is the OpenGL convention.
++        WGPUDepthStencilState dss = {};
++        dss.format = WGPUTextureFormat_Depth24Plus;
++        dss.depthWriteEnabled = WGPUOptionalBool_True;
++        dss.depthCompare = WGPUCompareFunction_LessEqual;
++        dss.stencilFront.compare = WGPUCompareFunction_Always;
++        dss.stencilBack.compare  = WGPUCompareFunction_Always;
++        dss.stencilFront.failOp = dss.stencilFront.depthFailOp = dss.stencilFront.passOp = WGPUStencilOperation_Keep;
++        dss.stencilBack.failOp  = dss.stencilBack.depthFailOp  = dss.stencilBack.passOp  = WGPUStencilOperation_Keep;
++
 +        WGPURenderPipelineDescriptor pd = {};
 +        pd.label = { "demoQuad", WGPU_STRLEN };
 +        pd.vertex.module = mod;
@@ -2201,6 +2236,7 @@ index 0000000..6eb9621
 +        pd.multisample.count = 1;
 +        pd.multisample.mask = 0xFFFFFFFF;
 +        pd.fragment = &frag;
++        pd.depthStencil = &dss;
 +        demoPipeline = wgpuDeviceCreateRenderPipeline(device, &pd);
 +        wgpuShaderModuleRelease(mod);
 +        if (!demoPipeline) { fprintf(stderr, "[WebGPU demo] pipeline create FAILED\n"); return; }
@@ -2331,6 +2367,15 @@ index 0000000..6eb9621
 +        frag.entryPoint = { "fs_main", WGPU_STRLEN };
 +        frag.targetCount = 1;
 +        frag.targets = &target;
++        WGPUDepthStencilState dss = {};
++        dss.format = WGPUTextureFormat_Depth24Plus;
++        dss.depthWriteEnabled = WGPUOptionalBool_True;
++        dss.depthCompare = WGPUCompareFunction_LessEqual;
++        dss.stencilFront.compare = WGPUCompareFunction_Always;
++        dss.stencilBack.compare  = WGPUCompareFunction_Always;
++        dss.stencilFront.failOp = dss.stencilFront.depthFailOp = dss.stencilFront.passOp = WGPUStencilOperation_Keep;
++        dss.stencilBack.failOp  = dss.stencilBack.depthFailOp  = dss.stencilBack.passOp  = WGPUStencilOperation_Keep;
++
 +        WGPURenderPipelineDescriptor pd = {};
 +        pd.label = { "interaction", WGPU_STRLEN };
 +        pd.vertex.module = mod;
@@ -2342,6 +2387,7 @@ index 0000000..6eb9621
 +        pd.multisample.count = 1;
 +        pd.multisample.mask = 0xFFFFFFFF;
 +        pd.fragment = &frag;
++        pd.depthStencil = &dss;
 +        interactionPipeline = wgpuDeviceCreateRenderPipeline(device, &pd);
 +        wgpuShaderModuleRelease(mod);
 +        if (!interactionPipeline) { fprintf(stderr, "[WebGPU iter4] interaction pipeline FAILED\n"); return; }
@@ -2906,6 +2952,10 @@ index 0000000..6eb9621
 +    WGPUSampler             interactionMaterialSampler = nullptr;
 +    WGPUSampler             interactionLightSampler = nullptr;
 +    WGPUBindGroup           interactionBindGroup = nullptr;
++    // Iter 5: depth buffer (proper occlusion for the captured DOOM 3 surface)
++    WGPUTexture             depthTexture = nullptr;
++    WGPUTextureView         depthView    = nullptr;
++    int                     depthW = 0, depthH = 0;
 +#endif
 +};
 +
