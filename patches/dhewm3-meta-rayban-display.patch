@@ -1763,10 +1763,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..2c9be05
+index 0000000..6eb9621
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,970 @@
+@@ -0,0 +1,1145 @@
 +/*
 +================================================================================
 +
@@ -1968,6 +1968,7 @@ index 0000000..2c9be05
 +        if (surface && !demoInit) {
 +            demoInit = true;
 +            initDemoQuad();
++            initInteractionPipeline();
 +        }
 +        if (surface && demoPipeline) {
 +            WGPUSurfaceTexture st;
@@ -1978,9 +1979,10 @@ index 0000000..2c9be05
 +                WGPUCommandEncoderDescriptor cd = {};
 +                WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(device, &cd);
 +
-+                // Iter 3: if the engine captured a triangle surface this frame,
-+                // upload its verts+indexes and draw with MVP = proj * view * model.
-+                // Otherwise fall back to the demo quad (identity MVP, full coverage).
++                // Iter 3/4: if the engine captured a lit-pass surface this frame,
++                // upload its verts+indexes and draw with interaction.wgsl using
++                // the real engine MVP + per-light/per-material uniforms. Otherwise
++                // fall back to the demo quad (identity MVP, full coverage).
 +                extern float g_lastViewMatrix[16];
 +                extern float g_lastProjMatrix[16];
 +                extern float g_lastModelMatrix[16];
@@ -1989,11 +1991,18 @@ index 0000000..2c9be05
 +                extern int      g_lastSurfNumVerts;
 +                extern int      g_lastSurfNumIndexes;
 +                extern uint32_t g_lastSurfFrameId;
++                extern float    g_lastDinLocalLightOrigin[4];
++                extern float    g_lastDinLocalViewOrigin[4];
++                extern float    g_lastDinLightProjS[4];
++                extern float    g_lastDinLightProjT[4];
++                extern float    g_lastDinLightProjQ[4];
++                extern float    g_lastDinLightFalloffS[4];
++                extern float    g_lastDinDiffuseColor[4];
++                extern float    g_lastDinSpecularColor[4];
 +
-+                bool drawSurface = false;
 +                if (g_lastSurfNumVerts > 0 && g_lastSurfNumIndexes > 0 &&
 +                    g_lastSurfFrameId != lastUploadedFrameId) {
-+                    drawSurface = uploadCapturedSurface();
++                    uploadCapturedSurface();
 +                }
 +
 +                // Compose MVP. For captured-surface path: proj * view * model.
@@ -2004,13 +2013,35 @@ index 0000000..2c9be05
 +                    matMul4(mv,  g_lastViewMatrix, g_lastModelMatrix);
 +                    matMul4(mvp, g_lastProjMatrix, mv);
 +                }
-+                float ub[20] = {
-+                    mvp[0],mvp[1],mvp[2],mvp[3], mvp[4],mvp[5],mvp[6],mvp[7],
-+                    mvp[8],mvp[9],mvp[10],mvp[11], mvp[12],mvp[13],mvp[14],mvp[15],
-+                    1.0f, 1.0f, 1.0f, 1.0f
-+                };
-+                wgpuQueueWriteBuffer(queue, demoUniformBuf, 0, ub, sizeof(ub));
-+                (void)drawSurface;
++
++                if (capturedReady && interactionPipeline) {
++                    // interaction.wgsl Uniforms layout: mvp + 7 vec4 = 176 bytes.
++                    // Tangent-space light origin / view origin are computed by the
++                    // engine; the WGSL shader recomputes object-space → tangent via TBN.
++                    // (Both paths produce equivalent math.)
++                    float intUB[44];
++                    memcpy(intUB +  0, mvp, 64);
++                    memcpy(intUB + 16, g_lastDinLocalLightOrigin, 16);
++                    memcpy(intUB + 20, g_lastDinLocalViewOrigin,  16);
++                    memcpy(intUB + 24, g_lastDinDiffuseColor,     16);
++                    memcpy(intUB + 28, g_lastDinSpecularColor,    16);
++                    memcpy(intUB + 32, g_lastDinLightProjS,       16);
++                    memcpy(intUB + 36, g_lastDinLightProjT,       16);
++                    memcpy(intUB + 40, g_lastDinLightProjQ,       16);
++                    // light_falloff_s sits past the end of our 44-float buffer; expand:
++                    float full[48];
++                    memcpy(full, intUB, sizeof(intUB));
++                    memcpy(full + 44, g_lastDinLightFalloffS, 16);
++                    wgpuQueueWriteBuffer(queue, interactionUniformBuf, 0, full, sizeof(full));
++                } else {
++                    // Demo quad path keeps its 80-byte uniform (mat4 + tint vec4)
++                    float ub[20] = {
++                        mvp[0],mvp[1],mvp[2],mvp[3], mvp[4],mvp[5],mvp[6],mvp[7],
++                        mvp[8],mvp[9],mvp[10],mvp[11], mvp[12],mvp[13],mvp[14],mvp[15],
++                        1.0f, 1.0f, 1.0f, 1.0f
++                    };
++                    wgpuQueueWriteBuffer(queue, demoUniformBuf, 0, ub, sizeof(ub));
++                }
 +
 +                WGPURenderPassColorAttachment ca = {};
 +                ca.view = v;
@@ -2022,13 +2053,15 @@ index 0000000..2c9be05
 +                rpd.colorAttachmentCount = 1;
 +                rpd.colorAttachments = &ca;
 +                WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
-+                wgpuRenderPassEncoderSetPipeline(rp, demoPipeline);
-+                wgpuRenderPassEncoderSetBindGroup(rp, 0, demoBindGroup, 0, nullptr);
-+                if (capturedReady) {
++                if (capturedReady && interactionPipeline) {
++                    wgpuRenderPassEncoderSetPipeline(rp, interactionPipeline);
++                    wgpuRenderPassEncoderSetBindGroup(rp, 0, interactionBindGroup, 0, nullptr);
 +                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, capturedVertexBuf, 0, WGPU_WHOLE_SIZE);
 +                    wgpuRenderPassEncoderSetIndexBuffer(rp, capturedIndexBuf, WGPUIndexFormat_Uint16, 0, WGPU_WHOLE_SIZE);
 +                    wgpuRenderPassEncoderDrawIndexed(rp, capturedIndexCount, 1, 0, 0, 0);
 +                } else {
++                    wgpuRenderPassEncoderSetPipeline(rp, demoPipeline);
++                    wgpuRenderPassEncoderSetBindGroup(rp, 0, demoBindGroup, 0, nullptr);
 +                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, demoVertexBuf, 0, WGPU_WHOLE_SIZE);
 +                    wgpuRenderPassEncoderDraw(rp, 6, 1, 0, 0);
 +                }
@@ -2250,6 +2283,142 @@ index 0000000..2c9be05
 +        wgpuBindGroupLayoutRelease(bgl);
 +        fprintf(stderr, "[WebGPU demo] pipeline+resources ready\n");
 +        EM_ASM({ console.info("[d3] WebGPU demo quad initialized"); });
++    }
++
++    // Iter 4: interaction.wgsl pipeline — real DOOM 3 lit pass.
++    // Bindings (matches interaction.wgsl @group(0)):
++    //   0 uniform   (mvp + light/view/colors/proj/falloff = 192 bytes)
++    //   1 sampler   s_material
++    //   2 sampler   s_lighting
++    //   3 texture   t_normal   (DXT5-NM neutral: alpha=0.5, g=0.5 → flat normal)
++    //   4 texture   t_specular (white)
++    //   5 texture   t_diffuse  (DOOM-3 green checker so we can see geometry)
++    //   6 texture   t_lightFalloff (white = no attenuation along light axis)
++    //   7 texture   t_lightProj    (white = no projection cookie)
++    // All procedural — real engine texture capture is iter 5.
++    void initInteractionPipeline() {
++        WGPUShaderSourceWGSL wgsl = {};
++        wgsl.chain.sType = WGPUSType_ShaderSourceWGSL;
++        wgsl.code = { kWGSL_interaction, WGPU_STRLEN };
++        WGPUShaderModuleDescriptor smd = {};
++        smd.nextInChain = &wgsl.chain;
++        WGPUShaderModule mod = wgpuDeviceCreateShaderModule(device, &smd);
++        if (!mod) { fprintf(stderr, "[WebGPU iter4] interaction.wgsl create FAILED\n"); return; }
++
++        static const WGPUVertexAttribute attrs[] = {
++            { nullptr, WGPUVertexFormat_Float32x3, 0,  0 },
++            { nullptr, WGPUVertexFormat_Float32x2, 12, 1 },
++            { nullptr, WGPUVertexFormat_Float32x3, 20, 2 },
++            { nullptr, WGPUVertexFormat_Float32x3, 32, 3 },
++            { nullptr, WGPUVertexFormat_Float32x3, 44, 4 },
++            { nullptr, WGPUVertexFormat_Unorm8x4,  56, 5 },
++        };
++        WGPUVertexBufferLayout vbl = {};
++        vbl.stepMode = WGPUVertexStepMode_Vertex;
++        vbl.arrayStride = 60;
++        vbl.attributeCount = 6;
++        vbl.attributes = attrs;
++
++        WGPUColorTargetState target = {};
++        target.format = surfaceFormat;
++        target.writeMask = WGPUColorWriteMask_All;
++        WGPUBlendState blend = {};
++        blend.color.srcFactor = WGPUBlendFactor_One; blend.color.dstFactor = WGPUBlendFactor_Zero;
++        blend.alpha.srcFactor = WGPUBlendFactor_One; blend.alpha.dstFactor = WGPUBlendFactor_Zero;
++        target.blend = &blend;
++        WGPUFragmentState frag = {};
++        frag.module = mod;
++        frag.entryPoint = { "fs_main", WGPU_STRLEN };
++        frag.targetCount = 1;
++        frag.targets = &target;
++        WGPURenderPipelineDescriptor pd = {};
++        pd.label = { "interaction", WGPU_STRLEN };
++        pd.vertex.module = mod;
++        pd.vertex.entryPoint = { "vs_main", WGPU_STRLEN };
++        pd.vertex.bufferCount = 1;
++        pd.vertex.buffers = &vbl;
++        pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
++        pd.primitive.cullMode = WGPUCullMode_None;  // no front/back yet
++        pd.multisample.count = 1;
++        pd.multisample.mask = 0xFFFFFFFF;
++        pd.fragment = &frag;
++        interactionPipeline = wgpuDeviceCreateRenderPipeline(device, &pd);
++        wgpuShaderModuleRelease(mod);
++        if (!interactionPipeline) { fprintf(stderr, "[WebGPU iter4] interaction pipeline FAILED\n"); return; }
++
++        // Uniform buffer (mvp + 7 vec4 + 1 pad-vec4 = 192 bytes; we write 192)
++        WGPUBufferDescriptor ubd = {};
++        ubd.size = 192;
++        ubd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
++        interactionUniformBuf = wgpuDeviceCreateBuffer(device, &ubd);
++
++        // 2 samplers
++        WGPUSamplerDescriptor msd = {};
++        msd.minFilter = WGPUFilterMode_Linear; msd.magFilter = WGPUFilterMode_Linear;
++        msd.mipmapFilter = WGPUMipmapFilterMode_Linear;
++        msd.addressModeU = WGPUAddressMode_Repeat;
++        msd.addressModeV = WGPUAddressMode_Repeat;
++        msd.addressModeW = WGPUAddressMode_Repeat;
++        msd.maxAnisotropy = 1;
++        interactionMaterialSampler = wgpuDeviceCreateSampler(device, &msd);
++        WGPUSamplerDescriptor lsd = msd;
++        lsd.addressModeU = WGPUAddressMode_ClampToEdge;
++        lsd.addressModeV = WGPUAddressMode_ClampToEdge;
++        interactionLightSampler = wgpuDeviceCreateSampler(device, &lsd);
++
++        // 5 procedural textures (all 4x4 — small, cheap, illustrative)
++        auto makeTex = [&](uint32_t fill, const char* label) -> WGPUTextureView {
++            const int M = 4;
++            uint32_t pixels[M*M];
++            for (int i = 0; i < M*M; ++i) pixels[i] = fill;
++            WGPUTextureDescriptor td = {};
++            td.size = { (uint32_t)M, (uint32_t)M, 1 };
++            td.mipLevelCount = 1;
++            td.sampleCount = 1;
++            td.dimension = WGPUTextureDimension_2D;
++            td.format = WGPUTextureFormat_RGBA8Unorm;
++            td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
++            td.label = { label, WGPU_STRLEN };
++            WGPUTexture tex = wgpuDeviceCreateTexture(device, &td);
++            WGPUTexelCopyTextureInfo dst = {};
++            dst.texture = tex;
++            WGPUTexelCopyBufferLayout layout = {};
++            layout.bytesPerRow = M * 4; layout.rowsPerImage = M;
++            WGPUExtent3D extent = { (uint32_t)M, (uint32_t)M, 1 };
++            wgpuQueueWriteTexture(queue, &dst, pixels, sizeof(pixels), &layout, &extent);
++            // Keep the texture handle so it isn't freed; we don't need a per-texture
++            // field — leaking 5 4x4 textures for the lifetime of the backend is fine.
++            return wgpuTextureCreateView(tex, nullptr);
++        };
++        // DXT5-NM neutral normal: alpha=0x80 (0.5), green=0x80 (0.5) → (0,0,1) in TS
++        WGPUTextureView vNormal   = makeTex(0xff808080u, "interactionNormal");
++        WGPUTextureView vSpecular = makeTex(0xffffffffu, "interactionSpecular");
++        WGPUTextureView vDiffuse  = makeTex(0xff80c080u, "interactionDiffuse");
++        WGPUTextureView vFalloff  = makeTex(0xffffffffu, "interactionFalloff");
++        WGPUTextureView vProj     = makeTex(0xffffffffu, "interactionProj");
++
++        WGPUBindGroupLayout bgl = wgpuRenderPipelineGetBindGroupLayout(interactionPipeline, 0);
++        WGPUBindGroupEntry e[8] = {};
++        e[0].binding = 0; e[0].buffer = interactionUniformBuf; e[0].size = 192;
++        e[1].binding = 1; e[1].sampler = interactionMaterialSampler;
++        e[2].binding = 2; e[2].sampler = interactionLightSampler;
++        e[3].binding = 3; e[3].textureView = vNormal;
++        e[4].binding = 4; e[4].textureView = vSpecular;
++        e[5].binding = 5; e[5].textureView = vDiffuse;
++        e[6].binding = 6; e[6].textureView = vFalloff;
++        e[7].binding = 7; e[7].textureView = vProj;
++        WGPUBindGroupDescriptor bgd = {};
++        bgd.layout = bgl;
++        bgd.entryCount = 8;
++        bgd.entries = e;
++        interactionBindGroup = wgpuDeviceCreateBindGroup(device, &bgd);
++        wgpuTextureViewRelease(vNormal);
++        wgpuTextureViewRelease(vSpecular);
++        wgpuTextureViewRelease(vDiffuse);
++        wgpuTextureViewRelease(vFalloff);
++        wgpuTextureViewRelease(vProj);
++        wgpuBindGroupLayoutRelease(bgl);
++        EM_ASM({ console.info("[d3] WebGPU interaction pipeline initialized"); });
 +    }
 +#endif
 +
@@ -2731,6 +2900,12 @@ index 0000000..2c9be05
 +    uint32_t                capturedIndexCount = 0;
 +    uint32_t                lastUploadedFrameId = 0;
 +    bool                    capturedReady    = false;
++    // Iter 4: interaction.wgsl pipeline (real DOOM 3 lit pass)
++    WGPURenderPipeline      interactionPipeline = nullptr;
++    WGPUBuffer              interactionUniformBuf = nullptr;
++    WGPUSampler             interactionMaterialSampler = nullptr;
++    WGPUSampler             interactionLightSampler = nullptr;
++    WGPUBindGroup           interactionBindGroup = nullptr;
 +#endif
 +};
 +
@@ -2885,6 +3060,68 @@ index 7914093..eed2277 100644
  	// free the context and close the window
  	GLimp_Shutdown();
  
+diff --git a/neo/renderer/draw_arb2.cpp b/neo/renderer/draw_arb2.cpp
+index c1d0d3e..2f21631 100644
+--- a/neo/renderer/draw_arb2.cpp
++++ b/neo/renderer/draw_arb2.cpp
+@@ -62,7 +62,57 @@ static void GL_SelectTextureNoClient( int unit ) {
+ RB_ARB2_DrawInteraction
+ ==================
+ */
++// Iter 4: external storage for lit-pass capture (defined in tr_render.cpp)
++extern "C" {
++    extern float    g_lastModelMatrix[16];
++    extern uint8_t  g_lastSurfVerts[];
++    extern uint16_t g_lastSurfIndexes16[];
++    extern int      g_lastSurfNumVerts;
++    extern int      g_lastSurfNumIndexes;
++    extern uint32_t g_lastSurfFrameId;
++    extern int      g_captureSlotUsedThisFrame;
++    extern float    g_lastDinLocalLightOrigin[4];
++    extern float    g_lastDinLocalViewOrigin[4];
++    extern float    g_lastDinLightProjS[4];
++    extern float    g_lastDinLightProjT[4];
++    extern float    g_lastDinLightProjQ[4];
++    extern float    g_lastDinLightFalloffS[4];
++    extern float    g_lastDinDiffuseColor[4];
++    extern float    g_lastDinSpecularColor[4];
++}
++enum { kWGPUMaxCapV = 8192, kWGPUMaxCapI = 32768 };
++
+ void	RB_ARB2_DrawInteraction( const drawInteraction_t *din ) {
++	// Iter 4: capture the first lit-pass interaction this frame for WebGPU echo.
++	// Lit-pass surfaces are visible walls/floors/props — more meaningful than
++	// the depth-fill pass we used in iter 3. The hook here also gives us the
++	// per-light + per-material uniforms (lightOrigin, lightProjection, colors).
++	if ( !g_captureSlotUsedThisFrame && din && din->surf && din->surf->geo
++		 && din->surf->geo->verts && din->surf->geo->indexes
++		 && din->surf->geo->numVerts > 0 && din->surf->geo->numIndexes > 0
++		 && din->surf->geo->numVerts   <= kWGPUMaxCapV
++		 && din->surf->geo->numIndexes <= kWGPUMaxCapI ) {
++		memcpy( g_lastSurfVerts, din->surf->geo->verts, din->surf->geo->numVerts * 60 );
++		for ( int i = 0; i < din->surf->geo->numIndexes; ++i ) {
++			g_lastSurfIndexes16[i] = (uint16_t)din->surf->geo->indexes[i];
++		}
++		g_lastSurfNumVerts   = din->surf->geo->numVerts;
++		g_lastSurfNumIndexes = din->surf->geo->numIndexes;
++		if ( din->surf->space ) {
++			memcpy( g_lastModelMatrix, din->surf->space->modelMatrix, sizeof(g_lastModelMatrix) );
++		}
++		memcpy( g_lastDinLocalLightOrigin, din->localLightOrigin.ToFloatPtr(), 16 );
++		memcpy( g_lastDinLocalViewOrigin,  din->localViewOrigin.ToFloatPtr(),  16 );
++		memcpy( g_lastDinLightProjS,       din->lightProjection[0].ToFloatPtr(), 16 );
++		memcpy( g_lastDinLightProjT,       din->lightProjection[1].ToFloatPtr(), 16 );
++		memcpy( g_lastDinLightProjQ,       din->lightProjection[2].ToFloatPtr(), 16 );
++		memcpy( g_lastDinLightFalloffS,    din->lightProjection[3].ToFloatPtr(), 16 );
++		memcpy( g_lastDinDiffuseColor,     din->diffuseColor.ToFloatPtr(),       16 );
++		memcpy( g_lastDinSpecularColor,    din->specularColor.ToFloatPtr(),      16 );
++		g_lastSurfFrameId++;
++		g_captureSlotUsedThisFrame = 1;
++	}
++
+ 	// load all the vertex program parameters
+ 	qglProgramEnvParameter4fvARB( GL_VERTEX_PROGRAM_ARB, PP_LIGHT_ORIGIN, din->localLightOrigin.ToFloatPtr() );
+ 	qglProgramEnvParameter4fvARB( GL_VERTEX_PROGRAM_ARB, PP_VIEW_ORIGIN, din->localViewOrigin.ToFloatPtr() );
 diff --git a/neo/renderer/draw_common.cpp b/neo/renderer/draw_common.cpp
 index 0cabbfd..e2baed3 100644
 --- a/neo/renderer/draw_common.cpp
@@ -3074,7 +3311,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..b166be2 100644
+index c83ebb5..a08e8da 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -3085,14 +3322,16 @@ index c83ebb5..b166be2 100644
  
  /*
  
-@@ -38,6 +39,23 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +39,34 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
-+// Iter 2/3: capture engine view+projection AND the first triangle surface each
-+// frame so the WebGPU backend can render real DOOM 3 geometry alongside the
-+// GL path. All flat C globals — engine is single-threaded. Defined here at
-+// file scope so RB_T_RenderTriangleSurface (above RB_BeginDrawingView) sees them.
++// Iter 2/3/4: capture engine view+projection, the first lit-pass surface, AND
++// the per-light/material uniforms each frame so the WebGPU backend can render
++// real DOOM 3 lit geometry alongside the GL path. All flat C globals — engine
++// is single-threaded. Defined here at file scope; populated from draw_arb2.cpp
++// (RB_ARB2_DrawInteraction) for lit-pass capture and from RB_BeginDrawingView
++// for camera matrices.
 +enum { kWGPUMaxCaptureVerts = 8192, kWGPUMaxCaptureIndexes = 32768 };
 +extern "C" {
 +    float    g_lastViewMatrix[16]  = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
@@ -3104,43 +3343,29 @@ index c83ebb5..b166be2 100644
 +    int      g_lastSurfNumIndexes = 0;
 +    uint32_t g_lastSurfFrameId    = 0;  // bumped each capture; WebGPU compares to detect newness
 +    int      g_captureSlotUsedThisFrame = 0;  // reset by RB_BeginDrawingView
++    // Iter 4: lit-pass uniforms — populated by draw_arb2.cpp:RB_ARB2_DrawInteraction
++    float    g_lastDinLocalLightOrigin[4] = {0,0,0,1};
++    float    g_lastDinLocalViewOrigin[4]  = {0,0,0,1};
++    float    g_lastDinLightProjS[4]       = {1,0,0,0};
++    float    g_lastDinLightProjT[4]       = {0,1,0,0};
++    float    g_lastDinLightProjQ[4]       = {0,0,0,1};
++    float    g_lastDinLightFalloffS[4]    = {0,0,1,0};
++    float    g_lastDinDiffuseColor[4]     = {1,1,1,1};
++    float    g_lastDinSpecularColor[4]    = {1,1,1,1};
 +}
 +
  
  /*
  =================
-@@ -166,6 +184,30 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +195,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
-+	// Iter 3: capture first qualifying surface this frame for WebGPU echo
-+	if ( !g_captureSlotUsedThisFrame && surf && surf->geo
-+		 && surf->geo->verts && surf->geo->indexes
-+		 && surf->geo->numVerts > 0 && surf->geo->numIndexes > 0
-+		 && surf->geo->numVerts   <= kWGPUMaxCaptureVerts
-+		 && surf->geo->numIndexes <= kWGPUMaxCaptureIndexes ) {
-+		// idDrawVert is 60 bytes — copy raw to avoid pulling its definition here
-+		memcpy( g_lastSurfVerts, surf->geo->verts, surf->geo->numVerts * 60 );
-+		// DOOM 3's GL_INDEX_TYPE is glIndex_t (int on dhewm3). WebGPU wants u16/u32;
-+		// downcast to u16 (8192-vert ceiling above guarantees no truncation).
-+		for ( int i = 0; i < surf->geo->numIndexes; ++i ) {
-+			g_lastSurfIndexes16[i] = (uint16_t)surf->geo->indexes[i];
-+		}
-+		g_lastSurfNumVerts   = surf->geo->numVerts;
-+		g_lastSurfNumIndexes = surf->geo->numIndexes;
-+		if ( surf->space ) {
-+			memcpy( g_lastModelMatrix, surf->space->modelMatrix, sizeof(g_lastModelMatrix) );
-+		} else {
-+			static const float kIdent[16] = {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
-+			memcpy( g_lastModelMatrix, kIdent, sizeof(g_lastModelMatrix) );
-+		}
-+		g_lastSurfFrameId++;
-+		g_captureSlotUsedThisFrame = 1;
-+	}
++	// Iter 4: lit-pass capture moved to draw_arb2.cpp:RB_ARB2_DrawInteraction.
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -557,22 +599,35 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +587,35 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
