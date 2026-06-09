@@ -1312,10 +1312,10 @@ index 0000000..c123b24
 +extern idRenderBackend* renderBackend;
 diff --git a/neo/renderer/RenderBackend_GL.cpp b/neo/renderer/RenderBackend_GL.cpp
 new file mode 100644
-index 0000000..324decc
+index 0000000..e71c87e
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_GL.cpp
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,445 @@
 +/*
 +================================================================================
 +
@@ -1327,11 +1327,19 @@ index 0000000..324decc
 +already makes directly. Migrated call sites (renderBackend->X()) produce
 +bit-identical GL command streams to unmigrated qgl* call sites.
 +
-+Phase 4a: file existed but methods were empty stubs.
-+Phase 4b: frame-boundary ops (BeginRenderPass / EndRenderPass / SetViewport
-+          / SetScissor / SetStencilReference) implemented properly.
-+Phase 4c+: pipeline / buffer / texture / draw ops implemented as call sites
-+           migrate.
++Phase 4a: existed as empty stubs.
++Phase 4b: frame-boundary ops implemented.
++Phase 4c+: pipeline / bind group / buffer / texture / sampler ops
++           implemented as stored-desc pattern. CreatePipeline copies
++           the desc, BindPipeline applies the state via qgl* on the fly.
++           Not deduplicating yet — that's a perf optimization for later.
++
++ID SCHEME
++---------
++For GL objects (GLuint texture/buffer names), the handle's id field is
++the GLuint cast to uint64_t. For wrapped descriptors (pipelines,
++samplers, bind groups), the id field is a pointer to a heap-allocated
++struct cast to uint64_t.
 +
 +================================================================================
 +*/
@@ -1341,6 +1349,102 @@ index 0000000..324decc
 +#include "renderer/qgl.h"
 +#include "renderer/tr_local.h"
 +#include <cstdio>
++#include <cstdlib>
++// (NOT <cstring> — dhewm3 redefines strcmp as a macro in idlib/Str.h which
++// breaks the libc++ <cstring> using-declaration. We don't actually need
++// string.h functions here.)
++
++// ─── Stored descriptors ──────────────────────────────────────────────────────
++
++struct idGLPipeline {
++    idGpuPipelineDesc desc;
++    // No GL shader program here — dhewm3 still uses its own ARB program
++    // path (arbVertexProgram + arbFragmentProgram) which is bound elsewhere.
++    // CreatePipeline just captures the state bits.
++};
++
++struct idGLSampler {
++    bool linearMin, linearMag, linearMip;
++    bool repeatU, repeatV;
++};
++
++struct idGLBindGroup {
++    idGpuPipeline pipeline;
++    idGpuTexture textures[8]; int textureCount;
++    idGpuSampler samplers[4]; int samplerCount;
++    idGpuBuffer  uniforms[4]; int uniformCount;
++};
++
++// ─── Enum mapping helpers ────────────────────────────────────────────────────
++
++static GLenum toGLCompare(idGpuCompare c) {
++    switch (c) {
++        case idGpuCompare::Never:        return GL_NEVER;
++        case idGpuCompare::Less:         return GL_LESS;
++        case idGpuCompare::Equal:        return GL_EQUAL;
++        case idGpuCompare::LessEqual:    return GL_LEQUAL;
++        case idGpuCompare::Greater:      return GL_GREATER;
++        case idGpuCompare::NotEqual:     return GL_NOTEQUAL;
++        case idGpuCompare::GreaterEqual: return GL_GEQUAL;
++        case idGpuCompare::Always:       return GL_ALWAYS;
++    }
++    return GL_ALWAYS;
++}
++
++static GLenum toGLBlendFactor(idGpuBlendFactor b) {
++    switch (b) {
++        case idGpuBlendFactor::Zero:               return GL_ZERO;
++        case idGpuBlendFactor::One:                return GL_ONE;
++        case idGpuBlendFactor::SrcColor:           return GL_SRC_COLOR;
++        case idGpuBlendFactor::OneMinusSrcColor:   return GL_ONE_MINUS_SRC_COLOR;
++        case idGpuBlendFactor::DstColor:           return GL_DST_COLOR;
++        case idGpuBlendFactor::OneMinusDstColor:   return GL_ONE_MINUS_DST_COLOR;
++        case idGpuBlendFactor::SrcAlpha:           return GL_SRC_ALPHA;
++        case idGpuBlendFactor::OneMinusSrcAlpha:   return GL_ONE_MINUS_SRC_ALPHA;
++        case idGpuBlendFactor::DstAlpha:           return GL_DST_ALPHA;
++        case idGpuBlendFactor::OneMinusDstAlpha:   return GL_ONE_MINUS_DST_ALPHA;
++    }
++    return GL_ZERO;
++}
++
++static GLenum toGLStencilOp(idGpuStencilOp op) {
++    switch (op) {
++        case idGpuStencilOp::Keep:           return GL_KEEP;
++        case idGpuStencilOp::Zero:           return GL_ZERO;
++        case idGpuStencilOp::Replace:        return GL_REPLACE;
++        case idGpuStencilOp::IncrementClamp: return GL_INCR;
++        case idGpuStencilOp::DecrementClamp: return GL_DECR;
++        case idGpuStencilOp::Invert:         return GL_INVERT;
++        case idGpuStencilOp::IncrementWrap:  return GL_INCR_WRAP;
++        case idGpuStencilOp::DecrementWrap:  return GL_DECR_WRAP;
++    }
++    return GL_KEEP;
++}
++
++// Map idGpuTextureFormat to (internalFormat, format, type) for glTexImage2D.
++// Returns false for compressed formats (handled separately).
++static bool toGLTextureFormat(idGpuTextureFormat f,
++                                GLint& internalFormat, GLenum& format, GLenum& type) {
++    switch (f) {
++        case idGpuTextureFormat::R8:
++            internalFormat = GL_R8; format = GL_RED; type = GL_UNSIGNED_BYTE; return true;
++        case idGpuTextureFormat::RG8:
++            internalFormat = GL_RG8; format = GL_RG; type = GL_UNSIGNED_BYTE; return true;
++        case idGpuTextureFormat::RGBA8:
++            internalFormat = GL_RGBA8; format = GL_RGBA; type = GL_UNSIGNED_BYTE; return true;
++        case idGpuTextureFormat::RGBA8Srgb:
++            internalFormat = GL_SRGB8_ALPHA8; format = GL_RGBA; type = GL_UNSIGNED_BYTE; return true;
++        case idGpuTextureFormat::Depth24:
++            internalFormat = GL_DEPTH_COMPONENT24; format = GL_DEPTH_COMPONENT; type = GL_UNSIGNED_INT; return true;
++        case idGpuTextureFormat::Depth24Stencil8:
++            internalFormat = GL_DEPTH24_STENCIL8; format = GL_DEPTH_STENCIL; type = GL_UNSIGNED_INT_24_8; return true;
++        default:
++            // Compressed formats handled outside.
++            return false;
++    }
++}
++
++// ─── Backend class ───────────────────────────────────────────────────────────
 +
 +class idRenderBackend_GL : public idRenderBackend {
 +public:
@@ -1353,46 +1457,21 @@ index 0000000..324decc
 +        return true;
 +    }
 +    void Shutdown() override {}
-+    void Resize(int w, int h) override {
-+        // Engine still owns viewport sizing via its own ResizeWindow path
-+        (void)w; (void)h;
-+    }
++    void Resize(int, int) override {}
 +
 +    // ─── Frame ──────────────────────────────────────────────────────────────
 +
-+    // Phase 4b: no per-frame GL state to flip. The engine's RB_ExecuteBackEndCommands
-+    // already handles its own frame boundaries (gl flush, swap, etc.). These are
-+    // no-ops at the GL layer; the WebGPU backend will use them to queue command
-+    // buffer submission.
 +    void BeginFrame() override {}
 +    void EndFrame() override {
-+        // Make sure any pending GPU work is flushed before swap. Matches the
-+        // r_finish cvar behavior the engine already does conditionally.
-+        if (r_finish.GetBool()) {
-+            qglFinish();
-+        }
++        if (r_finish.GetBool()) qglFinish();
 +    }
 +
 +    // ─── Render pass ────────────────────────────────────────────────────────
 +
 +    void BeginRenderPass(const idGpuRenderPassDesc& desc) override {
-+        // GL has no explicit render-pass concept; we emulate it via the
-+        // framebuffer binding + clear sequence that the engine was doing
-+        // inline. Currently we only support the default backbuffer (handle 0);
-+        // FBO support comes when migrating subview rendering.
-+        if (desc.colorAttachment.id == 0) {
-+            // Default framebuffer (canvas/backbuffer). On WebGL2 the engine
-+            // doesn't explicitly bind 0; staying compatible.
-+        } else {
-+            // Future: glBindFramebuffer with the attachment's FBO id.
-+        }
-+
-+        // Color clear
 +        if (desc.colorLoad == idGpuLoadOp::Clear) {
 +            qglClearColor(desc.clearR, desc.clearG, desc.clearB, desc.clearA);
 +        }
-+
-+        // Depth + stencil clear setup
 +        GLbitfield mask = 0;
 +        if (desc.colorLoad == idGpuLoadOp::Clear) mask |= GL_COLOR_BUFFER_BIT;
 +        if (desc.hasDepth) {
@@ -1405,42 +1484,260 @@ index 0000000..324decc
 +                mask |= GL_STENCIL_BUFFER_BIT;
 +            }
 +        }
-+        if (mask) {
-+            qglClear(mask);
++        if (mask) qglClear(mask);
++    }
++
++    void EndRenderPass() override {}
++
++    // ─── Pipeline (stored-desc) ─────────────────────────────────────────────
++
++    idGpuPipeline CreatePipeline(const idGpuPipelineDesc& desc) override {
++        idGLPipeline* p = (idGLPipeline*)malloc(sizeof(idGLPipeline));
++        p->desc = desc;   // shallow copy; WGSL/entryPoint strings assumed lifetime-stable
++        return { (uint64_t)p };
++    }
++
++    void DestroyPipeline(idGpuPipeline p) override {
++        if (p.id) free((void*)p.id);
++    }
++
++    void BindPipeline(idGpuPipeline p) override {
++        if (!p.id) return;
++        const idGLPipeline* pip = (const idGLPipeline*)p.id;
++        const idGpuPipelineDesc& d = pip->desc;
++
++        // Cull
++        if (d.cull == idGpuCullMode::None) {
++            qglDisable(GL_CULL_FACE);
++        } else {
++            qglEnable(GL_CULL_FACE);
++            qglCullFace(d.cull == idGpuCullMode::Front ? GL_FRONT : GL_BACK);
++        }
++        qglFrontFace(d.frontFace == idGpuFrontFace::CCW ? GL_CCW : GL_CW);
++
++        // Color target / blend
++        if (d.hasColorTarget) {
++            qglColorMask(
++                (d.color.writeMask & 1) ? GL_TRUE : GL_FALSE,
++                (d.color.writeMask & 2) ? GL_TRUE : GL_FALSE,
++                (d.color.writeMask & 4) ? GL_TRUE : GL_FALSE,
++                (d.color.writeMask & 8) ? GL_TRUE : GL_FALSE);
++            if (d.color.blendEnabled) {
++                qglEnable(GL_BLEND);
++                qglBlendFunc(toGLBlendFactor(d.color.srcColor),
++                             toGLBlendFactor(d.color.dstColor));
++            } else {
++                qglDisable(GL_BLEND);
++            }
++        }
++
++        // Depth-stencil
++        if (d.hasDepthStencil) {
++            qglEnable(GL_DEPTH_TEST);
++            qglDepthFunc(toGLCompare(d.depthStencil.depthCompare));
++            qglDepthMask(d.depthStencil.depthWriteEnabled ? GL_TRUE : GL_FALSE);
++            if (d.depthStencil.stencilEnabled) {
++                qglEnable(GL_STENCIL_TEST);
++                // dhewm3's qgl loader doesn't load StencilFuncSeparate; the
++                // engine uses single-face stencil func + ActiveStencilFaceEXT
++                // for shadow-volume two-sided trickery. For the abstraction
++                // we set the front-face params (matches what most materials
++                // need) + separate op for completeness.
++                qglStencilFunc(
++                    toGLCompare(d.depthStencil.stencilFrontCompare),
++                    0, d.depthStencil.stencilReadMask);
++                qglStencilOpSeparate(GL_FRONT,
++                    toGLStencilOp(d.depthStencil.stencilFrontFail),
++                    toGLStencilOp(d.depthStencil.stencilFrontDepthFail),
++                    toGLStencilOp(d.depthStencil.stencilFrontPass));
++                qglStencilOpSeparate(GL_BACK,
++                    toGLStencilOp(d.depthStencil.stencilBackFail),
++                    toGLStencilOp(d.depthStencil.stencilBackDepthFail),
++                    toGLStencilOp(d.depthStencil.stencilBackPass));
++                qglStencilMask(d.depthStencil.stencilWriteMask);
++            } else {
++                qglDisable(GL_STENCIL_TEST);
++            }
 +        }
 +    }
 +
-+    void EndRenderPass() override {
-+        // GL: nothing — the next BeginRenderPass implicitly ends the current.
-+        // The WebGPU backend will release the WGPURenderPassEncoder here.
++    // ─── Buffers (vertex / index / uniform) ─────────────────────────────────
++
++    idGpuBuffer CreateBuffer(size_t bytes, uint32_t usage, const char* /*label*/) override {
++        GLuint buf = 0;
++        qglGenBuffersARB(1, &buf);
++        if (!buf) return {};
++
++        // Pick target based on usage hint. We use dynamic for uniform/storage,
++        // static for vertex/index — matches what dhewm3 currently does for
++        // its vertex cache.
++        GLenum target = (usage & (uint32_t)idGpuBufferUsage::Index)
++            ? GL_ELEMENT_ARRAY_BUFFER_ARB
++            : GL_ARRAY_BUFFER_ARB;
++        GLenum hint = (usage & ((uint32_t)idGpuBufferUsage::Uniform |
++                                (uint32_t)idGpuBufferUsage::Storage))
++            ? GL_DYNAMIC_DRAW_ARB
++            : GL_STATIC_DRAW_ARB;
++
++        qglBindBufferARB(target, buf);
++        qglBufferDataARB(target, (GLsizeiptrARB)bytes, NULL, hint);
++        return { (uint64_t)buf };
 +    }
 +
-+    // ─── Pipeline / buffers / textures / bind groups / draw ─────────────────
-+    // Stubs for now. These get filled in as Phase 4c migrates draw_common.cpp.
++    void UpdateBuffer(idGpuBuffer buf, size_t offset, size_t bytes, const void* data) override {
++        if (!buf.id) return;
++        // Assume vertex array binding; switch to element array isn't trivially
++        // disambiguable from the id alone. dhewm3's vertex cache tracks this
++        // separately; this pass-through wrapper assumes ARRAY_BUFFER.
++        qglBindBufferARB(GL_ARRAY_BUFFER_ARB, (GLuint)buf.id);
++        qglBufferSubDataARB(GL_ARRAY_BUFFER_ARB, (GLintptrARB)offset,
++                            (GLsizeiptrARB)bytes, data);
++    }
 +
-+    idGpuPipeline CreatePipeline(const idGpuPipelineDesc&) override { return {}; }
-+    void DestroyPipeline(idGpuPipeline) override {}
-+    void BindPipeline(idGpuPipeline) override {}
++    void DestroyBuffer(idGpuBuffer buf) override {
++        if (!buf.id) return;
++        GLuint b = (GLuint)buf.id;
++        qglDeleteBuffersARB(1, &b);
++    }
 +
-+    idGpuBuffer CreateBuffer(size_t, uint32_t, const char*) override { return {}; }
-+    void UpdateBuffer(idGpuBuffer, size_t, size_t, const void*) override {}
-+    void DestroyBuffer(idGpuBuffer) override {}
-+    void BindVertexBuffer(uint32_t, idGpuBuffer, size_t) override {}
-+    void BindIndexBuffer(idGpuBuffer, size_t, bool) override {}
++    void BindVertexBuffer(uint32_t /*slot*/, idGpuBuffer buf, size_t /*offset*/) override {
++        if (!buf.id) return;
++        qglBindBufferARB(GL_ARRAY_BUFFER_ARB, (GLuint)buf.id);
++        // dhewm3's vertex attribute pointer setup happens elsewhere
++        // (in tr_render.cpp's RB_DrawElementsWithCounters). This bind just
++        // makes the buffer current; pointer setup follows in call sites
++        // that haven't been migrated yet.
++    }
 +
-+    idGpuTexture CreateTexture(int, int, int, idGpuTextureFormat, uint32_t, const char*) override { return {}; }
-+    void UploadTexture(idGpuTexture, int, int, int, int, int, const void*, size_t) override {}
-+    void DestroyTexture(idGpuTexture) override {}
++    void BindIndexBuffer(idGpuBuffer buf, size_t /*offset*/, bool /*isUint32*/) override {
++        if (!buf.id) return;
++        qglBindBufferARB(GL_ELEMENT_ARRAY_BUFFER_ARB, (GLuint)buf.id);
++    }
 +
-+    idGpuSampler CreateSampler(bool, bool, bool, bool, bool) override { return {}; }
-+    void DestroySampler(idGpuSampler) override {}
++    // ─── Textures ───────────────────────────────────────────────────────────
 +
-+    idGpuBindGroup CreateBindGroup(idGpuPipeline, const idGpuTexture*, int, const idGpuSampler*, int, const idGpuBuffer*, int) override { return {}; }
-+    void DestroyBindGroup(idGpuBindGroup) override {}
-+    void BindBindGroup(uint32_t, idGpuBindGroup) override {}
++    idGpuTexture CreateTexture(int width, int height, int mipCount,
++                                idGpuTextureFormat format, uint32_t /*usage*/,
++                                const char* /*label*/) override {
++        GLuint tex = 0;
++        qglGenTextures(1, &tex);
++        if (!tex) return {};
++        qglBindTexture(GL_TEXTURE_2D, tex);
 +
-+    void Draw(uint32_t, uint32_t, uint32_t, uint32_t) override {}
-+    void DrawIndexed(uint32_t, uint32_t, uint32_t, int32_t, uint32_t) override {}
++        GLint internalFormat;
++        GLenum glFormat, glType;
++        if (toGLTextureFormat(format, internalFormat, glFormat, glType)) {
++            // Allocate mip level 0 with no data; UploadTexture fills it in.
++            qglTexImage2D(GL_TEXTURE_2D, 0, internalFormat, width, height, 0,
++                          glFormat, glType, NULL);
++            // Allocate additional mip levels by halving size.
++            int w = width, h = height;
++            for (int i = 1; i < mipCount; ++i) {
++                w = w > 1 ? w / 2 : 1;
++                h = h > 1 ? h / 2 : 1;
++                qglTexImage2D(GL_TEXTURE_2D, i, internalFormat, w, h, 0,
++                              glFormat, glType, NULL);
++            }
++        }
++        return { (uint64_t)tex };
++    }
++
++    void UploadTexture(idGpuTexture tex, int mip, int x, int y,
++                        int width, int height, const void* pixels,
++                        size_t /*bytesPerRow*/) override {
++        if (!tex.id) return;
++        qglBindTexture(GL_TEXTURE_2D, (GLuint)tex.id);
++        // For simplicity, assume RGBA8 upload; full format inference would
++        // need the format to be stored alongside the texture handle.
++        qglTexSubImage2D(GL_TEXTURE_2D, mip, x, y, width, height,
++                          GL_RGBA, GL_UNSIGNED_BYTE, pixels);
++    }
++
++    void DestroyTexture(idGpuTexture tex) override {
++        if (!tex.id) return;
++        GLuint t = (GLuint)tex.id;
++        qglDeleteTextures(1, &t);
++    }
++
++    // ─── Samplers ───────────────────────────────────────────────────────────
++    // GL fixed-function samplers — they're attached to textures via
++    // glTexParameteri. The "sampler" here is just stored state that gets
++    // applied to the currently-bound texture at BindBindGroup time.
++
++    idGpuSampler CreateSampler(bool linearMin, bool linearMag, bool linearMip,
++                                 bool repeatU, bool repeatV) override {
++        idGLSampler* s = (idGLSampler*)malloc(sizeof(idGLSampler));
++        s->linearMin = linearMin; s->linearMag = linearMag; s->linearMip = linearMip;
++        s->repeatU = repeatU; s->repeatV = repeatV;
++        return { (uint64_t)s };
++    }
++
++    void DestroySampler(idGpuSampler s) override {
++        if (s.id) free((void*)s.id);
++    }
++
++    // ─── Bind groups (stored-desc) ──────────────────────────────────────────
++
++    idGpuBindGroup CreateBindGroup(idGpuPipeline pipeline,
++                                     const idGpuTexture* textures, int textureCount,
++                                     const idGpuSampler* samplers, int samplerCount,
++                                     const idGpuBuffer* uniforms, int uniformCount) override {
++        idGLBindGroup* bg = (idGLBindGroup*)malloc(sizeof(idGLBindGroup));
++        bg->pipeline = pipeline;
++        bg->textureCount = textureCount > 8 ? 8 : textureCount;
++        bg->samplerCount = samplerCount > 4 ? 4 : samplerCount;
++        bg->uniformCount = uniformCount > 4 ? 4 : uniformCount;
++        for (int i = 0; i < bg->textureCount; ++i) bg->textures[i] = textures[i];
++        for (int i = 0; i < bg->samplerCount; ++i) bg->samplers[i] = samplers[i];
++        for (int i = 0; i < bg->uniformCount; ++i) bg->uniforms[i] = uniforms[i];
++        return { (uint64_t)bg };
++    }
++
++    void DestroyBindGroup(idGpuBindGroup bg) override {
++        if (bg.id) free((void*)bg.id);
++    }
++
++    void BindBindGroup(uint32_t /*slot*/, idGpuBindGroup bgh) override {
++        if (!bgh.id) return;
++        const idGLBindGroup* bg = (const idGLBindGroup*)bgh.id;
++
++        // Apply textures + samplers to their texture units. Convention:
++        // texture[i] gets unit i; sampler[i] supplies the filter/wrap for
++        // texture[i].
++        for (int i = 0; i < bg->textureCount; ++i) {
++            qglActiveTextureARB(GL_TEXTURE0_ARB + i);
++            qglBindTexture(GL_TEXTURE_2D, (GLuint)bg->textures[i].id);
++            if (i < bg->samplerCount && bg->samplers[i].id) {
++                const idGLSampler* s = (const idGLSampler*)bg->samplers[i].id;
++                qglTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
++                    s->linearMin
++                        ? (s->linearMip ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR)
++                        : (s->linearMip ? GL_NEAREST_MIPMAP_LINEAR : GL_NEAREST));
++                qglTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
++                    s->linearMag ? GL_LINEAR : GL_NEAREST);
++                qglTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
++                    s->repeatU ? GL_REPEAT : GL_CLAMP_TO_EDGE);
++                qglTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
++                    s->repeatV ? GL_REPEAT : GL_CLAMP_TO_EDGE);
++            }
++        }
++        // Uniform buffers: in legacy GL these are ARB programs' env params,
++        // which dhewm3 sets via qglProgramEnvParameter4fvARB. The abstraction
++        // doesn't carry that data here — call sites currently set env params
++        // inline. Future migration can route them through this code.
++    }
++
++    // ─── Draw ───────────────────────────────────────────────────────────────
++
++    void Draw(uint32_t vertexCount, uint32_t /*instanceCount*/, uint32_t firstVertex, uint32_t /*firstInstance*/) override {
++        qglDrawArrays(GL_TRIANGLES, (GLint)firstVertex, (GLsizei)vertexCount);
++    }
++
++    void DrawIndexed(uint32_t indexCount, uint32_t /*instanceCount*/, uint32_t firstIndex,
++                       int32_t /*baseVertex*/, uint32_t /*firstInstance*/) override {
++        qglDrawElements(GL_TRIANGLES, (GLsizei)indexCount, GL_UNSIGNED_SHORT,
++                         (const void*)(uintptr_t)(firstIndex * sizeof(unsigned short)));
++    }
 +
 +    // ─── Dynamic state ──────────────────────────────────────────────────────
 +
@@ -1453,11 +1750,9 @@ index 0000000..324decc
 +        qglScissor(x, y, width, height);
 +    }
 +
-+    void SetStencilReference(uint32_t ref) override {
-+        // The engine's existing stencil-shadow setup encodes ref into glStencilFunc
-+        // directly; this is a hook for future migration. Initially a no-op since
-+        // unmigrated call sites still set the full stencil state inline.
-+        (void)ref;
++    void SetStencilReference(uint32_t /*ref*/) override {
++        // Engine's existing stencil setup encodes ref inline; this is a
++        // future migration hook.
 +    }
 +
 +    const char* GetDeviceName() const override { return "OpenGL (GL4ES → WebGL2)"; }
