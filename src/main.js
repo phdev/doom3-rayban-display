@@ -30,6 +30,7 @@ window.__d3Logs = runtimeLogs;
 app.innerHTML = `
   <main class="game-shell" aria-label="DOOM 3 runtime">
     <canvas id="gameCanvas" class="game-canvas" tabindex="-1"></canvas>
+    <canvas id="webgpuCanvas" class="webgpu-canvas" width="448" height="448" aria-hidden="true"></canvas>
     <div id="enemyLeftIndicator" class="enemy-indicator enemy-indicator-left" aria-hidden="true"></div>
     <div id="enemyRightIndicator" class="enemy-indicator enemy-indicator-right" aria-hidden="true"></div>
     <div id="flashlightIndicator" class="flashlight-indicator" aria-hidden="true">Flashlight</div>
@@ -75,8 +76,16 @@ const refs = {
   statusText: document.querySelector("#statusText"),
   imuStatus: document.querySelector("#imuStatus"),
   moveControls: document.querySelector("#moveControls"),
-  glDiag: document.querySelector("#glDiag")
+  glDiag: document.querySelector("#glDiag"),
+  webgpuCanvas: document.querySelector("#webgpuCanvas")
 };
+
+// Phase 5d: when ?backend=webgpu, reveal the side-by-side WebGPU canvas
+// so the user can see what the WebGPU backend is rendering (currently a
+// debug clear; will become real engine output as call sites migrate).
+if (/[?&]backend=webgpu\b/.test(location.search) && refs.webgpuCanvas) {
+  refs.webgpuCanvas.classList.add("is-active");
+}
 
 // Compact, always-visible GPU summary built from the captured GL4ES init lines.
 // The decisive field is "highp FS": a mobile GPU without high-precision floats in

@@ -1763,10 +1763,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..fa42732
+index 0000000..e91546a
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,632 @@
+@@ -0,0 +1,716 @@
 +/*
 +================================================================================
 +
@@ -1871,22 +1871,55 @@ index 0000000..fa42732
 +public:
 +    idGpuBackendKind GetKind() const override { return idGpuBackendKind::WebGPU; }
 +
-+    bool Init(void* /*nativeWindow*/, int /*w*/, int /*h*/) override {
++    bool Init(void* /*nativeWindow*/, int w, int h) override {
 +#if D3_WEBGPU_AVAILABLE
 +        // The JS shell pre-acquires the WGPUDevice and stashes it in
 +        // Module.preinitializedWebGPUDevice (see src/d3Runtime.js). The
 +        // Emscripten WebGPU port exposes it synchronously here.
 +        device = emscripten_webgpu_get_device();
 +        if (!device) {
-+            fprintf(stderr, "[WebGPU] emscripten_webgpu_get_device returned null. "
-+                            "JS pre-acquire likely failed (no navigator.gpu or "
-+                            "device request rejected).\n");
++            fprintf(stderr, "[WebGPU] emscripten_webgpu_get_device returned null.\n");
 +            return false;
 +        }
 +        queue = wgpuDeviceGetQueue(device);
 +        fprintf(stderr, "[WebGPU] device + queue acquired\n");
++
++        // Phase 5d: create a WGPUSurface on #webgpuCanvas (the
++        // side-by-side canvas added by main.js for the cutover period;
++        // the engine's GL path still owns #gameCanvas).
++        WGPUEmscriptenSurfaceSourceCanvasHTMLSelector cs = {};
++        cs.chain.sType = WGPUSType_EmscriptenSurfaceSourceCanvasHTMLSelector;
++        cs.selector = { "#webgpuCanvas", WGPU_STRLEN };
++        WGPUSurfaceDescriptor sd = {};
++        sd.nextInChain = &cs.chain;
++        // Need an instance to create a surface. Fresh instance is fine —
++        // the device was created from a different instance over in JS,
++        // but emdawnwebgpu reconciles instances for canvas surfaces.
++        WGPUInstanceDescriptor id = {};
++        WGPUInstance instance = wgpuCreateInstance(&id);
++        surface = instance ? wgpuInstanceCreateSurface(instance, &sd) : nullptr;
++        if (instance) wgpuInstanceRelease(instance);
++        if (!surface) {
++            fprintf(stderr, "[WebGPU] surface creation failed for #webgpuCanvas\n");
++            // Non-fatal: device is still acquired, resource ops still work.
++        } else {
++            // Configure the surface for rendering. Use rgba8unorm — the
++            // de facto WebGPU canvas format on iOS.
++            surfaceFormat = WGPUTextureFormat_BGRA8Unorm;
++            WGPUSurfaceConfiguration cfg = {};
++            cfg.device = device;
++            cfg.format = surfaceFormat;
++            cfg.usage = WGPUTextureUsage_RenderAttachment;
++            cfg.alphaMode = WGPUCompositeAlphaMode_Auto;
++            cfg.width = (uint32_t)w;
++            cfg.height = (uint32_t)h;
++            cfg.presentMode = WGPUPresentMode_Fifo;
++            wgpuSurfaceConfigure(surface, &cfg);
++            fprintf(stderr, "[WebGPU] surface configured %dx%d\n", w, h);
++        }
 +        return true;
 +#else
++        (void)w; (void)h;
 +        fprintf(stderr, "[WebGPU] not compiled in (D3_WEBGPU_BACKEND not set)\n");
 +        return false;
 +#endif
@@ -1894,8 +1927,9 @@ index 0000000..fa42732
 +
 +    void Shutdown() override {
 +#if D3_WEBGPU_AVAILABLE
-+        if (queue)  { wgpuQueueRelease(queue);   queue = nullptr; }
-+        if (device) { wgpuDeviceRelease(device); device = nullptr; }
++        if (surface) { wgpuSurfaceUnconfigure(surface); wgpuSurfaceRelease(surface); surface = nullptr; }
++        if (queue)   { wgpuQueueRelease(queue);   queue = nullptr; }
++        if (device)  { wgpuDeviceRelease(device); device = nullptr; }
 +#endif
 +    }
 +
@@ -1922,6 +1956,54 @@ index 0000000..fa42732
 +
 +    void EndFrame() override {
 +#if D3_WEBGPU_AVAILABLE
++        // Phase 5d: until call sites migrate to use BeginRenderPass on the
++        // surface, drive a per-frame debug clear on #webgpuCanvas so the
++        // user can SEE the WebGPU backend is alive. Color cycles slowly
++        // through hue so it's obvious the surface is being refreshed and
++        // composited by the browser. Once real draws migrate, this debug
++        // clear becomes the actual scene render.
++        if (surface) {
++            WGPUSurfaceTexture st;
++            wgpuSurfaceGetCurrentTexture(surface, &st);
++            if (st.status == WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal ||
++                st.status == WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal) {
++                WGPUTextureView v = wgpuTextureCreateView(st.texture, nullptr);
++                WGPUCommandEncoder enc = cmdEncoder;
++                bool ownEnc = false;
++                if (!enc) {
++                    WGPUCommandEncoderDescriptor cd = {};
++                    enc = wgpuDeviceCreateCommandEncoder(device, &cd);
++                    ownEnc = true;
++                }
++                // Slow color cycle so the user can tell it's animating
++                static uint32_t tick = 0;
++                tick++;
++                float r = 0.5f + 0.5f * (float)((tick / 30) % 4) / 4.0f;
++                float g = 0.2f + 0.3f * (float)((tick / 45) % 4) / 4.0f;
++                float b = 0.6f + 0.4f * (float)((tick / 60) % 4) / 4.0f;
++                WGPURenderPassColorAttachment ca = {};
++                ca.view = v;
++                ca.loadOp = WGPULoadOp_Clear;
++                ca.storeOp = WGPUStoreOp_Store;
++                ca.clearValue = { r, g, b, 1.0 };
++                ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
++                WGPURenderPassDescriptor rpd = {};
++                rpd.colorAttachmentCount = 1;
++                rpd.colorAttachments = &ca;
++                WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
++                wgpuRenderPassEncoderEnd(rp);
++                wgpuRenderPassEncoderRelease(rp);
++                if (ownEnc) {
++                    WGPUCommandBuffer cb = wgpuCommandEncoderFinish(enc, nullptr);
++                    wgpuCommandEncoderRelease(enc);
++                    wgpuQueueSubmit(queue, 1, &cb);
++                    wgpuCommandBufferRelease(cb);
++                }
++                wgpuTextureViewRelease(v);
++                wgpuTextureRelease(st.texture);
++            }
++        }
++
 +        if (!cmdEncoder) return;
 +        WGPUCommandBufferDescriptor cbd = {};
 +        cbd.label = { "frame", WGPU_STRLEN };
@@ -2390,6 +2472,8 @@ index 0000000..fa42732
 +#if D3_WEBGPU_AVAILABLE
 +    WGPUDevice              device           = nullptr;
 +    WGPUQueue               queue            = nullptr;
++    WGPUSurface             surface          = nullptr;
++    WGPUTextureFormat       surfaceFormat    = WGPUTextureFormat_Undefined;
 +    WGPUCommandEncoder      cmdEncoder       = nullptr;
 +    WGPURenderPassEncoder   renderPass       = nullptr;
 +    WGPURenderPipeline      currentPipeline  = nullptr;

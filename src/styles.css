@@ -75,6 +75,28 @@ body {
     saturate(var(--d3-display-saturate));
 }
 
+/* WebGPU side-by-side canvas for the Phase 5d cutover. Hidden by default;
+   only displayed when ?backend=webgpu is active. The WebGPU backend's
+   surface targets this canvas; the engine's GL path still targets
+   #gameCanvas. Eventually #gameCanvas goes away in Phase 8. */
+.webgpu-canvas {
+  display: none;
+}
+.webgpu-canvas.is-active {
+  display: block;
+  position: fixed;
+  right: max(12px, env(safe-area-inset-right));
+  top: max(12px, env(safe-area-inset-top));
+  z-index: 4;
+  width: 30vw;
+  max-width: 200px;
+  height: auto;
+  aspect-ratio: 1;
+  border: 1px solid #4a8a4a;
+  background: #021002;
+  image-rendering: pixelated;
+}
+
 .enemy-indicator {
   position: fixed;
   top: 50%;
