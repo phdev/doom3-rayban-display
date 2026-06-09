@@ -1009,10 +1009,35 @@ index a4883b5..095506b 100644
  extern idCVar	r_aspectRatio;
  
 diff --git a/neo/renderer/Image_load.cpp b/neo/renderer/Image_load.cpp
-index f9ae002..67d93a5 100644
+index f9ae002..00589ee 100644
 --- a/neo/renderer/Image_load.cpp
 +++ b/neo/renderer/Image_load.cpp
-@@ -1932,7 +1932,12 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
+@@ -27,6 +27,11 @@ If you have questions concerning this license or the applicable additional terms
+ */
+ 
+ #include "sys/platform.h"
++
++// Iter 7 (WebGPU): forward declaration so GenerateImage can call into the
++// CPU image cache that lives in tr_render.cpp.
++class idImage;
++extern "C" void D3_WebGPU_CacheImage( const idImage* img, const unsigned char* rgba, int w, int h );
+ #include "idlib/hashing/MD4.h"
+ #include "renderer/tr_local.h"
+ 
+@@ -604,6 +609,12 @@ void idImage::GenerateImage( const byte *pic, int width, int height,
+ 	uploadWidth = scaled_width;
+ 	type = TT_2D;
+ 
++	// Iter 7 (WebGPU): stash the RGBA8 source pixels so the WebGPU backend
++	// can upload them to its own textures. Without this hook the data lives
++	// only on the GL texture object and isn't readable from outside the GL
++	// context. Forward-declared above; defined in tr_render.cpp.
++	D3_WebGPU_CacheImage( this, (const unsigned char*)scaledBuffer, scaled_width, scaled_height );
++
+ 	// zero the border if desired, allowing clamped projection textures
+ 	// even after picmip resampling or careless artists.
+ 	if ( repeat == TR_CLAMP_TO_ZERO ) {
+@@ -1932,7 +1943,12 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
  		uploadWidth = potWidth;
  		uploadHeight = potHeight;
  		if ( potWidth == imageWidth && potHeight == imageHeight ) {
@@ -1026,7 +1051,7 @@ index f9ae002..67d93a5 100644
  		} else {
  			byte	*junk;
  			// we need to create a dummy image with power of two dimensions,
-@@ -1945,7 +1950,10 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
+@@ -1945,7 +1961,10 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
  				junk[i+1] = 255;
  			}
  #endif
@@ -3294,10 +3319,10 @@ index 7914093..eed2277 100644
  	GLimp_Shutdown();
  
 diff --git a/neo/renderer/draw_arb2.cpp b/neo/renderer/draw_arb2.cpp
-index c1d0d3e..6a92c35 100644
+index c1d0d3e..5752087 100644
 --- a/neo/renderer/draw_arb2.cpp
 +++ b/neo/renderer/draw_arb2.cpp
-@@ -62,7 +62,120 @@ static void GL_SelectTextureNoClient( int unit ) {
+@@ -62,7 +62,128 @@ static void GL_SelectTextureNoClient( int unit ) {
  RB_ARB2_DrawInteraction
  ==================
  */
@@ -3341,6 +3366,7 @@ index c1d0d3e..6a92c35 100644
 +    extern uint32_t g_capVertBytes;
 +    extern uint32_t g_capIndexBytes;
 +    extern uint32_t g_capFrameId;
++    extern void* g_capImagePtrs[][5];
 +}
 +enum { kWGPUMaxCapV = 8192, kWGPUMaxCapI = 32768 };
 +enum { kWGPUMaxRec = 64, kWGPUVertCap = 4*1024*1024, kWGPUIdxCap = 1*1024*1024 };
@@ -3381,6 +3407,13 @@ index c1d0d3e..6a92c35 100644
 +			memcpy( r.lightFalloffS,    din->lightProjection[3].ToFloatPtr(), 16 );
 +			memcpy( r.diffuseColor,     din->diffuseColor.ToFloatPtr(),       16 );
 +			memcpy( r.specularColor,    din->specularColor.ToFloatPtr(),      16 );
++			// Iter 7: image pointers per binding slot (matches the order in
++			// RB_ARB2_DrawInteraction below + interaction.wgsl bindings).
++			g_capImagePtrs[g_capRecordCount][0] = (void*)din->bumpImage;
++			g_capImagePtrs[g_capRecordCount][1] = (void*)din->lightFalloffImage;
++			g_capImagePtrs[g_capRecordCount][2] = (void*)din->lightImage;
++			g_capImagePtrs[g_capRecordCount][3] = (void*)din->diffuseImage;
++			g_capImagePtrs[g_capRecordCount][4] = (void*)din->specularImage;
 +			g_capVertBytes  += vbytesRound;
 +			g_capIndexBytes += ibytesRound;
 +			g_capRecordCount++;
@@ -3607,7 +3640,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..ac35b40 100644
+index c83ebb5..fbc64b1 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -3618,7 +3651,7 @@ index c83ebb5..ac35b40 100644
  
  /*
  
-@@ -38,6 +39,65 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +39,121 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -3671,6 +3704,11 @@ index c83ebb5..ac35b40 100644
 +    float    g_lastDinLightFalloffS[4]    = {0,0,1,0};
 +    float    g_lastDinDiffuseColor[4]     = {1,1,1,1};
 +    float    g_lastDinSpecularColor[4]    = {1,1,1,1};
++    // Iter 7: parallel array of image pointers per record (bump, falloff,
++    // proj, diffuse, specular) — looked up against the CPU image cache below.
++    // Captured by draw_arb2.cpp alongside the geometric record. nullptr means
++    // "use procedural fallback texture".
++    void* g_capImagePtrs[kWGPUMaxRecords][5];
 +    // Iter 6: multi-surface accumulator. draw_arb2.cpp appends here.
 +    WGPUInteractionRecord g_capRecords[kWGPUMaxRecords];
 +    uint8_t  g_capVertsAccum[kWGPUVertAccumBytes];
@@ -3681,10 +3719,61 @@ index c83ebb5..ac35b40 100644
 +    uint32_t g_capFrameId     = 0;   // bumped at BeginDrawingView once we have records
 +}
 +
++// Iter 7: CPU image cache for the WebGPU backend. Image_load.cpp calls
++// D3_WebGPU_CacheImage() at the end of GenerateImage; the WebGPU backend
++// looks up images by pointer via D3_WebGPU_LookupCachedImage() and copies
++// the pixels to GPU textures. Bounded slot table — first 512 unique images
++// are cached, the rest fall through to procedural textures. RAM cost cap:
++// 512 * 128 * 128 * 4 = 32MB worst case (image_downSizeLimit=128 enforced).
++struct WGPUImageSlot {
++    const void* ptr;        // idImage* (opaque void* to avoid the include)
++    int         w, h;
++    uint8_t*    pixels;     // malloc'd RGBA8 buffer, owned
++};
++extern "C" {
++    enum { kWGPUImageCacheSize = 512 };
++    WGPUImageSlot g_imgCache[kWGPUImageCacheSize] = {};
++    int g_imgCacheCount = 0;
++}
++
++
++extern "C" void D3_WebGPU_CacheImage( const class idImage* img, const unsigned char* rgba, int w, int h ) {
++    if ( !img || !rgba || w <= 0 || h <= 0 || w > 1024 || h > 1024 ) return;
++    // Find existing slot or allocate
++    int slot = -1;
++    for ( int i = 0; i < g_imgCacheCount; ++i ) {
++        if ( g_imgCache[i].ptr == (const void*)img ) { slot = i; break; }
++    }
++    if ( slot < 0 ) {
++        if ( g_imgCacheCount >= kWGPUImageCacheSize ) return;
++        slot = g_imgCacheCount++;
++        g_imgCache[slot].ptr = (const void*)img;
++        g_imgCache[slot].pixels = nullptr;
++    }
++    // Reallocate if size changed (e.g. reloaded at different mip level)
++    const size_t bytes = (size_t)w * (size_t)h * 4u;
++    if ( !g_imgCache[slot].pixels || g_imgCache[slot].w != w || g_imgCache[slot].h != h ) {
++        free( g_imgCache[slot].pixels );
++        g_imgCache[slot].pixels = (uint8_t*)malloc( bytes );
++        if ( !g_imgCache[slot].pixels ) { g_imgCache[slot].ptr = nullptr; return; }
++        g_imgCache[slot].w = w;
++        g_imgCache[slot].h = h;
++    }
++    memcpy( g_imgCache[slot].pixels, rgba, bytes );
++}
++
++extern "C" const WGPUImageSlot* D3_WebGPU_LookupCachedImage( const void* img ) {
++    if ( !img ) return nullptr;
++    for ( int i = 0; i < g_imgCacheCount; ++i ) {
++        if ( g_imgCache[i].ptr == img ) return &g_imgCache[i];
++    }
++    return nullptr;
++}
++
  
  /*
  =================
-@@ -166,6 +226,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +282,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -3692,7 +3781,7 @@ index c83ebb5..ac35b40 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -557,22 +618,41 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +674,41 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
