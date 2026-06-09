@@ -1468,10 +1468,10 @@ index 0000000..324decc
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..10453cc
+index 0000000..191dd16
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,296 @@
+@@ -0,0 +1,430 @@
 +/*
 +================================================================================
 +
@@ -1608,12 +1608,98 @@ index 0000000..10453cc
 +        // Surface reconfiguration goes here in Phase 5b.
 +    }
 +
-+    // ─── Frame / render pass — TODO Phase 5b ────────────────────────────────
++    // ─── Frame / render pass — IMPLEMENTED (Phase 5b) ───────────────────────
 +
-+    void BeginFrame() override                                { WGPU_NOT_YET("BeginFrame"); }
-+    void EndFrame() override                                  { WGPU_NOT_YET("EndFrame"); }
-+    void BeginRenderPass(const idGpuRenderPassDesc&) override { WGPU_NOT_YET("BeginRenderPass"); }
-+    void EndRenderPass() override                             { WGPU_NOT_YET("EndRenderPass"); }
++    void BeginFrame() override {
++#if D3_WEBGPU_AVAILABLE
++        if (!device) return;
++        if (cmdEncoder) {
++            // Stale encoder from a previous frame that wasn't submitted.
++            // Drop it; the engine will re-record this frame fresh.
++            wgpuCommandEncoderRelease(cmdEncoder);
++            cmdEncoder = nullptr;
++        }
++        WGPUCommandEncoderDescriptor cd = {};
++        cd.label = { "frame", WGPU_STRLEN };
++        cmdEncoder = wgpuDeviceCreateCommandEncoder(device, &cd);
++#endif
++    }
++
++    void EndFrame() override {
++#if D3_WEBGPU_AVAILABLE
++        if (!cmdEncoder) return;
++        WGPUCommandBufferDescriptor cbd = {};
++        cbd.label = { "frame", WGPU_STRLEN };
++        WGPUCommandBuffer cb = wgpuCommandEncoderFinish(cmdEncoder, &cbd);
++        wgpuCommandEncoderRelease(cmdEncoder);
++        cmdEncoder = nullptr;
++        wgpuQueueSubmit(queue, 1, &cb);
++        wgpuCommandBufferRelease(cb);
++#endif
++    }
++
++    void BeginRenderPass(const idGpuRenderPassDesc& desc) override {
++#if D3_WEBGPU_AVAILABLE
++        if (!cmdEncoder) return;
++        if (renderPass) {
++            // The engine called BeginRenderPass twice without EndRenderPass —
++            // close the previous one to avoid leaking state.
++            wgpuRenderPassEncoderEnd(renderPass);
++            wgpuRenderPassEncoderRelease(renderPass);
++            renderPass = nullptr;
++        }
++
++        // Color attachment. id 0 means "default backbuffer / surface", which
++        // we don't have a swapchain for yet (Phase 5c). Defensive: silently
++        // skip if no target — the migration is incremental.
++        if (!desc.colorAttachment.id) return;
++
++        WGPUTextureView colorView = wgpuTextureCreateView((WGPUTexture)desc.colorAttachment.id, nullptr);
++
++        WGPURenderPassColorAttachment colorAttach = {};
++        colorAttach.view = colorView;
++        colorAttach.loadOp = (desc.colorLoad == idGpuLoadOp::Clear) ? WGPULoadOp_Clear
++                            : (desc.colorLoad == idGpuLoadOp::Load)  ? WGPULoadOp_Load
++                            : WGPULoadOp_Undefined;
++        colorAttach.storeOp = (desc.colorStore == idGpuStoreOp::Store) ? WGPUStoreOp_Store : WGPUStoreOp_Discard;
++        colorAttach.clearValue = { desc.clearR, desc.clearG, desc.clearB, desc.clearA };
++        colorAttach.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
++
++        WGPURenderPassDepthStencilAttachment depthAttach = {};
++        WGPUTextureView depthView = nullptr;
++        if (desc.hasDepth && desc.depthAttachment.id) {
++            depthView = wgpuTextureCreateView((WGPUTexture)desc.depthAttachment.id, nullptr);
++            depthAttach.view = depthView;
++            depthAttach.depthLoadOp = (desc.depthLoad == idGpuLoadOp::Clear) ? WGPULoadOp_Clear : WGPULoadOp_Load;
++            depthAttach.depthStoreOp = (desc.depthStore == idGpuStoreOp::Store) ? WGPUStoreOp_Store : WGPUStoreOp_Discard;
++            depthAttach.depthClearValue = desc.clearDepth;
++            depthAttach.stencilLoadOp = (desc.stencilLoad == idGpuLoadOp::Clear) ? WGPULoadOp_Clear : WGPULoadOp_Load;
++            depthAttach.stencilStoreOp = (desc.stencilStore == idGpuStoreOp::Store) ? WGPUStoreOp_Store : WGPUStoreOp_Discard;
++            depthAttach.stencilClearValue = desc.clearStencil;
++        }
++
++        WGPURenderPassDescriptor rpd = {};
++        if (desc.name) rpd.label = { desc.name, WGPU_STRLEN };
++        rpd.colorAttachmentCount = 1;
++        rpd.colorAttachments = &colorAttach;
++        rpd.depthStencilAttachment = depthView ? &depthAttach : nullptr;
++
++        renderPass = wgpuCommandEncoderBeginRenderPass(cmdEncoder, &rpd);
++        wgpuTextureViewRelease(colorView);
++        if (depthView) wgpuTextureViewRelease(depthView);
++#else
++        (void)desc;
++#endif
++    }
++
++    void EndRenderPass() override {
++#if D3_WEBGPU_AVAILABLE
++        if (!renderPass) return;
++        wgpuRenderPassEncoderEnd(renderPass);
++        wgpuRenderPassEncoderRelease(renderPass);
++        renderPass = nullptr;
++#endif
++    }
 +
 +    // ─── Pipeline / bind group — TODO Phase 5c ──────────────────────────────
 +
@@ -1742,13 +1828,27 @@ index 0000000..10453cc
 +#endif
 +    }
 +
-+    // ─── Draw / dynamic state — TODO Phase 5b ───────────────────────────────
++    // ─── Draw — TODO Phase 5c (needs pipeline + bind group) ─────────────────
 +
-+    void Draw(uint32_t, uint32_t, uint32_t, uint32_t) override                            { WGPU_NOT_YET("Draw"); }
-+    void DrawIndexed(uint32_t, uint32_t, uint32_t, int32_t, uint32_t) override            { WGPU_NOT_YET("DrawIndexed"); }
-+    void SetViewport(int, int, int, int, float, float) override                           { WGPU_NOT_YET("SetViewport"); }
-+    void SetScissor(int, int, int, int) override                                          { WGPU_NOT_YET("SetScissor"); }
-+    void SetStencilReference(uint32_t) override                                           { WGPU_NOT_YET("SetStencilReference"); }
++    void Draw(uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance) override {
++#if D3_WEBGPU_AVAILABLE
++        if (!renderPass) return;
++        wgpuRenderPassEncoderDraw(renderPass, vertexCount, instanceCount, firstVertex, firstInstance);
++#else
++        (void)vertexCount; (void)instanceCount; (void)firstVertex; (void)firstInstance;
++#endif
++    }
++
++    void DrawIndexed(uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex,
++                       int32_t baseVertex, uint32_t firstInstance) override {
++#if D3_WEBGPU_AVAILABLE
++        if (!renderPass) return;
++        wgpuRenderPassEncoderDrawIndexed(renderPass, indexCount, instanceCount,
++                                          firstIndex, baseVertex, firstInstance);
++#else
++        (void)indexCount; (void)instanceCount; (void)firstIndex; (void)baseVertex; (void)firstInstance;
++#endif
++    }
 +
 +    const char* GetDeviceName() const override {
 +#if D3_WEBGPU_AVAILABLE
@@ -1758,10 +1858,44 @@ index 0000000..10453cc
 +#endif
 +    }
 +
++    // ─── Dynamic state — Phase 5b ───────────────────────────────────────────
++
++    void SetViewport(int x, int y, int width, int height, float minDepth, float maxDepth) override {
++#if D3_WEBGPU_AVAILABLE
++        if (!renderPass) return;
++        wgpuRenderPassEncoderSetViewport(renderPass,
++            (float)x, (float)y, (float)width, (float)height,
++            minDepth, maxDepth);
++#else
++        (void)x; (void)y; (void)width; (void)height; (void)minDepth; (void)maxDepth;
++#endif
++    }
++
++    void SetScissor(int x, int y, int width, int height) override {
++#if D3_WEBGPU_AVAILABLE
++        if (!renderPass) return;
++        wgpuRenderPassEncoderSetScissorRect(renderPass,
++            (uint32_t)x, (uint32_t)y, (uint32_t)width, (uint32_t)height);
++#else
++        (void)x; (void)y; (void)width; (void)height;
++#endif
++    }
++
++    void SetStencilReference(uint32_t ref) override {
++#if D3_WEBGPU_AVAILABLE
++        if (!renderPass) return;
++        wgpuRenderPassEncoderSetStencilReference(renderPass, ref);
++#else
++        (void)ref;
++#endif
++    }
++
 +private:
 +#if D3_WEBGPU_AVAILABLE
-+    WGPUDevice device = nullptr;
-+    WGPUQueue  queue  = nullptr;
++    WGPUDevice              device     = nullptr;
++    WGPUQueue               queue      = nullptr;
++    WGPUCommandEncoder      cmdEncoder = nullptr;
++    WGPURenderPassEncoder   renderPass = nullptr;
 +#endif
 +};
 +
