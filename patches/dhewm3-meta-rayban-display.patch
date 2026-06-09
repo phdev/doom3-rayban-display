@@ -1730,6 +1730,82 @@ index 7914093..a5517b7 100644
  	// free the context and close the window
  	GLimp_Shutdown();
  
+diff --git a/neo/renderer/draw_common.cpp b/neo/renderer/draw_common.cpp
+index 0cabbfd..e2baed3 100644
+--- a/neo/renderer/draw_common.cpp
++++ b/neo/renderer/draw_common.cpp
+@@ -30,6 +30,7 @@ If you have questions concerning this license or the applicable additional terms
+ #include "renderer/VertexCache.h"
+ 
+ #include "renderer/tr_local.h"
++#include "renderer/RenderBackend.h"
+ 
+ extern idCVar r_useCarmacksReverse;
+ extern idCVar r_useStencilOpSeparate;
+@@ -774,12 +775,19 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
+ 	}
+ 
+ 	// change the scissor if needed
++	// Phase 4c: scissor goes through renderBackend->SetScissor (GL backend
++	// translates to qglScissor — same command stream).
+ 	if ( r_useScissor.GetBool() && !backEnd.currentScissor.Equals( surf->scissorRect ) ) {
+ 		backEnd.currentScissor = surf->scissorRect;
+-		qglScissor( backEnd.viewDef->viewport.x1 + backEnd.currentScissor.x1,
+-			backEnd.viewDef->viewport.y1 + backEnd.currentScissor.y1,
+-			backEnd.currentScissor.x2 + 1 - backEnd.currentScissor.x1,
+-			backEnd.currentScissor.y2 + 1 - backEnd.currentScissor.y1 );
++		int sx = backEnd.viewDef->viewport.x1 + backEnd.currentScissor.x1;
++		int sy = backEnd.viewDef->viewport.y1 + backEnd.currentScissor.y1;
++		int sw = backEnd.currentScissor.x2 + 1 - backEnd.currentScissor.x1;
++		int sh = backEnd.currentScissor.y2 + 1 - backEnd.currentScissor.y1;
++		if ( renderBackend ) {
++			renderBackend->SetScissor( sx, sy, sw, sh );
++		} else {
++			qglScissor( sx, sy, sw, sh );
++		}
+ 	}
+ 
+ 	// some deforms may disable themselves by setting numIndexes = 0
+@@ -1851,10 +1859,15 @@ void RB_STD_FogAllLights( void ) {
+ 			// units from the origin
+ 			backEnd.currentScissor = vLight->scissorRect;
+ 			if ( r_useScissor.GetBool() ) {
+-				qglScissor( backEnd.viewDef->viewport.x1 + backEnd.currentScissor.x1,
+-					backEnd.viewDef->viewport.y1 + backEnd.currentScissor.y1,
+-					backEnd.currentScissor.x2 + 1 - backEnd.currentScissor.x1,
+-					backEnd.currentScissor.y2 + 1 - backEnd.currentScissor.y1 );
++				int sx = backEnd.viewDef->viewport.x1 + backEnd.currentScissor.x1;
++				int sy = backEnd.viewDef->viewport.y1 + backEnd.currentScissor.y1;
++				int sw = backEnd.currentScissor.x2 + 1 - backEnd.currentScissor.x1;
++				int sh = backEnd.currentScissor.y2 + 1 - backEnd.currentScissor.y1;
++				if ( renderBackend ) {
++					renderBackend->SetScissor( sx, sy, sw, sh );
++				} else {
++					qglScissor( sx, sy, sw, sh );
++				}
+ 			}
+ 			qglClear( GL_STENCIL_BUFFER_BIT );
+ 
+@@ -1903,10 +1916,15 @@ void RB_STD_LightScale( void ) {
+ 
+ 	// the scissor may be smaller than the viewport for subviews
+ 	if ( r_useScissor.GetBool() ) {
+-		qglScissor( backEnd.viewDef->viewport.x1 + backEnd.viewDef->scissor.x1,
+-			backEnd.viewDef->viewport.y1 + backEnd.viewDef->scissor.y1,
+-			backEnd.viewDef->scissor.x2 - backEnd.viewDef->scissor.x1 + 1,
+-			backEnd.viewDef->scissor.y2 - backEnd.viewDef->scissor.y1 + 1 );
++		int sx = backEnd.viewDef->viewport.x1 + backEnd.viewDef->scissor.x1;
++		int sy = backEnd.viewDef->viewport.y1 + backEnd.viewDef->scissor.y1;
++		int sw = backEnd.viewDef->scissor.x2 - backEnd.viewDef->scissor.x1 + 1;
++		int sh = backEnd.viewDef->scissor.y2 - backEnd.viewDef->scissor.y1 + 1;
++		if ( renderBackend ) {
++			renderBackend->SetScissor( sx, sy, sw, sh );
++		} else {
++			qglScissor( sx, sy, sw, sh );
++		}
+ 		backEnd.currentScissor = backEnd.viewDef->scissor;
+ 	}
+ 
 diff --git a/neo/renderer/tr_backend.cpp b/neo/renderer/tr_backend.cpp
 index cf1c571..47c0571 100644
 --- a/neo/renderer/tr_backend.cpp
@@ -1842,6 +1918,53 @@ index 0e40f19..e201948 100644
  extern idCVar r_usePortals;				// 1 = use portals to perform area culling, otherwise draw everything
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
+diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
+index c83ebb5..44fbbda 100644
+--- a/neo/renderer/tr_render.cpp
++++ b/neo/renderer/tr_render.cpp
+@@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
+ #include "renderer/Cinematic.h"
+ 
+ #include "renderer/tr_local.h"
++#include "renderer/RenderBackend.h"
+ 
+ /*
+ 
+@@ -563,16 +564,24 @@ void RB_BeginDrawingView (void) {
+ 	qglMatrixMode(GL_MODELVIEW);
+ 
+ 	// set the window clipping
+-	qglViewport( tr.viewportOffset[0] + viewDef->viewport.x1,
+-		tr.viewportOffset[1] + viewDef->viewport.y1,
+-		viewDef->viewport.x2 + 1 - viewDef->viewport.x1,
+-		viewDef->viewport.y2 + 1 - viewDef->viewport.y1 );
+-
+-	// the scissor may be smaller than the viewport for subviews
+-	qglScissor( tr.viewportOffset[0] + viewDef->viewport.x1 + viewDef->scissor.x1,
+-		tr.viewportOffset[1] + viewDef->viewport.y1 + viewDef->scissor.y1,
+-		viewDef->scissor.x2 + 1 - viewDef->scissor.x1,
+-		viewDef->scissor.y2 + 1 - viewDef->scissor.y1 );
++	// Phase 4c: viewport + scissor migrated to renderBackend abstraction.
++	{
++		int vx = tr.viewportOffset[0] + viewDef->viewport.x1;
++		int vy = tr.viewportOffset[1] + viewDef->viewport.y1;
++		int vw = viewDef->viewport.x2 + 1 - viewDef->viewport.x1;
++		int vh = viewDef->viewport.y2 + 1 - viewDef->viewport.y1;
++		int sx = tr.viewportOffset[0] + viewDef->viewport.x1 + viewDef->scissor.x1;
++		int sy = tr.viewportOffset[1] + viewDef->viewport.y1 + viewDef->scissor.y1;
++		int sw = viewDef->scissor.x2 + 1 - viewDef->scissor.x1;
++		int sh = viewDef->scissor.y2 + 1 - viewDef->scissor.y1;
++		if ( renderBackend ) {
++			renderBackend->SetViewport( vx, vy, vw, vh, 0.0f, 1.0f );
++			renderBackend->SetScissor( sx, sy, sw, sh );
++		} else {
++			qglViewport( vx, vy, vw, vh );
++			qglScissor( sx, sy, sw, sh );
++		}
++	}
+ 	backEnd.currentScissor = viewDef->scissor;
+ 
+ 	// ensures that depth writes are enabled for the depth clear
 diff --git a/neo/sound/snd_local.h b/neo/sound/snd_local.h
 index 808faaa..a1f260a 100644
 --- a/neo/sound/snd_local.h
