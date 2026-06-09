@@ -62,6 +62,15 @@ if [[ -n "${D3_REDUCED_PK4:-}" ]]; then
   install -m 0644 "$D3_REDUCED_PK4" "$EMBED_DIR/base/pak-display.pk4"
 fi
 
+# Phase 5 prep: D3_WEBGPU_BACKEND turns on the real WebGPU code path in
+# neo/renderer/RenderBackend_WebGPU.cpp (otherwise it's a fail-loud stub).
+# --use-port=emdawnwebgpu pulls Dawn into the link. WebGPU is only compiled
+# in on Emscripten targets (the only target where it's a thing).
+WEBGPU_FLAGS=""
+if [[ "${D3_WEBGPU:-1}" == "1" ]]; then
+  WEBGPU_FLAGS="-DD3_WEBGPU_BACKEND=1"
+fi
+
 emcmake cmake \
   -S "$BUILD_DIR/neo" \
   -B "$BUILD_DIR/build" \
@@ -77,9 +86,9 @@ emcmake cmake \
   -DHARDLINK_GAME=ON \
   -DONATIVE=OFF \
   -DD3_EMSCRIPTEN_EMBED="$EMBED_DIR" \
-  -DCMAKE_EXE_LINKER_FLAGS="-Wl,--whole-archive ${GL4ES_PATH}/lib/libGL.a -Wl,--no-whole-archive" \
-  -DCMAKE_C_FLAGS="-I${GL4ES_PATH}/include -I${VENDOR_EFX}" \
-  -DCMAKE_CXX_FLAGS="-I${GL4ES_PATH}/include -I${VENDOR_EFX}"
+  -DCMAKE_EXE_LINKER_FLAGS="-Wl,--whole-archive ${GL4ES_PATH}/lib/libGL.a -Wl,--no-whole-archive --use-port=emdawnwebgpu" \
+  -DCMAKE_C_FLAGS="-I${GL4ES_PATH}/include -I${VENDOR_EFX} --use-port=emdawnwebgpu" \
+  -DCMAKE_CXX_FLAGS="-I${GL4ES_PATH}/include -I${VENDOR_EFX} --use-port=emdawnwebgpu ${WEBGPU_FLAGS}"
 # NOTE: GL4ES must be whole-archived: dhewm3 resolves GL at runtime via
 # gl4es_GetProcAddress, so without --whole-archive the linker dead-strips
 # GL4ES's init/proc symbols and every legacy GL call resolves to null.
