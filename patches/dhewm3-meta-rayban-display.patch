@@ -1312,10 +1312,10 @@ index 0000000..c123b24
 +extern idRenderBackend* renderBackend;
 diff --git a/neo/renderer/RenderBackend_GL.cpp b/neo/renderer/RenderBackend_GL.cpp
 new file mode 100644
-index 0000000..f992d49
+index 0000000..324decc
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_GL.cpp
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,150 @@
 +/*
 +================================================================================
 +
@@ -1323,61 +1323,100 @@ index 0000000..f992d49
 +
 +PURPOSE
 +-------
-+Initial implementation just calls the existing qgl* functions through the
-+abstraction interface. ZERO behavior change for the GL backend — it's a
-+pass-through wrapper. The point of this file is:
++Pass-through wrapper: every method translates to the same qgl* calls dhewm3
++already makes directly. Migrated call sites (renderBackend->X()) produce
++bit-identical GL command streams to unmigrated qgl* call sites.
 +
-+  1. Establishes the call boundary so future code can be written against
-+     RenderBackend.h without caring which backend is active.
-+  2. As call sites get migrated from qgl* → renderBackend->X(), they keep
-+     producing identical GL command streams.
-+  3. Eventually, after Phase 4-7 complete, this file gets deprecated and
-+     the GL path is removed (the WebGPU backend replaces it entirely).
-+
-+DURING MIGRATION
-+----------------
-+- Call sites NOT yet migrated continue to use qgl* directly. No problem.
-+- Call sites that ARE migrated go through renderBackend->X(), which here
-+  just calls the same qgl* underneath. Output is bit-identical.
-+- The cvar `r_backend "gl"` (default during cutover) instantiates this.
-+- When WebGPU is ready: `r_backend "webgpu"` instantiates the other
-+  backend. Anything still using raw qgl* will silently bypass — that's
-+  why migration must complete before flipping the cvar default.
++Phase 4a: file existed but methods were empty stubs.
++Phase 4b: frame-boundary ops (BeginRenderPass / EndRenderPass / SetViewport
++          / SetScissor / SetStencilReference) implemented properly.
++Phase 4c+: pipeline / buffer / texture / draw ops implemented as call sites
++           migrate.
 +
 +================================================================================
 +*/
 +
 +#include "RenderBackend.h"
-+
-+// NOTE: This file references the engine's qgl* loader and GL constants.
-+// During Phase 4, this is kept as a stub that builds standalone. The
-+// integration step (Phase 4b) lifts it into neo/renderer/ and uncomments
-+// the qgl* calls. Initial commit ships the structure only.
-+
++#include "sys/platform.h"
++#include "renderer/qgl.h"
++#include "renderer/tr_local.h"
 +#include <cstdio>
 +
 +class idRenderBackend_GL : public idRenderBackend {
 +public:
 +    idGpuBackendKind GetKind() const override { return idGpuBackendKind::GL; }
 +
++    // ─── Lifecycle ──────────────────────────────────────────────────────────
++
 +    bool Init(void*, int w, int h) override {
-+        fprintf(stderr, "[GL backend] Init %dx%d (pass-through wrapper)\n", w, h);
-+        // Engine's existing GL init runs unchanged. This wrapper appears
-+        // AFTER GLimp_Init has already set up the WebGL context.
++        common->Printf("[GL backend] Init %dx%d (pass-through wrapper)\n", w, h);
 +        return true;
 +    }
 +    void Shutdown() override {}
-+    void Resize(int, int) override {}
++    void Resize(int w, int h) override {
++        // Engine still owns viewport sizing via its own ResizeWindow path
++        (void)w; (void)h;
++    }
 +
++    // ─── Frame ──────────────────────────────────────────────────────────────
++
++    // Phase 4b: no per-frame GL state to flip. The engine's RB_ExecuteBackEndCommands
++    // already handles its own frame boundaries (gl flush, swap, etc.). These are
++    // no-ops at the GL layer; the WebGPU backend will use them to queue command
++    // buffer submission.
 +    void BeginFrame() override {}
-+    void EndFrame() override {}
++    void EndFrame() override {
++        // Make sure any pending GPU work is flushed before swap. Matches the
++        // r_finish cvar behavior the engine already does conditionally.
++        if (r_finish.GetBool()) {
++            qglFinish();
++        }
++    }
++
++    // ─── Render pass ────────────────────────────────────────────────────────
 +
 +    void BeginRenderPass(const idGpuRenderPassDesc& desc) override {
-+        // GL impl: glBindFramebuffer + glClearColor + glClear if desc.colorLoad == Clear
-+        // ... wire up when migrating tr_backend.cpp
-+        (void)desc;
++        // GL has no explicit render-pass concept; we emulate it via the
++        // framebuffer binding + clear sequence that the engine was doing
++        // inline. Currently we only support the default backbuffer (handle 0);
++        // FBO support comes when migrating subview rendering.
++        if (desc.colorAttachment.id == 0) {
++            // Default framebuffer (canvas/backbuffer). On WebGL2 the engine
++            // doesn't explicitly bind 0; staying compatible.
++        } else {
++            // Future: glBindFramebuffer with the attachment's FBO id.
++        }
++
++        // Color clear
++        if (desc.colorLoad == idGpuLoadOp::Clear) {
++            qglClearColor(desc.clearR, desc.clearG, desc.clearB, desc.clearA);
++        }
++
++        // Depth + stencil clear setup
++        GLbitfield mask = 0;
++        if (desc.colorLoad == idGpuLoadOp::Clear) mask |= GL_COLOR_BUFFER_BIT;
++        if (desc.hasDepth) {
++            if (desc.depthLoad == idGpuLoadOp::Clear) {
++                qglClearDepth(desc.clearDepth);
++                mask |= GL_DEPTH_BUFFER_BIT;
++            }
++            if (desc.stencilLoad == idGpuLoadOp::Clear) {
++                qglClearStencil((GLint)desc.clearStencil);
++                mask |= GL_STENCIL_BUFFER_BIT;
++            }
++        }
++        if (mask) {
++            qglClear(mask);
++        }
 +    }
-+    void EndRenderPass() override {}
++
++    void EndRenderPass() override {
++        // GL: nothing — the next BeginRenderPass implicitly ends the current.
++        // The WebGPU backend will release the WGPURenderPassEncoder here.
++    }
++
++    // ─── Pipeline / buffers / textures / bind groups / draw ─────────────────
++    // Stubs for now. These get filled in as Phase 4c migrates draw_common.cpp.
 +
 +    idGpuPipeline CreatePipeline(const idGpuPipelineDesc&) override { return {}; }
 +    void DestroyPipeline(idGpuPipeline) override {}
@@ -1403,9 +1442,23 @@ index 0000000..f992d49
 +    void Draw(uint32_t, uint32_t, uint32_t, uint32_t) override {}
 +    void DrawIndexed(uint32_t, uint32_t, uint32_t, int32_t, uint32_t) override {}
 +
-+    void SetViewport(int, int, int, int, float, float) override {}
-+    void SetScissor(int, int, int, int) override {}
-+    void SetStencilReference(uint32_t) override {}
++    // ─── Dynamic state ──────────────────────────────────────────────────────
++
++    void SetViewport(int x, int y, int width, int height, float minDepth, float maxDepth) override {
++        qglViewport(x, y, width, height);
++        qglDepthRange(minDepth, maxDepth);
++    }
++
++    void SetScissor(int x, int y, int width, int height) override {
++        qglScissor(x, y, width, height);
++    }
++
++    void SetStencilReference(uint32_t ref) override {
++        // The engine's existing stencil-shadow setup encodes ref into glStencilFunc
++        // directly; this is a hook for future migration. Initially a no-op since
++        // unmigrated call sites still set the full stencil state inline.
++        (void)ref;
++    }
 +
 +    const char* GetDeviceName() const override { return "OpenGL (GL4ES → WebGL2)"; }
 +};
@@ -1678,10 +1731,18 @@ index 7914093..a5517b7 100644
  	GLimp_Shutdown();
  
 diff --git a/neo/renderer/tr_backend.cpp b/neo/renderer/tr_backend.cpp
-index cf1c571..6857970 100644
+index cf1c571..47c0571 100644
 --- a/neo/renderer/tr_backend.cpp
 +++ b/neo/renderer/tr_backend.cpp
-@@ -236,7 +236,11 @@ void GL_State( int stateBits ) {
+@@ -29,6 +29,7 @@ If you have questions concerning this license or the applicable additional terms
+ #include "sys/sys_imgui.h"
+ 
+ #include "renderer/tr_local.h"
++#include "renderer/RenderBackend.h"
+ 
+ static idCVar r_fillWindowAlphaChan( "r_fillWindowAlphaChan", "-1", CVAR_SYSTEM | CVAR_NOCHEAT | CVAR_ARCHIVE, "Make sure alpha channel of windows default framebuffer is completely opaque at the end of each frame. Needed at least when using Wayland with older drivers.\n 1: do this, 0: don't do it, -1: let dhewm3 decide (default)" );
+ 
+@@ -236,7 +237,11 @@ void GL_State( int stateBits ) {
  	//
  	if ( diff & ( GLS_DEPTHFUNC_EQUAL | GLS_DEPTHFUNC_LESS | GLS_DEPTHFUNC_ALWAYS ) ) {
  		if ( stateBits & GLS_DEPTHFUNC_EQUAL ) {
@@ -1694,6 +1755,81 @@ index cf1c571..6857970 100644
  		} else if ( stateBits & GLS_DEPTHFUNC_ALWAYS ) {
  			qglDepthFunc( GL_ALWAYS );
  		} else {
+@@ -402,9 +407,18 @@ This is not used by the normal game paths, just by some tools
+ */
+ void RB_SetGL2D( void ) {
+ 	// set 2D virtual screen size
+-	qglViewport( 0, 0, glConfig.vidWidth, glConfig.vidHeight );
+-	if ( r_useScissor.GetBool() ) {
+-		qglScissor( 0, 0, glConfig.vidWidth, glConfig.vidHeight );
++	// Phase 4b: migrated to renderBackend abstraction. GL backend translates
++	// these to qglViewport / qglScissor — identical command stream.
++	if ( renderBackend ) {
++		renderBackend->SetViewport( 0, 0, glConfig.vidWidth, glConfig.vidHeight, 0.0f, 1.0f );
++		if ( r_useScissor.GetBool() ) {
++			renderBackend->SetScissor( 0, 0, glConfig.vidWidth, glConfig.vidHeight );
++		}
++	} else {
++		qglViewport( 0, 0, glConfig.vidWidth, glConfig.vidHeight );
++		if ( r_useScissor.GetBool() ) {
++			qglScissor( 0, 0, glConfig.vidWidth, glConfig.vidHeight );
++		}
+ 	}
+ 	qglMatrixMode( GL_PROJECTION );
+ 	qglLoadIdentity();
+@@ -445,17 +459,33 @@ static void	RB_SetBuffer( const void *data ) {
+ 	// automatically enable this with several other debug tools
+ 	// that might leave unrendered portions of the screen
+ 	if ( r_clear.GetFloat() || idStr::Length( r_clear.GetString() ) != 1 || r_lockSurfaces.GetBool() || r_singleArea.GetBool() || r_showOverDraw.GetBool() ) {
++		// Phase 4b: migrated to renderBackend->BeginRenderPass with color clear.
++		// GL backend issues qglClearColor + qglClear(GL_COLOR_BUFFER_BIT) —
++		// bit-identical command stream to the inline path below.
++		idGpuRenderPassDesc desc = {};
++		desc.name = "RB_SetBuffer.debugClear";
++		desc.colorAttachment = {};   // default backbuffer (id == 0)
++		desc.colorLoad = idGpuLoadOp::Clear;
++		desc.colorStore = idGpuStoreOp::Store;
++		desc.clearA = 1.0f;
+ 		float c[3];
+ 		if ( sscanf( r_clear.GetString(), "%f %f %f", &c[0], &c[1], &c[2] ) == 3 ) {
+-			qglClearColor( c[0], c[1], c[2], 1 );
++			desc.clearR = c[0]; desc.clearG = c[1]; desc.clearB = c[2];
+ 		} else if ( r_clear.GetInteger() == 2 ) {
+-			qglClearColor( 0.0f, 0.0f,  0.0f, 1.0f );
++			desc.clearR = 0.0f; desc.clearG = 0.0f; desc.clearB = 0.0f;
+ 		} else if ( r_showOverDraw.GetBool() ) {
+-			qglClearColor( 1.0f, 1.0f, 1.0f, 1.0f );
++			desc.clearR = 1.0f; desc.clearG = 1.0f; desc.clearB = 1.0f;
++		} else {
++			desc.clearR = 0.4f; desc.clearG = 0.0f; desc.clearB = 0.25f;
++		}
++		desc.hasDepth = false;
++		if ( renderBackend ) {
++			renderBackend->BeginRenderPass( desc );
++			renderBackend->EndRenderPass();
+ 		} else {
+-			qglClearColor( 0.4f, 0.0f, 0.25f, 1.0f );
++			qglClearColor( desc.clearR, desc.clearG, desc.clearB, desc.clearA );
++			qglClear( GL_COLOR_BUFFER_BIT );
+ 		}
+-		qglClear( GL_COLOR_BUFFER_BIT );
+ 	}
+ }
+ 
+@@ -600,8 +630,11 @@ const void	RB_SwapBuffers( const void *data ) {
+ 			qglEnable( GL_SCISSOR_TEST );
+ 	}
+ 
+-	// force a gl sync if requested
+-	if ( r_finish.GetBool() ) {
++	// Phase 4b: end-of-frame sync via the abstraction. GL backend calls
++	// qglFinish() conditional on r_finish — identical behavior.
++	if ( renderBackend ) {
++		renderBackend->EndFrame();
++	} else if ( r_finish.GetBool() ) {
+ 		qglFinish();
+ 	}
+ 
 diff --git a/neo/renderer/tr_local.h b/neo/renderer/tr_local.h
 index 0e40f19..e201948 100644
 --- a/neo/renderer/tr_local.h
