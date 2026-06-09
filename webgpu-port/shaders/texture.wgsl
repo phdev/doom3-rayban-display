@@ -37,7 +37,9 @@ struct VSOut {
 @vertex
 fn vs_main(in: VSIn) -> VSOut {
     var out: VSOut;
-    out.clip_pos = u.mvp * vec4<f32>(in.position, 1.0);
+    let cp = u.mvp * vec4<f32>(in.position, 1.0);
+    // GL [-w, w] → WebGPU [0, w] clip-z remap. Identity MVP is unaffected.
+    out.clip_pos = vec4<f32>(cp.x, cp.y, (cp.z + cp.w) * 0.5, cp.w);
     out.uv = in.texcoord;
     out.vertex_color = in.color;
     return out;

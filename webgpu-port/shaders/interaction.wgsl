@@ -71,7 +71,12 @@ struct VSOut {
 @vertex
 fn vs_main(in: VSIn) -> VSOut {
     var out: VSOut;
-    out.clip_pos = u.mvp * vec4<f32>(in.position, 1.0);
+    let cp = u.mvp * vec4<f32>(in.position, 1.0);
+    // DOOM 3 (OpenGL) projection produces clip-z in [-w, w]. WebGPU clip-z is
+    // [0, w]. Remap so anything with GL clip-z >= 0 ends up in WebGPU's
+    // visible range. Without this, ~half the geometry gets near-plane-clipped
+    // and the canvas is black.
+    out.clip_pos = vec4<f32>(cp.x, cp.y, (cp.z + cp.w) * 0.5, cp.w);
 
     // Tangent-space TBN. The engine pre-computes tangent + bitangent per
     // vertex; we use them directly.
@@ -134,5 +139,9 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 * light_proj_color
                 * light_falloff;
 
-    return vec4<f32>(color, 1.0) * in.vertex_color;
+    // DEBUG (iter 6.5): use a fixed bright magenta tint to confirm geometry
+    // reaches the fragment stage at all. Once we can see the captured surfaces
+    // as silhouettes, revert this line and debug the lit-pass math properly.
+    let dbg = vec3<f32>(1.0, 0.0, 1.0);
+    return vec4<f32>(mix(dbg, color, 0.0), 1.0);
 }

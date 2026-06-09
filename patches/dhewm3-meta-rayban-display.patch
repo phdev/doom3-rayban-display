@@ -1788,7 +1788,7 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..8cd7c66
+index 0000000..5625bae
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
 @@ -0,0 +1,1378 @@
@@ -2100,7 +2100,7 @@ index 0000000..8cd7c66
 +                ca.view = v;
 +                ca.loadOp = WGPULoadOp_Clear;
 +                ca.storeOp = WGPUStoreOp_Store;
-+                ca.clearValue = { 0.05, 0.0, 0.05, 1.0 };  // tiny purple tint = "WebGPU pass ran"
++                ca.clearValue = { 0.0, 0.4, 0.6, 1.0 };  // BRIGHT TEAL clear so we can tell "is the pass running at all?"
 +                ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
 +                WGPURenderPassDepthStencilAttachment da = {};
 +                da.view = depthView;
