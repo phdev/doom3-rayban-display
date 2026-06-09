@@ -263,17 +263,21 @@ engine args before WASM runs — otherwise emdawnwebgpu's
   scene (first 64 surfaces).
 - **detTest harness** — `window.detTest("#webgpuCanvas", 5, 250)`
   from Safari Web Inspector. Captures N frames `delayMs` apart,
-  pairwise diffs RGB, reports mean % diff + max delta. The chunky-tile
-  bug shows up as 1-7% / max 192/255 in this metric.
-- **fullDetTest** — `window.fullDetTest(5, 300)` runs the full A/B:
-  pauses engine (`g_stopTime 1` + `pause`), runs detTest on both
-  canvases at matched timing, prints verdict.
-  **Chrome verified: WebGPU = 0.000% / 0, GL = 21.5% / 255 (5 frames,
-  300ms apart, paused).** The 21.5% on Chrome GL is engine-side
-  micro-animation that survives pause (sky shaders etc.), not the
-  iPhone chunky-tile bug. iPhone Safari A/B is still the load-bearing
-  test — its GL should show > 21.5% (engine micro-anim + chunky-tile
-  on top) and its WebGPU should be 0.
+  pairwise diffs RGB, reports mean % diff + max delta.
+  **CAVEAT (discovered 2026-06-09): drawImage readback of a WebGPU
+  canvas returns black** — the drawing buffer is cleared after present
+  (like WebGL without preserveDrawingBuffer). Every numerical detTest
+  result on `#webgpuCanvas` (including the earlier "0.000% verified"
+  claims) was vacuously diffing cleared buffers. detTest remains valid
+  for the GL canvas; for the WebGPU canvas only compositor-level
+  observation (eyeballs, or headed-browser screenshots) is honest.
+  Headless Chrome screenshots also fail to composite the WebGPU canvas
+  (black) — use HEADED Chrome via Playwright for local visual checks.
+- **fullDetTest** — `window.fullDetTest(5, 300)` pauses the engine and
+  A/Bs both canvases. On iPhone the pause makes iOS Safari throttle
+  canvas updates so both sides trivially report 0% — also not load-
+  bearing. The decisive instrument is the eyeball test: watch both
+  canvases side-by-side while the engine renders.
 - **Iter 7a** — engine-side CPU image cache: Image_load.cpp's
   GenerateImage stashes the RGBA8 source buffer for every loaded
   image keyed by idImage pointer (512-slot table in tr_render.cpp).
@@ -287,19 +291,44 @@ engine args before WASM runs — otherwise emdawnwebgpu's
 takes over and the engine boots to GL. Mac Safari 26+ has working
 WebGPU. Real iPhone Safari has working WebGPU (verified iter 1).
 
-**Chunky-tile bug: VISUALLY CONFIRMED FIXED via WebGPU (2026-06-09).**
-With the iter 6 echo canvas running on real iPhone Safari, the
-`#webgpuCanvas` (small green-bordered box top-right showing 64 lit
-surfaces through `interaction.wgsl`) renders rock-solid frame-to-frame,
-while the main `#gameCanvas` (GL → GL4ES → WebGL) flickers with the
-familiar chunky-tile signature, on the same iPhone, same scene, same
-frame. Conclusion: the bug is fundamentally a GL/WebKit interaction.
-The whole rest of the WebGPU port (iter 7b: real engine textures,
-plus depth pre-pass, multiple lights, shadow stencils, 2D HUD) is the
-production fix. `fullDetTest` numerical test on iPhone was
-inconclusive — iOS Safari throttles the canvas when the engine is
-paused so drawImage captured the same frame 5 times → both canvases
-0%; eyeballing is the load-bearing proof.
+**Iter 6.5/6.6/6.7 — the "black echo canvas" debug saga (2026-06-09).**
+The first iPhone eyeball test showed the echo canvas not flickering —
+but it was BLACK (nothing rendered), so that was no proof at all.
+Diagnostic ladder that cracked it (each step a deploy + iPhone look,
+then a local headed-Chrome loop once we discovered headless Chrome
+can't composite WebGPU canvases):
+1. Bright teal clear → user saw teal → render pass executes.
+2. Forced demo quad → user saw checker → base pipeline fine; bug
+   isolated to the captured-geometry path.
+3. Root causes found and fixed (iter 6.6):
+   - **Per-view reset wiped records**: `RB_BeginDrawingView` runs once
+     per VIEW (main view, lightgem, subviews), so resetting the record
+     accumulator there erased the main view's captures before
+     EndFrame read them — the multi path silently drew 0 records all
+     along (the "multi-surface upload" log never fired). Fix: EndFrame
+     CONSUMES (drains) the accumulator; no reset at view start.
+   - **MVP convention risk**: now the FULL MVP (projection *
+     modelViewMatrix) is baked per record at capture time in
+     draw_arb2.cpp where both matrices are in scope for the correct
+     view. WebGPU side uses it verbatim. Also skips views narrower
+     than 128px (lightgem).
+   - **GL→WebGPU clip-z**: GL clip-z is [-w,w], WebGPU is [0,w];
+     vertex shaders now remap `z' = (z+w)/2`. Without it geometry
+     near-plane-clips away.
+4. Magenta-forced fragment output → headed Chrome showed magenta
+   silhouettes → raster fine, lit math = 0. Two zero-makers fixed
+   (iter 6.7):
+   - **DXT5-NM neutral normal was wrong**: the procedural "flat"
+     normal must be A=0x80 G=0x80 (X=alpha in DXT5-NM); it was
+     A=0xFF → decoded normal (1,0,0) ⊥ light → NdotL≈0 → black.
+   - **Vertex-color multiply removed**: DOOM 3 interactions default
+     SVC_IGNORE (vertex color unused); world verts often carry black,
+     so the unconditional multiply zeroed the output.
+After iter 6.7 headed Chrome shows lit green-checker DOOM 3 geometry
+with real per-light shading in the echo canvas — 43 records/frame on
+mars_city1. **The chunky-tile A/B on iPhone is NOT yet concluded** —
+the earlier "confirmed fixed" claim was premature (black canvas can't
+flicker). Re-run the eyeball test now that content renders.
 
 ### Mobile / iOS (hard-won)
 

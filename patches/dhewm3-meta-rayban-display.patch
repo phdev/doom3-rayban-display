@@ -1788,10 +1788,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..026469b
+index 0000000..aee47e3
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,1362 @@
+@@ -0,0 +1,1376 @@
 +/*
 +================================================================================
 +
@@ -2032,11 +2032,12 @@ index 0000000..026469b
 +                WGPUCommandEncoderDescriptor cd = {};
 +                WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(device, &cd);
 +
-+                // Iter 3/4: if the engine captured a lit-pass surface this frame,
-+                // upload its verts+indexes and draw with interaction.wgsl using
-+                // the real engine MVP + per-light/per-material uniforms. Otherwise
-+                // fall back to the demo quad (identity MVP, full coverage).
-+                extern float g_lastViewMatrix[16];
++                // Iter 6.6: pull the engine's per-frame surface records.
++                // uploadCapturedRecords CONSUMES the CPU accumulator (the
++                // engine appends across all views in a frame — main view,
++                // lightgem, subviews — and we drain here, so a later
++                // RB_BeginDrawingView can't wipe records before we read them,
++                // which is what made the multi path silently produce 0).
 +                extern float g_lastProjMatrix[16];
 +                extern float g_lastModelMatrix[16];
 +                extern uint8_t  g_lastSurfVerts[];
@@ -2053,47 +2054,36 @@ index 0000000..026469b
 +                extern float    g_lastDinDiffuseColor[4];
 +                extern float    g_lastDinSpecularColor[4];
 +
-+                if (g_lastSurfNumVerts > 0 && g_lastSurfNumIndexes > 0 &&
-+                    g_lastSurfFrameId != lastUploadedFrameId) {
-+                    uploadCapturedSurface();
-+                }
++                uint32_t multiCount = 0;
++                bool multiOk = recordSlotsReady && interactionPipeline &&
++                               uploadCapturedRecords(multiCount) && multiCount > 0;
 +
-+                // Compose MVP. For captured-surface path: proj * view * model.
-+                // For demo-quad fallback: identity (NDC quad). Column-major.
-+                float mvp[16] = {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
-+                if (capturedReady) {
-+                    float mv[16];
-+                    matMul4(mv,  g_lastViewMatrix, g_lastModelMatrix);
-+                    matMul4(mvp, g_lastProjMatrix, mv);
-+                }
-+
-+                if (capturedReady && interactionPipeline) {
-+                    // interaction.wgsl Uniforms layout: mvp + 7 vec4 = 176 bytes.
-+                    // Tangent-space light origin / view origin are computed by the
-+                    // engine; the WGSL shader recomputes object-space → tangent via TBN.
-+                    // (Both paths produce equivalent math.)
-+                    float intUB[44];
-+                    memcpy(intUB +  0, mvp, 64);
-+                    memcpy(intUB + 16, g_lastDinLocalLightOrigin, 16);
-+                    memcpy(intUB + 20, g_lastDinLocalViewOrigin,  16);
-+                    memcpy(intUB + 24, g_lastDinDiffuseColor,     16);
-+                    memcpy(intUB + 28, g_lastDinSpecularColor,    16);
-+                    memcpy(intUB + 32, g_lastDinLightProjS,       16);
-+                    memcpy(intUB + 36, g_lastDinLightProjT,       16);
-+                    memcpy(intUB + 40, g_lastDinLightProjQ,       16);
-+                    // light_falloff_s sits past the end of our 44-float buffer; expand:
-+                    float full[48];
-+                    memcpy(full, intUB, sizeof(intUB));
-+                    memcpy(full + 44, g_lastDinLightFalloffS, 16);
-+                    wgpuQueueWriteBuffer(queue, interactionUniformBuf, 0, full, sizeof(full));
-+                } else {
-+                    // Demo quad path keeps its 80-byte uniform (mat4 + tint vec4)
-+                    float ub[20] = {
-+                        mvp[0],mvp[1],mvp[2],mvp[3], mvp[4],mvp[5],mvp[6],mvp[7],
-+                        mvp[8],mvp[9],mvp[10],mvp[11], mvp[12],mvp[13],mvp[14],mvp[15],
-+                        1.0f, 1.0f, 1.0f, 1.0f
-+                    };
-+                    wgpuQueueWriteBuffer(queue, demoUniformBuf, 0, ub, sizeof(ub));
++                if (!multiOk) {
++                    // Single-record fallback (iter 4). g_lastModelMatrix now
++                    // holds the FULL MVP baked at capture time in draw_arb2.
++                    if (g_lastSurfNumVerts > 0 && g_lastSurfNumIndexes > 0 &&
++                        g_lastSurfFrameId != lastUploadedFrameId) {
++                        uploadCapturedSurface();
++                    }
++                    if (capturedReady && interactionPipeline) {
++                        float full[48];
++                        memcpy(full +  0, g_lastModelMatrix, 64);
++                        memcpy(full + 16, g_lastDinLocalLightOrigin, 16);
++                        memcpy(full + 20, g_lastDinLocalViewOrigin,  16);
++                        memcpy(full + 24, g_lastDinDiffuseColor,     16);
++                        memcpy(full + 28, g_lastDinSpecularColor,    16);
++                        memcpy(full + 32, g_lastDinLightProjS,       16);
++                        memcpy(full + 36, g_lastDinLightProjT,       16);
++                        memcpy(full + 40, g_lastDinLightProjQ,       16);
++                        memcpy(full + 44, g_lastDinLightFalloffS,    16);
++                        wgpuQueueWriteBuffer(queue, interactionUniformBuf, 0, full, sizeof(full));
++                    } else {
++                        float ub[20] = {
++                            1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1,
++                            1.0f, 1.0f, 1.0f, 1.0f
++                        };
++                        wgpuQueueWriteBuffer(queue, demoUniformBuf, 0, ub, sizeof(ub));
++                    }
 +                }
 +
 +                WGPURenderPassColorAttachment ca = {};
@@ -2113,19 +2103,31 @@ index 0000000..026469b
 +                rpd.colorAttachmentCount = 1;
 +                rpd.colorAttachments = &ca;
 +                rpd.depthStencilAttachment = depthView ? &da : nullptr;
-+                // DIAGNOSTIC (iter 6.5): force iter 1 demo quad path so we
-+                // can isolate which layer broke. Reading order:
-+                //   - sees green checker quad → basic pipeline works,
-+                //     iter 4/6 captured-geometry path is the bug
-+                //   - still pure teal → basic pipeline broken on iPhone
-+                //     (surface format / depth attach / quad geometry itself)
-+                // Once isolated, restore the cascade below.
-+                (void)recordSlotsReady; (void)capturedReady; (void)interactionPipeline;
++                // Draw cascade: multi-record → single-record → demo quad.
++                // (Demo-quad-only diagnostic confirmed the base pipeline works
++                // on iPhone — green checker visible, 2026-06-09.)
 +                WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
-+                wgpuRenderPassEncoderSetPipeline(rp, demoPipeline);
-+                wgpuRenderPassEncoderSetBindGroup(rp, 0, demoBindGroup, 0, nullptr);
-+                wgpuRenderPassEncoderSetVertexBuffer(rp, 0, demoVertexBuf, 0, WGPU_WHOLE_SIZE);
-+                wgpuRenderPassEncoderDraw(rp, 6, 1, 0, 0);
++                if (multiOk) {
++                    wgpuRenderPassEncoderSetPipeline(rp, interactionPipeline);
++                    for (uint32_t i = 0; i < multiCount; ++i) {
++                        const Rec& r = lastRecords[i];
++                        wgpuRenderPassEncoderSetBindGroup(rp, 0, recordBindGroups[i], 0, nullptr);
++                        wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
++                        wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
++                        wgpuRenderPassEncoderDrawIndexed(rp, r.indexCount, 1, 0, 0, 0);
++                    }
++                } else if (capturedReady && interactionPipeline) {
++                    wgpuRenderPassEncoderSetPipeline(rp, interactionPipeline);
++                    wgpuRenderPassEncoderSetBindGroup(rp, 0, interactionBindGroup, 0, nullptr);
++                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, capturedVertexBuf, 0, WGPU_WHOLE_SIZE);
++                    wgpuRenderPassEncoderSetIndexBuffer(rp, capturedIndexBuf, WGPUIndexFormat_Uint16, 0, WGPU_WHOLE_SIZE);
++                    wgpuRenderPassEncoderDrawIndexed(rp, capturedIndexCount, 1, 0, 0, 0);
++                } else {
++                    wgpuRenderPassEncoderSetPipeline(rp, demoPipeline);
++                    wgpuRenderPassEncoderSetBindGroup(rp, 0, demoBindGroup, 0, nullptr);
++                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, demoVertexBuf, 0, WGPU_WHOLE_SIZE);
++                    wgpuRenderPassEncoderDraw(rp, 6, 1, 0, 0);
++                }
 +                wgpuRenderPassEncoderEnd(rp);
 +                wgpuRenderPassEncoderRelease(rp);
 +
@@ -2474,7 +2476,7 @@ index 0000000..026469b
 +            return wgpuTextureCreateView(tex, nullptr);
 +        };
 +        // DXT5-NM neutral normal: alpha=0x80 (0.5), green=0x80 (0.5) → (0,0,1) in TS
-+        WGPUTextureView vNormal   = makeTex(0xff808080u, "interactionNormal");
++        WGPUTextureView vNormal   = makeTex(0x80808080u, "interactionNormal");
 +        WGPUTextureView vSpecular = makeTex(0xffffffffu, "interactionSpecular");
 +        WGPUTextureView vDiffuse  = makeTex(0xff80c080u, "interactionDiffuse");
 +        WGPUTextureView vFalloff  = makeTex(0xffffffffu, "interactionFalloff");
@@ -2531,7 +2533,7 @@ index 0000000..026469b
 +            wgpuQueueWriteTexture(queue, &dst, px, sizeof(px), &layout, &ext);
 +            return wgpuTextureCreateView(tex, nullptr);
 +        };
-+        WGPUTextureView vNormal = makeTex(0xff808080u);
++        WGPUTextureView vNormal = makeTex(0x80808080u);
 +        WGPUTextureView vSpec   = makeTex(0xffffffffu);
 +        WGPUTextureView vDiff   = makeTex(0xff80c080u);
 +        WGPUTextureView vFall   = makeTex(0xffffffffu);
@@ -2567,8 +2569,12 @@ index 0000000..026469b
 +        EM_ASM_({ console.info("[d3] WebGPU record slots ready: " + $0); }, kMaxRecordSlots);
 +    }
 +
-+    // Iter 6: copy CPU-side records → GPU buffers. Grows the shared vertex
-+    // and index buffers as needed.
++    // Iter 6.6: copy CPU-side records → GPU buffers and CONSUME the
++    // accumulator (the engine appends across all of a frame's views; we
++    // drain here so a later RB_BeginDrawingView can't wipe records before
++    // we read them). When no fresh records exist this call, redraw the
++    // previous frame's set — the GPU buffers and uniforms are still valid
++    // (only happens on frames with no 3D view, where the camera can't move).
 +    bool uploadCapturedRecords(uint32_t& outCount) {
 +        extern Rec g_capRecords[];
 +        extern uint8_t  g_capVertsAccum[];
@@ -2579,11 +2585,10 @@ index 0000000..026469b
 +        extern uint32_t g_capFrameId;
 +
 +        outCount = 0;
-+        if (g_capRecordCount == 0) return false;
-+        if (g_capFrameId == lastUploadedCapFrameId) {
-+            // Same frame already uploaded — reuse what's on GPU.
-+            outCount = g_capRecordCount;
-+            return true;
++        if (g_capRecordCount == 0) {
++            // No fresh capture — keep showing last frame's records if any.
++            outCount = lastRecordCount;
++            return lastRecordCount > 0;
 +        }
 +
 +        const uint32_t vNeed = (g_capVertBytes + 3u) & ~3u;
@@ -2611,17 +2616,13 @@ index 0000000..026469b
 +        wgpuQueueWriteBuffer(queue, recordIndexBuf,  0, g_capIndexesAccum,  iNeed);
 +
 +        const uint32_t n = (g_capRecordCount < kMaxRecordSlots) ? g_capRecordCount : kMaxRecordSlots;
-+        // Per-slot uniform writes. Each interaction.wgsl Uniforms block is
-+        // 176 bytes (mvp 64 + 7 vec4 = 112). We pad to 192 for buffer size.
++        // Per-slot uniform writes. r.modelMatrix holds the FULL MVP, baked
++        // at capture time in draw_arb2.cpp where this view's projection and
++        // this surface's modelView are both in scope. Use verbatim.
 +        for (uint32_t i = 0; i < n; ++i) {
 +            const Rec& r = g_capRecords[i];
-+            extern float g_lastViewMatrix[16];
-+            extern float g_lastProjMatrix[16];
-+            float mv[16], mvp[16];
-+            matMul4(mv,  g_lastViewMatrix, r.modelMatrix);
-+            matMul4(mvp, g_lastProjMatrix, mv);
 +            float ub[48];
-+            memcpy(ub +  0, mvp, 64);
++            memcpy(ub +  0, r.modelMatrix, 64);
 +            memcpy(ub + 16, r.localLightOrigin, 16);
 +            memcpy(ub + 20, r.localViewOrigin,  16);
 +            memcpy(ub + 24, r.diffuseColor,     16);
@@ -2632,8 +2633,16 @@ index 0000000..026469b
 +            memcpy(ub + 44, r.lightFalloffS,    16);
 +            wgpuQueueWriteBuffer(queue, recordUniformBufs[i], 0, ub, 192);
 +        }
++        // Keep a backend-local copy of the consumed records (the draw loop
++        // reads offsets/counts from here, and no-capture frames redraw it).
++        memcpy(lastRecords, g_capRecords, n * sizeof(Rec));
++        lastRecordCount = n;
 +        outCount = n;
 +        lastUploadedCapFrameId = g_capFrameId;
++        // CONSUME: drain the accumulator so next frame starts fresh.
++        g_capRecordCount = 0;
++        g_capVertBytes   = 0;
++        g_capIndexBytes  = 0;
 +        static bool announcedOnce = false;
 +        if (!announcedOnce) {
 +            announcedOnce = true;
@@ -3148,6 +3157,11 @@ index 0000000..026469b
 +    WGPUBindGroup           recordBindGroups[kMaxRecordSlots]  = {nullptr};
 +    bool                    recordSlotsReady = false;
 +    uint32_t                lastUploadedCapFrameId = 0;
++    // Iter 6.6: backend-local copy of the last consumed records — the draw
++    // loop reads offsets/counts from here; frames with no fresh capture
++    // (GUI-only frames) redraw this set.
++    Rec                     lastRecords[kMaxRecordSlots] = {};
++    uint32_t                lastRecordCount = 0;
 +#endif
 +};
 +
@@ -3303,10 +3317,10 @@ index 7914093..eed2277 100644
  	GLimp_Shutdown();
  
 diff --git a/neo/renderer/draw_arb2.cpp b/neo/renderer/draw_arb2.cpp
-index c1d0d3e..5752087 100644
+index c1d0d3e..a840d8b 100644
 --- a/neo/renderer/draw_arb2.cpp
 +++ b/neo/renderer/draw_arb2.cpp
-@@ -62,7 +62,128 @@ static void GL_SelectTextureNoClient( int unit ) {
+@@ -62,7 +62,157 @@ static void GL_SelectTextureNoClient( int unit ) {
  RB_ARB2_DrawInteraction
  ==================
  */
@@ -3355,12 +3369,33 @@ index c1d0d3e..5752087 100644
 +enum { kWGPUMaxCapV = 8192, kWGPUMaxCapI = 32768 };
 +enum { kWGPUMaxRec = 64, kWGPUVertCap = 4*1024*1024, kWGPUIdxCap = 1*1024*1024 };
 +
++// Column-major 4x4 multiply (out = lhs * rhs), matching OpenGL storage.
++// Used to bake the full MVP per record at capture time — records can span
++// views (main view, subviews) with different projections, so a single
++// "last projection" global composed later would be wrong for all but the
++// last view's records.
++static void WGPU_MatMul4( float* out, const float* lhs, const float* rhs ) {
++	for ( int c = 0; c < 4; ++c ) {
++		for ( int r = 0; r < 4; ++r ) {
++			float s = 0.0f;
++			for ( int k = 0; k < 4; ++k ) {
++				s += lhs[k*4 + r] * rhs[c*4 + k];
++			}
++			out[c*4 + r] = s;
++		}
++	}
++}
++
  void	RB_ARB2_DrawInteraction( const drawInteraction_t *din ) {
 +	// Iter 4/6: capture every lit-pass interaction this frame into the
 +	// shared accumulator. The WebGPU backend replays them all into
-+	// #webgpuCanvas at EndFrame using interaction.wgsl + dynamic-offset
-+	// uniforms (one slot per record).
-+	if ( din && din->surf && din->surf->geo
++	// #webgpuCanvas at EndFrame using interaction.wgsl (one uniform slot
++	// per record). Skip tiny views (lightgem renders the player into a
++	// 64px viewport every frame — those records would draw a stray player
++	// model with an alien projection into our echo canvas).
++	const bool wgpuViewBigEnough = backEnd.viewDef &&
++		( backEnd.viewDef->viewport.x2 - backEnd.viewDef->viewport.x1 ) >= 128;
++	if ( wgpuViewBigEnough && din && din->surf && din->surf->geo
 +		 && din->surf->geo->verts && din->surf->geo->indexes
 +		 && din->surf->geo->numVerts > 0 && din->surf->geo->numIndexes > 0
 +		 && din->surf->geo->numVerts   <= kWGPUMaxCapV
@@ -3382,7 +3417,12 @@ index c1d0d3e..5752087 100644
 +			r.indexOffset = g_capIndexBytes;
 +			r.indexCount  = (uint32_t)din->surf->geo->numIndexes;
 +			static const float kIdent[16] = {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
-+			memcpy( r.modelMatrix, din->surf->space ? din->surf->space->modelMatrix : kIdent, 64 );
++			// Bake the FULL MVP (projection * modelView) at capture time —
++			// both matrices are in scope here with the correct values for
++			// THIS view, so the WebGPU side uses r.modelMatrix verbatim.
++			WGPU_MatMul4( r.modelMatrix,
++			              backEnd.viewDef->projectionMatrix,
++			              din->surf->space ? din->surf->space->modelViewMatrix : kIdent );
 +			memcpy( r.localLightOrigin, din->localLightOrigin.ToFloatPtr(), 16 );
 +			memcpy( r.localViewOrigin,  din->localViewOrigin.ToFloatPtr(),  16 );
 +			memcpy( r.lightProjS,       din->lightProjection[0].ToFloatPtr(), 16 );
@@ -3417,8 +3457,11 @@ index c1d0d3e..5752087 100644
 +		}
 +		g_lastSurfNumVerts   = din->surf->geo->numVerts;
 +		g_lastSurfNumIndexes = din->surf->geo->numIndexes;
-+		if ( din->surf->space ) {
-+			memcpy( g_lastModelMatrix, din->surf->space->modelMatrix, sizeof(g_lastModelMatrix) );
++		if ( din->surf->space && backEnd.viewDef ) {
++			// Full MVP baked at capture (see multi-record comment above)
++			WGPU_MatMul4( g_lastModelMatrix,
++			              backEnd.viewDef->projectionMatrix,
++			              din->surf->space->modelViewMatrix );
 +		}
 +		memcpy( g_lastDinLocalLightOrigin, din->localLightOrigin.ToFloatPtr(), 16 );
 +		memcpy( g_lastDinLocalViewOrigin,  din->localViewOrigin.ToFloatPtr(),  16 );
@@ -3624,7 +3667,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..fbc64b1 100644
+index c83ebb5..7ee4438 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -3773,12 +3816,12 @@ index c83ebb5..fbc64b1 100644
 +	memcpy(g_lastProjMatrix, viewDef->projectionMatrix, sizeof(g_lastProjMatrix));
 +	memcpy(g_lastViewMatrix, viewDef->worldSpace.modelViewMatrix, sizeof(g_lastViewMatrix));
 +	g_captureSlotUsedThisFrame = 0;
-+	// Iter 6: reset multi-surface accumulator. Bump frame id at NEXT
-+	// uploadCapturedRecords() so WebGPU only redraws when we actually
-+	// have something captured.
-+	g_capRecordCount = 0;
-+	g_capVertBytes   = 0;
-+	g_capIndexBytes  = 0;
++	// Iter 6.6: the multi-surface accumulator is intentionally NOT reset
++	// here. RB_BeginDrawingView runs once per VIEW (main view, lightgem,
++	// mirror subviews...), so a reset here wiped the records the main view
++	// captured before the WebGPU backend's EndFrame could read them — the
++	// multi path silently drew nothing. The WebGPU backend now consumes
++	// (drains) the accumulator in EndFrame instead.
 +
  	// set the modelview matrix for the viewer
  	qglMatrixMode(GL_PROJECTION);
@@ -3819,10 +3862,10 @@ index c83ebb5..fbc64b1 100644
  	// ensures that depth writes are enabled for the depth clear
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..2ff2263
+index 0000000..faa5194
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,324 @@
+@@ -0,0 +1,336 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -4028,7 +4071,12 @@ index 0000000..2ff2263
 +"@vertex\n"
 +"fn vs_main(in: VSIn) -> VSOut {\n"
 +"    var out: VSOut;\n"
-+"    out.clip_pos = u.mvp * vec4<f32>(in.position, 1.0);\n"
++"    let cp = u.mvp * vec4<f32>(in.position, 1.0);\n"
++"    // DOOM 3 (OpenGL) projection produces clip-z in [-w, w]. WebGPU clip-z is\n"
++"    // [0, w]. Remap so anything with GL clip-z >= 0 ends up in WebGPU's\n"
++"    // visible range. Without this, ~half the geometry gets near-plane-clipped\n"
++"    // and the canvas is black.\n"
++"    out.clip_pos = vec4<f32>(cp.x, cp.y, (cp.z + cp.w) * 0.5, cp.w);\n"
 +"\n"
 +"    // Tangent-space TBN. The engine pre-computes tangent + bitangent per\n"
 +"    // vertex; we use them directly.\n"
@@ -4091,7 +4139,12 @@ index 0000000..2ff2263
 +"                * light_proj_color\n"
 +"                * light_falloff;\n"
 +"\n"
-+"    return vec4<f32>(color, 1.0) * in.vertex_color;\n"
++"    // NOTE: deliberately NOT multiplied by vertex_color. DOOM 3 interactions\n"
++"    // default to SVC_IGNORE (color modulate=0, add=1 → vertex color unused),\n"
++"    // and world geometry often carries black vertex colors — multiplying\n"
++"    // would zero the whole lit pass. Proper modulate/add support comes with\n"
++"    // real material capture.\n"
++"    return vec4<f32>(color, 1.0);\n"
 +"}\n"
 +"";
 +
@@ -4135,7 +4188,9 @@ index 0000000..2ff2263
 +"@vertex\n"
 +"fn vs_main(in: VSIn) -> VSOut {\n"
 +"    var out: VSOut;\n"
-+"    out.clip_pos = u.mvp * vec4<f32>(in.position, 1.0);\n"
++"    let cp = u.mvp * vec4<f32>(in.position, 1.0);\n"
++"    // GL [-w, w] → WebGPU [0, w] clip-z remap. Identity MVP is unaffected.\n"
++"    out.clip_pos = vec4<f32>(cp.x, cp.y, (cp.z + cp.w) * 0.5, cp.w);\n"
 +"    out.uv = in.texcoord;\n"
 +"    out.vertex_color = in.color;\n"
 +"    return out;\n"

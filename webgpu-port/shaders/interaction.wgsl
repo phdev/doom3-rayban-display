@@ -139,9 +139,10 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 * light_proj_color
                 * light_falloff;
 
-    // DEBUG (iter 6.5): use a fixed bright magenta tint to confirm geometry
-    // reaches the fragment stage at all. Once we can see the captured surfaces
-    // as silhouettes, revert this line and debug the lit-pass math properly.
-    let dbg = vec3<f32>(1.0, 0.0, 1.0);
-    return vec4<f32>(mix(dbg, color, 0.0), 1.0);
+    // NOTE: deliberately NOT multiplied by vertex_color. DOOM 3 interactions
+    // default to SVC_IGNORE (color modulate=0, add=1 → vertex color unused),
+    // and world geometry often carries black vertex colors — multiplying
+    // would zero the whole lit pass. Proper modulate/add support comes with
+    // real material capture.
+    return vec4<f32>(color, 1.0);
 }
