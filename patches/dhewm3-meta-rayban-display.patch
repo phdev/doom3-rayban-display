@@ -1,5 +1,5 @@
 diff --git a/neo/CMakeLists.txt b/neo/CMakeLists.txt
-index 69f1892..099eef8 100644
+index 69f1892..b2caf90 100644
 --- a/neo/CMakeLists.txt
 +++ b/neo/CMakeLists.txt
 @@ -194,29 +194,46 @@ if(CMAKE_MAJOR_VERSION LESS 3 OR ( CMAKE_MAJOR_VERSION EQUAL 3 AND CMAKE_MINOR_V
@@ -119,7 +119,17 @@ index 69f1892..099eef8 100644
  # mingw and msvc
  if(WIN32)
  	add_definitions(-DWINVER=0x0501)
-@@ -699,6 +759,7 @@ set(src_framework
+@@ -633,6 +693,9 @@ set(src_renderer
+ 	renderer/Model_md5.cpp
+ 	renderer/Model_prt.cpp
+ 	renderer/Model_sprite.cpp
++	renderer/RenderBackend_factory.cpp
++	renderer/RenderBackend_GL.cpp
++	renderer/RenderBackend_WebGPU.cpp
+ 	renderer/RenderEntity.cpp
+ 	renderer/RenderSystem.cpp
+ 	renderer/RenderSystem_init.cpp
+@@ -699,6 +762,7 @@ set(src_framework
  	framework/FileSystem.cpp
  	framework/KeyInput.cpp
  	framework/UsercmdGen.cpp
@@ -127,7 +137,7 @@ index 69f1892..099eef8 100644
  	framework/Session_menu.cpp
  	framework/Session.cpp
  	framework/async/AsyncClient.cpp
-@@ -909,6 +970,7 @@ set(src_game
+@@ -909,6 +973,7 @@ set(src_game
  	game/AF.cpp
  	game/AFEntity.cpp
  	game/Actor.cpp
@@ -135,7 +145,7 @@ index 69f1892..099eef8 100644
  	game/Camera.cpp
  	game/Entity.cpp
  	game/BrittleFracture.cpp
-@@ -1280,7 +1342,7 @@ include_directories(${CMAKE_BINARY_DIR})
+@@ -1280,7 +1345,7 @@ include_directories(${CMAKE_BINARY_DIR})
  include_directories(${CMAKE_SOURCE_DIR})
  
  add_library(idlib STATIC ${src_idlib})
@@ -1028,11 +1038,580 @@ index f9ae002..67d93a5 100644
  			Mem_Free( junk );
  
  			qglCopyTexSubImage2D( GL_TEXTURE_2D, 0, 0, 0, x, y, imageWidth, imageHeight );
+diff --git a/neo/renderer/RenderBackend.h b/neo/renderer/RenderBackend.h
+new file mode 100644
+index 0000000..c123b24
+--- /dev/null
++++ b/neo/renderer/RenderBackend.h
+@@ -0,0 +1,266 @@
++/*
++================================================================================
++
++RenderBackend.h — Abstraction layer for dhewm3's GPU work.
++
++PURPOSE
++-------
++Decouple the engine's renderer (~17 files, 809 GL call sites, 94 unique GL
++functions) from any one graphics API so we can run on EITHER the existing
++GL4ES→WebGL path OR a new WebGPU path (and theoretically others later).
++
++This is the foundational Phase 4 deliverable. The interface here is the
++contract that both RenderBackend_GL.cpp (wraps existing qgl* calls) and
++RenderBackend_WebGPU.cpp (new, using emdawnwebgpu) must implement.
++
++DESIGN PHILOSOPHY
++-----------------
++NOT a 1:1 wrapper around 94 GL functions. That would inherit GL's
++implicit-state-machine nature and produce slow, unverifiable WebGPU code
++(the same problem D3Wasm hit with Regal in 2018). Instead:
++
++  Higher-level operations modeled on what DOOM 3 ACTUALLY does:
++    - Resource lifecycle (buffers, textures, programs)
++    - Encoded render passes (clear → draws → end)
++    - Pipeline state objects (bundles of state vs. per-call setters)
++    - Material/light interaction draws (the engine's primary "verb")
++
++That maps cleanly onto WebGPU's design and can also be implemented by the
++GL backend by translating to immediate-mode calls under the hood.
++
++CALL-SITE MIGRATION STRATEGY
++----------------------------
++Phase 4a: introduce RenderBackend.h, wrap the existing GL backend behind
++          it. Call sites still use qgl* directly. Zero behavior change.
++Phase 4b: migrate tr_backend.cpp's frame loop to RenderBackend ops.
++Phase 4c: migrate draw_common.cpp (the lit-interaction pass) to
++          RenderBackend ops.
++Phase 4d: migrate Image_load.cpp's texture upload to RenderBackend ops.
++Phase 4e: migrate VertexCache.cpp / draw_arb2.cpp.
++Phase 5: enable the WebGPU backend; cut over one shader/material at a
++         time. Both backends coexist via runtime cvar.
++
++================================================================================
++*/
++
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++// ─── Opaque handles ─────────────────────────────────────────────────────────
++// Backend resource IDs. Tagged via type-aliased uint64_t so a GL handle and
++// a WebGPU handle can't be accidentally mixed across backends.
++
++struct idGpuBuffer    { uint64_t id; };
++struct idGpuTexture   { uint64_t id; };
++struct idGpuSampler   { uint64_t id; };
++struct idGpuPipeline  { uint64_t id; };
++struct idGpuBindGroup { uint64_t id; };
++
++// ─── Enums ──────────────────────────────────────────────────────────────────
++
++enum class idGpuBackendKind : int {
++    GL,        // current behavior, qgl* + GL4ES → WebGL2
++    WebGPU,    // new, emdawnwebgpu → Metal/Vulkan/D3D12
++};
++
++enum class idGpuTextureFormat : int {
++    Invalid = 0,
++    R8,
++    RG8,
++    RGBA8,
++    RGBA8Srgb,
++    RGB10A2,
++    R11G11B10F,
++    R16F,
++    RGBA16F,
++    R32F,
++    Depth16,
++    Depth24,
++    Depth24Stencil8,
++    Depth32F,
++    // Compressed (chosen at upload time based on extension support):
++    BC1,    // S3TC DXT1
++    BC3,    // S3TC DXT5
++    BC7,    // BPTC
++    ASTC4x4,
++};
++
++enum class idGpuBufferUsage : uint32_t {
++    Vertex   = 1 << 0,
++    Index    = 1 << 1,
++    Uniform  = 1 << 2,
++    Storage  = 1 << 3,
++    CopySrc  = 1 << 4,
++    CopyDst  = 1 << 5,
++    MapWrite = 1 << 6,
++    MapRead  = 1 << 7,
++};
++
++enum class idGpuTextureUsage : uint32_t {
++    Sampled       = 1 << 0,
++    Storage       = 1 << 1,
++    RenderTarget  = 1 << 2,
++    CopySrc       = 1 << 3,
++    CopyDst       = 1 << 4,
++};
++
++enum class idGpuCullMode : int { None, Front, Back };
++enum class idGpuFrontFace : int { CW, CCW };
++enum class idGpuCompare : int { Never, Less, Equal, LessEqual, Greater, NotEqual, GreaterEqual, Always };
++enum class idGpuBlendFactor : int { Zero, One, SrcColor, OneMinusSrcColor, DstColor, OneMinusDstColor, SrcAlpha, OneMinusSrcAlpha, DstAlpha, OneMinusDstAlpha };
++enum class idGpuBlendOp : int { Add, Subtract, ReverseSubtract, Min, Max };
++enum class idGpuStencilOp : int { Keep, Zero, Replace, IncrementClamp, DecrementClamp, Invert, IncrementWrap, DecrementWrap };
++enum class idGpuLoadOp : int { Load, Clear, DontCare };
++enum class idGpuStoreOp : int { Store, DontCare };
++
++// ─── Descriptor structs ─────────────────────────────────────────────────────
++
++struct idGpuColorTargetState {
++    idGpuTextureFormat format;
++    bool               blendEnabled;
++    idGpuBlendFactor   srcColor, dstColor;
++    idGpuBlendOp       colorOp;
++    idGpuBlendFactor   srcAlpha, dstAlpha;
++    idGpuBlendOp       alphaOp;
++    uint8_t            writeMask;  // bits 0..3 = R,G,B,A
++};
++
++struct idGpuDepthStencilState {
++    idGpuTextureFormat format;
++    bool               depthWriteEnabled;
++    idGpuCompare       depthCompare;
++    bool               stencilEnabled;
++    // Front face
++    idGpuCompare       stencilFrontCompare;
++    idGpuStencilOp     stencilFrontFail, stencilFrontDepthFail, stencilFrontPass;
++    // Back face
++    idGpuCompare       stencilBackCompare;
++    idGpuStencilOp     stencilBackFail, stencilBackDepthFail, stencilBackPass;
++    uint8_t            stencilReadMask, stencilWriteMask;
++};
++
++struct idGpuPipelineDesc {
++    const char*               name;          // debug label
++    const char*               wgsl;          // WGSL source (WebGPU backend); for GL, this is the ARB program or compiled GLSL
++    const char*               vsEntryPoint;  // "vs_main"
++    const char*               fsEntryPoint;  // "fs_main"
++    // Vertex attribute layout — DOOM 3's draw verts have fixed layout
++    // (position + normal + tangent + bitangent + texcoord + color),
++    // so the descriptor can be largely templated. Initial impl assumes
++    // the standard idDrawVert layout.
++
++    idGpuCullMode             cull;
++    idGpuFrontFace            frontFace;
++
++    bool                      hasColorTarget;
++    idGpuColorTargetState     color;
++    bool                      hasDepthStencil;
++    idGpuDepthStencilState    depthStencil;
++
++    // Bind group layout — slots dhewm3 uses:
++    //   0: per-frame uniforms (view/proj matrices, time)
++    //   1: per-light uniforms (light origin/color/falloff)
++    //   2: per-material uniforms (diffuse/spec color, scroll)
++    //   3..6: material textures (normal, specular, diffuse, glow)
++    //   7: light projection cookie
++    //   8: light falloff
++    //   9: normalization cubemap
++    // The descriptor includes the WGSL bind group layout that matches.
++};
++
++struct idGpuRenderPassDesc {
++    const char*       name;  // debug label
++    idGpuTexture      colorAttachment;
++    idGpuLoadOp       colorLoad;
++    idGpuStoreOp      colorStore;
++    float             clearR, clearG, clearB, clearA;
++
++    bool              hasDepth;
++    idGpuTexture      depthAttachment;
++    idGpuLoadOp       depthLoad, stencilLoad;
++    idGpuStoreOp      depthStore, stencilStore;
++    float             clearDepth;
++    uint32_t          clearStencil;
++};
++
++// ─── The backend interface ──────────────────────────────────────────────────
++
++class idRenderBackend {
++public:
++    virtual ~idRenderBackend() = default;
++    virtual idGpuBackendKind GetKind() const = 0;
++
++    // Lifecycle
++    virtual bool   Init(void* nativeWindow, int width, int height) = 0;
++    virtual void   Shutdown() = 0;
++    virtual void   Resize(int width, int height) = 0;
++
++    // Frame
++    virtual void   BeginFrame() = 0;
++    virtual void   EndFrame() = 0;
++
++    // Render pass
++    virtual void   BeginRenderPass(const idGpuRenderPassDesc& desc) = 0;
++    virtual void   EndRenderPass() = 0;
++
++    // Pipeline state
++    virtual idGpuPipeline  CreatePipeline(const idGpuPipelineDesc& desc) = 0;
++    virtual void           DestroyPipeline(idGpuPipeline pipeline) = 0;
++    virtual void           BindPipeline(idGpuPipeline pipeline) = 0;
++
++    // Buffers
++    virtual idGpuBuffer    CreateBuffer(size_t bytes, uint32_t usage, const char* label) = 0;
++    virtual void           UpdateBuffer(idGpuBuffer buf, size_t offset, size_t bytes, const void* data) = 0;
++    virtual void           DestroyBuffer(idGpuBuffer buf) = 0;
++    virtual void           BindVertexBuffer(uint32_t slot, idGpuBuffer buf, size_t offset) = 0;
++    virtual void           BindIndexBuffer(idGpuBuffer buf, size_t offset, bool isUint32) = 0;
++
++    // Textures
++    virtual idGpuTexture   CreateTexture(int width, int height, int mipCount,
++                                          idGpuTextureFormat format, uint32_t usage,
++                                          const char* label) = 0;
++    virtual void           UploadTexture(idGpuTexture tex, int mip, int x, int y,
++                                          int width, int height, const void* pixels,
++                                          size_t bytesPerRow) = 0;
++    virtual void           DestroyTexture(idGpuTexture tex) = 0;
++
++    // Samplers
++    virtual idGpuSampler   CreateSampler(bool linearMin, bool linearMag, bool linearMip,
++                                          bool repeatU, bool repeatV) = 0;
++    virtual void           DestroySampler(idGpuSampler sampler) = 0;
++
++    // Bind groups (WebGPU-native; the GL backend simulates them via
++    // batched glBindTexture / glActiveTexture / glUniform4fv).
++    virtual idGpuBindGroup CreateBindGroup(idGpuPipeline pipeline,
++                                            const idGpuTexture* textures, int textureCount,
++                                            const idGpuSampler* samplers, int samplerCount,
++                                            const idGpuBuffer* uniforms, int uniformCount) = 0;
++    virtual void           DestroyBindGroup(idGpuBindGroup bg) = 0;
++    virtual void           BindBindGroup(uint32_t slot, idGpuBindGroup bg) = 0;
++
++    // Draw
++    virtual void           Draw(uint32_t vertexCount, uint32_t instanceCount,
++                                 uint32_t firstVertex, uint32_t firstInstance) = 0;
++    virtual void           DrawIndexed(uint32_t indexCount, uint32_t instanceCount,
++                                        uint32_t firstIndex, int32_t baseVertex,
++                                        uint32_t firstInstance) = 0;
++
++    // Dynamic state (kept fluid because the engine sets it per-draw a lot)
++    virtual void           SetViewport(int x, int y, int width, int height,
++                                        float minDepth, float maxDepth) = 0;
++    virtual void           SetScissor(int x, int y, int width, int height) = 0;
++    virtual void           SetStencilReference(uint32_t ref) = 0;
++
++    // Debug / introspection
++    virtual const char*    GetDeviceName() const = 0;
++};
++
++// ─── Factory ────────────────────────────────────────────────────────────────
++
++idRenderBackend* CreateRenderBackend(idGpuBackendKind kind);
++
++// Globally-accessible current backend (initialized in RenderSystem_init.cpp).
++// Selected via cvar `r_backend` (values: "gl" | "webgpu").
++extern idRenderBackend* renderBackend;
+diff --git a/neo/renderer/RenderBackend_GL.cpp b/neo/renderer/RenderBackend_GL.cpp
+new file mode 100644
+index 0000000..f992d49
+--- /dev/null
++++ b/neo/renderer/RenderBackend_GL.cpp
+@@ -0,0 +1,97 @@
++/*
++================================================================================
++
++RenderBackend_GL.cpp — Backward-compat backend wrapping the existing GL path.
++
++PURPOSE
++-------
++Initial implementation just calls the existing qgl* functions through the
++abstraction interface. ZERO behavior change for the GL backend — it's a
++pass-through wrapper. The point of this file is:
++
++  1. Establishes the call boundary so future code can be written against
++     RenderBackend.h without caring which backend is active.
++  2. As call sites get migrated from qgl* → renderBackend->X(), they keep
++     producing identical GL command streams.
++  3. Eventually, after Phase 4-7 complete, this file gets deprecated and
++     the GL path is removed (the WebGPU backend replaces it entirely).
++
++DURING MIGRATION
++----------------
++- Call sites NOT yet migrated continue to use qgl* directly. No problem.
++- Call sites that ARE migrated go through renderBackend->X(), which here
++  just calls the same qgl* underneath. Output is bit-identical.
++- The cvar `r_backend "gl"` (default during cutover) instantiates this.
++- When WebGPU is ready: `r_backend "webgpu"` instantiates the other
++  backend. Anything still using raw qgl* will silently bypass — that's
++  why migration must complete before flipping the cvar default.
++
++================================================================================
++*/
++
++#include "RenderBackend.h"
++
++// NOTE: This file references the engine's qgl* loader and GL constants.
++// During Phase 4, this is kept as a stub that builds standalone. The
++// integration step (Phase 4b) lifts it into neo/renderer/ and uncomments
++// the qgl* calls. Initial commit ships the structure only.
++
++#include <cstdio>
++
++class idRenderBackend_GL : public idRenderBackend {
++public:
++    idGpuBackendKind GetKind() const override { return idGpuBackendKind::GL; }
++
++    bool Init(void*, int w, int h) override {
++        fprintf(stderr, "[GL backend] Init %dx%d (pass-through wrapper)\n", w, h);
++        // Engine's existing GL init runs unchanged. This wrapper appears
++        // AFTER GLimp_Init has already set up the WebGL context.
++        return true;
++    }
++    void Shutdown() override {}
++    void Resize(int, int) override {}
++
++    void BeginFrame() override {}
++    void EndFrame() override {}
++
++    void BeginRenderPass(const idGpuRenderPassDesc& desc) override {
++        // GL impl: glBindFramebuffer + glClearColor + glClear if desc.colorLoad == Clear
++        // ... wire up when migrating tr_backend.cpp
++        (void)desc;
++    }
++    void EndRenderPass() override {}
++
++    idGpuPipeline CreatePipeline(const idGpuPipelineDesc&) override { return {}; }
++    void DestroyPipeline(idGpuPipeline) override {}
++    void BindPipeline(idGpuPipeline) override {}
++
++    idGpuBuffer CreateBuffer(size_t, uint32_t, const char*) override { return {}; }
++    void UpdateBuffer(idGpuBuffer, size_t, size_t, const void*) override {}
++    void DestroyBuffer(idGpuBuffer) override {}
++    void BindVertexBuffer(uint32_t, idGpuBuffer, size_t) override {}
++    void BindIndexBuffer(idGpuBuffer, size_t, bool) override {}
++
++    idGpuTexture CreateTexture(int, int, int, idGpuTextureFormat, uint32_t, const char*) override { return {}; }
++    void UploadTexture(idGpuTexture, int, int, int, int, int, const void*, size_t) override {}
++    void DestroyTexture(idGpuTexture) override {}
++
++    idGpuSampler CreateSampler(bool, bool, bool, bool, bool) override { return {}; }
++    void DestroySampler(idGpuSampler) override {}
++
++    idGpuBindGroup CreateBindGroup(idGpuPipeline, const idGpuTexture*, int, const idGpuSampler*, int, const idGpuBuffer*, int) override { return {}; }
++    void DestroyBindGroup(idGpuBindGroup) override {}
++    void BindBindGroup(uint32_t, idGpuBindGroup) override {}
++
++    void Draw(uint32_t, uint32_t, uint32_t, uint32_t) override {}
++    void DrawIndexed(uint32_t, uint32_t, uint32_t, int32_t, uint32_t) override {}
++
++    void SetViewport(int, int, int, int, float, float) override {}
++    void SetScissor(int, int, int, int) override {}
++    void SetStencilReference(uint32_t) override {}
++
++    const char* GetDeviceName() const override { return "OpenGL (GL4ES → WebGL2)"; }
++};
++
++idRenderBackend* CreateRenderBackend_GL() {
++    return new idRenderBackend_GL();
++}
+diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
+new file mode 100644
+index 0000000..ea4bcb2
+--- /dev/null
++++ b/neo/renderer/RenderBackend_WebGPU.cpp
+@@ -0,0 +1,135 @@
++/*
++================================================================================
++
++RenderBackend_WebGPU.cpp — Skeleton WebGPU backend (Phase 4 stub).
++
++STATUS
++------
++SKELETON ONLY. Every operation is stubbed to fail-loud (assert or print).
++The structure is in place; the implementations get filled in across the
++phases listed in WEBGPU_PORT_PLAN.md.
++
++The stub deliberately fails (instead of silently no-op) so that any GL
++call site that hasn't been migrated yet causes an immediate visible
++failure during the cutover — rather than a hard-to-diagnose missing-
++work bug downstream.
++
++DEPENDENCIES
++------------
++emdawnwebgpu (via Emscripten --use-port=emdawnwebgpu). Same Dawn snapshot
++already used by webgpu-test/wall.cpp. The WGPUInstance / WGPUDevice
++lifecycle is managed here (created during Init, destroyed on Shutdown).
++
++================================================================================
++*/
++
++#include "RenderBackend.h"
++
++// Phase 4a: WebGPU port is OFF by default. The engine build doesn't yet
++// pull in emdawnwebgpu — that integration is Phase 5. For now this file
++// compiles as a pure stub on every target. Define D3_WEBGPU_BACKEND=1 in
++// the CMake flags (and add --use-port=emdawnwebgpu to emcc link args) to
++// enable the real backend.
++#if defined(D3_WEBGPU_BACKEND) && defined(__EMSCRIPTEN__)
++#include <emscripten.h>
++#include <webgpu/webgpu.h>
++#define D3_WEBGPU_AVAILABLE 1
++#else
++#define D3_WEBGPU_AVAILABLE 0
++#endif
++
++#include <cassert>
++#include <cstdio>
++#include <cstring>
++
++#define WGPU_NOT_YET(name) do { \
++    static bool warned = false; \
++    if (!warned) { fprintf(stderr, "[WebGPU stub] %s not implemented\n", name); warned = true; } \
++    assert(!"WebGPU backend not implemented for " name); \
++} while (0)
++
++class idRenderBackend_WebGPU : public idRenderBackend {
++public:
++    idRenderBackend_WebGPU() = default;
++    ~idRenderBackend_WebGPU() override = default;
++
++    idGpuBackendKind GetKind() const override { return idGpuBackendKind::WebGPU; }
++
++    bool Init(void* /*nativeWindow*/, int /*w*/, int /*h*/) override {
++#if D3_WEBGPU_AVAILABLE
++        // Phase 5: create the WGPUInstance + WGPUAdapter + WGPUDevice
++        // and stash them. Surface creation follows once we actually own
++        // the canvas (currently still owned by SDL3 + GL4ES during cutover).
++        WGPUInstanceDescriptor id = {};
++        instance = wgpuCreateInstance(&id);
++        if (!instance) { fprintf(stderr, "[WebGPU] no instance\n"); return false; }
++        fprintf(stderr, "[WebGPU] Init: instance created (adapter/device async TBD)\n");
++        return true;
++#else
++        fprintf(stderr, "[WebGPU] stub Init — backend not compiled in. "
++                        "Define D3_WEBGPU_BACKEND in CMake to enable.\n");
++        return false;
++#endif
++    }
++
++    void Shutdown() override {
++#if D3_WEBGPU_AVAILABLE
++        if (device)   { wgpuDeviceRelease(device);   device = nullptr; }
++        if (adapter)  { wgpuAdapterRelease(adapter); adapter = nullptr; }
++        if (instance) { wgpuInstanceRelease(instance); instance = nullptr; }
++#endif
++    }
++
++    void Resize(int /*w*/, int /*h*/) override { WGPU_NOT_YET("Resize"); }
++
++    void BeginFrame() override                            { WGPU_NOT_YET("BeginFrame"); }
++    void EndFrame() override                              { WGPU_NOT_YET("EndFrame"); }
++    void BeginRenderPass(const idGpuRenderPassDesc&) override { WGPU_NOT_YET("BeginRenderPass"); }
++    void EndRenderPass() override                         { WGPU_NOT_YET("EndRenderPass"); }
++
++    idGpuPipeline CreatePipeline(const idGpuPipelineDesc&) override { WGPU_NOT_YET("CreatePipeline"); return {}; }
++    void DestroyPipeline(idGpuPipeline) override          { WGPU_NOT_YET("DestroyPipeline"); }
++    void BindPipeline(idGpuPipeline) override             { WGPU_NOT_YET("BindPipeline"); }
++
++    idGpuBuffer CreateBuffer(size_t, uint32_t, const char*) override { WGPU_NOT_YET("CreateBuffer"); return {}; }
++    void UpdateBuffer(idGpuBuffer, size_t, size_t, const void*) override { WGPU_NOT_YET("UpdateBuffer"); }
++    void DestroyBuffer(idGpuBuffer) override              { WGPU_NOT_YET("DestroyBuffer"); }
++    void BindVertexBuffer(uint32_t, idGpuBuffer, size_t) override { WGPU_NOT_YET("BindVertexBuffer"); }
++    void BindIndexBuffer(idGpuBuffer, size_t, bool) override { WGPU_NOT_YET("BindIndexBuffer"); }
++
++    idGpuTexture CreateTexture(int, int, int, idGpuTextureFormat, uint32_t, const char*) override { WGPU_NOT_YET("CreateTexture"); return {}; }
++    void UploadTexture(idGpuTexture, int, int, int, int, int, const void*, size_t) override { WGPU_NOT_YET("UploadTexture"); }
++    void DestroyTexture(idGpuTexture) override            { WGPU_NOT_YET("DestroyTexture"); }
++
++    idGpuSampler CreateSampler(bool, bool, bool, bool, bool) override { WGPU_NOT_YET("CreateSampler"); return {}; }
++    void DestroySampler(idGpuSampler) override            { WGPU_NOT_YET("DestroySampler"); }
++
++    idGpuBindGroup CreateBindGroup(idGpuPipeline, const idGpuTexture*, int, const idGpuSampler*, int, const idGpuBuffer*, int) override { WGPU_NOT_YET("CreateBindGroup"); return {}; }
++    void DestroyBindGroup(idGpuBindGroup) override        { WGPU_NOT_YET("DestroyBindGroup"); }
++    void BindBindGroup(uint32_t, idGpuBindGroup) override { WGPU_NOT_YET("BindBindGroup"); }
++
++    void Draw(uint32_t, uint32_t, uint32_t, uint32_t) override { WGPU_NOT_YET("Draw"); }
++    void DrawIndexed(uint32_t, uint32_t, uint32_t, int32_t, uint32_t) override { WGPU_NOT_YET("DrawIndexed"); }
++
++    void SetViewport(int, int, int, int, float, float) override { WGPU_NOT_YET("SetViewport"); }
++    void SetScissor(int, int, int, int) override          { WGPU_NOT_YET("SetScissor"); }
++    void SetStencilReference(uint32_t) override           { WGPU_NOT_YET("SetStencilReference"); }
++
++    const char* GetDeviceName() const override { return "WebGPU (stub)"; }
++
++private:
++#if D3_WEBGPU_AVAILABLE
++    WGPUInstance instance = nullptr;
++    WGPUAdapter  adapter  = nullptr;
++    WGPUDevice   device   = nullptr;
++    WGPUQueue    queue    = nullptr;
++    WGPUSurface  surface  = nullptr;
++#endif
++};
++
++// Factory glue. The full factory lives in RenderBackend_factory.cpp; this
++// stub is exposed so the linker doesn't have to know which backend is
++// being built.
++idRenderBackend* CreateRenderBackend_WebGPU() {
++    return new idRenderBackend_WebGPU();
++}
+diff --git a/neo/renderer/RenderBackend_factory.cpp b/neo/renderer/RenderBackend_factory.cpp
+new file mode 100644
+index 0000000..0f9c8e6
+--- /dev/null
++++ b/neo/renderer/RenderBackend_factory.cpp
+@@ -0,0 +1,26 @@
++/*
++================================================================================
++
++RenderBackend_factory.cpp — Selects which backend implementation to instantiate
++based on a cvar / build-time flag. Defined separately so RenderBackend_GL.cpp
++and RenderBackend_WebGPU.cpp can be compiled independently and the cutover
++can be controlled at runtime.
++
++================================================================================
++*/
++
++#include "RenderBackend.h"
++
++idRenderBackend* renderBackend = nullptr;
++
++// Forward decls — defined in the respective backend .cpp files.
++idRenderBackend* CreateRenderBackend_GL();
++idRenderBackend* CreateRenderBackend_WebGPU();
++
++idRenderBackend* CreateRenderBackend(idGpuBackendKind kind) {
++    switch (kind) {
++        case idGpuBackendKind::GL:     return CreateRenderBackend_GL();
++        case idGpuBackendKind::WebGPU: return CreateRenderBackend_WebGPU();
++    }
++    return nullptr;
++}
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
-index 7914093..492e2b1 100644
+index 7914093..a5517b7 100644
 --- a/neo/renderer/RenderSystem_init.cpp
 +++ b/neo/renderer/RenderSystem_init.cpp
-@@ -158,6 +158,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
+@@ -39,6 +39,7 @@ If you have questions concerning this license or the applicable additional terms
+ #include "ui/UserInterface.h"
+ 
+ #include "renderer/tr_local.h"
++#include "renderer/RenderBackend.h"
+ 
+ #include "framework/GameCallbacks_local.h"
+ #include "framework/Game.h"
+@@ -102,6 +103,12 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
+ 
+ idCVar r_skipSuppress( "r_skipSuppress", "0", CVAR_RENDERER | CVAR_BOOL, "ignore the per-view suppressions" );
+ idCVar r_skipPostProcess( "r_skipPostProcess", "0", CVAR_RENDERER | CVAR_BOOL, "skip all post-process renderings" );
++
++// Phase 4a: which RenderBackend implementation to instantiate.
++// Currently "gl" is a thin pass-through wrapper around the existing qgl* path.
++// "webgpu" is a fail-loud stub until Phase 4b–5 fill it in. See
++// neo/renderer/RenderBackend.h + WEBGPU_PORT_PLAN.md for the cutover plan.
++idCVar r_backend( "r_backend", "gl", CVAR_RENDERER | CVAR_INIT, "render backend: gl | webgpu" );
+ idCVar r_skipLightScale( "r_skipLightScale", "0", CVAR_RENDERER | CVAR_BOOL, "don't do any post-interaction light scaling, makes things dim on low-dynamic range cards" );
+ idCVar r_skipInteractions( "r_skipInteractions", "0", CVAR_RENDERER | CVAR_BOOL, "skip all light/surface interaction drawing" );
+ idCVar r_skipDynamicTextures( "r_skipDynamicTextures", "0", CVAR_RENDERER | CVAR_BOOL, "don't dynamically create textures" );
+@@ -158,6 +165,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
  idCVar r_useExternalShadows( "r_useExternalShadows", "1", CVAR_RENDERER | CVAR_INTEGER, "1 = skip drawing caps when outside the light volume, 2 = force to no caps for testing", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
  idCVar r_useOptimizedShadows( "r_useOptimizedShadows", "1", CVAR_RENDERER | CVAR_BOOL, "use the dmap generated static shadow volumes" );
  idCVar r_useScissor( "r_useScissor", "1", CVAR_RENDERER | CVAR_BOOL, "scissor clip as portals and lights are processed" );
@@ -1040,9 +1619,30 @@ index 7914093..492e2b1 100644
  idCVar r_useCombinerDisplayLists( "r_useCombinerDisplayLists", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "put all nvidia register combiner programming in display lists" );
  idCVar r_useDepthBoundsTest( "r_useDepthBoundsTest", "1", CVAR_RENDERER | CVAR_BOOL, "use depth bounds test to reduce shadow fill" );
  
-@@ -820,10 +821,21 @@ void R_InitOpenGL( void ) {
+@@ -819,11 +827,42 @@ void R_InitOpenGL( void ) {
+ 		r_multiSamples.SetInteger( 0 );
  	}
  
++	// Phase 4a: instantiate the RenderBackend. GL is the default pass-through
++	// wrapper around the existing qgl* code path; WebGPU is fail-loud-stub
++	// until later phases. The cvar r_backend selects which. The engine still
++	// drives rendering through qgl* directly — this just creates the
++	// abstraction object so call sites can begin migrating to renderBackend->X().
++	{
++		idGpuBackendKind kind = idGpuBackendKind::GL;
++		if ( idStr::Icmp( r_backend.GetString(), "webgpu" ) == 0 ) {
++			kind = idGpuBackendKind::WebGPU;
++		}
++		renderBackend = CreateRenderBackend( kind );
++		if ( renderBackend ) {
++			renderBackend->Init( NULL, glConfig.vidWidth, glConfig.vidHeight );
++			common->Printf( "Render backend: %s\n", renderBackend->GetDeviceName() );
++		} else {
++			common->Warning( "Failed to create render backend (%s); call sites stay on qgl*",
++				r_backend.GetString() );
++		}
++	}
++
  // load qgl function pointers
 +#ifdef __EMSCRIPTEN__
 +// GL4ES translates DOOM 3's legacy GL to WebGL2 and legitimately omits a few
@@ -1061,6 +1661,21 @@ index 7914093..492e2b1 100644
 +#endif
  
  #include "renderer/qgl_proc.h"
+ 
+@@ -2505,6 +2544,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
+ 	// is destroyed (relevant when starting a mod which also recreates window)
+ 	Sys_ShutdownInput();
+ 
++	// Phase 4a: tear down the render backend before GLimp_Shutdown so any
++	// GPU resources tied to the GL context have a chance to release cleanly.
++	if ( renderBackend ) {
++		renderBackend->Shutdown();
++		delete renderBackend;
++		renderBackend = NULL;
++	}
++
+ 	// free the context and close the window
+ 	GLimp_Shutdown();
  
 diff --git a/neo/renderer/tr_backend.cpp b/neo/renderer/tr_backend.cpp
 index cf1c571..6857970 100644
@@ -1400,9 +2015,13 @@ index 0000000..2e7755b
 +}());
 diff --git a/neo/sys/wasm/embed/base/autoexec.cfg b/neo/sys/wasm/embed/base/autoexec.cfg
 new file mode 100644
-index 0000000..7c721f0
+index 0000000..350f6f7
 --- /dev/null
 +++ b/neo/sys/wasm/embed/base/autoexec.cfg
-@@ -0,0 +1,2 @@
+@@ -0,0 +1,6 @@
 +seta com_skipIntroVideos "1"
 +seta r_fullscreen "0"
++seta r_customWidth "600"
++seta r_customHeight "600"
++seta r_mode "-1"
++seta in_mouse "0"
