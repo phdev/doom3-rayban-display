@@ -2432,18 +2432,22 @@ index 0000000..0f9c8e6
 +    return nullptr;
 +}
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
-index 7914093..a5517b7 100644
+index 7914093..eed2277 100644
 --- a/neo/renderer/RenderSystem_init.cpp
 +++ b/neo/renderer/RenderSystem_init.cpp
-@@ -39,6 +39,7 @@ If you have questions concerning this license or the applicable additional terms
+@@ -39,6 +39,11 @@ If you have questions concerning this license or the applicable additional terms
  #include "ui/UserInterface.h"
  
  #include "renderer/tr_local.h"
 +#include "renderer/RenderBackend.h"
++
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++#endif
  
  #include "framework/GameCallbacks_local.h"
  #include "framework/Game.h"
-@@ -102,6 +103,12 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
+@@ -102,6 +107,12 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
  
  idCVar r_skipSuppress( "r_skipSuppress", "0", CVAR_RENDERER | CVAR_BOOL, "ignore the per-view suppressions" );
  idCVar r_skipPostProcess( "r_skipPostProcess", "0", CVAR_RENDERER | CVAR_BOOL, "skip all post-process renderings" );
@@ -2456,7 +2460,7 @@ index 7914093..a5517b7 100644
  idCVar r_skipLightScale( "r_skipLightScale", "0", CVAR_RENDERER | CVAR_BOOL, "don't do any post-interaction light scaling, makes things dim on low-dynamic range cards" );
  idCVar r_skipInteractions( "r_skipInteractions", "0", CVAR_RENDERER | CVAR_BOOL, "skip all light/surface interaction drawing" );
  idCVar r_skipDynamicTextures( "r_skipDynamicTextures", "0", CVAR_RENDERER | CVAR_BOOL, "don't dynamically create textures" );
-@@ -158,6 +165,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
+@@ -158,6 +169,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
  idCVar r_useExternalShadows( "r_useExternalShadows", "1", CVAR_RENDERER | CVAR_INTEGER, "1 = skip drawing caps when outside the light volume, 2 = force to no caps for testing", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
  idCVar r_useOptimizedShadows( "r_useOptimizedShadows", "1", CVAR_RENDERER | CVAR_BOOL, "use the dmap generated static shadow volumes" );
  idCVar r_useScissor( "r_useScissor", "1", CVAR_RENDERER | CVAR_BOOL, "scissor clip as portals and lights are processed" );
@@ -2464,7 +2468,7 @@ index 7914093..a5517b7 100644
  idCVar r_useCombinerDisplayLists( "r_useCombinerDisplayLists", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "put all nvidia register combiner programming in display lists" );
  idCVar r_useDepthBoundsTest( "r_useDepthBoundsTest", "1", CVAR_RENDERER | CVAR_BOOL, "use depth bounds test to reduce shadow fill" );
  
-@@ -819,11 +827,42 @@ void R_InitOpenGL( void ) {
+@@ -819,11 +831,63 @@ void R_InitOpenGL( void ) {
  		r_multiSamples.SetInteger( 0 );
  	}
  
@@ -2478,13 +2482,34 @@ index 7914093..a5517b7 100644
 +		if ( idStr::Icmp( r_backend.GetString(), "webgpu" ) == 0 ) {
 +			kind = idGpuBackendKind::WebGPU;
 +		}
++#ifdef __EMSCRIPTEN__
++		// Route to browser console.log directly — the engine's diag overlay
++		// has a limited scrollback that gets overwhelmed by map-init warnings.
++		EM_ASM({
++			console.info("[d3] r_backend cvar:", UTF8ToString($0),
++			             "kind:", $1 == 0 ? "GL" : "WebGPU");
++		}, r_backend.GetString(), (int)kind);
++#endif
 +		renderBackend = CreateRenderBackend( kind );
 +		if ( renderBackend ) {
-+			renderBackend->Init( NULL, glConfig.vidWidth, glConfig.vidHeight );
-+			common->Printf( "Render backend: %s\n", renderBackend->GetDeviceName() );
++			bool initOk = renderBackend->Init( NULL, glConfig.vidWidth, glConfig.vidHeight );
++			common->Printf( "Render backend: %s (Init %s)\n",
++				renderBackend->GetDeviceName(),
++				initOk ? "OK" : "FAILED" );
++#ifdef __EMSCRIPTEN__
++			EM_ASM({
++				console.info("[d3] Render backend:", UTF8ToString($0),
++				             "Init:", $1 ? "OK" : "FAILED");
++			}, renderBackend->GetDeviceName(), initOk ? 1 : 0);
++#endif
 +		} else {
 +			common->Warning( "Failed to create render backend (%s); call sites stay on qgl*",
 +				r_backend.GetString() );
++#ifdef __EMSCRIPTEN__
++			EM_ASM({
++				console.warn("[d3] Render backend create FAILED:", UTF8ToString($0));
++			}, r_backend.GetString());
++#endif
 +		}
 +	}
 +
@@ -2507,7 +2532,7 @@ index 7914093..a5517b7 100644
  
  #include "renderer/qgl_proc.h"
  
-@@ -2505,6 +2544,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
+@@ -2505,6 +2569,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
  	// is destroyed (relevant when starting a mod which also recreates window)
  	Sys_ShutdownInput();
  
