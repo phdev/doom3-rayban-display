@@ -246,13 +246,27 @@ engine args before WASM runs — otherwise emdawnwebgpu's
   AND the per-light/per-material uniforms (`localLightOrigin`,
   `localViewOrigin`, `lightProjection[0..3]`, `diffuse/specularColor`).
   WebGPU backend adds a second pipeline using `interaction.wgsl` with
-  5 procedural textures (DXT5-NM neutral normal, white spec, green
-  checker diffuse, white falloff, white proj) + material/lighting
-  samplers + a 192-byte uniform buffer. Lit-pass MATH runs through
-  WebGPU end-to-end; textures don't visually match yet (iter 5).
-  Verified on Chrome WebGPU: logs
-  `[d3] WebGPU interaction pipeline initialized` +
-  `[d3] WebGPU captured first DOOM 3 surface verts=178 idx=18`.
+  5 procedural textures + material/lighting samplers + a 192-byte
+  uniform buffer. Lit-pass MATH runs through WebGPU end-to-end.
+- **Iter 5** — depth attachment (Depth24Plus) on the WebGPU render
+  pass + LessEqual depth-stencil state on both pipelines so the
+  captured surface composites without z-fighting. Prereq for iter 6.
+- **Iter 6** — capture ALL lit-pass surfaces per frame (up to 64),
+  not just the first. CPU-side `g_capRecords[]` accumulates the 64
+  best surfaces with verts/indexes appended to a 4MB / 1MB
+  accumulator. WebGPU side: 64 pre-allocated per-record uniform
+  buffers + 64 bind groups (textures shared). EndFrame loops:
+  upload accumulators → recordVertexBuf/recordIndexBuf, write each
+  record's MVP+light uniforms, loop `setBindGroup[i] +
+  setVertexBuffer(vertOffset) + setIndexBuffer(indexOffset) +
+  drawIndexed(indexCount)`. WebGPU canvas now shows the whole lit
+  scene (first 64 surfaces).
+- **detTest harness** — `window.detTest("#webgpuCanvas", 5)` from
+  Safari Web Inspector. Captures N consecutive frames, pairwise diffs
+  RGB, reports mean % diff + max delta. The chunky-tile bug shows up
+  as 1-7% / max 192/255 in this metric. **Chrome verified WebGPU =
+  0.000% / 0 across 10 frames** (also Chrome GL = 0 — Chrome doesn't
+  have the bug; the iPhone test is the load-bearing one).
 
 **Mac Safari / iOS Sim caveats:** iOS Simulator's WebKit reports
 `navigator.gpu` but the actual adapter request fails; the fallback
