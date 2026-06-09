@@ -208,6 +208,57 @@ The earlier WebGL probe (`caps:` + `gpu-tex:` + `frame-px:` in the diag), the
 "copy log" button, and the URL overrides (`?dbright=` etc.) all stayed —
 they're how the bug was bisected and remain useful for future on-device work.
 
+### WebGPU port (Phase 5+, in-progress, 2026-06)
+
+Approach: side-by-side cutover. The `r_backend` cvar (`"gl"`/`"webgpu"`)
+selects which `idRenderBackend` instance the engine drives, gated by the
+`?backend=webgpu` URL flag. The WebGPU backend renders into a separate
+`#webgpuCanvas` so the existing `#gameCanvas` GL path keeps working
+unchanged — eventually `#gameCanvas` goes away. The whole port lives in
+`patches/dhewm3-meta-rayban-display.patch` + `webgpu-port/shaders/*.wgsl`
+(`scripts/embed_wgsl.py` bakes them into the wasm at build time).
+
+JS bootstraps via `navigator.gpu.requestAdapter()` →
+`requestDevice()` → `Module.preinitializedWebGPUDevice` in
+`d3Runtime.js`; the C++ side picks it up synchronously via
+`emscripten_webgpu_get_device()`. If acquisition fails (no
+`navigator.gpu`, or adapter/device unavailable like in the iOS
+Simulator), `d3Runtime.js` demotes `r_backend=webgpu` → `"gl"` in the
+engine args before WASM runs — otherwise emdawnwebgpu's
+`importJsDevice` crashes on the undefined device's `.queue`.
+
+**Iteration log:**
+- **Iter 1** — textured demo quad on `#webgpuCanvas` via `texture.wgsl`
+  + 64×64 procedural green-checker. Confirmed end-to-end:
+  pipeline-create + bindgroup + textured draw + present on iOS Safari.
+- **Iter 2** — `RB_BeginDrawingView` captures `viewDef->{projection,
+  worldSpace.modelView}Matrix` into file-scope `extern "C"` globals
+  in `tr_render.cpp` (`g_lastViewMatrix`, `g_lastProjMatrix`). Demo
+  quad still draws with identity MVP — plumbing only.
+- **Iter 3** — `RB_T_RenderTriangleSurface` captures the first
+  qualifying triangle surface each frame (~480KB verts + 64KB indexes,
+  downcast to u16, capped at 8192/32768). WebGPU backend grows GPU
+  buffers as needed (`uploadCapturedSurface`), draws with
+  `MVP = proj * view * model`. Fired in depth-fill pass — superseded
+  by iter 4.
+- **Iter 4** — capture moved to `RB_ARB2_DrawInteraction` (lit pass)
+  so we get a visible wall/floor/prop instead of depth-only geometry,
+  AND the per-light/per-material uniforms (`localLightOrigin`,
+  `localViewOrigin`, `lightProjection[0..3]`, `diffuse/specularColor`).
+  WebGPU backend adds a second pipeline using `interaction.wgsl` with
+  5 procedural textures (DXT5-NM neutral normal, white spec, green
+  checker diffuse, white falloff, white proj) + material/lighting
+  samplers + a 192-byte uniform buffer. Lit-pass MATH runs through
+  WebGPU end-to-end; textures don't visually match yet (iter 5).
+  Verified on Chrome WebGPU: logs
+  `[d3] WebGPU interaction pipeline initialized` +
+  `[d3] WebGPU captured first DOOM 3 surface verts=178 idx=18`.
+
+**Mac Safari / iOS Sim caveats:** iOS Simulator's WebKit reports
+`navigator.gpu` but the actual adapter request fails; the fallback
+takes over and the engine boots to GL. Mac Safari 26+ has working
+WebGPU. Real iPhone Safari has working WebGPU (verified iter 1).
+
 ### Mobile / iOS (hard-won)
 
 - **Stale-404 cache** — `fetchBytes` defaulted to `cache:"force-cache"`; after a
