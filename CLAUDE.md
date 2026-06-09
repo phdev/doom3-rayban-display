@@ -261,12 +261,26 @@ engine args before WASM runs — otherwise emdawnwebgpu's
   setVertexBuffer(vertOffset) + setIndexBuffer(indexOffset) +
   drawIndexed(indexCount)`. WebGPU canvas now shows the whole lit
   scene (first 64 surfaces).
-- **detTest harness** — `window.detTest("#webgpuCanvas", 5)` from
-  Safari Web Inspector. Captures N consecutive frames, pairwise diffs
-  RGB, reports mean % diff + max delta. The chunky-tile bug shows up
-  as 1-7% / max 192/255 in this metric. **Chrome verified WebGPU =
-  0.000% / 0 across 10 frames** (also Chrome GL = 0 — Chrome doesn't
-  have the bug; the iPhone test is the load-bearing one).
+- **detTest harness** — `window.detTest("#webgpuCanvas", 5, 250)`
+  from Safari Web Inspector. Captures N frames `delayMs` apart,
+  pairwise diffs RGB, reports mean % diff + max delta. The chunky-tile
+  bug shows up as 1-7% / max 192/255 in this metric.
+- **fullDetTest** — `window.fullDetTest(5, 300)` runs the full A/B:
+  pauses engine (`g_stopTime 1` + `pause`), runs detTest on both
+  canvases at matched timing, prints verdict.
+  **Chrome verified: WebGPU = 0.000% / 0, GL = 21.5% / 255 (5 frames,
+  300ms apart, paused).** The 21.5% on Chrome GL is engine-side
+  micro-animation that survives pause (sky shaders etc.), not the
+  iPhone chunky-tile bug. iPhone Safari A/B is still the load-bearing
+  test — its GL should show > 21.5% (engine micro-anim + chunky-tile
+  on top) and its WebGPU should be 0.
+- **Iter 7a** — engine-side CPU image cache: Image_load.cpp's
+  GenerateImage stashes the RGBA8 source buffer for every loaded
+  image keyed by idImage pointer (512-slot table in tr_render.cpp).
+  draw_arb2.cpp captures the 5 image pointers per record alongside
+  the geometric data. WebGPU backend doesn't yet upload these
+  (procedural fallback stays); iter 7b is the GPU upload + per-record
+  bind-group rebuild.
 
 **Mac Safari / iOS Sim caveats:** iOS Simulator's WebKit reports
 `navigator.gpu` but the actual adapter request fails; the fallback
