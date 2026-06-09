@@ -125,6 +125,29 @@ export function createRuntimeConfig() {
     config.height = Math.round(config.height * renderScale);
     config.renderScale = renderScale;
   }
+
+  // Pre-boot override for image_downSizeLimit (texture upload cap). The
+  // wearable profile defaults to 128 which on the iPhone produces visibly
+  // chunky walls in the Web Inspector GPU trace (draw call #3,183 chunky
+  // surface, 128x128 texture stretched over a screen-space ~200px wall).
+  // ?dsl=N overrides; matching ?dslbump=N for the bump-map cap. dsl=0
+  // disables downsizing entirely. Restart required (URL reload, not
+  // vid_restart — runtime cvar change doesn't reload already-uploaded
+  // textures in this build).
+  try {
+    const qs = window.location.search;
+    const dslMatch = /[?&]dsl=(\d+)\b/.exec(qs);
+    const bumpMatch = /[?&]dslbump=(\d+)\b/.exec(qs);
+    if (dslMatch) {
+      const v = Number(dslMatch[1]);
+      if (Number.isFinite(v) && v >= 0) config.imageDownSizeLimit = v;
+    }
+    if (bumpMatch) {
+      const v = Number(bumpMatch[1]);
+      if (Number.isFinite(v) && v >= 0) config.imageDownSizeBumpLimit = v;
+    }
+  } catch {}
+
   try { window.__d3RuntimeConfig = config; } catch {}
   return config;
 }
@@ -505,10 +528,12 @@ function buildArguments(config) {
     // renders. (This is also why the menu's animated logo panel shows a
     // placeholder.) See README "Limitations".
     "+set", "r_skipROQ", "1",
-    "+set", "image_downSize", "1",
+    // image_downSize=0 disables the downsize pass entirely (full-resolution
+    // texture uploads). Set when ?dsl=0 explicitly chosen via runtime config.
+    "+set", "image_downSize", config.imageDownSizeLimit === 0 ? "0" : "1",
     "+set", "image_downSizeLimit", String(getNumericConfig(config.imageDownSizeLimit, 256)),
-    "+set", "image_downSizeBump", "1",
-    "+set", "image_downSizeBumpLimit", String(getNumericConfig(config.imageDownSizeLimit, 256)),
+    "+set", "image_downSizeBump", config.imageDownSizeBumpLimit === 0 ? "0" : "1",
+    "+set", "image_downSizeBumpLimit", String(getNumericConfig(config.imageDownSizeBumpLimit || config.imageDownSizeLimit, 256)),
     // Load textures synchronously: the single-threaded browser build has no
     // background worker, and the cached path would block forever waiting on it.
     "+set", "image_useCache", "0",
