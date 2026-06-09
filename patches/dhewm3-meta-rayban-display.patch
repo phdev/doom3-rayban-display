@@ -1763,10 +1763,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..8605104
+index 0000000..4084a03
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,868 @@
+@@ -0,0 +1,894 @@
 +/*
 +================================================================================
 +
@@ -1978,14 +1978,40 @@ index 0000000..8605104
 +                WGPUCommandEncoderDescriptor cd = {};
 +                WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(device, &cd);
 +
-+                // Slow tint cycle to confirm liveness
-+                static uint32_t tick = 0;
-+                tick++;
++                // Iter 2: pull the engine's last view+proj matrices and compose
++                // MVP = proj * view * (small world-space transform). The quad
++                // is at world origin, slightly in front of the camera.
++                extern float g_lastViewMatrix[16];
++                extern float g_lastProjMatrix[16];
++                static uint32_t tick = 0; tick++;
 +                float a = 0.7f + 0.3f * (float)((tick / 30) % 4) / 4.0f;
++                // Build a model matrix: translate to (0, 0, -200) in view space
++                // so the quad floats in front of the camera regardless of view.
++                // Simpler for visibility: use identity MVP with tint cycling so
++                // we ensure the textured quad is visible; full transform comes
++                // when we have a depth buffer + world placement.
++                // For now: write the engine's projection*view as the MVP. The
++                // quad in NDC (-1..1) will get re-projected — if the camera is
++                // looking down +z it'll be roughly visible.
++                float mvp[16];
++                // mvp = proj * view (column-major mul)
++                for (int r = 0; r < 4; ++r) {
++                    for (int c = 0; c < 4; ++c) {
++                        float s = 0;
++                        for (int k = 0; k < 4; ++k) {
++                            s += g_lastProjMatrix[k*4 + r] * g_lastViewMatrix[c*4 + k];
++                        }
++                        mvp[c*4 + r] = s;
++                    }
++                }
++                // For initial visual confirmation, use identity MVP — full
++                // transform would clip the NDC quad away. Tinted with engine
++                // tick so we see it react to the engine being alive.
 +                float ub[20] = {
-+                    1,0,0,0,  0,1,0,0,  0,0,1,0,  0,0,0,1,  // identity MVP
-+                    a, a, a, 1.0f                              // tint
++                    1,0,0,0,  0,1,0,0,  0,0,1,0,  0,0,0,1,
++                    a, a, a, 1.0f
 +                };
++                (void)mvp;   // computed, currently unused; iter 3 will use it
 +                wgpuQueueWriteBuffer(queue, demoUniformBuf, 0, ub, sizeof(ub));
 +
 +                WGPURenderPassColorAttachment ca = {};
@@ -2972,7 +2998,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..44fbbda 100644
+index c83ebb5..0094153 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -2983,7 +3009,29 @@ index c83ebb5..44fbbda 100644
  
  /*
  
-@@ -563,16 +564,24 @@ void RB_BeginDrawingView (void) {
+@@ -553,26 +554,46 @@ Any mirrored or portaled views have already been drawn, so prepare
+ to actually render the visible surfaces for this view
+ =================
+ */
++// Iter 2: capture engine view + projection each frame so the WebGPU
++// backend can show a demo quad transformed by the player's view. Two
++// flat float[16]s, no atomic — the engine is single-threaded.
++extern "C" float g_lastViewMatrix[16];
++extern "C" float g_lastProjMatrix[16];
++float g_lastViewMatrix[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
++float g_lastProjMatrix[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
++
+ void RB_BeginDrawingView (void) {
+ 
+ 	const viewDef_t* viewDef = backEnd.viewDef;
+ 
++	// Iter 2 capture: stash matrices for the WebGPU backend demo render
++	memcpy(g_lastProjMatrix, viewDef->projectionMatrix, sizeof(g_lastProjMatrix));
++	memcpy(g_lastViewMatrix, viewDef->worldSpace.modelViewMatrix, sizeof(g_lastViewMatrix));
++
+ 	// set the modelview matrix for the viewer
+ 	qglMatrixMode(GL_PROJECTION);
+ 	qglLoadMatrixf( viewDef->projectionMatrix );
  	qglMatrixMode(GL_MODELVIEW);
  
  	// set the window clipping
