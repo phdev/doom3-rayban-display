@@ -14,16 +14,37 @@ iOS Safari WebGL's chunky-tile artifact (whole-scene per-pixel intensity drift i
 | **4a** | ✅ done | RenderBackend abstraction wired into engine; r_backend cvar; Init/Shutdown |
 | **4b** | 🟡 partial | tr_backend.cpp frame-boundary ops (4/97 sites). GL backend impls BeginRenderPass etc. |
 | **4c** | 🟡 partial | draw_common.cpp + tr_render.cpp viewport/scissor (6/310 sites combined) |
-| 4d, 4e | pending | Texture upload migration; remaining files. Blocked on GL pipeline state cache |
+| **GL backend** | ✅ done | Pipeline/Buffer/Texture/Sampler/BindGroup all genuinely implemented (~450 lines). Phase 4b/4c continuation is now unblocked. |
+| 4d, 4e | pending | Texture upload migration; remaining files. Ready to proceed. |
 | **5 prep** | ✅ done | emdawnwebgpu linked into engine build; D3_WEBGPU_BACKEND flag wired |
 | **5a** | ✅ done | JS pre-acquires WGPU device; backend Init grabs via emscripten_webgpu_get_device |
 | **5a (resources)** | ✅ done | CreateBuffer/Texture/Sampler + Update + Destroy against Dawn API |
 | **5b** | ✅ done | Command encoder + render pass lifecycle; SetViewport/Scissor/StencilRef; Draw/DrawIndexed |
 | **5c** | ✅ done | CreatePipeline (idDrawVert layout + WGSL compile); CreateBindGroup; all bind ops |
 | 5d | pending | Surface/swapchain creation. Blocker: canvas already owned by GL context |
-| 6 | pending | Port DOOM 3 shaders RBDOOM-3-BFG HLSL → SPIR-V → WGSL |
+| **6 setup** | ✅ done | HLSL→SPIR-V→WGSL toolchain validated end-to-end (`webgpu-port/shader-tools/hlsl2wgsl.sh`) |
+| 6 (full) | pending | Port 60 RBDOOM-3-BFG shaders. Needs `register(tN/sN/bN)` → `vk::binding(N,M)` preprocessor + include resolver. |
 | 7 | pending | Integration + iOS perf tuning + chunky-tile validation |
 | 8 | pending | Cutover; remove GL backend |
+
+## What the WebGPU backend has, post-session
+
+The `RenderBackend_WebGPU.cpp` is ~600 lines of working Dawn code covering EVERY method in the abstraction except surface/swapchain (Phase 5d). Specifically:
+
+| Operation | Status | Maps to |
+|---|---|---|
+| Init / Shutdown | ✅ | emscripten_webgpu_get_device → JS pre-acquired WGPUDevice |
+| Buffer create/update/destroy | ✅ | wgpuDeviceCreateBuffer + wgpuQueueWriteBuffer + wgpuBufferRelease |
+| Texture create/upload/destroy | ✅ | wgpuDeviceCreateTexture + wgpuQueueWriteTexture + wgpuTextureRelease |
+| Sampler create/destroy | ✅ | wgpuDeviceCreateSampler + wgpuSamplerRelease |
+| Pipeline create/destroy/bind | ✅ | wgpuDeviceCreateRenderPipeline (idDrawVert vertex layout + WGSL + blend/depth/stencil) |
+| BindGroup create/destroy/bind | ✅ | wgpuDeviceCreateBindGroup (auto layout from pipeline) |
+| BindVertexBuffer / BindIndexBuffer | ✅ | wgpuRenderPassEncoderSet*Buffer |
+| BeginFrame / EndFrame | ✅ | wgpuDeviceCreateCommandEncoder + Finish + QueueSubmit |
+| BeginRenderPass / EndRenderPass | ✅ | wgpuCommandEncoderBeginRenderPass + clear/load/store + depth-stencil attachment |
+| Draw / DrawIndexed | ✅ | wgpuRenderPassEncoderDraw[Indexed] |
+| SetViewport / SetScissor / SetStencilRef | ✅ | wgpuRenderPassEncoder* dynamic state |
+| Surface / swapchain | ❌ | Phase 5d — canvas conflict needs resolving |
 
 ## Files committed in this Phase 4 starting commit
 
