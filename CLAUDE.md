@@ -345,9 +345,17 @@ groups as the on-screen echo), copies both to MapRead buffers
 `window.__d3WgpuDet`. If a GPU produces different bytes for identical
 command buffers, that's exactly the chunky-tile class of
 non-determinism. Chrome verified: rounds 1-2 IDENTICAL, 64 surfaces,
-600x600. The load-bearing run is iPhone Safari: IDENTICAL there +
-visibly flickering GL = the WebGPU port fixes the bug, measured
-on-device with no eyeballs needed.
+600x600.
+
+**RESULT (2026-06-09, physical iPhone): rounds 1-2 IDENTICAL
+[448x448, 64 surfaces]** while the GL view on the same device showed
+the chunky-tile flicker (quantified in earlier sessions at 1-7% px
+divergence on a stationary scene). Identical input → identical output
+through WebGPU on the same Metal driver where GL diverges. The
+chunky-tile bug is conclusively a GL→GL4ES→WebGL→Metal stack defect;
+completing the WebGPU port is the production fix. (The multi-surface
+echo also rendered on iPhone: `records=43` upload logged, lit
+green-checker geometry tracking the camera.)
 
 ### Mobile / iOS (hard-won)
 
