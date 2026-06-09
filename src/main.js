@@ -87,6 +87,62 @@ if (/[?&]backend=webgpu\b/.test(location.search) && refs.webgpuCanvas) {
   refs.webgpuCanvas.classList.add("is-active");
 }
 
+// Determinism comparison harness — captures N consecutive canvas frames and
+// reports pixel-level deltas. The chunky-tile FP-determinism bug on iPhone
+// Safari shows up as 1-7% of pixels differing frame-to-frame on a stationary
+// scene with max delta up to 192/255. WebGPU should produce 0% / 0. Use this
+// to A/B the two backends.
+//
+// Usage from Safari Web Inspector (Mac):
+//   await window.detTest("#webgpuCanvas", 5)
+//   await window.detTest("#gameCanvas",   5)
+// Returns: { meanDiffPct, maxDelta, perFrame: [...] }
+window.detTest = async function detTest(selector = "#webgpuCanvas", frameCount = 5) {
+  const canvas = document.querySelector(selector);
+  if (!canvas) { console.warn("detTest: no canvas", selector); return null; }
+  const w = canvas.width, h = canvas.height;
+  if (!w || !h) { console.warn("detTest: zero-size canvas", selector); return null; }
+  const tmp = document.createElement("canvas");
+  tmp.width = w; tmp.height = h;
+  const ctx2d = tmp.getContext("2d", { willReadFrequently: true });
+  const frames = [];
+  for (let i = 0; i < frameCount; ++i) {
+    await new Promise((r) => requestAnimationFrame(r));
+    try {
+      ctx2d.clearRect(0, 0, w, h);
+      ctx2d.drawImage(canvas, 0, 0, w, h);
+      frames.push(ctx2d.getImageData(0, 0, w, h).data);
+    } catch (e) {
+      console.warn("detTest: drawImage failed (preserveDrawingBuffer?)", e.message);
+      return null;
+    }
+  }
+  const totalPx = w * h;
+  let sumDiffPx = 0, maxDelta = 0;
+  const perFrame = [];
+  for (let i = 1; i < frames.length; ++i) {
+    const a = frames[i - 1], b = frames[i];
+    let diffPx = 0, frameMax = 0;
+    for (let p = 0; p < a.length; p += 4) {
+      const dr = Math.abs(a[p] - b[p]);
+      const dg = Math.abs(a[p + 1] - b[p + 1]);
+      const db = Math.abs(a[p + 2] - b[p + 2]);
+      const d = Math.max(dr, dg, db);
+      if (d > 0) diffPx++;
+      if (d > frameMax) frameMax = d;
+    }
+    sumDiffPx += diffPx;
+    if (frameMax > maxDelta) maxDelta = frameMax;
+    perFrame.push({ pair: `${i - 1}->${i}`, diffPct: (diffPx / totalPx * 100).toFixed(3), maxDelta: frameMax });
+  }
+  const meanDiffPct = (sumDiffPx / (frames.length - 1) / totalPx * 100).toFixed(3);
+  const summary = `detTest ${selector}: meanDiff=${meanDiffPct}% maxDelta=${maxDelta} (${w}x${h}, ${frames.length} frames)`;
+  console.info(summary);
+  for (const f of perFrame) console.info(`  ${f.pair}: ${f.diffPct}% pxs differ, maxDelta=${f.maxDelta}`);
+  if (typeof appendRuntimeLog === "function") appendRuntimeLog(`[detTest] ${summary}`);
+  return { selector, w, h, meanDiffPct: Number(meanDiffPct), maxDelta, perFrame };
+};
+
 // Compact, always-visible GPU summary built from the captured GL4ES init lines.
 // The decisive field is "highp FS": a mobile GPU without high-precision floats in
 // fragment shaders underflows DOOM 3's lighting math to ~0 (near-black scene).
