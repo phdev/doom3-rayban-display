@@ -512,6 +512,12 @@ function buildArguments(config) {
     "+set", "r_customHeight", String(config.height),
     "+set", "r_aspectRatio", "0",
     "+set", "r_multiSamples", "0",
+    // Phase 5: pick which RenderBackend to instantiate at engine boot.
+    // ?backend=webgpu selects the WebGPU backend (requires navigator.gpu).
+    // Default "gl" keeps the existing pass-through wrapper.
+    "+set", "r_backend",
+        /[?&]backend=webgpu\b/.test(typeof window !== "undefined" ? window.location.search : "")
+            ? "webgpu" : "gl",
     "+set", "r_gamma", String(getNumericConfig(config.rGamma, 1.1)),
     "+set", "r_brightness", String(getNumericConfig(config.rBrightness, 1)),
     // Multiply every light's intensity (default 2). On a dark, enclosed map like

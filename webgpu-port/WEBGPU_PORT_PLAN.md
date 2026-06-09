@@ -11,11 +11,19 @@ iOS Safari WebGL's chunky-tile artifact (whole-scene per-pixel intensity drift i
 | 1 | ✅ done | `--use-port=emdawnwebgpu` Emscripten port building, Dawn snapshot cached |
 | 2 | ✅ done | `webgpu-test/triangle.cpp` — colored triangle renders via WebGPU |
 | 3 | ✅ done | `webgpu-test/wall.cpp` — DOOM-3-style lit brick wall renders, validated on iPhone |
-| **4** | **in progress** | **Renderer abstraction layer + WebGPU backend stub (this commit)** |
-| 5 | pending | Migrate dhewm3 call sites to `idRenderBackend` interface |
-| 6 | pending | Implement WebGPU backend operations (replace stubs) |
-| 7 | pending | Port DOOM 3 shaders RBDOOM-3-BFG HLSL → SPIR-V → WGSL |
-| 8 | pending | Integration + iOS perf tuning + chunky-tile validation |
+| **4a** | ✅ done | RenderBackend abstraction wired into engine; r_backend cvar; Init/Shutdown |
+| **4b** | 🟡 partial | tr_backend.cpp frame-boundary ops (4/97 sites). GL backend impls BeginRenderPass etc. |
+| **4c** | 🟡 partial | draw_common.cpp + tr_render.cpp viewport/scissor (6/310 sites combined) |
+| 4d, 4e | pending | Texture upload migration; remaining files. Blocked on GL pipeline state cache |
+| **5 prep** | ✅ done | emdawnwebgpu linked into engine build; D3_WEBGPU_BACKEND flag wired |
+| **5a** | ✅ done | JS pre-acquires WGPU device; backend Init grabs via emscripten_webgpu_get_device |
+| **5a (resources)** | ✅ done | CreateBuffer/Texture/Sampler + Update + Destroy against Dawn API |
+| **5b** | ✅ done | Command encoder + render pass lifecycle; SetViewport/Scissor/StencilRef; Draw/DrawIndexed |
+| **5c** | ✅ done | CreatePipeline (idDrawVert layout + WGSL compile); CreateBindGroup; all bind ops |
+| 5d | pending | Surface/swapchain creation. Blocker: canvas already owned by GL context |
+| 6 | pending | Port DOOM 3 shaders RBDOOM-3-BFG HLSL → SPIR-V → WGSL |
+| 7 | pending | Integration + iOS perf tuning + chunky-tile validation |
+| 8 | pending | Cutover; remove GL backend |
 
 ## Files committed in this Phase 4 starting commit
 
