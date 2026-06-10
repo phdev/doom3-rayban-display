@@ -120,6 +120,20 @@ export function createRuntimeConfig() {
         headTickMs: 50
       };
 
+  // WebGPU-primary sharpening: the 448px wearable cap dates from GL-era GPU
+  // memory pressure. With WebGPU rendering the scene (GL draws skipped),
+  // the framebuffer can afford 640px — visibly sharper on the iPhone at
+  // negligible GPU cost (the WASM game loop, not the GPU, bounds the fps).
+  // ?render2x/?render4x still override; ?lowres keeps the old 448.
+  try {
+    const qs2 = typeof window !== "undefined" ? window.location.search : "";
+    const webgpuPrimary = /[?&]backend=webgpu\b/.test(qs2) && !/[?&]echo\b/.test(qs2);
+    if (webgpuPrimary && renderScale === 1 && config.width < 640 && !/[?&]lowres\b/.test(qs2)) {
+      config.width = 640;
+      config.height = 640;
+    }
+  } catch {}
+
   if (renderScale > 1) {
     config.width = Math.round(config.width * renderScale);
     config.height = Math.round(config.height * renderScale);
