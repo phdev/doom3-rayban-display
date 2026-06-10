@@ -1917,10 +1917,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..ccde3dc
+index 0000000..482efce
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,3406 @@
+@@ -0,0 +1,3416 @@
 +/*
 +================================================================================
 +
@@ -2046,6 +2046,7 @@ index 0000000..ccde3dc
 +extern "C" SubLink g_subviewLinks[];
 +extern "C" uint32_t g_subviewLinkCount;
 +extern "C" const char* D3_WebGPU_ImageName(const void* imgPtr);
++extern "C" void D3_WebGPU_ReportImageCache(void);
 +extern "C" uint32_t g_capBloomOn;
 +extern "C" float    g_capBloomThresh;
 +extern "C" float    g_capBloomScale;
@@ -4130,6 +4131,15 @@ index 0000000..ccde3dc
 +        g_capRecordCount = 0;
 +        g_capVertBytes   = 0;
 +        g_capIndexBytes  = 0;
++        // One-shot cache-budget report once the level + HUD have loaded
++        // (texture-resolution measurement instrument).
++        {
++            static bool cacheReported = false;
++            if (!cacheReported && detFrameCounter >= 300) {
++                cacheReported = true;
++                D3_WebGPU_ReportImageCache();
++            }
++        }
 +        static bool announcedOnce = false;
 +        if (!announcedOnce) {
 +            announcedOnce = true;
@@ -6053,7 +6063,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..e6434b3 100644
+index c83ebb5..4ab2be1 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -6064,7 +6074,7 @@ index c83ebb5..e6434b3 100644
  
  /*
  
-@@ -38,6 +39,709 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +39,720 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -6347,6 +6357,13 @@ index c83ebb5..e6434b3 100644
 +    enum { kWGPUImageCacheSize = 3072 };
 +    WGPUImageSlot g_imgCache[kWGPUImageCacheSize] = {};
 +    int g_imgCacheCount = 0;
++    size_t g_imgCacheBytes = 0;   // live RAM held by cached pixel buffers
++}
++
++// Diag: cache occupancy for texture-budget measurements (window.__d3Logs).
++extern "C" void D3_WebGPU_ReportImageCache( void ) {
++	common->Printf( "[d3] WebGPU CPU image cache: %d slots, %.1f MB\n",
++		g_imgCacheCount, (double)g_imgCacheBytes / 1e6 );
 +}
 +
 +
@@ -6384,11 +6401,15 @@ index c83ebb5..e6434b3 100644
 +    // Reallocate if size changed (e.g. reloaded at different mip level)
 +    const size_t bytes = (size_t)dw * (size_t)dh * 4u;
 +    if ( !g_imgCache[slot].pixels || g_imgCache[slot].w != dw || g_imgCache[slot].h != dh ) {
++        if ( g_imgCache[slot].pixels ) {
++            g_imgCacheBytes -= (size_t)g_imgCache[slot].w * (size_t)g_imgCache[slot].h * 4u;
++        }
 +        free( g_imgCache[slot].pixels );
 +        g_imgCache[slot].pixels = (uint8_t*)malloc( bytes );
 +        if ( !g_imgCache[slot].pixels ) { g_imgCache[slot].ptr = nullptr; return; }
 +        g_imgCache[slot].w = dw;
 +        g_imgCache[slot].h = dh;
++        g_imgCacheBytes += bytes;
 +    }
 +    if ( step == 1 ) {
 +        memcpy( g_imgCache[slot].pixels, rgba, bytes );
@@ -6774,7 +6795,7 @@ index c83ebb5..e6434b3 100644
  
  /*
  =================
-@@ -49,6 +753,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +764,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -6790,7 +6811,7 @@ index c83ebb5..e6434b3 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +791,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +802,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -6806,7 +6827,7 @@ index c83ebb5..e6434b3 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +838,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +849,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -6823,7 +6844,7 @@ index c83ebb5..e6434b3 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +898,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +909,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -6831,7 +6852,7 @@ index c83ebb5..e6434b3 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1125,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1136,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -6844,7 +6865,7 @@ index c83ebb5..e6434b3 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1294,48 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1305,48 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  

@@ -978,3 +978,26 @@ volumes), full shadow mapping = new depth-pass architecture (capture
 per-light depth renders; texture_depth_2d + sampler_comparison +
 textureSampleCompare in WGSL; point lights need 6 faces) — feasible
 but a multi-session feature.
+
+**Texture-resolution measurement (2026-06-10).** Question: can we
+recover texture detail (pak is baked --max-texture 128)? Measured
+with new cache-RAM accounting (`D3_WebGPU_ReportImageCache`, logs
+"[d3] WebGPU CPU image cache: N slots, X MB" ~300 frames after
+records flow):
+- 128px pak (shipped): 65.6 MB download, 77.5 MB cache RAM, baseline
+- 256px pak: 115.7 MB (+76%), 212.5 MB cache RAM, +8.4% detail energy
+- 512px pak: 159.8 MB (+144%), cache est. >600 MB — NOT viable (wasm
+  initial 512MB; iOS Safari memory budget)
+iPhone note: the wearable profile's image_downSizeLimit 128 means the
+256 pak alone only costs download size there — seeing 256px textures
+on-device additionally needs ?dsl=256 (cache → ~212MB; device test
+required before defaulting).
+**CRITICAL REDUCER GOTCHA found en route: the GOG 1.3.1 installer's
+pak005–008 are the PATCH paks (updated scripts/defs) — a bake from
+pak000–004 alone BOOTS but the game aborts at spawn with "ERROR:
+Missing 'WEAPON_NETFIRING' field in script object 'weapon_fists'"
+(1.1-era scripts vs dhewm3's 1.3.1 expectation) and the WebGPU view
+shows the demo-quad checker (zero records). ALWAYS include all 9 paks
+in the reducer input.** Shipping the 256 pak = user product call
+(cellular download cost); rebuild recipe: reduce from /tmp/d3gog/base
+(9 paks) --max-texture 256 --no-audio, then scripts/chunk-pk4.py.
