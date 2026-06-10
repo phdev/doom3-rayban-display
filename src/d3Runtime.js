@@ -535,6 +535,11 @@ function buildArguments(config) {
     "+set", "r_backend",
         /[?&]backend=webgpu\b/.test(typeof window !== "undefined" ? window.location.search : "")
             ? "webgpu" : "gl",
+    // Cutover (?wgpufull): WebGPU is the primary display, so skip the GL
+    // draw calls entirely (lightgem excepted — see r_skipGLDraw).
+    "+set", "r_skipGLDraw",
+        /[?&]wgpufull\b/.test(typeof window !== "undefined" ? window.location.search : "")
+            ? "1" : "0",
     "+set", "r_gamma", String(getNumericConfig(config.rGamma, 1.1)),
     "+set", "r_brightness", String(getNumericConfig(config.rBrightness, 1)),
     // Multiply every light's intensity (default 2). On a dark, enclosed map like

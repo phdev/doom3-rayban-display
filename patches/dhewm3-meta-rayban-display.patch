@@ -1009,7 +1009,7 @@ index a4883b5..095506b 100644
  extern idCVar	r_aspectRatio;
  
 diff --git a/neo/renderer/Image_load.cpp b/neo/renderer/Image_load.cpp
-index f9ae002..00589ee 100644
+index f9ae002..00f6a10 100644
 --- a/neo/renderer/Image_load.cpp
 +++ b/neo/renderer/Image_load.cpp
 @@ -27,6 +27,11 @@ If you have questions concerning this license or the applicable additional terms
@@ -1037,7 +1037,20 @@ index f9ae002..00589ee 100644
  	// zero the border if desired, allowing clamped projection textures
  	// even after picmip resampling or careless artists.
  	if ( repeat == TR_CLAMP_TO_ZERO ) {
-@@ -1932,7 +1943,12 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
+@@ -1907,6 +1918,12 @@ CopyFramebuffer
+ ====================
+ */
+ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bool useOversizedBuffer ) {
++	// Iter 11b: with GL draws skipped (WebGPU primary) the framebuffer holds
++	// garbage; copying it just spams INVALID_OPERATION on WebGL. Skip.
++	extern idCVar r_skipGLDraw;
++	if ( r_skipGLDraw.GetBool() ) {
++		return;
++	}
+ 	Bind();
+ 
+ 	if ( cvarSystem->GetCVarBool( "g_lowresFullscreenFX" ) ) {
+@@ -1932,7 +1949,12 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
  		uploadWidth = potWidth;
  		uploadHeight = potHeight;
  		if ( potWidth == imageWidth && potHeight == imageHeight ) {
@@ -1051,7 +1064,7 @@ index f9ae002..00589ee 100644
  		} else {
  			byte	*junk;
  			// we need to create a dummy image with power of two dimensions,
-@@ -1945,7 +1961,10 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
+@@ -1945,7 +1967,10 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
  				junk[i+1] = 255;
  			}
  #endif
@@ -3893,7 +3906,7 @@ index 0000000..0f9c8e6
 +    return nullptr;
 +}
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
-index 7914093..eed2277 100644
+index 7914093..2bcb018 100644
 --- a/neo/renderer/RenderSystem_init.cpp
 +++ b/neo/renderer/RenderSystem_init.cpp
 @@ -39,6 +39,11 @@ If you have questions concerning this license or the applicable additional terms
@@ -3908,7 +3921,7 @@ index 7914093..eed2277 100644
  
  #include "framework/GameCallbacks_local.h"
  #include "framework/Game.h"
-@@ -102,6 +107,12 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
+@@ -102,6 +107,15 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
  
  idCVar r_skipSuppress( "r_skipSuppress", "0", CVAR_RENDERER | CVAR_BOOL, "ignore the per-view suppressions" );
  idCVar r_skipPostProcess( "r_skipPostProcess", "0", CVAR_RENDERER | CVAR_BOOL, "skip all post-process renderings" );
@@ -3918,10 +3931,13 @@ index 7914093..eed2277 100644
 +// "webgpu" is a fail-loud stub until Phase 4b–5 fill it in. See
 +// neo/renderer/RenderBackend.h + WEBGPU_PORT_PLAN.md for the cutover plan.
 +idCVar r_backend( "r_backend", "gl", CVAR_RENDERER | CVAR_INIT, "render backend: gl | webgpu" );
++idCVar r_skipGLDraw( "r_skipGLDraw", "0", CVAR_RENDERER | CVAR_BOOL,
++	"skip GL draw calls (WebGPU-primary cutover; the WebGPU echo renders instead). "
++	"Tiny views (lightgem) keep drawing so gameplay light readback works." );
  idCVar r_skipLightScale( "r_skipLightScale", "0", CVAR_RENDERER | CVAR_BOOL, "don't do any post-interaction light scaling, makes things dim on low-dynamic range cards" );
  idCVar r_skipInteractions( "r_skipInteractions", "0", CVAR_RENDERER | CVAR_BOOL, "skip all light/surface interaction drawing" );
  idCVar r_skipDynamicTextures( "r_skipDynamicTextures", "0", CVAR_RENDERER | CVAR_BOOL, "don't dynamically create textures" );
-@@ -158,6 +169,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
+@@ -158,6 +172,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
  idCVar r_useExternalShadows( "r_useExternalShadows", "1", CVAR_RENDERER | CVAR_INTEGER, "1 = skip drawing caps when outside the light volume, 2 = force to no caps for testing", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
  idCVar r_useOptimizedShadows( "r_useOptimizedShadows", "1", CVAR_RENDERER | CVAR_BOOL, "use the dmap generated static shadow volumes" );
  idCVar r_useScissor( "r_useScissor", "1", CVAR_RENDERER | CVAR_BOOL, "scissor clip as portals and lights are processed" );
@@ -3929,7 +3945,7 @@ index 7914093..eed2277 100644
  idCVar r_useCombinerDisplayLists( "r_useCombinerDisplayLists", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "put all nvidia register combiner programming in display lists" );
  idCVar r_useDepthBoundsTest( "r_useDepthBoundsTest", "1", CVAR_RENDERER | CVAR_BOOL, "use depth bounds test to reduce shadow fill" );
  
-@@ -819,11 +831,63 @@ void R_InitOpenGL( void ) {
+@@ -819,11 +834,63 @@ void R_InitOpenGL( void ) {
  		r_multiSamples.SetInteger( 0 );
  	}
  
@@ -3993,7 +4009,7 @@ index 7914093..eed2277 100644
  
  #include "renderer/qgl_proc.h"
  
-@@ -2505,6 +2569,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
+@@ -2505,6 +2572,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
  	// is destroyed (relevant when starting a mod which also recreates window)
  	Sys_ShutdownInput();
  
@@ -4426,7 +4442,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..6e8e46e 100644
+index c83ebb5..02d514c 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -4749,7 +4765,56 @@ index c83ebb5..6e8e46e 100644
  
  /*
  =================
-@@ -166,6 +472,7 @@ RB_T_RenderTriangleSurface
+@@ -49,6 +355,15 @@ This should never happen if the vertex cache is operating properly.
+ */
+ void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
+ 
++	// Iter 11b: WebGPU-primary cutover — skip the actual GL draw. The
++	// capture hooks in the callers have already run. The lightgem (tiny
++	// viewport) keeps drawing: gameplay reads its pixels back.
++	extern idCVar r_skipGLDraw;
++	if ( r_skipGLDraw.GetBool() && backEnd.viewDef
++		 && ( backEnd.viewDef->viewport.x2 - backEnd.viewDef->viewport.x1 ) >= 128 ) {
++		return;
++	}
++
+ 	backEnd.pc.c_drawElements++;
+ 	backEnd.pc.c_drawIndexes += tri->numIndexes;
+ 	backEnd.pc.c_drawVertexes += tri->numVerts;
+@@ -78,6 +393,15 @@ RB_DrawElementsWithCounters
+ */
+ void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
+ 
++	// Iter 11b: WebGPU-primary cutover — skip the actual GL draw. The
++	// capture hooks in the callers have already run. The lightgem (tiny
++	// viewport) keeps drawing: gameplay reads its pixels back.
++	extern idCVar r_skipGLDraw;
++	if ( r_skipGLDraw.GetBool() && backEnd.viewDef
++		 && ( backEnd.viewDef->viewport.x2 - backEnd.viewDef->viewport.x1 ) >= 128 ) {
++		return;
++	}
++
+ 	backEnd.pc.c_drawElements++;
+ 	backEnd.pc.c_drawIndexes += tri->numIndexes;
+ 	backEnd.pc.c_drawVertexes += tri->numVerts;
+@@ -116,6 +440,16 @@ May not use all the indexes in the surface if caps are skipped
+ ================
+ */
+ void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
++
++	// Iter 11b: WebGPU-primary cutover — skip the actual GL draw. The
++	// capture hooks in the callers have already run. The lightgem (tiny
++	// viewport) keeps drawing: gameplay reads its pixels back.
++	extern idCVar r_skipGLDraw;
++	if ( r_skipGLDraw.GetBool() && backEnd.viewDef
++		 && ( backEnd.viewDef->viewport.x2 - backEnd.viewDef->viewport.x1 ) >= 128 ) {
++		return;
++	}
++
+ 	backEnd.pc.c_shadowElements++;
+ 	backEnd.pc.c_shadowIndexes += numIndexes;
+ 	backEnd.pc.c_shadowVertexes += tri->numVerts;
+@@ -166,6 +500,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -4757,7 +4822,7 @@ index c83ebb5..6e8e46e 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -557,22 +864,41 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +892,41 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
