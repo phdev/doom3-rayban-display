@@ -29,9 +29,9 @@ const TIMEOUTS = {
   probe: 15000,
   script: 20000,
   runtime: 45000,
-  pk4: 120000
+  pk4: 420000
 };
-const PK4_FETCH_STALL_TIMEOUT_MS = 20000;
+const PK4_FETCH_STALL_TIMEOUT_MS = 45000;
 const PK4_FETCH_RETRY_DELAY_MS = 750;
 const PK4_MANIFEST_TIMEOUT_MS = 8000;
 // The game module is hard-linked into the monolithic wasm binary (HARDLINK_GAME),
@@ -928,6 +928,43 @@ async function readUrlPk4Bytes(source, onStatus, log, progress) {
 }
 
 async function readBundledPk4Bytes(onStatus, log, progress) {
+  // Cached bundled PK4 (IndexedDB): a 65MB download on flaky cellular only
+  // has to succeed ONCE. Freshness: a 4s HEAD compares content-length; if
+  // the HEAD fails (offline, flaky), the cache is trusted — better to play
+  // a slightly stale pak than to fail the boot.
+  try {
+    const cached = await readCachedUrlPk4(BUNDLED_PK4_URL);
+    if (cached && isPk4Payload(cached)) {
+      let fresh = true;
+      try {
+        const head = await fetch(BUNDLED_PK4_URL, {
+          method: "HEAD",
+          cache: "no-store",
+          signal: AbortSignal.timeout(4000)
+        });
+        const len = Number(head.headers.get("content-length") || 0);
+        if (head.ok && len > 0 && len !== cached.byteLength) {
+          fresh = false;
+        }
+      } catch {
+        // offline / flaky — use the cache
+      }
+      if (fresh) {
+        log?.(`Using cached bundled PK4 (${formatByteCount(cached.byteLength)})`);
+        progress?.(60, "Loading PK4");
+        return cached;
+      }
+      log?.("Cached bundled PK4 is stale; re-downloading...");
+    }
+  } catch (error) {
+    log?.(`Bundled PK4 cache read failed: ${formatError(error)}`);
+  }
+  const finish = (bytes) => {
+    if (bytes) {
+      cacheUrlPk4Bytes(BUNDLED_PK4_URL, bytes, log);
+    }
+    return bytes;
+  };
   // Try the raw chunked manifest first on every runtime (not just the glasses
   // WebView): a bundled PK4 larger than a host's per-file limit (e.g. GitHub's
   // 100 MB) has to ship as raw < 100 MB chunks + a manifest, and raw chunks are
@@ -944,7 +981,7 @@ async function readBundledPk4Bytes(onStatus, log, progress) {
 
     if (chunked) {
       progress?.(60, "Loading PK4");
-      return chunked;
+      return finish(chunked);
     }
 
     log?.("Chunked display PK4 was not found; trying compressed display PK4...");
@@ -963,13 +1000,13 @@ async function readBundledPk4Bytes(onStatus, log, progress) {
       progress?.(60, "Decompressing PK4");
       onStatus?.("Decompressing display PK4...");
       log?.(`Decompressing display PK4 (${formatByteCount(chunkedCompressed.byteLength)} compressed)...`);
-      return decompressGzip(chunkedCompressed);
+      return finish(await decompressGzip(chunkedCompressed));
     }
 
     if (chunkedCompressed) {
       progress?.(60, "Loading PK4");
       log?.(`Using chunked browser-decoded display PK4 (${formatByteCount(chunkedCompressed.byteLength)})...`);
-      return chunkedCompressed;
+      return finish(chunkedCompressed);
     }
 
     progress?.(54, "Fetching PK4");
@@ -986,13 +1023,13 @@ async function readBundledPk4Bytes(onStatus, log, progress) {
         progress?.(60, "Decompressing PK4");
         onStatus?.("Decompressing display PK4...");
         log?.(`Decompressing display PK4 (${formatByteCount(compressed.byteLength)} compressed)...`);
-        return decompressGzip(compressed);
+        return finish(await decompressGzip(compressed));
       }
 
       if (isPk4Payload(compressed)) {
         progress?.(60, "Loading PK4");
         log?.(`Using browser-decoded display PK4 (${formatByteCount(compressed.byteLength)})...`);
-        return compressed;
+        return finish(compressed);
       }
     }
     log?.("Compressed display PK4 was not found; trying raw PK4...");
@@ -1016,7 +1053,7 @@ async function readBundledPk4Bytes(onStatus, log, progress) {
     return null;
   }
 
-  return bytes;
+  return finish(bytes);
 }
 
 async function fetchChunkedBytes(candidate, progress, log) {
