@@ -217,8 +217,16 @@ function updateGlDiag() {
   const colorAtt = (find(/Max Color Attachments/i).replace(/^LIBGL:\s*/i, "").trim() || "?");
   const arb2 = has(/ARB2 renderer: *Available/i) ? "yes" : "NO/missing";
   const errs = glInfo.filter((l) => /error|: END not found|program is invalid|not available/i.test(l)).length;
+  // Lead with the ACTIVE render backend — the GL context still exists
+  // (fallback + lightgem + texture uploads) but under WebGPU-primary it no
+  // longer renders the scene, and "GPU: GL4ES" read as if it did.
+  const wgpuPrimary = /[?&]backend=webgpu\b/.test(location.search) && !/[?&]echo\b/.test(location.search);
+  const backendLine = wgpuPrimary
+    ? "render: WebGPU (Dawn) — GL idle (fallback/lightgem only)\n"
+    : "";
   refs.glDiag.textContent =
-    `GPU: ${renderer}\nhighp FS: ${highp}   floatRT: ${floatRT}   halfRT: ${halfRT}\n` +
+    backendLine +
+    `GL ctx: ${renderer}\nhighp FS: ${highp}   floatRT: ${floatRT}   halfRT: ${halfRT}\n` +
     `ARB2: ${arb2}   ${colorAtt}   shaderErrs: ${errs}`;
   refs.glDiag.hidden = false;
 }
