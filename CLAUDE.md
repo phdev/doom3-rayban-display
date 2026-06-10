@@ -683,3 +683,14 @@ comparing content-length; HEAD failure → trust the cache (offline-
 friendly); pak-size change in a deploy → auto re-download. Watchdog
 45s, overall 420s. Verified: boot 2 logs "Using cached bundled PK4"
 with zero pak network traffic.
+
+**Iter 13a — blend lights (2026-06-10).** RB_T_BlendLight captures
+localized S/T/Q+falloff planes per surface; RB_BlendLight's stage loop
+exports the projection image + blend kind. blend.wgsl =
+projTex(s/q,t/q) * falloff(sF,.5) * stageColor through blendFilter
+(Dst/Zero) or blendAdd (One/One) pipelines, final pass after fog.
+LIGHT-TYPE COVERAGE NOW COMPLETE: point/projected interactions,
+ambient, fog, blend. Remaining big-architecture items: sky cubemaps
+(GenerateCubeImage cache hook + samplerCube path), subviews
+(render-to-texture), lightgem via WebGPU, GL4ES retirement, heat-haze
+new-stages, ROQ.
