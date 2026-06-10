@@ -120,6 +120,15 @@ export function createRuntimeConfig() {
         headTickMs: 50
       };
 
+  // ?audio: opt-in sound (compiled in but disabled since day one — the
+  // async sound thread doesn't exist on WASM; com_asyncSound 0 runs the
+  // sound update synchronously on the main loop instead).
+  try {
+    if (/[?&]audio\b/.test(typeof window !== "undefined" ? window.location.search : "")) {
+      config.audioEnabled = true;
+    }
+  } catch {}
+
   // WebGPU-primary sharpening: the 448px wearable cap dates from GL-era GPU
   // memory pressure. With WebGPU rendering the scene (GL draws skipped),
   // the framebuffer can afford 640px — visibly sharper on the iPhone at
@@ -576,6 +585,11 @@ function buildArguments(config) {
     "+set", "g_skipCinematics", "1",
     "+set", "com_showFPS", "0",
     "+set", "s_noSound", config.audioEnabled ? "0" : "1",
+    // WASM has no async sound thread; update sound from the main loop.
+    "+set", "com_asyncSound", "0",
+    // Emscripten's OpenAL has no real EFX — the reverb proc addresses are
+    // garbage and calling them traps ("table index is out of bounds").
+    "+set", "s_useEAXReverb", "0",
     "+set", "g_skill", String(getNumericConfig(config.skill, 1)),
     // The wearable drives the camera through _D3_AddViewAngles, so disable the
     // engine's own pointer-lock mouse path.

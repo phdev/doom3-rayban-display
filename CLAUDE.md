@@ -727,3 +727,17 @@ target. Monitors/mirrors now show live WebGPU subview renders.
 ECHO FEATURE SET COMPLETE for the demo's scope. Remaining niche:
 lightgem via WebGPU + GL4ES build retirement (the true finish line),
 reflect/screen texgens, heat-haze new-stages, ROQ.
+
+**GL4ES retention decision + audio investigation (2026-06-10).**
+GL4ES STAYS: it's the required fallback for non-WebGPU browsers, the
+`&echo` mode is the permanent A/B comparison harness, and the lightgem
+renders through it. "Retirement" demoted to someday-maybe.
+AUDIO: compiled in but traps at boot when enabled. `?audio` flag wired
+(opt-in, default off) + `com_asyncSound 0` + `s_useEAXReverb 0` — still
+traps with "null function" during sound init AFTER the EFX cvar is off,
+so the null pointer is in the device/backend path (likely an
+Emscripten-OpenAL gap or a patch-era stub), NOT the reverb procs.
+Next audio session: rebuild with `--profiling-funcs` for a named WASM
+stack trace (same method that cracked the ROQ null-pointer crash),
+then stub/guard the offending call. Boot logs to reproduce:
+`?backend=webgpu&audio` → "Starting DOOM 3 main..." → trap.
