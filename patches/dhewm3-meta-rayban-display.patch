@@ -1917,10 +1917,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..d7b74c2
+index 0000000..1fe8266
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,3204 @@
+@@ -0,0 +1,3399 @@
 +/*
 +================================================================================
 +
@@ -2046,6 +2046,9 @@ index 0000000..d7b74c2
 +extern "C" SubLink g_subviewLinks[];
 +extern "C" uint32_t g_subviewLinkCount;
 +extern "C" const char* D3_WebGPU_ImageName(const void* imgPtr);
++extern "C" uint32_t g_capBloomOn;
++extern "C" float    g_capBloomThresh;
++extern "C" float    g_capBloomScale;
 +
 +// ─── Backend class ──────────────────────────────────────────────────────────
 +
@@ -2170,6 +2173,7 @@ index 0000000..d7b74c2
 +            initShadowPipelines();
 +            initFogPipeline();
 +            initHazePipeline();
++            initBloomPipelines();
 +            initBlendPipelines();
 +            initSkyPipeline();
 +            initReflectPipeline();
@@ -2849,6 +2853,104 @@ index 0000000..d7b74c2
 +        currentRenderView = currentRenderTex ? wgpuTextureCreateView(currentRenderTex, nullptr) : nullptr;
 +        currentRenderW = w; currentRenderH = h;
 +        currentRenderGen++;   // existing haze bind groups now stale
++    }
++
++    // Iter 19: bloom pipelines (bloom.wgsl) — fullscreen-triangle passes,
++    // no vertex buffers, no depth. bright/blur render into the quarter-res
++    // bloom targets; composite blends additively over the canvas.
++    void initBloomPipelines() {
++        WGPUShaderSourceWGSL wgsl = {};
++        wgsl.chain.sType = WGPUSType_ShaderSourceWGSL;
++        wgsl.code = { kWGSL_bloom, WGPU_STRLEN };
++        WGPUShaderModuleDescriptor smd = {};
++        smd.nextInChain = &wgsl.chain;
++        WGPUShaderModule mod = wgpuDeviceCreateShaderModule(device, &smd);
++        if (!mod) { fprintf(stderr, "[WebGPU] bloom.wgsl create FAILED\n"); return; }
++
++        WGPUBindGroupLayoutEntry ble[3] = {};
++        ble[0].binding = 0;
++        ble[0].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
++        ble[0].buffer.type = WGPUBufferBindingType_Uniform;
++        ble[0].buffer.minBindingSize = 32;
++        ble[1].binding = 1;
++        ble[1].visibility = WGPUShaderStage_Fragment;
++        ble[1].sampler.type = WGPUSamplerBindingType_Filtering;
++        ble[2].binding = 2;
++        ble[2].visibility = WGPUShaderStage_Fragment;
++        ble[2].texture.sampleType = WGPUTextureSampleType_Float;
++        ble[2].texture.viewDimension = WGPUTextureViewDimension_2D;
++        WGPUBindGroupLayoutDescriptor bld = {};
++        bld.entryCount = 3;
++        bld.entries = ble;
++        bloomBGL = wgpuDeviceCreateBindGroupLayout(device, &bld);
++        WGPUPipelineLayoutDescriptor pld = {};
++        pld.bindGroupLayoutCount = 1;
++        pld.bindGroupLayouts = &bloomBGL;
++        WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(device, &pld);
++
++        auto makeBloom = [&](const char* fsEntry, bool additive, const char* label) -> WGPURenderPipeline {
++            WGPUColorTargetState target = {};
++            target.format = surfaceFormat;
++            target.writeMask = WGPUColorWriteMask_All;
++            WGPUBlendState blend = {};
++            blend.color.srcFactor = WGPUBlendFactor_One;
++            blend.color.dstFactor = additive ? WGPUBlendFactor_One : WGPUBlendFactor_Zero;
++            blend.alpha.srcFactor = WGPUBlendFactor_One;
++            blend.alpha.dstFactor = additive ? WGPUBlendFactor_One : WGPUBlendFactor_Zero;
++            target.blend = &blend;
++            WGPUFragmentState frag = {};
++            frag.module = mod;
++            frag.entryPoint = { fsEntry, WGPU_STRLEN };
++            frag.targetCount = 1;
++            frag.targets = &target;
++            WGPURenderPipelineDescriptor pd = {};
++            pd.label = { label, WGPU_STRLEN };
++            pd.layout = pl;
++            pd.vertex.module = mod;
++            pd.vertex.entryPoint = { "vs_main", WGPU_STRLEN };
++            pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
++            pd.primitive.cullMode = WGPUCullMode_None;
++            pd.multisample.count = 1;
++            pd.multisample.mask = 0xFFFFFFFF;
++            pd.fragment = &frag;
++            return wgpuDeviceCreateRenderPipeline(device, &pd);
++        };
++        bloomBrightPipeline    = makeBloom("fs_bright", false, "bloomBright");
++        bloomBlurPipeline      = makeBloom("fs_blur", false, "bloomBlur");
++        bloomCompositePipeline = makeBloom("fs_composite", true, "bloomComposite");
++        wgpuPipelineLayoutRelease(pl);
++        wgpuShaderModuleRelease(mod);
++
++        for (int i = 0; i < 4; ++i) {
++            WGPUBufferDescriptor d = {};
++            d.size = 32;
++            d.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
++            bloomUB[i] = wgpuDeviceCreateBuffer(device, &d);
++        }
++    }
++
++    void ensureBloomTargets(uint32_t w, uint32_t h) {
++        uint32_t bw = w / 4u; if (bw < 64u) bw = 64u;
++        uint32_t bh = h / 4u; if (bh < 64u) bh = 64u;
++        if (bloomTexA && bloomW == bw && bloomH == bh) return;
++        if (bloomViewA) { wgpuTextureViewRelease(bloomViewA); bloomViewA = nullptr; }
++        if (bloomViewB) { wgpuTextureViewRelease(bloomViewB); bloomViewB = nullptr; }
++        if (bloomTexA)  { wgpuTextureRelease(bloomTexA); bloomTexA = nullptr; }
++        if (bloomTexB)  { wgpuTextureRelease(bloomTexB); bloomTexB = nullptr; }
++        WGPUTextureDescriptor td = {};
++        td.size = { bw, bh, 1 };
++        td.mipLevelCount = 1;
++        td.sampleCount = 1;
++        td.dimension = WGPUTextureDimension_2D;
++        td.format = surfaceFormat;
++        td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
++        td.label = { "bloom", WGPU_STRLEN };
++        bloomTexA = wgpuDeviceCreateTexture(device, &td);
++        bloomTexB = wgpuDeviceCreateTexture(device, &td);
++        bloomViewA = bloomTexA ? wgpuTextureCreateView(bloomTexA, nullptr) : nullptr;
++        bloomViewB = bloomTexB ? wgpuTextureCreateView(bloomTexB, nullptr) : nullptr;
++        bloomW = bw; bloomH = bh;
++        bloomGen++;
 +    }
 +
 +    // Iter 13a: blend light pipelines (blend.wgsl) — filter multiplies the
@@ -4233,6 +4335,8 @@ index 0000000..d7b74c2
 +                                    currentRenderTex && currentRenderView &&
 +                                    currentRenderW == (uint32_t)depthW &&
 +                                    currentRenderH == (uint32_t)depthH;
++            const bool bloomActive = bloomCompositePipeline && bloomBGL && colorTex && g_capBloomOn;
++            const bool splitGUI = hazeActive || bloomActive;   // GUI draws after post-FX
 +            WGPURenderPassColorAttachment ca = {};
 +            ca.view = color;
 +            ca.loadOp = colorCleared ? WGPULoadOp_Load : WGPULoadOp_Clear;
@@ -4301,7 +4405,7 @@ index 0000000..d7b74c2
 +            }
 +            for (uint32_t i = 0; i < lastPassCount; ++i) {
 +                const Rec& r = lastPassRecords[i];
-+                if (hazeActive && r.pad3 == 1u) continue;   // GUI moves to part B
++                if (splitGUI && r.pad3 == 1u) continue;   // GUI draws after post-FX
 +                WGPURenderPipeline p;
 +                if (r.pad3 == 1u) {
 +                    p = (r.pad1 == 2u) ? guiAddPipeline : guiAlphaPipeline;
@@ -4344,19 +4448,97 @@ index 0000000..d7b74c2
 +                        wgpuRenderPassEncoderDrawIndexed(rp2, r.indexCount, 1, 0, 0, 0);
 +                    }
 +                }
++                wgpuRenderPassEncoderEnd(rp2);
++                wgpuRenderPassEncoderRelease(rp2);
++            }
++
++            // Iter 19: bloom — copy the (post-haze) frame, bright-pass it
++            // into the quarter-res target, blur H+V, composite additively.
++            if (bloomActive) {
++                ensureCurrentRenderTarget((uint32_t)depthW, (uint32_t)depthH);
++                ensureBloomTargets((uint32_t)depthW, (uint32_t)depthH);
++                if (currentRenderTex && currentRenderView && bloomViewA && bloomViewB &&
++                    currentRenderW == (uint32_t)depthW && currentRenderH == (uint32_t)depthH) {
++                    WGPUTexelCopyTextureInfo src = {};
++                    src.texture = colorTex;
++                    WGPUTexelCopyTextureInfo dst = {};
++                    dst.texture = currentRenderTex;
++                    WGPUExtent3D ext = { currentRenderW, currentRenderH, 1 };
++                    wgpuCommandEncoderCopyTextureToTexture(enc, &src, &dst, &ext);
++
++                    // tunables (live via d3cmd r_bloomThreshold / r_bloomScale)
++                    const float tw = 1.0f / (float)bloomW, th = 1.0f / (float)bloomH;
++                    float ub0[8] = { g_capBloomThresh, 0, 0, 0,            0, 0, 0, 0 };   // bright
++                    float ub1[8] = { 0, 0, tw, th,                          1, 0, 0, 0 };   // blur H
++                    float ub2[8] = { 0, 0, tw, th,                          0, 1, 0, 0 };   // blur V
++                    float ub3[8] = { 0, g_capBloomScale, 0, 0,              0, 0, 0, 0 };   // composite
++                    wgpuQueueWriteBuffer(queue, bloomUB[0], 0, ub0, 32);
++                    wgpuQueueWriteBuffer(queue, bloomUB[1], 0, ub1, 32);
++                    wgpuQueueWriteBuffer(queue, bloomUB[2], 0, ub2, 32);
++                    wgpuQueueWriteBuffer(queue, bloomUB[3], 0, ub3, 32);
++
++                    // bind groups: rebuilt when the copy target or bloom
++                    // targets were recreated
++                    if (bloomBGGen != currentRenderGen || bloomBGCurGen != bloomGen || !bloomBG[0]) {
++                        WGPUTextureView ins[4] = { currentRenderView, bloomViewA, bloomViewB, bloomViewA };
++                        for (int i = 0; i < 4; ++i) {
++                            if (bloomBG[i]) { wgpuBindGroupRelease(bloomBG[i]); bloomBG[i] = nullptr; }
++                            WGPUBindGroupEntry e[3] = {};
++                            e[0].binding = 0; e[0].buffer = bloomUB[i]; e[0].size = 32;
++                            e[1].binding = 1; e[1].sampler = interactionLightSampler;
++                            e[2].binding = 2; e[2].textureView = ins[i];
++                            WGPUBindGroupDescriptor bgd = {};
++                            bgd.layout = bloomBGL;
++                            bgd.entryCount = 3;
++                            bgd.entries = e;
++                            bloomBG[i] = wgpuDeviceCreateBindGroup(device, &bgd);
++                        }
++                        bloomBGGen = currentRenderGen;
++                        bloomBGCurGen = bloomGen;
++                    }
++
++                    auto fxPass = [&](WGPUTextureView target, WGPULoadOp load,
++                                      WGPURenderPipeline pipe, WGPUBindGroup bg) {
++                        WGPURenderPassColorAttachment fca = {};
++                        fca.view = target;
++                        fca.loadOp = load;
++                        fca.storeOp = WGPUStoreOp_Store;
++                        fca.clearValue = { 0.0, 0.0, 0.0, 1.0 };
++                        fca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
++                        WGPURenderPassDescriptor frpd = {};
++                        frpd.colorAttachmentCount = 1;
++                        frpd.colorAttachments = &fca;
++                        WGPURenderPassEncoder frp = wgpuCommandEncoderBeginRenderPass(enc, &frpd);
++                        wgpuRenderPassEncoderSetPipeline(frp, pipe);
++                        wgpuRenderPassEncoderSetBindGroup(frp, 0, bg, 0, nullptr);
++                        wgpuRenderPassEncoderDraw(frp, 3, 1, 0, 0);
++                        wgpuRenderPassEncoderEnd(frp);
++                        wgpuRenderPassEncoderRelease(frp);
++                    };
++                    fxPass(bloomViewA, WGPULoadOp_Clear, bloomBrightPipeline, bloomBG[0]);
++                    fxPass(bloomViewB, WGPULoadOp_Clear, bloomBlurPipeline,   bloomBG[1]);
++                    fxPass(bloomViewA, WGPULoadOp_Clear, bloomBlurPipeline,   bloomBG[2]);
++                    fxPass(color,      WGPULoadOp_Load,  bloomCompositePipeline, bloomBG[3]);
++                }
++            }
++
++            // GUI overlay last (post-FX must not bloom/warp the HUD).
++            if (splitGUI) {
++                ca.loadOp = WGPULoadOp_Load;
++                WGPURenderPassEncoder rp3 = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
 +                for (uint32_t i = 0; i < lastPassCount; ++i) {
 +                    const Rec& r = lastPassRecords[i];
 +                    if (r.pad3 != 1u) continue;
 +                    WGPURenderPipeline p = (r.pad1 == 2u) ? guiAddPipeline : guiAlphaPipeline;
 +                    if (!p || !lastPassGroups[i]) continue;
-+                    wgpuRenderPassEncoderSetPipeline(rp2, p);
-+                    wgpuRenderPassEncoderSetBindGroup(rp2, 0, lastPassGroups[i], 0, nullptr);
-+                    wgpuRenderPassEncoderSetVertexBuffer(rp2, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
-+                    wgpuRenderPassEncoderSetIndexBuffer(rp2, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
-+                    wgpuRenderPassEncoderDrawIndexed(rp2, r.indexCount, 1, 0, 0, 0);
++                    wgpuRenderPassEncoderSetPipeline(rp3, p);
++                    wgpuRenderPassEncoderSetBindGroup(rp3, 0, lastPassGroups[i], 0, nullptr);
++                    wgpuRenderPassEncoderSetVertexBuffer(rp3, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
++                    wgpuRenderPassEncoderSetIndexBuffer(rp3, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
++                    wgpuRenderPassEncoderDrawIndexed(rp3, r.indexCount, 1, 0, 0, 0);
 +                }
-+                wgpuRenderPassEncoderEnd(rp2);
-+                wgpuRenderPassEncoderRelease(rp2);
++                wgpuRenderPassEncoderEnd(rp3);
++                wgpuRenderPassEncoderRelease(rp3);
 +            }
 +        }
 +    }
@@ -5102,6 +5284,19 @@ index 0000000..d7b74c2
 +    int                     cinTexW[kCinSlots] = {0};
 +    int                     cinTexH[kCinSlots] = {0};
 +    WGPUBindGroup           cinFrameGroups[kCinSlots] = {nullptr};   // transient, per frame
++    // Iter 19: bloom — quarter-res bright-pass + separable blur + additive
++    // composite over the canvas. Tunables ride g_capBloom* (cvar exports).
++    WGPUBindGroupLayout     bloomBGL = nullptr;
++    WGPURenderPipeline      bloomBrightPipeline = nullptr;
++    WGPURenderPipeline      bloomBlurPipeline = nullptr;
++    WGPURenderPipeline      bloomCompositePipeline = nullptr;
++    WGPUTexture             bloomTexA = nullptr, bloomTexB = nullptr;
++    WGPUTextureView         bloomViewA = nullptr, bloomViewB = nullptr;
++    uint32_t                bloomW = 0, bloomH = 0;
++    uint32_t                bloomGen = 0;
++    WGPUBuffer              bloomUB[4] = {nullptr};      // bright, blurH, blurV, composite
++    WGPUBindGroup           bloomBG[4] = {nullptr};
++    uint32_t                bloomBGGen = 0, bloomBGCurGen = 0;
 +    // Iter 6.8: on-device determinism self-test. Renders the identical
 +    // record set twice into two offscreen textures, reads both back,
 +    // byte-compares. Sidesteps the canvas-readback trap (WebGPU canvases
@@ -5158,7 +5353,7 @@ index 0000000..0f9c8e6
 +    return nullptr;
 +}
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
-index 7914093..2bcb018 100644
+index 7914093..cb4f589 100644
 --- a/neo/renderer/RenderSystem_init.cpp
 +++ b/neo/renderer/RenderSystem_init.cpp
 @@ -39,6 +39,11 @@ If you have questions concerning this license or the applicable additional terms
@@ -5173,7 +5368,7 @@ index 7914093..2bcb018 100644
  
  #include "framework/GameCallbacks_local.h"
  #include "framework/Game.h"
-@@ -102,6 +107,15 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
+@@ -102,6 +107,21 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
  
  idCVar r_skipSuppress( "r_skipSuppress", "0", CVAR_RENDERER | CVAR_BOOL, "ignore the per-view suppressions" );
  idCVar r_skipPostProcess( "r_skipPostProcess", "0", CVAR_RENDERER | CVAR_BOOL, "skip all post-process renderings" );
@@ -5183,13 +5378,19 @@ index 7914093..2bcb018 100644
 +// "webgpu" is a fail-loud stub until Phase 4b–5 fill it in. See
 +// neo/renderer/RenderBackend.h + WEBGPU_PORT_PLAN.md for the cutover plan.
 +idCVar r_backend( "r_backend", "gl", CVAR_RENDERER | CVAR_INIT, "render backend: gl | webgpu" );
++// Iter 19: WebGPU bloom post-process (vanilla dhewm3 has none). Live-tunable
++// on-device via d3cmd("r_bloomThreshold 0.5") etc — exported to the backend
++// each view by RB_BeginDrawingView.
++idCVar r_bloom( "r_bloom", "0", CVAR_RENDERER | CVAR_BOOL, "WebGPU bloom post-process" );
++idCVar r_bloomThreshold( "r_bloomThreshold", "0.5", CVAR_RENDERER | CVAR_FLOAT, "bloom bright-pass threshold (0..1)" );
++idCVar r_bloomScale( "r_bloomScale", "1.25", CVAR_RENDERER | CVAR_FLOAT, "bloom intensity" );
 +idCVar r_skipGLDraw( "r_skipGLDraw", "0", CVAR_RENDERER | CVAR_BOOL,
 +	"skip GL draw calls (WebGPU-primary cutover; the WebGPU echo renders instead). "
 +	"Tiny views (lightgem) keep drawing so gameplay light readback works." );
  idCVar r_skipLightScale( "r_skipLightScale", "0", CVAR_RENDERER | CVAR_BOOL, "don't do any post-interaction light scaling, makes things dim on low-dynamic range cards" );
  idCVar r_skipInteractions( "r_skipInteractions", "0", CVAR_RENDERER | CVAR_BOOL, "skip all light/surface interaction drawing" );
  idCVar r_skipDynamicTextures( "r_skipDynamicTextures", "0", CVAR_RENDERER | CVAR_BOOL, "don't dynamically create textures" );
-@@ -158,6 +172,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
+@@ -158,6 +178,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
  idCVar r_useExternalShadows( "r_useExternalShadows", "1", CVAR_RENDERER | CVAR_INTEGER, "1 = skip drawing caps when outside the light volume, 2 = force to no caps for testing", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
  idCVar r_useOptimizedShadows( "r_useOptimizedShadows", "1", CVAR_RENDERER | CVAR_BOOL, "use the dmap generated static shadow volumes" );
  idCVar r_useScissor( "r_useScissor", "1", CVAR_RENDERER | CVAR_BOOL, "scissor clip as portals and lights are processed" );
@@ -5197,7 +5398,7 @@ index 7914093..2bcb018 100644
  idCVar r_useCombinerDisplayLists( "r_useCombinerDisplayLists", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "put all nvidia register combiner programming in display lists" );
  idCVar r_useDepthBoundsTest( "r_useDepthBoundsTest", "1", CVAR_RENDERER | CVAR_BOOL, "use depth bounds test to reduce shadow fill" );
  
-@@ -819,11 +834,63 @@ void R_InitOpenGL( void ) {
+@@ -819,11 +840,63 @@ void R_InitOpenGL( void ) {
  		r_multiSamples.SetInteger( 0 );
  	}
  
@@ -5261,7 +5462,7 @@ index 7914093..2bcb018 100644
  
  #include "renderer/qgl_proc.h"
  
-@@ -2505,6 +2572,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
+@@ -2505,6 +2578,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
  	// is destroyed (relevant when starting a mod which also recreates window)
  	Sys_ShutdownInput();
  
@@ -5845,7 +6046,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..663daf8 100644
+index c83ebb5..e6434b3 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -5856,7 +6057,7 @@ index c83ebb5..663daf8 100644
  
  /*
  
-@@ -38,6 +39,704 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +39,709 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -6005,6 +6206,11 @@ index c83ebb5..663daf8 100644
 +    int      g_cinFrameH[kWGPUCinSlots];
 +    uint32_t g_cinFrameCount = 0;
 +    int      g_cinPendingSlot = -1;
++    // Iter 19: bloom tunables, refreshed per view from the r_bloom* cvars
++    // (the backend has no cvar access by design).
++    uint32_t g_capBloomOn = 0;
++    float    g_capBloomThresh = 0.62f;
++    float    g_capBloomScale = 0.9f;
 +}
 +
 +// Iter 17: stash a decoded cinematic frame (called from
@@ -6561,7 +6767,7 @@ index c83ebb5..663daf8 100644
  
  /*
  =================
-@@ -49,6 +748,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +753,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -6577,7 +6783,7 @@ index c83ebb5..663daf8 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +786,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +791,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -6593,7 +6799,7 @@ index c83ebb5..663daf8 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +833,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +838,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -6610,7 +6816,7 @@ index c83ebb5..663daf8 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +893,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +898,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -6618,7 +6824,7 @@ index c83ebb5..663daf8 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1120,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1125,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -6631,7 +6837,7 @@ index c83ebb5..663daf8 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1289,41 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1294,48 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
@@ -6639,6 +6845,13 @@ index c83ebb5..663daf8 100644
 +	memcpy(g_lastProjMatrix, viewDef->projectionMatrix, sizeof(g_lastProjMatrix));
 +	memcpy(g_lastViewMatrix, viewDef->worldSpace.modelViewMatrix, sizeof(g_lastViewMatrix));
 +	g_captureSlotUsedThisFrame = 0;
++	// Iter 19: export the bloom tunables for the backend (live d3cmd tuning).
++	{
++		extern idCVar r_bloom, r_bloomThreshold, r_bloomScale;
++		g_capBloomOn = r_bloom.GetBool() ? 1u : 0u;
++		g_capBloomThresh = r_bloomThreshold.GetFloat();
++		g_capBloomScale = r_bloomScale.GetFloat();
++	}
 +	// Iter 6.6: the multi-surface accumulator is intentionally NOT reset
 +	// here. RB_BeginDrawingView runs once per VIEW (main view, lightgem,
 +	// mirror subviews...), so a reset here wiped the records the main view
@@ -6685,10 +6898,10 @@ index c83ebb5..663daf8 100644
  	// ensures that depth writes are enabled for the depth clear
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..43684ae
+index 0000000..864e8b2
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,753 @@
+@@ -0,0 +1,822 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -6827,6 +7040,75 @@ index 0000000..43684ae
 +"    let c0 = textureSample(t_proj, samp, uv);\n"
 +"    let c1 = textureSample(t_falloff, samp, vec2<f32>(in.sF, 0.5));\n"
 +"    return c0 * c1 * u.color;\n"
++"}\n"
++"";
++
++// bloom.wgsl
++static const char* const kWGSL_bloom = "// bloom.wgsl — WebGPU-native bloom post-process (iter 19).\n"
++"//\n"
++"// Vanilla dhewm3 has no bloom at all; this adds the RBDOOM-style glow the\n"
++"// PC reference shots show (halos on emissives — alarm lights, fixtures,\n"
++"// monitors). Three entry points share one module + bind group layout:\n"
++"//   fs_bright    — threshold the scene copy into the quarter-res target\n"
++"//   fs_blur      — 9-tap separable Gaussian (direction in u.dir)\n"
++"//   fs_composite — additive blend of the blurred glow over the canvas\n"
++"// All draws are bufferless fullscreen triangles (vertex_index trick).\n"
++"//\n"
++"// params: x = threshold, y = intensity, z = 1/texW, w = 1/texH\n"
++"// dir:    blur direction in texels (1,0) or (0,1); zw unused\n"
++"\n"
++"struct BloomUniforms {\n"
++"    params: vec4<f32>,\n"
++"    dir: vec4<f32>,\n"
++"};\n"
++"\n"
++"@group(0) @binding(0) var<uniform> u: BloomUniforms;\n"
++"@group(0) @binding(1) var samp: sampler;\n"
++"@group(0) @binding(2) var tex: texture_2d<f32>;\n"
++"\n"
++"struct VSOut {\n"
++"    @builtin(position) pos: vec4<f32>,\n"
++"    @location(0) uv: vec2<f32>,\n"
++"};\n"
++"\n"
++"@vertex\n"
++"fn vs_main(@builtin(vertex_index) vi: u32) -> VSOut {\n"
++"    var out: VSOut;\n"
++"    let x = f32(i32(vi & 1u) * 4 - 1);   // -1, 3, -1\n"
++"    let y = f32(i32(vi >> 1u) * 4 - 1);  // -1, -1, 3\n"
++"    out.pos = vec4<f32>(x, y, 0.0, 1.0);\n"
++"    out.uv = vec2<f32>(x, -y) * 0.5 + vec2<f32>(0.5, 0.5);\n"
++"    return out;\n"
++"}\n"
++"\n"
++"@fragment\n"
++"fn fs_bright(in: VSOut) -> @location(0) vec4<f32> {\n"
++"    let c = textureSampleLevel(tex, samp, in.uv, 0.0).rgb;\n"
++"    let t = u.params.x;\n"
++"    // soft knee: rescale what survives the threshold back to 0..1\n"
++"    let b = max(c - vec3<f32>(t), vec3<f32>(0.0)) / max(1.0 - t, 0.001);\n"
++"    return vec4<f32>(b, 1.0);\n"
++"}\n"
++"\n"
++"@fragment\n"
++"fn fs_blur(in: VSOut) -> @location(0) vec4<f32> {\n"
++"    let step = u.dir.xy * vec2<f32>(u.params.z, u.params.w);\n"
++"    var c = textureSampleLevel(tex, samp, in.uv, 0.0).rgb * 0.227027;\n"
++"    c += textureSampleLevel(tex, samp, in.uv + step * 1.0, 0.0).rgb * 0.1945946;\n"
++"    c += textureSampleLevel(tex, samp, in.uv - step * 1.0, 0.0).rgb * 0.1945946;\n"
++"    c += textureSampleLevel(tex, samp, in.uv + step * 2.0, 0.0).rgb * 0.1216216;\n"
++"    c += textureSampleLevel(tex, samp, in.uv - step * 2.0, 0.0).rgb * 0.1216216;\n"
++"    c += textureSampleLevel(tex, samp, in.uv + step * 3.0, 0.0).rgb * 0.054054;\n"
++"    c += textureSampleLevel(tex, samp, in.uv - step * 3.0, 0.0).rgb * 0.054054;\n"
++"    c += textureSampleLevel(tex, samp, in.uv + step * 4.0, 0.0).rgb * 0.016216;\n"
++"    c += textureSampleLevel(tex, samp, in.uv - step * 4.0, 0.0).rgb * 0.016216;\n"
++"    return vec4<f32>(c, 1.0);\n"
++"}\n"
++"\n"
++"@fragment\n"
++"fn fs_composite(in: VSOut) -> @location(0) vec4<f32> {\n"
++"    let b = textureSampleLevel(tex, samp, in.uv, 0.0).rgb;\n"
++"    return vec4<f32>(b * u.params.y, 1.0);   // pipeline blend is additive\n"
 +"}\n"
 +"";
 +

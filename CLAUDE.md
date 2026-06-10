@@ -934,3 +934,25 @@ kMaxRecordSlots in the backend!). Verified: zero fallbacks at the
 reported area, correct bordered HUD, no validation errors.
 `?shadows` flag added: stencil shadows (iter 9) are implemented but
 default-off for perf — flag enables for on-device A/B.
+
+**Iter 19 — BLOOM + shadows-on-by-default (2026-06-10).** Vanilla
+dhewm3 has NO bloom (the PC reference shots with glowing emissives are
+RBDOOM-3-BFG-class builds) — added WebGPU-native: canvas copy →
+quarter-res bright pass (soft-knee threshold) → separable 9-tap
+Gaussian (H+V ping-pong) → additive fullscreen composite, all
+bufferless fullscreen triangles (vertex_index), one shared BGL, no
+depth. Final pass restructure: the GUI overlay now ALWAYS draws in its
+own pass after post-FX when haze or bloom is active (post-FX must not
+bloom/warp the HUD). Tunables are LIVE on-device: cvars r_bloom /
+r_bloomThreshold (0.5) / r_bloomScale (1.25) exported to the backend
+per view via RB_BeginDrawingView globals (the backend has no cvar
+access by design) — d3cmd("r_bloomThreshold 0.4") etc. Defaults: ON
+under WebGPU-primary, ?nobloom opts out. STENCIL SHADOWS now also ON
+by default under WebGPU-primary (user direction); ?noshadows opts out.
+Verified headed Chrome: glow on fixtures/doorways, live tuning works,
+r_bloom 0 kills it clean, zero validation errors, A/B quantified
+(bright-region mean delta 6.4 at default, 2.4% px >10 at strong).
+GL-PARITY NOTE on "black materials": the spawn-area black crate is
+near-black in GL TOO (dark material + vanilla's dark lighting, no
+working gamma) — the PC reference's visible version comes from
+RBDOOM's HDR pipeline, not something our port lost.

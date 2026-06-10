@@ -618,11 +618,21 @@ function buildArguments(config) {
     // shadows are the single biggest cost in DOOM 3, so disable them, run the
     // low machine spec, and downsize textures for faster uploads.
     "+set", "com_machineSpec", "0",
-    // Stencil shadows are fully implemented in the WebGPU backend (iter 9)
-    // but off by default for perf (the CPU shadow-volume build is the cost
-    // at WASM speeds). ?shadows enables for A/B.
+    // Stencil shadows (iter 9, WebGPU) — ON by default under WebGPU-primary
+    // per user direction; ?noshadows opts out (the CPU shadow-volume build
+    // is the perf cost at WASM speeds). GL paths keep them off unless
+    // ?shadows forces.
     "+set", "r_shadows",
-        (/[?&]shadows\b/.test(typeof window !== "undefined" ? window.location.search : "")) ? "1" : "0",
+        ((/[?&]backend=webgpu\b/.test(typeof window !== "undefined" ? window.location.search : "")
+          && !/[?&]echo\b/.test(typeof window !== "undefined" ? window.location.search : "")
+          && !/[?&]noshadows\b/.test(typeof window !== "undefined" ? window.location.search : ""))
+         || /[?&]shadows\b/.test(typeof window !== "undefined" ? window.location.search : "")) ? "1" : "0",
+    // Iter 19: WebGPU bloom — ON under WebGPU-primary; ?nobloom opts out.
+    // Live-tune: d3cmd("r_bloomThreshold 0.5"), d3cmd("r_bloomScale 1.2").
+    "+set", "r_bloom",
+        (/[?&]backend=webgpu\b/.test(typeof window !== "undefined" ? window.location.search : "")
+         && !/[?&]echo\b/.test(typeof window !== "undefined" ? window.location.search : "")
+         && !/[?&]nobloom\b/.test(typeof window !== "undefined" ? window.location.search : "")) ? "1" : "0",
     // Skip ROQ cinematic decoding. The RoQ decoder calls a null function pointer
     // in this WASM build (idCinematicLocal::ImageForTime, reached from
     // RB_BindVariableStageImage when a surface has a video texture), which traps
