@@ -1057,6 +1057,52 @@ index a4883b5..095506b 100644
  
  extern idCVar	r_aspectRatio;
  
+diff --git a/neo/renderer/Cinematic.cpp b/neo/renderer/Cinematic.cpp
+index e6bb4aa..e173c9f 100644
+--- a/neo/renderer/Cinematic.cpp
++++ b/neo/renderer/Cinematic.cpp
+@@ -402,6 +402,17 @@ cinData_t idCinematicLocal::ImageForTime( int thisTime ) {
+ 		return cinData;
+ 	}
+ 
++	// A GUI can ResetTime() a cinematic whose .roq was never opened (missing
++	// from the pak) or already shut down — status flips to FMV_PLAY with no
++	// file. RoQInterrupt would then virtual-call through the NULL idFile
++	// (under WASM a null deref reads linear memory instead of faulting, so it
++	// traps later as "null function"), and the buf==NULL pump below would
++	// never terminate. Park the cinematic in IDLE instead.
++	if ( !iFile ) {
++		status = FMV_IDLE;
++		return cinData;
++	}
++
+ 	if ( buf == NULL || startTime == -1 ) {
+ 		if ( startTime == -1 ) {
+ 			RoQReset();
+@@ -422,7 +433,9 @@ cinData_t idCinematicLocal::ImageForTime( int thisTime ) {
+ 	}
+ 
+ 	if ( buf == NULL ) {
+-		while( buf == NULL ) {
++		// also bail on EOF/IDLE — without the status check this pump spins
++		// forever if RoQInterrupt can't produce a frame
++		while( buf == NULL && status == FMV_PLAY ) {
+ 			RoQInterrupt();
+ 		}
+ 	} else {
+@@ -1427,6 +1440,12 @@ idCinematicLocal::RoQInterrupt
+ void idCinematicLocal::RoQInterrupt(void) {
+ 	byte				*framedata;
+ 
++	// belt and braces for the NULL-idFile trap guarded in ImageForTime
++	if ( !iFile ) {
++		status = FMV_EOF;
++		return;
++	}
++
+ 	iFile->Read( file, RoQFrameSize+8 );
+ 	if ( RoQPlayed >= ROQSize ) {
+ 		if (looping) {
 diff --git a/neo/renderer/Image_load.cpp b/neo/renderer/Image_load.cpp
 index f9ae002..4f86a5e 100644
 --- a/neo/renderer/Image_load.cpp

@@ -790,3 +790,28 @@ boots" lesson is RETRACTED — any 2 extra args would have trapped.
 `?audio` stays opt-in: the reduced pak strips `sound/`, so everything
 plays the engine-default beep — shipping real audio = pak-reducer
 scope (add sound/ subset), not engine work.
+
+**ROQ NULL-FUNCTION ROOT CAUSE + FIX (2026-06-10).** The crash that
+forced `r_skipROQ 1` is solved. Named stack (profiling build):
+`RoQInterrupt ← ImageForTime ← idMaterial::UpdateCinematic ←
+idWindow::StateChanged/Trigger` — a GUI screen triggering its video.
+Chain: the reduced pak strips `video/`, so `InitFromFile` fails and
+leaves `iFile = NULL`… but `ResetTime()` later sets `status = FMV_PLAY`
+UNCONDITIONALLY, and `ImageForTime` then pumps `RoQInterrupt()`, whose
+first act is `iFile->Read(...)` — a virtual call through NULL. Under
+WASM a null deref doesn't fault (address 0 is valid linear memory), so
+the garbage vtable load surfaces as "null function". Fixes (in the
+patch): (1) `ImageForTime` parks the cinematic FMV_IDLE when `iFile`
+is NULL; (2) `RoQInterrupt` entry guard; (3) the `while(buf==NULL)`
+pump now also checks `status == FMV_PLAY` (it could spin forever).
+Verified: `?args=%2Bset%20r_skipROQ%200` boots + full camera spin with
+NO trap on the stripped pak, AND on a local test pak with the real
+`video/marscity/*.RoQ` files injected the decoder runs clean (GUI
+triggers fire, no trap, no decode errors). r_skipROQ stays 1 by
+default for now (videos aren't in the shipped pak; flipping it buys
+nothing until they are) — but it is now SAFE to turn off, and real
+playback is one pak-reducer change away (include `video/` subset,
+~12MB for the marscity set). The GOG installer extraction recipe for
+testing: `innoextract --include "base/pak003.pk4" setup_doom_3*.exe`
+(marscity videos live in pak003; sounds for the future ?audio work
+live in pak001/pak004 as .ogg).
