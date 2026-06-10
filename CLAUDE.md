@@ -389,9 +389,33 @@ green-checker geometry tracking the camera.)
   bit-identical for the future pre-pass).
 - Verified headed Chrome: echo shows the real corridor (floor grate,
   walls, fixtures, real lighting); determinism self-test IDENTICAL
-  with 256 surfaces + real textures. Echo runs brighter than GL
-  (no gamma term, ambient-light approximation, no specular LUT) —
-  fidelity polish is future work.
+  with 256 surfaces + real textures.
+
+**Device check #2 (2026-06-09 evening, real iPhone): the real-content
+echo HOLDS STEADY exactly where GL flickers** — the eyeball A/B is
+confirmed with actual content (the earlier black-canvas version was
+vacuous). Chunky-tile conclusion final: visual + byte-level, same
+device.
+
+**Iter 8a — the green/untextured echo, root-caused (2026-06-09).**
+User reported the echo green-tinted and seemingly untextured. Cause:
+the CPU image cache capped at 512 slots; a full level loads far more
+images, so most level textures never got cached and every miss fell
+back to the GREEN CHECKER diffuse (the tint) or WHITE falloff (lights
+reaching infinitely — the washes). A per-slot miss logger
+(`matGroup MISS bump=..`) showed 123 affected tuples. Fix: CPU cache
+512 → 2048, GPU texture cache → 2048, material groups → 1024. Misses
+now 0; headed Chrome echo matches GL tones (dark rock, catwalk, warm
+fixtures, viewmodel hands). Also added fidelity params (uniforms
+192 → 224B): ambient-light flag (N·L=1, no spec), vertex-color
+modulate/add (SVC modes), r_brightness + 1/r_gamma per pass (matches
+r_gammaInShader), specular-map doubling. The probe methodology that
+cracked it: paint suspected term as color channels → fixed-coordinate
+content probe → named per-image cache inventory → per-slot miss
+logger. "GL not better lit" from the same report is likely positional
+(the catwalk-area lights use falloffs that were already in the pak);
+the new pak is confirmed live (deployed pak central directory contains
+all 53 lights/*.tga; boot line reads "62.8 MB" vs old "61.7 MB").
 
 ### Mobile / iOS (hard-won)
 
