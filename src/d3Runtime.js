@@ -636,11 +636,15 @@ function buildArguments(config) {
     // (no batching), adding massive submission overhead. r_skipPostProcess 1
     // discards both the framebuffer copy AND the heat-haze surface itself
     // (the surface is auto-sorted to SS_POST_PROCESS when it references
-    // _currentRender per Material.cpp:2223). Net effect: massive WebKit GPU
-    // pressure drop, slightly-flat-looking heat sources (no waver behind hot
-    // pipes/vents). ?heathaze re-enables for A/B.
+    // _currentRender per Material.cpp:2223). ?heathaze re-enables for GL A/B.
+    // Iter 16: under WebGPU-primary the skip is OFF — the WebGPU backend
+    // replays heat-haze stages against its own single canvas copy per frame
+    // (one copyTextureToTexture, none of the GL blit storm: GL draws are
+    // skipped via r_skipGLDraw and the GL copy is gated in CopyFramebuffer).
     "+set", "r_skipPostProcess",
-        (/[?&]heathaze\b/.test(typeof window !== "undefined" ? window.location.search : "")) ? "0" : "1",
+        ((/[?&]backend=webgpu\b/.test(typeof window !== "undefined" ? window.location.search : "")
+          && !/[?&]echo\b/.test(typeof window !== "undefined" ? window.location.search : ""))
+         || /[?&]heathaze\b/.test(typeof window !== "undefined" ? window.location.search : "")) ? "0" : "1",
     // image_downSize=0 disables the downsize pass entirely (full-resolution
     // texture uploads). Set when ?dsl=0 explicitly chosen via runtime config.
     "+set", "image_downSize", config.imageDownSizeLimit === 0 ? "0" : "1",

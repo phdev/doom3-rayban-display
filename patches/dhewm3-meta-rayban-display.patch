@@ -1104,7 +1104,7 @@ index e6bb4aa..e173c9f 100644
  	if ( RoQPlayed >= ROQSize ) {
  		if (looping) {
 diff --git a/neo/renderer/Image_load.cpp b/neo/renderer/Image_load.cpp
-index f9ae002..4f86a5e 100644
+index f9ae002..8429a89 100644
 --- a/neo/renderer/Image_load.cpp
 +++ b/neo/renderer/Image_load.cpp
 @@ -27,6 +27,13 @@ If you have questions concerning this license or the applicable additional terms
@@ -1143,7 +1143,7 @@ index f9ae002..4f86a5e 100644
  	int			scaled_width, scaled_height;
  	int			width, height;
  	int			i;
-@@ -1907,6 +1922,16 @@ CopyFramebuffer
+@@ -1907,6 +1922,22 @@ CopyFramebuffer
  ====================
  */
  void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bool useOversizedBuffer ) {
@@ -1152,15 +1152,21 @@ index f9ae002..4f86a5e 100644
 +	// copied: this image was meant to hold the render of the view that just
 +	// finished (mirror/monitor subview). The WebGPU backend substitutes its
 +	// own offscreen render of that view wherever this image is sampled.
++	// Iter 16: post-process copies (_currentRender for heat haze, _scratch
++	// for fullscreen FX) are MID-view framebuffer grabs, not subview
++	// results — noting them would wrongly re-route every sample of those
++	// images to a subview target. The haze pipeline takes its own copy.
 +	extern idCVar r_skipGLDraw;
 +	if ( r_skipGLDraw.GetBool() ) {
-+		D3_WebGPU_NoteSubviewCopy( (void*)this );
++		if ( imgName.Icmp( "_currentRender" ) != 0 && imgName.Icmp( "_scratch" ) != 0 ) {
++			D3_WebGPU_NoteSubviewCopy( (void*)this );
++		}
 +		return;
 +	}
  	Bind();
  
  	if ( cvarSystem->GetCVarBool( "g_lowresFullscreenFX" ) ) {
-@@ -1932,7 +1957,12 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
+@@ -1932,7 +1963,12 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
  		uploadWidth = potWidth;
  		uploadHeight = potHeight;
  		if ( potWidth == imageWidth && potHeight == imageHeight ) {
@@ -1174,7 +1180,7 @@ index f9ae002..4f86a5e 100644
  		} else {
  			byte	*junk;
  			// we need to create a dummy image with power of two dimensions,
-@@ -1945,7 +1975,10 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
+@@ -1945,7 +1981,10 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
  				junk[i+1] = 255;
  			}
  #endif
@@ -1911,10 +1917,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..5e3e9da
+index 0000000..8be710e
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,2835 @@
+@@ -0,0 +1,3106 @@
 +/*
 +================================================================================
 +
@@ -2084,7 +2090,9 @@ index 0000000..5e3e9da
 +            WGPUSurfaceConfiguration cfg = {};
 +            cfg.device = device;
 +            cfg.format = surfaceFormat;
-+            cfg.usage = WGPUTextureUsage_RenderAttachment;
++            // CopySrc: iter 16's heat haze copies the canvas into its
++            // _currentRender substitute between the final-pass halves.
++            cfg.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc;
 +            cfg.alphaMode = WGPUCompositeAlphaMode_Auto;
 +            cfg.width = (uint32_t)w;
 +            cfg.height = (uint32_t)h;
@@ -2160,6 +2168,7 @@ index 0000000..5e3e9da
 +            initPassPipelines();
 +            initShadowPipelines();
 +            initFogPipeline();
++            initHazePipeline();
 +            initBlendPipelines();
 +            initSkyPipeline();
 +            initReflectPipeline();
@@ -2187,7 +2196,7 @@ index 0000000..5e3e9da
 +                if (multiOk) {
 +                    // Full echo: depth pre-pass + additive lit pass, exactly
 +                    // the structure the determinism self-test exercises.
-+                    encodeRecordsPass(enc, v, depthView);
++                    encodeRecordsPass(enc, v, depthView, st.texture);
 +                } else {
 +                    // Boot/fallback: teal clear + textured demo quad.
 +                    float ub[32] = {
@@ -2575,6 +2584,8 @@ index 0000000..5e3e9da
 +        passOpaquePipeline = makeVariant(WGPUBlendFactor_One, WGPUBlendFactor_Zero, true,  WGPUCompareFunction_LessEqual, "passOpaque");
 +        passAddPipeline    = makeVariant(WGPUBlendFactor_One, WGPUBlendFactor_One,  false, WGPUCompareFunction_LessEqual, "passAdditive");
 +        passAlphaPipeline  = makeVariant(WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_OneMinusSrcAlpha, false, WGPUCompareFunction_LessEqual, "passAlpha");
++        // Iter 16: 'blend filter' stages (gl_dst_color, gl_zero) — glass tints.
++        passFilterPipeline = makeVariant(WGPUBlendFactor_Dst, WGPUBlendFactor_Zero, false, WGPUCompareFunction_LessEqual, "passFilter");
 +        // Iter 8d: 2D overlay variants (HUD/menus) — no depth dependence
 +        guiAddPipeline     = makeVariant(WGPUBlendFactor_One, WGPUBlendFactor_One,  false, WGPUCompareFunction_Always, "guiAdditive");
 +        guiAlphaPipeline   = makeVariant(WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_OneMinusSrcAlpha, false, WGPUCompareFunction_Always, "guiAlpha");
@@ -2740,6 +2751,103 @@ index 0000000..5e3e9da
 +        fogPipeline = wgpuDeviceCreateRenderPipeline(device, &pd);
 +        wgpuPipelineLayoutRelease(pl);
 +        wgpuShaderModuleRelease(mod);
++    }
++
++    // Iter 16: heat-haze pipeline (haze.wgsl) — replaces the framebuffer
++    // pixel with a deflected sample of the canvas copy (One/Zero), depth
++    // LessEqual without writes (post-process sorts after everything).
++    // Explicit layout: uniform(128) + sampler + 3 textures (canvas copy,
++    // normal map, mask).
++    void initHazePipeline() {
++        WGPUShaderSourceWGSL wgsl = {};
++        wgsl.chain.sType = WGPUSType_ShaderSourceWGSL;
++        wgsl.code = { kWGSL_haze, WGPU_STRLEN };
++        WGPUShaderModuleDescriptor smd = {};
++        smd.nextInChain = &wgsl.chain;
++        WGPUShaderModule mod = wgpuDeviceCreateShaderModule(device, &smd);
++        if (!mod) { fprintf(stderr, "[WebGPU] haze.wgsl create FAILED\n"); return; }
++
++        WGPUBindGroupLayoutEntry ble[5] = {};
++        ble[0].binding = 0;
++        ble[0].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
++        ble[0].buffer.type = WGPUBufferBindingType_Uniform;
++        ble[0].buffer.minBindingSize = 128;
++        ble[1].binding = 1;
++        ble[1].visibility = WGPUShaderStage_Fragment;
++        ble[1].sampler.type = WGPUSamplerBindingType_Filtering;
++        ble[2].binding = 2;
++        ble[2].visibility = WGPUShaderStage_Fragment;
++        ble[2].texture.sampleType = WGPUTextureSampleType_Float;
++        ble[2].texture.viewDimension = WGPUTextureViewDimension_2D;
++        ble[3] = ble[2]; ble[3].binding = 3;
++        ble[4] = ble[2]; ble[4].binding = 4;
++        WGPUBindGroupLayoutDescriptor bld = {};
++        bld.entryCount = 5;
++        bld.entries = ble;
++        hazeBGL = wgpuDeviceCreateBindGroupLayout(device, &bld);
++        WGPUPipelineLayoutDescriptor pld = {};
++        pld.bindGroupLayoutCount = 1;
++        pld.bindGroupLayouts = &hazeBGL;
++        WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(device, &pld);
++
++        WGPUDepthStencilState dss = {};
++        dss.format = WGPUTextureFormat_Depth24PlusStencil8;
++        dss.depthWriteEnabled = WGPUOptionalBool_False;
++        dss.depthCompare = WGPUCompareFunction_LessEqual;
++        dss.stencilFront.compare = WGPUCompareFunction_Always;
++        dss.stencilBack.compare  = WGPUCompareFunction_Always;
++        dss.stencilFront.failOp = dss.stencilFront.depthFailOp = dss.stencilFront.passOp = WGPUStencilOperation_Keep;
++        dss.stencilBack.failOp  = dss.stencilBack.depthFailOp  = dss.stencilBack.passOp  = WGPUStencilOperation_Keep;
++        WGPUColorTargetState target = {};
++        target.format = surfaceFormat;
++        target.writeMask = WGPUColorWriteMask_All;
++        WGPUBlendState blend = {};
++        blend.color.srcFactor = WGPUBlendFactor_One;
++        blend.color.dstFactor = WGPUBlendFactor_Zero;
++        blend.alpha.srcFactor = WGPUBlendFactor_One;
++        blend.alpha.dstFactor = WGPUBlendFactor_Zero;
++        target.blend = &blend;
++        WGPUFragmentState frag = {};
++        frag.module = mod;
++        frag.entryPoint = { "fs_main", WGPU_STRLEN };
++        frag.targetCount = 1;
++        frag.targets = &target;
++        WGPURenderPipelineDescriptor pd = {};
++        pd.label = { "haze", WGPU_STRLEN };
++        pd.layout = pl;
++        pd.vertex.module = mod;
++        pd.vertex.entryPoint = { "vs_main", WGPU_STRLEN };
++        pd.vertex.bufferCount = 1;
++        pd.vertex.buffers = drawVertLayout();
++        pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
++        pd.primitive.cullMode = WGPUCullMode_None;
++        pd.multisample.count = 1;
++        pd.multisample.mask = 0xFFFFFFFF;
++        pd.fragment = &frag;
++        pd.depthStencil = &dss;
++        hazePipeline = wgpuDeviceCreateRenderPipeline(device, &pd);
++        wgpuPipelineLayoutRelease(pl);
++        wgpuShaderModuleRelease(mod);
++    }
++
++    // Iter 16: the _currentRender substitute — a canvas-sized texture the
++    // final pass copies the frame into right before haze surfaces draw.
++    void ensureCurrentRenderTarget(uint32_t w, uint32_t h) {
++        if (currentRenderTex && currentRenderW == w && currentRenderH == h) return;
++        if (currentRenderView) { wgpuTextureViewRelease(currentRenderView); currentRenderView = nullptr; }
++        if (currentRenderTex)  { wgpuTextureRelease(currentRenderTex); currentRenderTex = nullptr; }
++        WGPUTextureDescriptor td = {};
++        td.size = { w, h, 1 };
++        td.mipLevelCount = 1;
++        td.sampleCount = 1;
++        td.dimension = WGPUTextureDimension_2D;
++        td.format = surfaceFormat;
++        td.usage = WGPUTextureUsage_CopyDst | WGPUTextureUsage_TextureBinding;
++        td.label = { "currentRender", WGPU_STRLEN };
++        currentRenderTex = wgpuDeviceCreateTexture(device, &td);
++        currentRenderView = currentRenderTex ? wgpuTextureCreateView(currentRenderTex, nullptr) : nullptr;
++        currentRenderW = w; currentRenderH = h;
++        currentRenderGen++;   // existing haze bind groups now stale
 +    }
 +
 +    // Iter 13a: blend light pipelines (blend.wgsl) — filter multiplies the
@@ -3722,6 +3830,102 @@ index 0000000..5e3e9da
 +            g_blendRecordCount = 0;
 +        }
 +
++        // Iter 16: drain heat-haze records. Geometry rides DEDICATED
++        // accumulators (post-process surfaces capture after the shared one
++        // is full). Bind groups carry the canvas copy + normal + mask;
++        // rebuilt when images or the copy target generation change.
++        {
++            extern Rec      g_hazeRecords[];
++            extern void*    g_hazeImagePtrs[][2];
++            extern uint32_t g_hazeRecordCount;
++            extern uint8_t  g_hazeVertsAccum[];
++            extern uint16_t g_hazeIndexesAccum[];
++            extern uint32_t g_hazeVertBytes;
++            extern uint32_t g_hazeIndexBytes;
++            uint32_t hn = 0;
++            if (g_hazeRecordCount > 0 && lastRecordCount > 0 && hazeBGL && hazePipeline) {
++                ensureCurrentRenderTarget((uint32_t)depthW, (uint32_t)depthH);
++                if (g_hazeVertBytes > hazeVertexCap) {
++                    if (hazeVertexBuf) wgpuBufferRelease(hazeVertexBuf);
++                    WGPUBufferDescriptor d = {};
++                    d.size = (g_hazeVertBytes + 0xFFFFu) & ~0xFFFFu;
++                    d.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
++                    hazeVertexBuf = wgpuDeviceCreateBuffer(device, &d);
++                    hazeVertexCap = (uint32_t)d.size;
++                }
++                if (g_hazeIndexBytes > hazeIndexCap) {
++                    if (hazeIndexBuf) wgpuBufferRelease(hazeIndexBuf);
++                    WGPUBufferDescriptor d = {};
++                    d.size = (g_hazeIndexBytes + 0xFFFFu) & ~0xFFFFu;
++                    d.usage = WGPUBufferUsage_Index | WGPUBufferUsage_CopyDst;
++                    hazeIndexBuf = wgpuDeviceCreateBuffer(device, &d);
++                    hazeIndexCap = (uint32_t)d.size;
++                }
++                if (hazeVertexBuf && g_hazeVertBytes > 0) {
++                    wgpuQueueWriteBuffer(queue, hazeVertexBuf, 0, g_hazeVertsAccum, g_hazeVertBytes);
++                }
++                if (hazeIndexBuf && g_hazeIndexBytes > 0) {
++                    wgpuQueueWriteBuffer(queue, hazeIndexBuf, 0, g_hazeIndexesAccum, g_hazeIndexBytes);
++                }
++                const uint32_t mainView = lastRecords[lastRecordCount - 1].pad0;
++                const uint32_t hTotal = (g_hazeRecordCount < 16u) ? g_hazeRecordCount : 16u;
++                for (uint32_t i = 0; i < hTotal && currentRenderView; ++i) {
++                    if (g_hazeRecords[i].pad0 != mainView) continue;
++                    const Rec& r = g_hazeRecords[i];
++                    if (!hazeUniformBufs[hn]) {
++                        WGPUBufferDescriptor d = {};
++                        d.size = 128;
++                        d.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
++                        hazeUniformBufs[hn] = wgpuDeviceCreateBuffer(device, &d);
++                    }
++                    if (!hazeBindGroups[hn] ||
++                        hazeGroupImgs[hn][0] != g_hazeImagePtrs[i][0] ||
++                        hazeGroupImgs[hn][1] != g_hazeImagePtrs[i][1] ||
++                        hazeGroupGen[hn] != currentRenderGen) {
++                        if (hazeBindGroups[hn]) wgpuBindGroupRelease(hazeBindGroups[hn]);
++                        WGPUBindGroupEntry e[5] = {};
++                        e[0].binding = 0; e[0].buffer = hazeUniformBufs[hn]; e[0].size = 128;
++                        e[1].binding = 1; e[1].sampler = interactionMaterialSampler;
++                        e[2].binding = 2; e[2].textureView = currentRenderView;
++                        e[3].binding = 3; e[3].textureView = getEngineTextureView(g_hazeImagePtrs[i][0], fbFlatNormalView);
++                        e[4].binding = 4; e[4].textureView = getEngineTextureView(g_hazeImagePtrs[i][1], fbWhiteView);
++                        WGPUBindGroupDescriptor bgd = {};
++                        bgd.layout = hazeBGL;
++                        bgd.entryCount = 5;
++                        bgd.entries = e;
++                        hazeBindGroups[hn] = wgpuDeviceCreateBindGroup(device, &bgd);
++                        hazeGroupImgs[hn][0] = g_hazeImagePtrs[i][0];
++                        hazeGroupImgs[hn][1] = g_hazeImagePtrs[i][1];
++                        hazeGroupGen[hn] = currentRenderGen;
++                    }
++                    float ub[32];
++                    memcpy(ub +  0, r.modelMatrix,     64);
++                    memcpy(ub + 16, r.localLightOrigin, 16);   // vertexParm 0: scroll
++                    memcpy(ub + 20, r.localViewOrigin,  16);   // vertexParm 1: magnitude
++                    ub[24] = r.specularColor[0];               // projection m00
++                    ub[25] = (r.pad1 & 1u) ? 1.0f : 0.0f;      // hasMask
++                    ub[26] = (float)depthW;
++                    ub[27] = (float)depthH;
++                    ub[28] = (r.pad1 & 2u) ? 1.0f : 0.0f;      // mask *= vertex color
++                    ub[29] = ub[30] = ub[31] = 0.0f;
++                    wgpuQueueWriteBuffer(queue, hazeUniformBufs[hn], 0, ub, 128);
++                    lastHazeRecords[hn] = r;
++                    hn++;
++                }
++            }
++            lastHazeCount = hn;
++            g_hazeRecordCount = 0;
++            g_hazeVertBytes = 0;
++            g_hazeIndexBytes = 0;
++            if (hn > 0) {
++                static bool hazeAnnounced = false;
++                if (!hazeAnnounced) {
++                    hazeAnnounced = true;
++                    EM_ASM_({ console.info("[d3] WebGPU heat haze active: " + $0 + " surfaces"); }, hn);
++                }
++            }
++        }
++
 +        // CONSUME: drain the accumulator so next frame starts fresh.
 +        g_capRecordCount = 0;
 +        g_capVertBytes   = 0;
@@ -3750,7 +3954,11 @@ index 0000000..5e3e9da
 +    // Encode the full record draw — depth pre-pass then additive lit pass —
 +    // into the given color/depth views. Used by both the on-screen echo and
 +    // the determinism self-test so the two stay structurally identical.
-+    void encodeRecordsPass(WGPUCommandEncoder enc, WGPUTextureView color, WGPUTextureView depth) {
++    // colorTex (optional) is the texture behind `color` — needed as the copy
++    // source for the heat-haze _currentRender substitute. Pass null to skip
++    // haze (it then simply doesn't draw).
++    void encodeRecordsPass(WGPUCommandEncoder enc, WGPUTextureView color, WGPUTextureView depth,
++                           WGPUTexture colorTex = nullptr) {
 +        // Iter 14: render linked subviews (mirrors/monitors) into their
 +        // offscreen targets FIRST — the main view samples them.
 +        for (uint32_t g = 0; g < subGroupCount; ++g) {
@@ -3924,7 +4132,16 @@ index 0000000..5e3e9da
 +            }
 +        }
 +        // Final pass: emissive shader passes + 2D HUD over the lit result.
++        // With heat-haze records it splits in two around a canvas copy:
++        // part A = sky/reflect/fog/blend/3D passes, then the frame so far is
++        // copied into currentRenderTex, part B = haze draws (sampling the
++        // copy) + the 2D GUI overlay. The drain orders lastPassRecords as
++        // [3D..., GUI...], so the split preserves draw order exactly.
 +        {
++            const bool hazeActive = hazePipeline && lastHazeCount > 0 && colorTex &&
++                                    currentRenderTex && currentRenderView &&
++                                    currentRenderW == (uint32_t)depthW &&
++                                    currentRenderH == (uint32_t)depthH;
 +            WGPURenderPassColorAttachment ca = {};
 +            ca.view = color;
 +            ca.loadOp = colorCleared ? WGPULoadOp_Load : WGPULoadOp_Clear;
@@ -3993,12 +4210,14 @@ index 0000000..5e3e9da
 +            }
 +            for (uint32_t i = 0; i < lastPassCount; ++i) {
 +                const Rec& r = lastPassRecords[i];
++                if (hazeActive && r.pad3 == 1u) continue;   // GUI moves to part B
 +                WGPURenderPipeline p;
 +                if (r.pad3 == 1u) {
 +                    p = (r.pad1 == 2u) ? guiAddPipeline : guiAlphaPipeline;
 +                } else {
 +                    p = (r.pad1 == 1u) ? passOpaquePipeline
 +                      : (r.pad1 == 3u) ? passAlphaPipeline
++                      : (r.pad1 == 4u) ? passFilterPipeline
 +                      : passAddPipeline;
 +                }
 +                if (!p || !lastPassGroups[i]) continue;
@@ -4010,6 +4229,44 @@ index 0000000..5e3e9da
 +            }
 +            wgpuRenderPassEncoderEnd(rp);
 +            wgpuRenderPassEncoderRelease(rp);
++
++            // Iter 16 part B: copy the frame so far, then draw the haze
++            // surfaces (deflected samples of the copy) and the GUI overlay.
++            if (hazeActive) {
++                WGPUTexelCopyTextureInfo src = {};
++                src.texture = colorTex;
++                WGPUTexelCopyTextureInfo dst = {};
++                dst.texture = currentRenderTex;
++                WGPUExtent3D ext = { currentRenderW, currentRenderH, 1 };
++                wgpuCommandEncoderCopyTextureToTexture(enc, &src, &dst, &ext);
++
++                ca.loadOp = WGPULoadOp_Load;
++                WGPURenderPassEncoder rp2 = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
++                if (hazeVertexBuf && hazeIndexBuf) {
++                    wgpuRenderPassEncoderSetPipeline(rp2, hazePipeline);
++                    for (uint32_t i = 0; i < lastHazeCount; ++i) {
++                        const Rec& r = lastHazeRecords[i];
++                        if (!hazeBindGroups[i]) continue;
++                        wgpuRenderPassEncoderSetBindGroup(rp2, 0, hazeBindGroups[i], 0, nullptr);
++                        wgpuRenderPassEncoderSetVertexBuffer(rp2, 0, hazeVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
++                        wgpuRenderPassEncoderSetIndexBuffer(rp2, hazeIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
++                        wgpuRenderPassEncoderDrawIndexed(rp2, r.indexCount, 1, 0, 0, 0);
++                    }
++                }
++                for (uint32_t i = 0; i < lastPassCount; ++i) {
++                    const Rec& r = lastPassRecords[i];
++                    if (r.pad3 != 1u) continue;
++                    WGPURenderPipeline p = (r.pad1 == 2u) ? guiAddPipeline : guiAlphaPipeline;
++                    if (!p || !lastPassGroups[i]) continue;
++                    wgpuRenderPassEncoderSetPipeline(rp2, p);
++                    wgpuRenderPassEncoderSetBindGroup(rp2, 0, lastPassGroups[i], 0, nullptr);
++                    wgpuRenderPassEncoderSetVertexBuffer(rp2, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
++                    wgpuRenderPassEncoderSetIndexBuffer(rp2, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
++                    wgpuRenderPassEncoderDrawIndexed(rp2, r.indexCount, 1, 0, 0, 0);
++                }
++                wgpuRenderPassEncoderEnd(rp2);
++                wgpuRenderPassEncoderRelease(rp2);
++            }
 +        }
 +    }
 +
@@ -4101,8 +4358,8 @@ index 0000000..5e3e9da
 +
 +        WGPUCommandEncoderDescriptor cd = {};
 +        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(device, &cd);
-+        encodeRecordsPass(enc, detViewA, detDepthView);
-+        encodeRecordsPass(enc, detViewB, detDepthView);
++        encodeRecordsPass(enc, detViewA, detDepthView, detTexA);
++        encodeRecordsPass(enc, detViewB, detDepthView, detTexB);
 +        WGPUTexelCopyTextureInfo srcA = {}; srcA.texture = detTexA;
 +        WGPUTexelCopyTextureInfo srcB = {}; srcB.texture = detTexB;
 +        WGPUTexelCopyBufferInfo dstA = {};
@@ -4653,6 +4910,7 @@ index 0000000..5e3e9da
 +    WGPURenderPipeline      passOpaquePipeline = nullptr;
 +    WGPURenderPipeline      passAddPipeline   = nullptr;
 +    WGPURenderPipeline      passAlphaPipeline = nullptr;
++    WGPURenderPipeline      passFilterPipeline = nullptr;
 +    // Iter 8d: 2D GUI/HUD variants — depth test Always (overlay)
 +    WGPURenderPipeline      guiAddPipeline    = nullptr;
 +    WGPURenderPipeline      guiAlphaPipeline  = nullptr;
@@ -4727,6 +4985,25 @@ index 0000000..5e3e9da
 +    const void*             reflectGroupImg[8] = {};
 +    Rec                     lastReflectRecords[8] = {};
 +    uint32_t                lastReflectCount = 0;
++    // Iter 16: heat-haze new stages. The final pass splits in two around a
++    // canvas→currentRenderTex copy; haze draws sample the copy, deflected
++    // by a scrolled normal map (heatHaze*.vfp semantics in haze.wgsl).
++    WGPURenderPipeline      hazePipeline = nullptr;
++    WGPUBindGroupLayout     hazeBGL = nullptr;
++    WGPUBuffer              hazeVertexBuf = nullptr;
++    WGPUBuffer              hazeIndexBuf = nullptr;
++    uint32_t                hazeVertexCap = 0;
++    uint32_t                hazeIndexCap = 0;
++    WGPUBuffer              hazeUniformBufs[16] = {nullptr};
++    WGPUBindGroup           hazeBindGroups[16]  = {nullptr};
++    const void*             hazeGroupImgs[16][2] = {};
++    uint32_t                hazeGroupGen[16] = {};
++    Rec                     lastHazeRecords[16] = {};
++    uint32_t                lastHazeCount = 0;
++    WGPUTexture             currentRenderTex = nullptr;
++    WGPUTextureView         currentRenderView = nullptr;
++    uint32_t                currentRenderW = 0, currentRenderH = 0;
++    uint32_t                currentRenderGen = 0;   // bumps on recreate → bind groups rebuild
 +    // Iter 6.8: on-device determinism self-test. Renders the identical
 +    // record set twice into two offscreen textures, reads both back,
 +    // byte-compares. Sidesteps the canvas-readback trap (WebGPU canvases
@@ -4902,7 +5179,7 @@ index 7914093..2bcb018 100644
  	GLimp_Shutdown();
  
 diff --git a/neo/renderer/draw_arb2.cpp b/neo/renderer/draw_arb2.cpp
-index c1d0d3e..7d46152 100644
+index c1d0d3e..bf3ce6d 100644
 --- a/neo/renderer/draw_arb2.cpp
 +++ b/neo/renderer/draw_arb2.cpp
 @@ -62,7 +62,170 @@ static void GL_SelectTextureNoClient( int unit ) {
@@ -5102,11 +5379,38 @@ index c1d0d3e..7d46152 100644
  
  		backEnd.depthFunc = GLS_DEPTHFUNC_EQUAL;
  	}
+@@ -757,6 +924,26 @@ int R_FindARBProgram( GLenum target, const char *program ) {
+ 	return progs[i].ident;
+ }
+ 
++#ifdef __EMSCRIPTEN__
++/*
++==================
++D3_ARB2_ProgramName
++
++Iter 16 (WebGPU echo): reverse lookup so the new-stage capture hook can
++classify a material's fragment program (heat haze etc.) from the GL ident
++stored in newShaderStage_t. Returns "" when unknown.
++==================
++*/
++extern "C" const char* D3_ARB2_ProgramName( unsigned int target, unsigned int ident ) {
++	for ( int i = 0 ; progs[i].name[0] ; i++ ) {
++		if ( progs[i].target == (GLenum)target && progs[i].ident == (GLuint)ident ) {
++			return progs[i].name;
++		}
++	}
++	return "";
++}
++#endif
++
+ /*
+ ==================
+ R_ReloadARBPrograms_f
 diff --git a/neo/renderer/draw_common.cpp b/neo/renderer/draw_common.cpp
-index 0cabbfd..0cb1bd6 100644
+index 0cabbfd..52210e6 100644
 --- a/neo/renderer/draw_common.cpp
 +++ b/neo/renderer/draw_common.cpp
-@@ -30,10 +30,26 @@ If you have questions concerning this license or the applicable additional terms
+@@ -30,10 +30,28 @@ If you have questions concerning this license or the applicable additional terms
  #include "renderer/VertexCache.h"
  
  #include "renderer/tr_local.h"
@@ -5118,6 +5422,8 @@ index 0cabbfd..0cb1bd6 100644
 +// Iter 8c/9 (WebGPU echo): defined in tr_render.cpp.
 +void D3_WebGPU_CapturePassStage( const drawSurf_t* surf, const srfTriangles_t* tri,
 +                                 const shaderStage_t* pStage, const float color[4] );
++void D3_WebGPU_CaptureNewStage( const drawSurf_t* surf, const srfTriangles_t* tri,
++                                const shaderStage_t* pStage, const float* regs );
 +void D3_WebGPU_CaptureShadow( const drawSurf_t* surf, const srfTriangles_t* tri,
 +                              int numIndexes, bool external, const float localLight[4] );
 +void D3_WebGPU_CaptureFog( const drawSurf_t* surf, const srfTriangles_t* tri,
@@ -5133,7 +5439,7 @@ index 0cabbfd..0cb1bd6 100644
  /*
  =====================
  RB_BakeTextureMatrixIntoTexgen
-@@ -774,12 +790,19 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
+@@ -774,12 +792,19 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
  	}
  
  	// change the scissor if needed
@@ -5157,7 +5463,18 @@ index 0cabbfd..0cb1bd6 100644
  	}
  
  	// some deforms may disable themselves by setting numIndexes = 0
-@@ -1175,6 +1198,12 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
+@@ -898,6 +923,10 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
+ 			qglBindProgramARB( GL_FRAGMENT_PROGRAM_ARB, newStage->fragmentProgram );
+ 			qglEnable( GL_FRAGMENT_PROGRAM_ARB );
+ 
++			// Iter 16 (WebGPU echo): capture heat-haze new stages — the
++			// backend replays them against its own _currentRender copy.
++			D3_WebGPU_CaptureNewStage( surf, tri, pStage, regs );
++
+ 			// draw it
+ 			RB_DrawElementsWithCounters( tri );
+ 
+@@ -1175,6 +1204,12 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
  
  		RB_PrepareStageTexturing( pStage, surf, ac );
  
@@ -5170,7 +5487,7 @@ index 0cabbfd..0cb1bd6 100644
  		// draw it
  		RB_DrawElementsWithCounters( tri );
  
-@@ -1345,6 +1374,16 @@ static void RB_T_Shadow( const drawSurf_t *surf ) {
+@@ -1345,6 +1380,16 @@ static void RB_T_Shadow( const drawSurf_t *surf ) {
  		qglDepthBoundsEXT( surf->scissorRect.zmin, surf->scissorRect.zmax );
  	}
  
@@ -5187,7 +5504,7 @@ index 0cabbfd..0cb1bd6 100644
  	// debug visualization
  	if ( r_showShadows.GetInteger() ) {
  		if ( r_showShadows.GetInteger() == 3 ) {
-@@ -1568,6 +1607,18 @@ static void RB_T_BlendLight( const drawSurf_t *surf ) {
+@@ -1568,6 +1613,18 @@ static void RB_T_BlendLight( const drawSurf_t *surf ) {
  		qglTexGenfv( GL_S, GL_OBJECT_PLANE, lightProject[3].ToFloatPtr() );
  	}
  
@@ -5206,7 +5523,7 @@ index 0cabbfd..0cb1bd6 100644
  	// this gets used for both blend lights and shadow draws
  	if ( tri->ambientCache ) {
  		idDrawVert	*ac = (idDrawVert *)vertexCache.Position( tri->ambientCache );
-@@ -1630,6 +1681,11 @@ static void RB_BlendLight( const drawSurf_t *drawSurfs,  const drawSurf_t *drawS
+@@ -1630,6 +1687,11 @@ static void RB_BlendLight( const drawSurf_t *drawSurfs,  const drawSurf_t *drawS
  
  		GL_SelectTexture( 0 );
  		stage->texture.image->Bind();
@@ -5218,7 +5535,7 @@ index 0cabbfd..0cb1bd6 100644
  
  		if ( stage->texture.hasMatrix ) {
  			RB_LoadShaderTextureMatrix( regs, &stage->texture );
-@@ -1700,6 +1756,19 @@ local[0] = local[1] = local[2] = 0; local[3] = 0.5;
+@@ -1700,6 +1762,19 @@ local[0] = local[1] = local[2] = 0; local[3] = 0.5;
  		qglTexGenfv( GL_S, GL_OBJECT_PLANE, local.ToFloatPtr() );
  	}
  
@@ -5238,7 +5555,7 @@ index 0cabbfd..0cb1bd6 100644
  	RB_T_RenderTriangleSurface( surf );
  }
  
-@@ -1758,6 +1827,8 @@ static void RB_FogPass( const drawSurf_t *drawSurfs,  const drawSurf_t *drawSurf
+@@ -1758,6 +1833,8 @@ static void RB_FogPass( const drawSurf_t *drawSurfs,  const drawSurf_t *drawSurf
  	// texture 0 is the falloff image
  	GL_SelectTexture( 0 );
  	globalImages->fogImage->Bind();
@@ -5247,7 +5564,7 @@ index 0cabbfd..0cb1bd6 100644
  	//GL_Bind( tr.whiteImage );
  	qglDisableClientState( GL_TEXTURE_COORD_ARRAY );
  	qglEnable( GL_TEXTURE_GEN_S );
-@@ -1851,10 +1922,15 @@ void RB_STD_FogAllLights( void ) {
+@@ -1851,10 +1928,15 @@ void RB_STD_FogAllLights( void ) {
  			// units from the origin
  			backEnd.currentScissor = vLight->scissorRect;
  			if ( r_useScissor.GetBool() ) {
@@ -5267,7 +5584,7 @@ index 0cabbfd..0cb1bd6 100644
  			}
  			qglClear( GL_STENCIL_BUFFER_BIT );
  
-@@ -1903,10 +1979,15 @@ void RB_STD_LightScale( void ) {
+@@ -1903,10 +1985,15 @@ void RB_STD_LightScale( void ) {
  
  	// the scissor may be smaller than the viewport for subviews
  	if ( r_useScissor.GetBool() ) {
@@ -5430,7 +5747,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..0f3dfed 100644
+index c83ebb5..6cf925d 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -5441,7 +5758,7 @@ index c83ebb5..0f3dfed 100644
  
  /*
  
-@@ -38,6 +39,538 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +39,640 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -5559,6 +5876,22 @@ index c83ebb5..0f3dfed 100644
 +    struct WGPUSubviewLink { void* img; uint32_t viewTag; };
 +    WGPUSubviewLink g_subviewLinks[4];
 +    uint32_t g_subviewLinkCount = 0;
++    // Iter 16: heat-haze new-stage records (heatHaze*.vfp materials).
++    // localLightOrigin = vertexParm 0 (scroll), localViewOrigin =
++    // vertexParm 1 (magnitude), specularColor[0] = projectionMatrix[0],
++    // pad1 bit0 = has mask, bit1 = modulate by vertex color; image ptrs
++    // parallel array = [normal map, mask]. Geometry gets DEDICATED
++    // accumulators: post-process surfaces draw LAST, when the shared 8MB
++    // accumulator is already exhausted by the interaction + pass records
++    // (haze captures were silently cap-dropped when they shared it).
++    enum { kWGPUHazeVertBytes = 256 * 1024, kWGPUHazeIndexBytes = 64 * 1024 };
++    WGPUInteractionRecord g_hazeRecords[16];
++    void*    g_hazeImagePtrs[16][2];
++    uint32_t g_hazeRecordCount = 0;
++    uint8_t  g_hazeVertsAccum[kWGPUHazeVertBytes];
++    uint16_t g_hazeIndexesAccum[kWGPUHazeIndexBytes / 2];
++    uint32_t g_hazeVertBytes = 0;
++    uint32_t g_hazeIndexBytes = 0;
 +}
 +
 +extern "C" void D3_WebGPU_NoteSubviewCopy( void* img ) {
@@ -5892,11 +6225,22 @@ index c83ebb5..0f3dfed 100644
 +		if ( !skyStash || skyStash->numVerts != tri->numVerts ) return;
 +		if ( g_skyDirBytes + (uint32_t)tri->numVerts * 12u > (uint32_t)kWGPUSkyDirBytes ) { g_capDropped++; return; }
 +	} else if ( pStage->texture.texgen == TG_REFLECT_CUBE ) {
-+		// handled below: pad3=3, modelView matrix rides the light fields
++		// handled below: pad3=3, modelView matrix rides the light fields.
++		// Iter 16: only OPAQUE env maps (chrome) replay correctly — the
++		// reflect pipeline draws opaque, so a translucent dst-alpha
++		// reflection (glass panes) would paint solid over the scene.
++		if ( ( pStage->drawStateBits & (GLS_SRCBLEND_BITS | GLS_DSTBLEND_BITS) ) != 0 ) {
++			return;
++		}
 +	} else if ( pStage->texture.texgen != TG_EXPLICIT ) {
 +		return;   // screen-space texgens still unsupported
 +	}
 +	if ( pStage->texture.cinematic ) return;               // skip ROQ video surfaces
++	// Stages that mask off ALL color writes (maskcolor / makealpha — they
++	// only prime the alpha channel for a later gl_dst_alpha stage) must NOT
++	// be replayed: our pipelines write RGB, so they'd paint opaque blocks
++	// (found via glass1's alpha-prime stage painting the window white).
++	if ( ( pStage->drawStateBits & GLS_COLORMASK ) == GLS_COLORMASK ) return;
 +	idImage* img = pStage->texture.image;
 +	if ( !img ) return;
 +	if ( g_passRecordCount >= (uint32_t)kWGPUMaxRecords ) { g_capDropped++; return; }
@@ -5955,6 +6299,7 @@ index c83ebb5..0f3dfed 100644
 +	if ( blend == (GLS_SRCBLEND_ONE | GLS_DSTBLEND_ONE) )                            r.pad1 = 2;
 +	else if ( blend == (GLS_SRCBLEND_SRC_ALPHA | GLS_DSTBLEND_ONE_MINUS_SRC_ALPHA) ) r.pad1 = 3;
 +	else if ( blend == (GLS_SRCBLEND_ONE | GLS_DSTBLEND_ZERO) )                      r.pad1 = 1;
++	else if ( blend == (GLS_SRCBLEND_DST_COLOR | GLS_DSTBLEND_ZERO) )                r.pad1 = 4;  // filter (blend filter / gl_dst_color gl_zero)
 +	else                                                                             r.pad1 = 2;
 +	r.pad2 = (uint32_t)pStage->vertexColor;
 +	r.pad3 = is2D ? 1u : 0u;
@@ -5977,10 +6322,84 @@ index c83ebb5..0f3dfed 100644
 +	g_capFrameId++;
 +}
 +
++// Iter 16: capture heat-haze ARB new stages (the only new-stage programs the
++// demo pak's materials reference besides colorProcess). Called from
++// draw_common.cpp's newStage branch, where the vertex parms are evaluated
++// from the same regs GL would feed qglProgramLocalParameter4fvARB.
++extern "C" const char* D3_ARB2_ProgramName( unsigned int target, unsigned int ident );
++
++void D3_WebGPU_CaptureNewStage( const drawSurf_t* surf, const srfTriangles_t* tri,
++                                const shaderStage_t* pStage, const float* regs ) {
++	if ( !backEnd.viewDef || !backEnd.viewDef->viewEntitys ) return;   // 3D views only
++	if ( ( backEnd.viewDef->viewport.x2 - backEnd.viewDef->viewport.x1 ) < 128 ) return;
++	if ( !surf || !tri || !tri->verts || !tri->indexes || !pStage || !pStage->newStage || !regs ) return;
++	if ( tri->numVerts <= 0 || tri->numIndexes <= 0 ) return;
++	if ( tri->numVerts > kWGPUMaxCaptureVerts || tri->numIndexes > kWGPUMaxCaptureIndexes ) return;
++
++	const newShaderStage_t* ns = pStage->newStage;
++	const char* fpName = D3_ARB2_ProgramName( GL_FRAGMENT_PROGRAM_ARB, (unsigned int)ns->fragmentProgram );
++	if ( idStr::Icmpn( fpName, "heatHaze", 8 ) != 0 ) return;   // only haze variants echoed
++	// images: [0]=_currentRender (backend substitutes its canvas copy),
++	// [1]=normal map, [2]=mask (WithMask variants)
++	if ( ns->numFragmentProgramImages < 2 || !ns->fragmentProgramImages[1] ) return;
++	const bool hasMask = ( ns->numFragmentProgramImages >= 3 ) && ns->fragmentProgramImages[2];
++	const bool vertexMod = ( idStr::FindText( fpName, "AndVertex", false ) >= 0 );
++	if ( g_hazeRecordCount >= 16u ) { g_capDropped++; return; }
++
++	const uint32_t vbytes = (uint32_t)tri->numVerts * 60u;
++	const uint32_t ibytes = (uint32_t)tri->numIndexes * 2u;
++	const uint32_t vR = (vbytes + 3u) & ~3u;
++	const uint32_t iR = (ibytes + 3u) & ~3u;
++	if ( g_hazeVertBytes + vR > (uint32_t)kWGPUHazeVertBytes ||
++	     g_hazeIndexBytes + iR > (uint32_t)kWGPUHazeIndexBytes ) { g_capDropped++; return; }
++	memcpy( g_hazeVertsAccum + g_hazeVertBytes, tri->verts, vbytes );
++	for ( int i = 0; i < tri->numIndexes; ++i ) {
++		g_hazeIndexesAccum[(g_hazeIndexBytes / 2) + i] = (uint16_t)tri->indexes[i];
++	}
++
++	WGPUInteractionRecord& r = g_hazeRecords[g_hazeRecordCount];
++	memset( &r, 0, sizeof(r) );
++	r.vertOffset  = g_hazeVertBytes;
++	r.vertCount   = (uint32_t)tri->numVerts;
++	r.indexOffset = g_hazeIndexBytes;
++	r.indexCount  = (uint32_t)tri->numIndexes;
++	static const float kIdent[16] = {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
++	float capProj[16];
++	memcpy( capProj, backEnd.viewDef->projectionMatrix, sizeof(capProj) );
++	if ( surf->space ) {
++		if ( surf->space->weaponDepthHack ) {
++			capProj[14] *= 0.25f;
++		} else if ( surf->space->modelDepthHack != 0.0f ) {
++			capProj[14] -= surf->space->modelDepthHack;
++		}
++	}
++	WGPU_PassMatMul4( r.modelMatrix, capProj,
++	                  surf->space ? surf->space->modelViewMatrix : kIdent );
++	// vertexParm 0 = scroll, vertexParm 1 = deform magnitude — evaluated now,
++	// so time-driven scroll expressions arrive as plain numbers.
++	for ( int p = 0; p < 2 && p < ns->numVertexParms; ++p ) {
++		float* dst = ( p == 0 ) ? r.localLightOrigin : r.localViewOrigin;
++		dst[0] = regs[ ns->vertexParms[p][0] ];
++		dst[1] = regs[ ns->vertexParms[p][1] ];
++		dst[2] = regs[ ns->vertexParms[p][2] ];
++		dst[3] = regs[ ns->vertexParms[p][3] ];
++	}
++	r.specularColor[0] = backEnd.viewDef->projectionMatrix[0];   // m00 for the deflection scale
++	r.pad0 = (uint32_t)(uintptr_t)backEnd.viewDef;
++	r.pad1 = ( hasMask ? 1u : 0u ) | ( vertexMod ? 2u : 0u );
++	r.pad3 = 4u;   // haze record
++	g_hazeImagePtrs[g_hazeRecordCount][0] = (void*)ns->fragmentProgramImages[1];
++	g_hazeImagePtrs[g_hazeRecordCount][1] = hasMask ? (void*)ns->fragmentProgramImages[2] : NULL;
++	g_hazeVertBytes  += vR;
++	g_hazeIndexBytes += iR;
++	g_hazeRecordCount++;
++	g_capFrameId++;
++}
++
  
  /*
  =================
-@@ -49,6 +582,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +684,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -5996,7 +6415,7 @@ index c83ebb5..0f3dfed 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +620,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +722,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -6012,7 +6431,7 @@ index c83ebb5..0f3dfed 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +667,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +769,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -6029,7 +6448,7 @@ index c83ebb5..0f3dfed 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +727,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +829,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -6037,7 +6456,7 @@ index c83ebb5..0f3dfed 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -557,22 +1119,41 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1221,41 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
@@ -6091,10 +6510,10 @@ index c83ebb5..0f3dfed 100644
  	// ensures that depth writes are enabled for the depth clear
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..224ea59
+index 0000000..43684ae
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,646 @@
+@@ -0,0 +1,753 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -6341,6 +6760,113 @@ index 0000000..224ea59
 +"    let a0 = textureSample(t_fog,      samp, vec2<f32>(in.s0, 0.5)).a;\n"
 +"    let a1 = textureSample(t_fogEnter, samp, vec2<f32>(in.s1, in.t1)).a;\n"
 +"    return vec4<f32>(u.color.rgb, a0 * a1);\n"
++"}\n"
++"";
++
++// haze.wgsl
++static const char* const kWGSL_haze = "// haze.wgsl — heat-haze / screen-distortion new-stage echo (iter 16).\n"
++"//\n"
++"// Replicates glprogs/heatHaze.vfp, heatHazeWithMask.vfp and\n"
++"// heatHazeWithMaskAndVertex.vfp (the variant mars_city1's materials use).\n"
++"// The ARB program samples _currentRender (a copy of the framebuffer taken\n"
++"// just before post-process surfaces draw) at screen coordinates deflected\n"
++"// by a scrolled normal map:\n"
++"//\n"
++"//   deflection = min(proj_m00 / max(clipW, 1), 0.02) * magnitude   (per vertex)\n"
++"//   offset.xy  = (normal*2-1).xy * maskTerm.xy * deflection.xy     (per fragment)\n"
++"//   color      = currentRender[saturate(screenUV + offset)]\n"
++"//\n"
++"// Differences from the ARB text, on purpose:\n"
++"//  - The normal map reads X from RGB, not alpha: the engine CPU image cache\n"
++"//    feeding WebGPU holds PRE-rxgb-swap standard RGB normals (the DXT5-NM\n"
++"//    alpha swizzle happens at GL upload, which we bypass).\n"
++"//  - screenUV comes from @builtin(position)/canvasSize (already perspective-\n"
++"//    divided), replacing fragment.position * env[1]; env[0]'s NPOT adjust is\n"
++"//    1.0 here (the copy target matches the canvas exactly).\n"
++"//  - proj_m00/max(w,1) assumes a symmetric frustum (proj[2][0]==0), true for\n"
++"//    all DOOM 3 player views; haze inside subviews is dropped at capture.\n"
++"//\n"
++"// Bindings: uniform(128B) + sampler + _currentRender copy + normal + mask.\n"
++"\n"
++"struct HazeUniforms {\n"
++"    mvp: mat4x4<f32>,\n"
++"    scroll: vec4<f32>,       // vertexParm 0 (evaluated at capture)\n"
++"    magnitude: vec4<f32>,    // vertexParm 1 (evaluated at capture)\n"
++"    // params: x = projectionMatrix[0] (m00), y = hasMask (0/1),\n"
++"    //         z = canvas width px, w = canvas height px\n"
++"    params: vec4<f32>,\n"
++"    // params2: x = modulate mask by vertex color (0/1); yzw unused\n"
++"    params2: vec4<f32>,\n"
++"};\n"
++"\n"
++"@group(0) @binding(0) var<uniform> u: HazeUniforms;\n"
++"@group(0) @binding(1) var samp: sampler;\n"
++"@group(0) @binding(2) var texRender: texture_2d<f32>;\n"
++"@group(0) @binding(3) var texNormal: texture_2d<f32>;\n"
++"@group(0) @binding(4) var texMask: texture_2d<f32>;\n"
++"\n"
++"struct VSIn {\n"
++"    @location(0) position:  vec3<f32>,\n"
++"    @location(1) texcoord:  vec2<f32>,\n"
++"    @location(2) normal:    vec3<f32>,\n"
++"    @location(3) tangent:   vec3<f32>,\n"
++"    @location(4) bitangent: vec3<f32>,\n"
++"    @location(5) color:     vec4<f32>,\n"
++"};\n"
++"\n"
++"struct VSOut {\n"
++"    @builtin(position) clip_pos: vec4<f32>,\n"
++"    @location(0) uv_mask: vec2<f32>,      // unscrolled (mask lookup)\n"
++"    @location(1) uv_normal: vec2<f32>,    // scrolled (normal lookup)\n"
++"    @location(2) deflect: vec2<f32>,      // projection-scaled magnitude\n"
++"    @location(3) vertex_color: vec4<f32>,\n"
++"};\n"
++"\n"
++"@vertex\n"
++"fn vs_main(in: VSIn) -> VSOut {\n"
++"    var out: VSOut;\n"
++"    let cp = u.mvp * vec4<f32>(in.position, 1.0);\n"
++"    // GL clip-z [-w,w] -> WebGPU [0,w]\n"
++"    out.clip_pos = vec4<f32>(cp.x, cp.y, (cp.z + cp.w) * 0.5, cp.w);\n"
++"    out.uv_mask = in.texcoord;\n"
++"    out.uv_normal = in.texcoord + u.scroll.xy;\n"
++"    // heatHaze.vfp: scale magnitude by projected size of one world unit,\n"
++"    // clamped so deformation doesn't go wild near the view plane.\n"
++"    let d = min(u.params.x / max(cp.w, 1.0), 0.02);\n"
++"    out.deflect = vec2<f32>(d * u.magnitude.x, d * u.magnitude.y);\n"
++"    out.vertex_color = in.color;\n"
++"    return out;\n"
++"}\n"
++"\n"
++"@fragment\n"
++"fn fs_main(in: VSOut) -> @location(0) vec4<f32> {\n"
++"    // Sample everything before the discard (keeps control flow uniform for\n"
++"    // the derivative-based samples).\n"
++"    let maskTex = textureSample(texMask, samp, in.uv_mask);\n"
++"    let nrm = textureSample(texNormal, samp, in.uv_normal);\n"
++"\n"
++"    let hasMask = u.params.y > 0.5;\n"
++"    let vc = select(vec4<f32>(1.0), in.vertex_color, u.params2.x > 0.5);\n"
++"    // heatHazeWithMask: mask.xy = mask.xy [* vertexColor.xy] - 0.01; KIL on <0\n"
++"    var m = vec2<f32>(1.0, 1.0);\n"
++"    if (hasMask) {\n"
++"        m = maskTex.xy * vc.xy - vec2<f32>(0.01, 0.01);\n"
++"    }\n"
++"\n"
++"    var n = nrm.xyz * 2.0 - 1.0;           // RGB normal (pre-rxgb cache)\n"
++"    let offset = n.xy * m * in.deflect;\n"
++"\n"
++"    var suv = in.clip_pos.xy / vec2<f32>(u.params.z, u.params.w);\n"
++"    // half-texel inset: the shared sampler is REPEAT (the normal map\n"
++"    // scrolls), so keep filter taps off the copy's wrap-around border\n"
++"    let inset = vec2<f32>(0.5, 0.5) / vec2<f32>(u.params.z, u.params.w);\n"
++"    suv = clamp(suv + offset, inset, vec2<f32>(1.0, 1.0) - inset);\n"
++"    let scene = textureSampleLevel(texRender, samp, suv, 0.0);\n"
++"\n"
++"    if (hasMask && (m.x < 0.0 || m.y < 0.0)) {\n"
++"        discard;\n"
++"    }\n"
++"    return vec4<f32>(scene.rgb, 1.0);\n"
 +"}\n"
 +"";
 +

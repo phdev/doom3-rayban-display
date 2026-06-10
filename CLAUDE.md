@@ -840,3 +840,45 @@ dynamic-texture feature first (per-record scratch frames; the shared
 cinematicImage scratch breaks capture-replay when 2+ monitors are in
 view). GL paths (&echo, fallback) play them fine — decode verified
 clean with the real monitor videos injected locally.
+
+**Iter 16 — HEAT HAZE / _currentRender post-process (2026-06-10).**
+The effect r_skipPostProcess had to disable for GL (WebKit blit storm)
+now runs WebGPU-native: `D3_WebGPU_CaptureNewStage` (called from the
+newStage branch in RB_STD_T_RenderShaderPasses) captures heatHaze*.vfp
+stages — program identified via the new `D3_ARB2_ProgramName` reverse
+lookup in draw_arb2 — with evaluated vertexParms (scroll, magnitude),
+projection m00, variant flags (mask / vertex-color), and the
+normal+mask image ptrs. haze.wgsl replicates the ARB math: deflection
+= min(m00/max(clipW,1), .02)×magnitude, offset = RGB-normal(*2-1)
+× (mask[*vc]−.01) × deflection, sample a CANVAS COPY at
+saturate(screenUV+offset) (half-texel inset — shared REPEAT sampler).
+Frame restructure: final pass splits in two around ONE
+copyTextureToTexture (canvas → currentRenderTex; surface usage now
+includes CopySrc) — part A = sky/reflect/fog/blend/3D passes, part B =
+haze + GUI (drain orders pass records [3D...,GUI...] so the split
+preserves order). r_skipPostProcess now boots 0 under WebGPU-primary
+(GL keeps 1; its draws/copies stay gated by r_skipGLDraw).
+HARD-WON BRING-UP LESSONS:
+- Haze records need DEDICATED accumulators (256KB/64KB): post-process
+  surfaces draw LAST, when the shared 8MB accumulator is exhausted —
+  captures silently cap-dropped for hours.
+- `extern` (without "C") on an extern-"C" function inside a function
+  body links a MANGLED stub under -sERROR_ON_UNDEFINED_SYMBOLS=0 that
+  aborts mid-draw when called ("missing function" in __d3Logs).
+- mars_city1 spawn has NO main-view haze: the only nearby heatHaze
+  surface (glass1 window) lives inside a security-camera SUBVIEW
+  (vw=255 in the capture trace). Verification teleport:
+  `setviewpos -3450 -1536 276 0` faces a real glass1 pane (found via
+  .proc surface scan → func_static_52992 origin in the .map).
+- TWO GL-parity capture bugs found en route: (1) maskcolor/makealpha
+  stages (GLS_COLORMASK all masked — alpha-prime for gl_dst_alpha)
+  painted OPAQUE blocks — now skipped; (2) translucent dst-alpha
+  REFLECT stages (glass cubemaps) drew opaque black through the
+  iter-15b reflect path — reflect capture now requires opaque blend.
+  Plus: `blend filter` (gl_dst_color,gl_zero) pass stages now get a
+  real passFilterPipeline (Dst/Zero) instead of additive fallback.
+VERIFIED: haze active (4 surfaces) at the glass pane, suv/raster math
+confirmed via shader probe, zero validation errors, det rounds
+IDENTICAL, spawn scene unchanged. Visual fidelity eyeball at a
+haze-rich location (dropship pad vents) = on-device follow-up; the
+glass-pane vantage is record-cap-starved (256) and not representative.
