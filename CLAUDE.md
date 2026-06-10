@@ -585,3 +585,18 @@ grouping/ordering), specular LUT fidelity, translucency ordering,
 post-process/2D effects, then default r_backend=webgpu and retire
 GL4ES. The echo's capture+replay architecture and the headed-Chrome +
 det-self-test verification loop carry over directly.
+
+**Iter 9 — stencil shadow volumes (2026-06-09).** Full echo of idTech4
+stencil shadows: `D3_WebGPU_CaptureShadow` (from RB_T_Shadow) captures
+vec4 shadow-cache verts + per-light grouping (g_capLightId bumps per
+vLight; Rec gained lightId — three struct mirrors). shadow.wgsl
+replicates the stencil-shadow VP (w==0 verts project to infinity away
+from the light). Backend: Depth24PlusStencil8 everywhere; frame =
+pre-pass → ONE PASS PER LIGHT (stencilLoadOp Clear 128 → volumes
+incr/decr via z-fail or depth-pass pipelines → interactions with
+stencil GreaterEqual ref 128) → final emissive/HUD pass. Verified with
++set r_shadows 1 in headed Chrome: echo mirrors GL's shadowed regions,
+zero validation errors, det IDENTICAL. App profile keeps r_shadows 0
+(perf) so behavior matches GL either way. SECOND DAWN LESSON: pipelines
+must declare pass-compatible COLOR targets even when writing only
+stencil (fragment stage with writeMask=none, empty fs).
