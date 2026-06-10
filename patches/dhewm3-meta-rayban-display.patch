@@ -1009,10 +1009,10 @@ index a4883b5..095506b 100644
  extern idCVar	r_aspectRatio;
  
 diff --git a/neo/renderer/Image_load.cpp b/neo/renderer/Image_load.cpp
-index f9ae002..cc4e36f 100644
+index f9ae002..4f86a5e 100644
 --- a/neo/renderer/Image_load.cpp
 +++ b/neo/renderer/Image_load.cpp
-@@ -27,6 +27,12 @@ If you have questions concerning this license or the applicable additional terms
+@@ -27,6 +27,13 @@ If you have questions concerning this license or the applicable additional terms
  */
  
  #include "sys/platform.h"
@@ -1022,10 +1022,11 @@ index f9ae002..cc4e36f 100644
 +class idImage;
 +extern "C" void D3_WebGPU_CacheImage( const idImage* img, const unsigned char* rgba, int w, int h );
 +extern "C" void D3_WebGPU_CacheCubeImage( const idImage* img, const unsigned char* const pic[6], int size );
++extern "C" void D3_WebGPU_NoteSubviewCopy( void* img );
  #include "idlib/hashing/MD4.h"
  #include "renderer/tr_local.h"
  
-@@ -604,6 +610,12 @@ void idImage::GenerateImage( const byte *pic, int width, int height,
+@@ -604,6 +611,12 @@ void idImage::GenerateImage( const byte *pic, int width, int height,
  	uploadWidth = scaled_width;
  	type = TT_2D;
  
@@ -1038,7 +1039,7 @@ index f9ae002..cc4e36f 100644
  	// zero the border if desired, allowing clamped projection textures
  	// even after picmip resampling or careless artists.
  	if ( repeat == TR_CLAMP_TO_ZERO ) {
-@@ -872,6 +884,8 @@ Non-square cube sides are not allowed
+@@ -872,6 +885,8 @@ Non-square cube sides are not allowed
  void idImage::GenerateCubeImage( const byte *pic[6], int size,
  					   textureFilter_t filterParm, bool allowDownSizeParm,
  					   textureDepth_t depthParm ) {
@@ -1047,20 +1048,24 @@ index f9ae002..cc4e36f 100644
  	int			scaled_width, scaled_height;
  	int			width, height;
  	int			i;
-@@ -1907,6 +1921,12 @@ CopyFramebuffer
+@@ -1907,6 +1922,16 @@ CopyFramebuffer
  ====================
  */
  void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bool useOversizedBuffer ) {
-+	// Iter 11b: with GL draws skipped (WebGPU primary) the framebuffer holds
-+	// garbage; copying it just spams INVALID_OPERATION on WebGL. Skip.
++	// Iter 11b/14: with GL draws skipped (WebGPU primary) the framebuffer
++	// holds garbage — skip the copy, but record WHAT the engine wanted
++	// copied: this image was meant to hold the render of the view that just
++	// finished (mirror/monitor subview). The WebGPU backend substitutes its
++	// own offscreen render of that view wherever this image is sampled.
 +	extern idCVar r_skipGLDraw;
 +	if ( r_skipGLDraw.GetBool() ) {
++		D3_WebGPU_NoteSubviewCopy( (void*)this );
 +		return;
 +	}
  	Bind();
  
  	if ( cvarSystem->GetCVarBool( "g_lowresFullscreenFX" ) ) {
-@@ -1932,7 +1952,12 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
+@@ -1932,7 +1957,12 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
  		uploadWidth = potWidth;
  		uploadHeight = potHeight;
  		if ( potWidth == imageWidth && potHeight == imageHeight ) {
@@ -1074,7 +1079,7 @@ index f9ae002..cc4e36f 100644
  		} else {
  			byte	*junk;
  			// we need to create a dummy image with power of two dimensions,
-@@ -1945,7 +1970,10 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
+@@ -1945,7 +1975,10 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
  				junk[i+1] = 255;
  			}
  #endif
@@ -1811,10 +1816,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..ad05893
+index 0000000..34a3a80
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,2570 @@
+@@ -0,0 +1,2693 @@
 +/*
 +================================================================================
 +
@@ -1935,6 +1940,10 @@ index 0000000..ad05893
 +// Iter 13b: mirrors WGPUCubeSlot in tr_render.cpp.
 +struct CubeSlot { const void* ptr; int size; uint8_t* faces[6]; };
 +extern "C" const CubeSlot* D3_WebGPU_LookupCubeImage(const void* img);
++// Iter 14: mirrors WGPUSubviewLink in tr_render.cpp.
++struct SubLink { void* img; uint32_t viewTag; };
++extern "C" SubLink g_subviewLinks[];
++extern "C" uint32_t g_subviewLinkCount;
 +
 +// ─── Backend class ──────────────────────────────────────────────────────────
 +
@@ -2938,6 +2947,10 @@ index 0000000..ad05893
 +    // idImage pointer, created+uploaded on first use.
 +    WGPUTextureView getEngineTextureView(const void* imgPtr, WGPUTextureView fallback) {
 +        if (!imgPtr) return fallback;
++        // Iter 14: linked subview render targets shadow the engine image.
++        for (uint32_t i = 0; i < g_subviewLinkCount && i < kMaxSubviews; ++i) {
++            if (g_subviewLinks[i].img == imgPtr && subviewView[i]) return subviewView[i];
++        }
 +        for (int i = 0; i < texCacheCount; ++i) {
 +            if (texCache[i].ptr == imgPtr) return texCache[i].view;
 +        }
@@ -3185,15 +3198,36 @@ index 0000000..ad05893
 +        // identifies the main view; records from other views would draw
 +        // ghost geometry with alien projections. Compact in place.
 +        uint32_t n = 0;
++        uint32_t mainN = 0;
++        subGroupCount = 0;
 +        if (total > 0) {
 +            const uint32_t mainView = g_capRecords[total - 1].pad0;
++            // In-place compaction would clobber records we still need for the
++            // subview sweep, so partition via a scratch copy of the order.
++            static Rec scratch[kMaxRecordSlots];
++            static void* scratchImgs[kMaxRecordSlots][5];
++            memcpy(scratch, g_capRecords, total * sizeof(Rec));
++            memcpy(scratchImgs, g_capImagePtrs, total * sizeof(void*) * 5);
 +            for (uint32_t i = 0; i < total; ++i) {
-+                if (g_capRecords[i].pad0 != mainView) continue;
-+                if (n != i) {
-+                    g_capRecords[n] = g_capRecords[i];
-+                    memcpy(g_capImagePtrs[n], g_capImagePtrs[i], sizeof(void*) * 5);
-+                }
++                if (scratch[i].pad0 != mainView) continue;
++                g_capRecords[n] = scratch[i];
++                memcpy(g_capImagePtrs[n], scratchImgs[i], sizeof(void*) * 5);
 +                n++;
++            }
++            mainN = n;
++            // Iter 14: linked subview records follow, one slot range per link.
++            for (uint32_t L = 0; L < g_subviewLinkCount && L < kMaxSubviews; ++L) {
++                const uint32_t start = n;
++                for (uint32_t i = 0; i < total && n < kMaxRecordSlots; ++i) {
++                    if (scratch[i].pad0 != g_subviewLinks[L].viewTag) continue;
++                    if (scratch[i].pad0 == mainView) continue;
++                    g_capRecords[n] = scratch[i];
++                    memcpy(g_capImagePtrs[n], scratchImgs[i], sizeof(void*) * 5);
++                    n++;
++                }
++                subGroups[L].startSlot = start;
++                subGroups[L].count = n - start;
++                if (n > start) subGroupCount = L + 1;
 +            }
 +        }
 +        // Per-slot uniform writes. r.modelMatrix holds the FULL MVP, baked
@@ -3230,9 +3264,11 @@ index 0000000..ad05893
 +        }
 +        // Keep a backend-local copy of the consumed records (the draw loop
 +        // reads offsets/counts from here, and no-capture frames redraw it).
++        // lastRecordCount counts MAIN-view records only — the subview slot
++        // ranges (mainN..n) are drawn exclusively by their offscreen passes.
 +        memcpy(lastRecords, g_capRecords, n * sizeof(Rec));
-+        lastRecordCount = n;
-+        outCount = n;
++        lastRecordCount = mainN;
++        outCount = mainN;
 +        lastUploadedCapFrameId = g_capFrameId;
 +
 +        // Iter 13b: upload the sky cube-dir stream before the pass sweep.
@@ -3500,6 +3536,87 @@ index 0000000..ad05893
 +    // into the given color/depth views. Used by both the on-screen echo and
 +    // the determinism self-test so the two stay structurally identical.
 +    void encodeRecordsPass(WGPUCommandEncoder enc, WGPUTextureView color, WGPUTextureView depth) {
++        // Iter 14: render linked subviews (mirrors/monitors) into their
++        // offscreen targets FIRST — the main view samples them.
++        for (uint32_t g = 0; g < subGroupCount; ++g) {
++            const SubGroup& sg = subGroups[g];
++            if (!sg.count || !interactionPipeline || !depthPipeline) continue;
++            if (!subviewTex[g]) {
++                WGPUTextureDescriptor td = {};
++                td.size = { 256, 256, 1 };
++                td.mipLevelCount = 1;
++                td.sampleCount = 1;
++                td.dimension = WGPUTextureDimension_2D;
++                td.format = surfaceFormat;
++                td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
++                subviewTex[g] = wgpuDeviceCreateTexture(device, &td);
++                subviewView[g] = subviewTex[g] ? wgpuTextureCreateView(subviewTex[g], nullptr) : nullptr;
++                WGPUTextureDescriptor dd = td;
++                dd.format = WGPUTextureFormat_Depth24PlusStencil8;
++                dd.usage = WGPUTextureUsage_RenderAttachment;
++                subviewDepthTex[g] = wgpuDeviceCreateTexture(device, &dd);
++                subviewDepthView[g] = subviewDepthTex[g] ? wgpuTextureCreateView(subviewDepthTex[g], nullptr) : nullptr;
++            }
++            if (!subviewView[g] || !subviewDepthView[g]) continue;
++            // z-fill
++            {
++                WGPURenderPassDepthStencilAttachment da = {};
++                da.view = subviewDepthView[g];
++                da.depthLoadOp = WGPULoadOp_Clear;
++                da.depthStoreOp = WGPUStoreOp_Store;
++                da.depthClearValue = 1.0f;
++                da.stencilLoadOp = WGPULoadOp_Clear;
++                da.stencilStoreOp = WGPUStoreOp_Store;
++                da.stencilClearValue = 128;
++                WGPURenderPassDescriptor rpd = {};
++                rpd.colorAttachmentCount = 0;
++                rpd.depthStencilAttachment = &da;
++                WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
++                wgpuRenderPassEncoderSetPipeline(rp, depthPipeline);
++                for (uint32_t i = sg.startSlot; i < sg.startSlot + sg.count; ++i) {
++                    const Rec& r = lastRecords[i];
++                    wgpuRenderPassEncoderSetBindGroup(rp, 0, recordDepthBindGroups[i], 0, nullptr);
++                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
++                    wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
++                    wgpuRenderPassEncoderDrawIndexed(rp, r.indexCount, 1, 0, 0, 0);
++                }
++                wgpuRenderPassEncoderEnd(rp);
++                wgpuRenderPassEncoderRelease(rp);
++            }
++            // additive lit
++            {
++                WGPURenderPassColorAttachment ca = {};
++                ca.view = subviewView[g];
++                ca.loadOp = WGPULoadOp_Clear;
++                ca.storeOp = WGPUStoreOp_Store;
++                ca.clearValue = { 0.0, 0.0, 0.0, 1.0 };
++                ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
++                WGPURenderPassDepthStencilAttachment da = {};
++                da.view = subviewDepthView[g];
++                da.depthLoadOp = WGPULoadOp_Load;
++                da.depthStoreOp = WGPUStoreOp_Store;
++                da.stencilLoadOp = WGPULoadOp_Load;
++                da.stencilStoreOp = WGPUStoreOp_Store;
++                WGPURenderPassDescriptor rpd = {};
++                rpd.colorAttachmentCount = 1;
++                rpd.colorAttachments = &ca;
++                rpd.depthStencilAttachment = &da;
++                WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
++                wgpuRenderPassEncoderSetStencilReference(rp, 128);
++                wgpuRenderPassEncoderSetPipeline(rp, interactionPipeline);
++                for (uint32_t i = sg.startSlot; i < sg.startSlot + sg.count; ++i) {
++                    const Rec& r = lastRecords[i];
++                    wgpuRenderPassEncoderSetBindGroup(rp, 0, recordBindGroups[i], 0, nullptr);
++                    wgpuRenderPassEncoderSetBindGroup(rp, 1, lastMatGroups[i] ? lastMatGroups[i] : fallbackMatGroup(), 0, nullptr);
++                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
++                    wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
++                    wgpuRenderPassEncoderDrawIndexed(rp, r.indexCount, 1, 0, 0, 0);
++                }
++                wgpuRenderPassEncoderEnd(rp);
++                wgpuRenderPassEncoderRelease(rp);
++            }
++        }
++
 +        // Iter 8b: pre-pass enabled — the depth pipeline now shares
 +        // interaction.wgsl's vs_main, so clip-z is bit-identical between
 +        // the z-fill and lit passes.
@@ -4362,6 +4479,17 @@ index 0000000..ad05893
 +    struct CubeTexEntry { const void* ptr; WGPUTextureView view; };
 +    CubeTexEntry            cubeTexCache[32] = {};
 +    int                     cubeTexCacheCount = 0;
++    // Iter 14: subviews (mirrors/security monitors). Linked subview records
++    // render into 256px offscreen targets BEFORE the main passes; samples of
++    // the linked engine image are overridden with the target's view.
++    static constexpr uint32_t kMaxSubviews = 2;
++    WGPUTexture             subviewTex[kMaxSubviews] = {nullptr};
++    WGPUTextureView         subviewView[kMaxSubviews] = {nullptr};
++    WGPUTexture             subviewDepthTex[kMaxSubviews] = {nullptr};
++    WGPUTextureView         subviewDepthView[kMaxSubviews] = {nullptr};
++    struct SubGroup { uint32_t startSlot, count; };
++    SubGroup                subGroups[kMaxSubviews] = {};
++    uint32_t                subGroupCount = 0;
 +    // Iter 6.8: on-device determinism self-test. Renders the identical
 +    // record set twice into two offscreen textures, reads both back,
 +    // byte-compares. Sidesteps the canvas-readback trap (WebGPU canvases
@@ -5053,7 +5181,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..b809e2e 100644
+index c83ebb5..02358bc 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -5064,7 +5192,7 @@ index c83ebb5..b809e2e 100644
  
  /*
  
-@@ -38,6 +39,508 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +39,529 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -5173,6 +5301,27 @@ index c83ebb5..b809e2e 100644
 +    enum { kWGPUSkyDirBytes = 1024 * 1024 };
 +    uint8_t  g_skyDirsAccum[kWGPUSkyDirBytes];
 +    uint32_t g_skyDirBytes = 0;
++    // Iter 14: subview links. When GL would CopyFramebuffer a finished
++    // subview into an idImage (mirror/monitor render target), we record
++    // (image ptr, that subview's viewDef tag). The backend renders the
++    // subview's captured records into an offscreen texture and overrides
++    // every sample of that image with it.
++    struct WGPUSubviewLink { void* img; uint32_t viewTag; };
++    WGPUSubviewLink g_subviewLinks[4];
++    uint32_t g_subviewLinkCount = 0;
++}
++
++extern "C" void D3_WebGPU_NoteSubviewCopy( void* img ) {
++	if ( !backEnd.viewDef || !img ) return;
++	const uint32_t tag = (uint32_t)(uintptr_t)backEnd.viewDef;
++	for ( uint32_t i = 0; i < g_subviewLinkCount; ++i ) {
++		if ( g_subviewLinks[i].img == img ) { g_subviewLinks[i].viewTag = tag; return; }
++	}
++	if ( g_subviewLinkCount < 4 ) {
++		g_subviewLinks[g_subviewLinkCount].img = img;
++		g_subviewLinks[g_subviewLinkCount].viewTag = tag;
++		g_subviewLinkCount++;
++	}
 +}
 +
 +// Iter 13b: frontend texgen stash — R_Skybox/WobbleskyTexGen hand us their
@@ -5573,7 +5722,7 @@ index c83ebb5..b809e2e 100644
  
  /*
  =================
-@@ -49,6 +552,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +573,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -5589,7 +5738,7 @@ index c83ebb5..b809e2e 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +590,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +611,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -5605,7 +5754,7 @@ index c83ebb5..b809e2e 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +637,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +658,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -5622,7 +5771,7 @@ index c83ebb5..b809e2e 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +697,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +718,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -5630,7 +5779,7 @@ index c83ebb5..b809e2e 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -557,22 +1089,41 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1110,41 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
