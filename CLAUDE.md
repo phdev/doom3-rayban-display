@@ -673,3 +673,13 @@ GenerateCubeImage is NOT hooked into the CPU image cache), ARB
 new-stage effects (heat haze), subviews/mirrors/monitors (needs
 render-to-texture echo architecture), lightgem via WebGPU (so GL can
 fully retire), GL4ES build retirement, ROQ video (broken in GL too).
+
+**PK4 stall fix (2026-06-10).** "Downloading PK4 stalled for 20s" on
+cellular: the 65MB pak re-downloaded EVERY boot with a 20s no-progress
+watchdog + 120s overall cap. Now: the bundled PK4 caches in IndexedDB
+after the first successful download (all six fetch paths feed the
+cache via finish()); next boots load locally. Freshness = 4s HEAD
+comparing content-length; HEAD failure → trust the cache (offline-
+friendly); pak-size change in a deploy → auto re-download. Watchdog
+45s, overall 420s. Verified: boot 2 logs "Using cached bundled PK4"
+with zero pak network traffic.
