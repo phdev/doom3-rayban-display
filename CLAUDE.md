@@ -694,3 +694,12 @@ ambient, fog, blend. Remaining big-architecture items: sky cubemaps
 (GenerateCubeImage cache hook + samplerCube path), subviews
 (render-to-texture), lightgem via WebGPU, GL4ES retirement, heat-haze
 new-stages, ROQ.
+
+**PK4 chunked delivery (2026-06-10).** Second cellular stall proved a
+65MB single download can't finish on weak links (no resume — retries
+restart from 0). The pak now ALSO ships as 16x4MB chunks + manifest
+(`scripts/chunk-pk4.py` — RERUN IT WHENEVER THE PAK CHANGES, then
+force-add the chunks; they're gitignore-excepted like the pak). The
+runtime prefers the manifest; each chunk gets its own stall window +
+retries AND caches individually in IndexedDB for cross-reload resume
+(entries dropped once the assembled pak caches whole).
