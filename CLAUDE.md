@@ -566,3 +566,22 @@ instantly). texture.wgsl gained a params vec4 (SVC modulate/add);
 demo-quad uniform grew 80→96B to match. Headed Chrome: doorway glow,
 screens, fixture emissives visible; validation clean; determinism
 IDENTICAL.
+
+**Iter 8d — 2D HUD/GUI overlay in the echo (2026-06-09).** 2D GUI
+views are recognized by `viewEntitys == NULL` in the capture hook
+(bypassing the lightgem viewport filter), tagged pad3=1, drained in a
+second sweep after the main view's 3D pass records, and drawn last
+through texture.wgsl variants with depth compare Always (guiAlpha /
+guiAdditive). HUD health counter visible in the echo, matching GL.
+
+**WebGPU port status snapshot (end of 2026-06-09):** echo = z pre-pass
+(shared-VS invariant) + additive lit pass (256 interactions, real
+textures, ambient/SVC/gamma params) + emissive shader passes
+(opaque/additive/alpha) + 2D HUD overlay, all determinism-self-tested
+IDENTICAL on-device. Remaining for full cutover (iter 9+): stencil
+shadow volumes (per-light passes over Depth24PlusStencil8, capture
+RB_T_Shadow shadow-cache vec4 geometry, two-sided stencil ops, light
+grouping/ordering), specular LUT fidelity, translucency ordering,
+post-process/2D effects, then default r_backend=webgpu and retire
+GL4ES. The echo's capture+replay architecture and the headed-Chrome +
+det-self-test verification loop carry over directly.
