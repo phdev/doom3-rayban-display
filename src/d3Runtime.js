@@ -456,6 +456,15 @@ export async function bootDoom3({
     };
   } catch (error) {
     log(`Error: ${formatError(error)}`);
+    // WASM traps (RuntimeError: null function / table index out of bounds)
+    // carry the wasm frame list in .stack — with a --profiling-funcs build the
+    // frames are NAMED, which is how the ROQ crash was found. Surface it in
+    // the boot log so on-device (diag overlay) traps are diagnosable too.
+    if (error?.stack && /wasm|RuntimeError/i.test(error.stack)) {
+      for (const line of String(error.stack).split("\n").slice(0, 16)) {
+        log(`  ${line}`);
+      }
+    }
     throw error;
   }
 }
@@ -585,9 +594,12 @@ function buildArguments(config) {
     "+set", "g_skipCinematics", "1",
     "+set", "com_showFPS", "0",
     "+set", "s_noSound", config.audioEnabled ? "0" : "1",
-    // Audio-only cvars. LESSON (live outage 2026-06-10): setting sound
-    // cvars on MUTED boots trapped a null function pointer at startup —
-    // never touch sound state unless audio is actually enabled.
+    // Audio-only cvars. ROOT CAUSE of the 2026-06-10 "null function at boot"
+    // (initially blamed on sound state): idTech4's ParseCommandLine had NO
+    // bounds check on its 32-slot console-line array, and this list sits at
+    // the limit — two extra "+set"s overflowed it and stomped the console
+    // object. The engine patch now bounds-checks (and the cap is 64), so
+    // extra args are safe; keeping these conditional is just tidiness.
     ...(config.audioEnabled ? ["+set", "com_asyncSound", "0", "+set", "s_useEAXReverb", "0"] : []),
 
     "+set", "g_skill", String(getNumericConfig(config.skill, 1)),

@@ -765,3 +765,28 @@ pak download) — wait on explicit verdict lines ("DOOM 3 main
 started" vs trap regex) with a 180s deadline, not a fixed sleep;
 (d) never touch sound state on muted boots; re-validate a NORMAL
 boot after wiring any experimental flag.
+
+**AUDIO ROOT CAUSE FOUND — ParseCommandLine buffer overflow
+(2026-06-10).** The "?audio traps with null function" bug (and the
+sound-cvar half of the live outage) was never OpenAL: **idTech4's
+`ParseCommandLine` has NO bounds check on `com_consoleLines[32]`**,
+and the web shell's arg list sits at EXACTLY 32 "+" commands (31 +set
++ 1 +map). The two audio cvars made 34 → the overflow stomped the
+globals after the array (each idCmdArgs is multi-KB) → the FIRST
+`Printf` (version banner) trapped at `console->Print` (a call_indirect
+through the clobbered console object). Method: `-DD3_PROFILING_FUNCS=ON`
+(new CMake option, relink-only) gave a NAMED trap stack
+(`idCommonLocal::VPrintf ← Printf ← Init`); Sys_Printf markers between
+VPrintf's four indirect call sites pinpointed `console->Print`; the
+printed message being the FIRST banner + "+2 args breaks it" gave the
+overflow. Boot errors now also log `error.stack` to the boot log
+(named wasm frames on-device when built with profiling).
+Engine fix (in the patch): MAX_CONSOLE_LINES 32→64 AND a proper
+bounds check (over-limit "+cmd" warns + drops, its argument tokens
+drop with it — appending them to the previous command would corrupt
+it). Verified: `?audio` boots clean (OpenAL device up, map loads),
+muted boot unregressed. The earlier "never touch sound cvars on muted
+boots" lesson is RETRACTED — any 2 extra args would have trapped.
+`?audio` stays opt-in: the reduced pak strips `sound/`, so everything
+plays the engine-default beep — shipping real audio = pak-reducer
+scope (add sound/ subset), not engine work.
