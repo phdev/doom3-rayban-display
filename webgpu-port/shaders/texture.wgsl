@@ -13,6 +13,9 @@
 struct Uniforms {
     mvp: mat4x4<f32>,
     tint: vec4<f32>,
+    // params.x/.y = vertex-color modulate/add (SVC_IGNORE=(0,1),
+    // SVC_MODULATE=(1,0), SVC_INVERSE=(-1,1)); .zw unused.
+    params: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -47,5 +50,6 @@ fn vs_main(in: VSIn) -> VSOut {
 
 @fragment
 fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
-    return textureSample(tex, samp, in.uv) * u.tint * in.vertex_color;
+    let vc = in.vertex_color * u.params.x + vec4<f32>(u.params.y);
+    return textureSample(tex, samp, in.uv) * u.tint * vc;
 }
