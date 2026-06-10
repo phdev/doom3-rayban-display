@@ -648,3 +648,10 @@ swap noise, NOT engine copies. Remaining GL-side per-frame cost: state
 calls + vertexCache uploads + lightgem. Next cutover steps: persistent
 WebGPU vertex buffers, resize/device-lost, r_backend default flip,
 GL4ES retirement; missing features per the iter 11+ plan above.
+
+**Touch-look (2026-06-10).** Dragging the right ~55% of the screen aims
+via `engine.callAddViewAngles` (same hook as head tracking; deltas
+add). dyaw = -dx*sens, dpitch = dy*sens (idTech: yaw+ = left, pitch+ =
+down, engine clamps ±89). Button/diag/left-side touches ignored;
+preventDefault during the drag kills Safari scroll-bounce.
+`?looksens=<deg/px>` tunes (default 0.25).
