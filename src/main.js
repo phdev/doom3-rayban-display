@@ -85,11 +85,12 @@ const refs = {
 // debug clear; will become real engine output as call sites migrate).
 if (/[?&]backend=webgpu\b/.test(location.search) && refs.webgpuCanvas) {
   refs.webgpuCanvas.classList.add("is-active");
-  // Cutover preview (?wgpufull): the WebGPU canvas becomes the fullscreen
-  // primary display and the GL canvas is hidden (opacity, not display:none —
-  // SDL still owns its context/sizing). The engine still renders both; this
-  // flips which one the player SEES. Flicker-free DOOM 3 on iPhone, today.
-  if (/[?&]wgpufull\b/.test(location.search)) {
+  // DEFAULT (cutover): with ?backend=webgpu, the WebGPU canvas IS the
+  // fullscreen primary display and the GL canvas is hidden (opacity, not
+  // display:none — SDL still owns its context/sizing). Add &echo for the
+  // old side-by-side debug layout (small box top-right, GL fullscreen).
+  // ?wgpufull is still accepted as a synonym of the default.
+  if (!/[?&]echo\b/.test(location.search)) {
     refs.webgpuCanvas.classList.add("is-primary");
     document.getElementById("gameCanvas")?.classList.add("is-ghost");
   }
