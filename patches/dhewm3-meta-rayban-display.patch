@@ -1816,10 +1816,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..34a3a80
+index 0000000..5e3e9da
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,2693 @@
+@@ -0,0 +1,2835 @@
 +/*
 +================================================================================
 +
@@ -2067,6 +2067,7 @@ index 0000000..34a3a80
 +            initFogPipeline();
 +            initBlendPipelines();
 +            initSkyPipeline();
++            initReflectPipeline();
 +            initRecordSlots();
 +        }
 +        if (surface && demoPipeline) {
@@ -2842,6 +2843,74 @@ index 0000000..34a3a80
 +        wgpuShaderModuleRelease(mod);
 +    }
 +
++    // Iter 15b: reflect pipeline (reflect.wgsl) — opaque env-mapped surfaces.
++    void initReflectPipeline() {
++        WGPUShaderSourceWGSL wgsl = {};
++        wgsl.chain.sType = WGPUSType_ShaderSourceWGSL;
++        wgsl.code = { kWGSL_reflect, WGPU_STRLEN };
++        WGPUShaderModuleDescriptor smd = {};
++        smd.nextInChain = &wgsl.chain;
++        WGPUShaderModule mod = wgpuDeviceCreateShaderModule(device, &smd);
++        if (!mod) { fprintf(stderr, "[WebGPU] reflect.wgsl create FAILED\n"); return; }
++        WGPUBindGroupLayoutEntry ble[3] = {};
++        ble[0].binding = 0;
++        ble[0].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
++        ble[0].buffer.type = WGPUBufferBindingType_Uniform;
++        ble[0].buffer.minBindingSize = 192;
++        ble[1].binding = 1;
++        ble[1].visibility = WGPUShaderStage_Fragment;
++        ble[1].sampler.type = WGPUSamplerBindingType_Filtering;
++        ble[2].binding = 2;
++        ble[2].visibility = WGPUShaderStage_Fragment;
++        ble[2].texture.sampleType = WGPUTextureSampleType_Float;
++        ble[2].texture.viewDimension = WGPUTextureViewDimension_Cube;
++        WGPUBindGroupLayoutDescriptor bld = {};
++        bld.entryCount = 3;
++        bld.entries = ble;
++        reflectBGL = wgpuDeviceCreateBindGroupLayout(device, &bld);
++        WGPUPipelineLayoutDescriptor pld = {};
++        pld.bindGroupLayoutCount = 1;
++        pld.bindGroupLayouts = &reflectBGL;
++        WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(device, &pld);
++
++        WGPUDepthStencilState dss = {};
++        dss.format = WGPUTextureFormat_Depth24PlusStencil8;
++        dss.depthWriteEnabled = WGPUOptionalBool_True;
++        dss.depthCompare = WGPUCompareFunction_LessEqual;
++        dss.stencilFront.compare = WGPUCompareFunction_Always;
++        dss.stencilBack.compare  = WGPUCompareFunction_Always;
++        dss.stencilFront.failOp = dss.stencilFront.depthFailOp = dss.stencilFront.passOp = WGPUStencilOperation_Keep;
++        dss.stencilBack.failOp  = dss.stencilBack.depthFailOp  = dss.stencilBack.passOp  = WGPUStencilOperation_Keep;
++        WGPUColorTargetState target = {};
++        target.format = surfaceFormat;
++        target.writeMask = WGPUColorWriteMask_All;
++        WGPUBlendState blend = {};
++        blend.color.srcFactor = WGPUBlendFactor_One; blend.color.dstFactor = WGPUBlendFactor_Zero;
++        blend.alpha.srcFactor = WGPUBlendFactor_One; blend.alpha.dstFactor = WGPUBlendFactor_Zero;
++        target.blend = &blend;
++        WGPUFragmentState frag = {};
++        frag.module = mod;
++        frag.entryPoint = { "fs_main", WGPU_STRLEN };
++        frag.targetCount = 1;
++        frag.targets = &target;
++        WGPURenderPipelineDescriptor pd = {};
++        pd.label = { "reflect", WGPU_STRLEN };
++        pd.layout = pl;
++        pd.vertex.module = mod;
++        pd.vertex.entryPoint = { "vs_main", WGPU_STRLEN };
++        pd.vertex.bufferCount = 1;
++        pd.vertex.buffers = drawVertLayout();
++        pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
++        pd.primitive.cullMode = WGPUCullMode_None;
++        pd.multisample.count = 1;
++        pd.multisample.mask = 0xFFFFFFFF;
++        pd.fragment = &frag;
++        pd.depthStencil = &dss;
++        reflectPipeline = wgpuDeviceCreateRenderPipeline(device, &pd);
++        wgpuPipelineLayoutRelease(pl);
++        wgpuShaderModuleRelease(mod);
++    }
++
 +    // Iter 8c: bind group for a shader-pass record slot — texture.wgsl
 +    // group(0) = uniform + sampler + texture. Cached per (slot, image).
 +    WGPUBindGroup getPassBindGroup(uint32_t slot, const void* imgPtr) {
@@ -3301,6 +3370,7 @@ index 0000000..34a3a80
 +            uint32_t pTotal = (g_passRecordCount < kMaxRecordSlots) ? g_passRecordCount : kMaxRecordSlots;
 +            uint32_t pn = 0;
 +            uint32_t skyN = 0;
++            lastReflectCount = 0;
 +            if (pTotal > 0 && lastRecordCount > 0) {
 +                const uint32_t mainView = lastRecords[lastRecordCount - 1].pad0;
 +                // Sweep 1: 3D records from the main view. Sweep 2: 2D GUI
@@ -3340,6 +3410,56 @@ index 0000000..34a3a80
 +                            wgpuQueueWriteBuffer(queue, skyUniformBufs[skyN], 0, ub, 80);
 +                            lastSkyRecords[skyN] = sr;
 +                            skyN++;
++                        }
++                        continue;
++                    }
++                    // Iter 15b: reflect records → their own slots.
++                    if (sweep == 0 && g_passRecords[i].pad3 == 3u &&
++                        g_passRecords[i].pad0 == mainView && reflectBGL) {
++                        uint32_t rn = lastReflectCount;
++                        if (rn < 8) {
++                            const Rec& rr = g_passRecords[i];
++                            if (!reflectUniformBufs[rn]) {
++                                WGPUBufferDescriptor d = {};
++                                d.size = 192;
++                                d.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
++                                reflectUniformBufs[rn] = wgpuDeviceCreateBuffer(device, &d);
++                            }
++                            const void* cubeImg = g_passImagePtrs[i];
++                            if (!reflectBindGroups[rn] || reflectGroupImg[rn] != cubeImg) {
++                                WGPUTextureView cv = getCubeTextureView(cubeImg);
++                                if (cv) {
++                                    WGPUBindGroupEntry e[3] = {};
++                                    e[0].binding = 0; e[0].buffer = reflectUniformBufs[rn]; e[0].size = 192;
++                                    e[1].binding = 1; e[1].sampler = interactionLightSampler;
++                                    e[2].binding = 2; e[2].textureView = cv;
++                                    WGPUBindGroupDescriptor bgd = {};
++                                    bgd.layout = reflectBGL;
++                                    bgd.entryCount = 3;
++                                    bgd.entries = e;
++                                    reflectBindGroups[rn] = wgpuDeviceCreateBindGroup(device, &bgd);
++                                    reflectGroupImg[rn] = cubeImg;
++                                }
++                            }
++                            if (reflectBindGroups[rn]) {
++                                extern float g_lastViewMatrix[16];
++                                const float* V = g_lastViewMatrix;
++                                float ub[48];
++                                memcpy(ub + 0, rr.modelMatrix, 64);
++                                // model-view rode the light fields
++                                memcpy(ub + 16, rr.lightProjS,    16);
++                                memcpy(ub + 20, rr.lightProjT,    16);
++                                memcpy(ub + 24, rr.lightProjQ,    16);
++                                memcpy(ub + 28, rr.lightFalloffS, 16);
++                                // transpose(view rotation) rows
++                                ub[32] = V[0]; ub[33] = V[1]; ub[34] = V[2];  ub[35] = 0;
++                                ub[36] = V[4]; ub[37] = V[5]; ub[38] = V[6];  ub[39] = 0;
++                                ub[40] = V[8]; ub[41] = V[9]; ub[42] = V[10]; ub[43] = 0;
++                                memcpy(ub + 44, rr.diffuseColor, 16);
++                                wgpuQueueWriteBuffer(queue, reflectUniformBufs[rn], 0, ub, 192);
++                                lastReflectRecords[rn] = rr;
++                                lastReflectCount = rn + 1;
++                            }
 +                        }
 +                        continue;
 +                    }
@@ -3575,6 +3695,7 @@ index 0000000..34a3a80
 +                wgpuRenderPassEncoderSetPipeline(rp, depthPipeline);
 +                for (uint32_t i = sg.startSlot; i < sg.startSlot + sg.count; ++i) {
 +                    const Rec& r = lastRecords[i];
++                    if (r.sPad2) continue;   // translucent: no depth write
 +                    wgpuRenderPassEncoderSetBindGroup(rp, 0, recordDepthBindGroups[i], 0, nullptr);
 +                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
 +                    wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
@@ -3638,6 +3759,7 @@ index 0000000..34a3a80
 +            wgpuRenderPassEncoderSetPipeline(rp, depthPipeline);
 +            for (uint32_t i = 0; i < lastRecordCount; ++i) {
 +                const Rec& r = lastRecords[i];
++                if (r.sPad2) continue;   // translucent interactions: no depth write
 +                wgpuRenderPassEncoderSetBindGroup(rp, 0, recordDepthBindGroups[i], 0, nullptr);
 +                wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
 +                wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
@@ -3735,6 +3857,18 @@ index 0000000..34a3a80
 +                    wgpuRenderPassEncoderSetBindGroup(rp, 0, skyBindGroups[i], 0, nullptr);
 +                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
 +                    wgpuRenderPassEncoderSetVertexBuffer(rp, 1, skyDirBuf, r.sPad1, (uint64_t)r.vertCount * 12u);
++                    wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
++                    wgpuRenderPassEncoderDrawIndexed(rp, r.indexCount, 1, 0, 0, 0);
++                }
++            }
++            // Iter 15b: reflect-cube surfaces (opaque env maps).
++            if (reflectPipeline && lastReflectCount > 0) {
++                wgpuRenderPassEncoderSetPipeline(rp, reflectPipeline);
++                for (uint32_t i = 0; i < lastReflectCount; ++i) {
++                    const Rec& r = lastReflectRecords[i];
++                    if (!reflectBindGroups[i]) continue;
++                    wgpuRenderPassEncoderSetBindGroup(rp, 0, reflectBindGroups[i], 0, nullptr);
++                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
 +                    wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
 +                    wgpuRenderPassEncoderDrawIndexed(rp, r.indexCount, 1, 0, 0, 0);
 +                }
@@ -4490,6 +4624,14 @@ index 0000000..34a3a80
 +    struct SubGroup { uint32_t startSlot, count; };
 +    SubGroup                subGroups[kMaxSubviews] = {};
 +    uint32_t                subGroupCount = 0;
++    // Iter 15b: reflect-cube records (chrome/env-mapped surfaces).
++    WGPURenderPipeline      reflectPipeline = nullptr;
++    WGPUBindGroupLayout     reflectBGL = nullptr;
++    WGPUBuffer              reflectUniformBufs[8] = {nullptr};
++    WGPUBindGroup           reflectBindGroups[8]  = {nullptr};
++    const void*             reflectGroupImg[8] = {};
++    Rec                     lastReflectRecords[8] = {};
++    uint32_t                lastReflectCount = 0;
 +    // Iter 6.8: on-device determinism self-test. Renders the identical
 +    // record set twice into two offscreen textures, reads both back,
 +    // byte-compares. Sidesteps the canvas-readback trap (WebGPU canvases
@@ -4665,10 +4807,10 @@ index 7914093..2bcb018 100644
  	GLimp_Shutdown();
  
 diff --git a/neo/renderer/draw_arb2.cpp b/neo/renderer/draw_arb2.cpp
-index c1d0d3e..19a540a 100644
+index c1d0d3e..7d46152 100644
 --- a/neo/renderer/draw_arb2.cpp
 +++ b/neo/renderer/draw_arb2.cpp
-@@ -62,7 +62,168 @@ static void GL_SelectTextureNoClient( int unit ) {
+@@ -62,7 +62,170 @@ static void GL_SelectTextureNoClient( int unit ) {
  RB_ARB2_DrawInteraction
  ==================
  */
@@ -4718,6 +4860,7 @@ index c1d0d3e..19a540a 100644
 +    extern float    g_capInvGamma;
 +    extern uint32_t g_capLightId;
 +    extern void* g_capSpecLUTPtr;
++    extern uint32_t g_capTranslucent;
 +    extern void* g_capImagePtrs[][5];
 +}
 +enum { kWGPUMaxCapV = 8192, kWGPUMaxCapI = 32768 };
@@ -4783,6 +4926,7 @@ index c1d0d3e..19a540a 100644
 +			// brightness in pad3 (x1000 fixed-point); 1/gamma via global.
 +			r.pad3 = (uint32_t)(r_brightness.GetFloat() * 1000.0f);
 +			r.lightId = g_capLightId;
++			r.sPad2 = g_capTranslucent;   // 1 = translucent: no depth write
 +			{
 +				const float g = r_gamma.GetFloat();
 +				g_capInvGamma = (g > 0.01f) ? (1.0f / g) : 1.0f;
@@ -4837,7 +4981,7 @@ index c1d0d3e..19a540a 100644
  	// load all the vertex program parameters
  	qglProgramEnvParameter4fvARB( GL_VERTEX_PROGRAM_ARB, PP_LIGHT_ORIGIN, din->localLightOrigin.ToFloatPtr() );
  	qglProgramEnvParameter4fvARB( GL_VERTEX_PROGRAM_ARB, PP_VIEW_ORIGIN, din->localViewOrigin.ToFloatPtr() );
-@@ -190,6 +351,7 @@ void RB_ARB2_CreateDrawInteractions( const drawSurf_t *surf ) {
+@@ -190,6 +353,7 @@ void RB_ARB2_CreateDrawInteractions( const drawSurf_t *surf ) {
  	} else {
  		globalImages->specularTableImage->Bind();
  	}
@@ -4845,7 +4989,7 @@ index c1d0d3e..19a540a 100644
  
  
  	for ( ; surf ; surf=surf->nextOnLight ) {
-@@ -258,6 +420,7 @@ void RB_ARB2_DrawInteractions( void ) {
+@@ -258,6 +422,7 @@ void RB_ARB2_DrawInteractions( void ) {
  	//
  	for ( vLight = backEnd.viewDef->viewLights ; vLight ; vLight = vLight->next ) {
  		backEnd.vLight = vLight;
@@ -4853,6 +4997,16 @@ index c1d0d3e..19a540a 100644
  
  		// do fogging later
  		if ( vLight->lightShader->IsFogLight() ) {
+@@ -314,7 +479,9 @@ void RB_ARB2_DrawInteractions( void ) {
+ 		qglStencilFunc( GL_ALWAYS, 128, 255 );
+ 
+ 		backEnd.depthFunc = GLS_DEPTHFUNC_LESS;
++		g_capTranslucent = 1;   // WebGPU echo: these records skip the z pre-pass
+ 		RB_ARB2_CreateDrawInteractions( vLight->translucentInteractions );
++		g_capTranslucent = 0;
+ 
+ 		backEnd.depthFunc = GLS_DEPTHFUNC_EQUAL;
+ 	}
 diff --git a/neo/renderer/draw_common.cpp b/neo/renderer/draw_common.cpp
 index 0cabbfd..0cb1bd6 100644
 --- a/neo/renderer/draw_common.cpp
@@ -5181,7 +5335,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..02358bc 100644
+index c83ebb5..0f3dfed 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -5192,7 +5346,7 @@ index c83ebb5..02358bc 100644
  
  /*
  
-@@ -38,6 +39,529 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +39,538 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -5276,6 +5430,7 @@ index c83ebb5..02358bc 100644
 +    // accumulator. lightId groups shadows with their light's interactions.
 +    uint32_t g_capLightId     = 0;   // bumped per vLight in RB_ARB2_DrawInteractions
 +    void*    g_capSpecLUTPtr  = 0;   // globalImages->specularTableImage (iter 10b)
++    uint32_t g_capTranslucent = 0;   // set around translucent interactions (iter 15a)
 +    enum { kWGPUShadowVertBytes = 4 * 1024 * 1024 };
 +    uint8_t  g_shadowVertsAccum[kWGPUShadowVertBytes];
 +    uint32_t g_shadowVertBytes = 0;
@@ -5641,8 +5796,10 @@ index c83ebb5..02358bc 100644
 +		skyStash = WGPU_FindSkyStash( surf );
 +		if ( !skyStash || skyStash->numVerts != tri->numVerts ) return;
 +		if ( g_skyDirBytes + (uint32_t)tri->numVerts * 12u > (uint32_t)kWGPUSkyDirBytes ) { g_capDropped++; return; }
++	} else if ( pStage->texture.texgen == TG_REFLECT_CUBE ) {
++		// handled below: pad3=3, modelView matrix rides the light fields
 +	} else if ( pStage->texture.texgen != TG_EXPLICIT ) {
-+		return;   // other texgens (reflect/screen) still unsupported
++		return;   // screen-space texgens still unsupported
 +	}
 +	if ( pStage->texture.cinematic ) return;               // skip ROQ video surfaces
 +	idImage* img = pStage->texture.image;
@@ -5711,6 +5868,12 @@ index c83ebb5..02358bc 100644
 +		r.sPad1 = g_skyDirBytes;
 +		memcpy( g_skyDirsAccum + g_skyDirBytes, skyStash->coords, (size_t)tri->numVerts * 12u );
 +		g_skyDirBytes += (uint32_t)tri->numVerts * 12u;
++	} else if ( pStage->texture.texgen == TG_REFLECT_CUBE && surf->space ) {
++		r.pad3 = 3u;   // reflect cube record: modelView in the light fields
++		memcpy( r.lightProjS,    &surf->space->modelViewMatrix[0],  16 );
++		memcpy( r.lightProjT,    &surf->space->modelViewMatrix[4],  16 );
++		memcpy( r.lightProjQ,    &surf->space->modelViewMatrix[8],  16 );
++		memcpy( r.lightFalloffS, &surf->space->modelViewMatrix[12], 16 );
 +	}
 +	g_passImagePtrs[g_passRecordCount] = (void*)img;
 +	g_capVertBytes  += vR;
@@ -5722,7 +5885,7 @@ index c83ebb5..02358bc 100644
  
  /*
  =================
-@@ -49,6 +573,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +582,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -5738,7 +5901,7 @@ index c83ebb5..02358bc 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +611,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +620,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -5754,7 +5917,7 @@ index c83ebb5..02358bc 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +658,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +667,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -5771,7 +5934,7 @@ index c83ebb5..02358bc 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +718,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +727,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -5779,7 +5942,7 @@ index c83ebb5..02358bc 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -557,22 +1110,41 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1119,41 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
@@ -5833,10 +5996,10 @@ index c83ebb5..02358bc 100644
  	// ensures that depth writes are enabled for the depth clear
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..5732c3c
+index 0000000..224ea59
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,589 @@
+@@ -0,0 +1,646 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -6265,6 +6428,63 @@ index 0000000..5732c3c
 +"    color = pow(max(color * u.params.w, vec3<f32>(0.0)), vec3<f32>(u.params2.x));\n"
 +"\n"
 +"    return vec4<f32>(color, 1.0);\n"
++"}\n"
++"";
++
++// reflect.wgsl
++static const char* const kWGSL_reflect = "// reflect.wgsl — TG_REFLECT_CUBE environment mapping.\n"
++"//\n"
++"// GL used fixed-function GL_REFLECTION_MAP (eye-space reflection of the\n"
++"// per-vertex normal) with the texture matrix set to the transposed view\n"
++"// rotation, rotating the eye-space reflection into world axes for the cube\n"
++"// lookup. Same math here, per fragment.\n"
++"\n"
++"struct Uniforms {\n"
++"    mvp:        mat4x4<f32>,\n"
++"    model_view: mat4x4<f32>,   // model -> eye\n"
++"    inv_view0:  vec4<f32>,     // rows of transpose(view rotation)\n"
++"    inv_view1:  vec4<f32>,\n"
++"    inv_view2:  vec4<f32>,\n"
++"    tint:       vec4<f32>,\n"
++"};\n"
++"@group(0) @binding(0) var<uniform> u: Uniforms;\n"
++"@group(0) @binding(1) var samp: sampler;\n"
++"@group(0) @binding(2) var tcube: texture_cube<f32>;\n"
++"\n"
++"struct VSIn {\n"
++"    @location(0) position:  vec3<f32>,\n"
++"    @location(1) texcoord:  vec2<f32>,\n"
++"    @location(2) normal:    vec3<f32>,\n"
++"    @location(3) tangent:   vec3<f32>,\n"
++"    @location(4) bitangent: vec3<f32>,\n"
++"    @location(5) color:     vec4<f32>,\n"
++"};\n"
++"\n"
++"struct VSOut {\n"
++"    @builtin(position) clip_pos: vec4<f32>,\n"
++"    @location(0) n_eye: vec3<f32>,\n"
++"    @location(1) p_eye: vec3<f32>,\n"
++"};\n"
++"\n"
++"@vertex\n"
++"fn vs_main(in: VSIn) -> VSOut {\n"
++"    var out: VSOut;\n"
++"    let cp = u.mvp * vec4<f32>(in.position, 1.0);\n"
++"    out.clip_pos = vec4<f32>(cp.x, cp.y, (cp.z + cp.w) * 0.5, cp.w);\n"
++"    out.n_eye = (u.model_view * vec4<f32>(in.normal, 0.0)).xyz;\n"
++"    out.p_eye = (u.model_view * vec4<f32>(in.position, 1.0)).xyz;\n"
++"    return out;\n"
++"}\n"
++"\n"
++"@fragment\n"
++"fn fs_main(in: VSOut) -> @location(0) vec4<f32> {\n"
++"    let n = normalize(in.n_eye);\n"
++"    let v = normalize(in.p_eye);\n"
++"    let r = reflect(v, n);\n"
++"    let dir = vec3<f32>(dot(u.inv_view0.xyz, r),\n"
++"                        dot(u.inv_view1.xyz, r),\n"
++"                        dot(u.inv_view2.xyz, r));\n"
++"    return textureSample(tcube, samp, dir) * u.tint;\n"
 +"}\n"
 +"";
 +

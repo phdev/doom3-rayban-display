@@ -585,11 +585,11 @@ function buildArguments(config) {
     "+set", "g_skipCinematics", "1",
     "+set", "com_showFPS", "0",
     "+set", "s_noSound", config.audioEnabled ? "0" : "1",
-    // WASM has no async sound thread; update sound from the main loop.
-    "+set", "com_asyncSound", "0",
-    // Emscripten's OpenAL has no real EFX — the reverb proc addresses are
-    // garbage and calling them traps ("table index is out of bounds").
-    "+set", "s_useEAXReverb", "0",
+    // Audio-only cvars. LESSON (live outage 2026-06-10): setting sound
+    // cvars on MUTED boots trapped a null function pointer at startup —
+    // never touch sound state unless audio is actually enabled.
+    ...(config.audioEnabled ? ["+set", "com_asyncSound", "0", "+set", "s_useEAXReverb", "0"] : []),
+
     "+set", "g_skill", String(getNumericConfig(config.skill, 1)),
     // The wearable drives the camera through _D3_AddViewAngles, so disable the
     // engine's own pointer-lock mouse path.
