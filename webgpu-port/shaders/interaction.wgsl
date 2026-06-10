@@ -39,6 +39,14 @@ struct Uniforms {
     light_proj_t:         vec4<f32>,
     light_proj_q:         vec4<f32>,
     light_falloff_s:      vec4<f32>,   // light falloff texgen S
+    // Iter 8a fidelity params:
+    //   params.x = isAmbient (1 = ambient light: N·L term forced to 1, no spec)
+    //   params.y = vertex color modulate (SVC: 0 ignore, 1 modulate, -1 inverse)
+    //   params.z = vertex color add      (1 for ignore/inverse, 0 for modulate)
+    //   params.w = r_brightness
+    //   params2.x = 1 / r_gamma
+    params:               vec4<f32>,
+    params2:              vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -121,8 +129,16 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let nm = textureSample(t_normal, s_material, in.tex_bump);
     let N = normalize(nm.rgb * 2.0 - vec3<f32>(1.0, 1.0, 1.0));
 
-    let NdotL = clamp(dot(N, L), 0.0, 1.0);
-    let NdotH = clamp(dot(N, H), 0.0, 1.0);
+    // Ambient lights have no meaningful direction: the engine renders them
+    // with a flat "ambient normal map" so the N·L term is ~constant. Force
+    // the diffuse term to 1 and kill specular for them.
+    let is_ambient = u.params.x > 0.5;
+    var NdotL = clamp(dot(N, L), 0.0, 1.0);
+    var NdotH = clamp(dot(N, H), 0.0, 1.0);
+    if (is_ambient) {
+        NdotL = 1.0;
+        NdotH = 0.0;
+    }
 
     // Light projection cookie (perspective-corrected projection)
     let proj_uv = in.light_proj_uvw.xy / max(in.light_proj_uvw.z, 0.001);
@@ -140,18 +156,22 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let spec = textureSample(t_specular, s_material, in.tex_specular).rgb
                * u.specular_color.rgb;
 
-    // Phong specular (pow 12 to match the engine's interaction.vfp default)
+    // Phong specular approximating the engine's specular lookup table;
+    // vanilla also doubles the specular map (ADD R2, R2, R2).
     let specFalloff = pow(NdotH, 12.0);
 
-    let color = (diffuse + specFalloff * spec)
+    var color = (diffuse + specFalloff * spec * 2.0)
                 * NdotL
                 * light_proj_color
                 * light_falloff;
 
-    // NOTE: deliberately NOT multiplied by vertex_color. DOOM 3 interactions
-    // default to SVC_IGNORE (color modulate=0, add=1 → vertex color unused),
-    // and world geometry often carries black vertex colors — multiplying
-    // would zero the whole lit pass. Proper modulate/add support comes with
-    // real material capture.
+    // Vertex color, engine-style: vc' = vc * modulate + add. SVC_IGNORE is
+    // (0, 1) → multiply by 1; SVC_MODULATE (1, 0); SVC_INVERSE (-1, 1).
+    let vc = in.vertex_color.rgb * u.params.y + vec3<f32>(u.params.z);
+    color = color * vc;
+
+    // Gamma/brightness term matching dhewm3's r_gammaInShader injection.
+    color = pow(max(color * u.params.w, vec3<f32>(0.0)), vec3<f32>(u.params2.x));
+
     return vec4<f32>(color, 1.0);
 }

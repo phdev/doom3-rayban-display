@@ -1788,10 +1788,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..ed5c2ea
+index 0000000..071261f
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,1601 @@
+@@ -0,0 +1,1618 @@
 +/*
 +================================================================================
 +
@@ -2478,6 +2478,23 @@ index 0000000..ed5c2ea
 +        WGPUTextureView vProj     = getEngineTextureView(imgs[2], fbWhiteView);
 +        WGPUTextureView vDiffuse  = getEngineTextureView(imgs[3], fbCheckerView);
 +        WGPUTextureView vSpecular = getEngineTextureView(imgs[4], fbWhiteView);
++        // Diagnostic: per-slot fallback misses. A falloff miss = the light
++        // extends forever along its axis (falloff=1) — giant washes.
++        {
++            const bool miss[5] = {
++                vNormal == fbFlatNormalView && imgs[0] != nullptr,
++                vFalloff == fbWhiteView     && imgs[1] != nullptr,
++                vProj == fbWhiteView        && imgs[2] != nullptr,
++                vDiffuse == fbCheckerView   && imgs[3] != nullptr,
++                vSpecular == fbWhiteView    && imgs[4] != nullptr,
++            };
++            if (miss[0] || miss[1] || miss[2] || miss[3] || miss[4]) {
++                EM_ASM_({
++                    console.info("[d3] matGroup MISS bump=" + $0 + " falloff=" + $1 +
++                                 " proj=" + $2 + " diffuse=" + $3 + " specular=" + $4);
++                }, (int)miss[0], (int)miss[1], (int)miss[2], (int)miss[3], (int)miss[4]);
++            }
++        }
 +
 +        WGPUBindGroupLayout bgl = wgpuRenderPipelineGetBindGroupLayout(interactionPipeline, 1);
 +        WGPUBindGroupEntry e[7] = {};
@@ -2505,11 +2522,11 @@ index 0000000..ed5c2ea
 +        return group;
 +    }
 +
-+    // Iter 7b: per-record slot resources. Each slot gets one 192-byte
++    // Iter 7b: per-record slot resources. Each slot gets one 224-byte
 +    // uniform buffer plus TWO group(0) bind groups over it: one for the
 +    // interaction pipeline's layout, one for the depth pre-pass pipeline's
 +    // layout (depth.wgsl only declares the mat4, so its auto layout has a
-+    // smaller minBindingSize — entry.size 192 satisfies both). Fallback
++    // smaller minBindingSize — entry.size 224 satisfies both). Fallback
 +    // texture views are created here too.
 +    void initRecordSlots() {
 +        if (recordSlotsReady) return;
@@ -2525,11 +2542,11 @@ index 0000000..ed5c2ea
 +        WGPUBindGroupLayout bglDepth       = wgpuRenderPipelineGetBindGroupLayout(depthPipeline, 0);
 +        for (uint32_t i = 0; i < kMaxRecordSlots; ++i) {
 +            WGPUBufferDescriptor ubd = {};
-+            ubd.size = 192;
++            ubd.size = 224;
 +            ubd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
 +            recordUniformBufs[i] = wgpuDeviceCreateBuffer(device, &ubd);
 +            WGPUBindGroupEntry e = {};
-+            e.binding = 0; e.buffer = recordUniformBufs[i]; e.size = 192;
++            e.binding = 0; e.buffer = recordUniformBufs[i]; e.size = 224;
 +            WGPUBindGroupDescriptor bgd = {};
 +            bgd.entryCount = 1;
 +            bgd.entries = &e;
@@ -2612,9 +2629,10 @@ index 0000000..ed5c2ea
 +        // Per-slot uniform writes. r.modelMatrix holds the FULL MVP, baked
 +        // at capture time in draw_arb2.cpp where this view's projection and
 +        // this surface's modelView are both in scope. Use verbatim.
++        extern float g_capInvGamma;
 +        for (uint32_t i = 0; i < n; ++i) {
 +            const Rec& r = g_capRecords[i];
-+            float ub[48];
++            float ub[56];
 +            memcpy(ub +  0, r.modelMatrix, 64);
 +            memcpy(ub + 16, r.localLightOrigin, 16);
 +            memcpy(ub + 20, r.localViewOrigin,  16);
@@ -2624,22 +2642,21 @@ index 0000000..ed5c2ea
 +            memcpy(ub + 36, r.lightProjT,       16);
 +            memcpy(ub + 40, r.lightProjQ,       16);
 +            memcpy(ub + 44, r.lightFalloffS,    16);
-+            wgpuQueueWriteBuffer(queue, recordUniformBufs[i], 0, ub, 192);
++            // Iter 8a params: ambient flag, vertex-color modulate/add
++            // (SVC_IGNORE=(0,1), SVC_MODULATE=(1,0), SVC_INVERSE=(-1,1)),
++            // brightness (pad3 is x1000 fixed-point), 1/gamma.
++            const float svcMod = (r.pad2 == 1u) ? 1.0f : (r.pad2 == 2u) ? -1.0f : 0.0f;
++            const float svcAdd = (r.pad2 == 1u) ? 0.0f : 1.0f;
++            ub[48] = (r.pad1 != 0u) ? 1.0f : 0.0f;
++            ub[49] = svcMod;
++            ub[50] = svcAdd;
++            ub[51] = (float)r.pad3 / 1000.0f;
++            ub[52] = g_capInvGamma;
++            ub[53] = 0.0f; ub[54] = 0.0f; ub[55] = 0.0f;
++            wgpuQueueWriteBuffer(queue, recordUniformBufs[i], 0, ub, 224);
 +            // Iter 7b: resolve the material bind group (creates GPU textures
 +            // from the CPU image cache on first sight of each image).
 +            lastMatGroups[i] = getMaterialBindGroup(g_capImagePtrs[i]);
-+            // Diagnostic: name the falloff image feeding each record (once).
-+            static bool falloffDumped = false;
-+            if (!falloffDumped && i + 1 == n) {
-+                falloffDumped = true;
-+                for (uint32_t k = 0; k < n && k < 12; ++k) {
-+                    const ImgSlot* fs = D3_WebGPU_LookupCachedImage(g_capImagePtrs[k][1]);
-+                    EM_ASM_({
-+                        console.info("[d3] rec" + $0 + " falloff=" +
-+                                     ($1 ? UTF8ToString($1) : "<not cached>"));
-+                    }, k, fs ? (intptr_t)fs->name : 0);
-+                }
-+            }
 +        }
 +        // Keep a backend-local copy of the consumed records (the draw loop
 +        // reads offsets/counts from here, and no-capture frames redraw it).
@@ -3357,8 +3374,8 @@ index 0000000..ed5c2ea
 +    WGPUBindGroup           lastMatGroups[kMaxRecordSlots] = {nullptr};
 +    // Iter 7b: GPU texture cache (engine idImage ptr → WGPUTextureView) and
 +    // material bind-group cache (5-image tuple → group(1) bind group).
-+    static constexpr uint32_t kTexCacheSize = 512;
-+    static constexpr uint32_t kMatCacheSize = 512;
++    static constexpr uint32_t kTexCacheSize = 2048;
++    static constexpr uint32_t kMatCacheSize = 1024;
 +    struct TexCacheEntry { const void* ptr; WGPUTextureView view; };
 +    struct MatCacheEntry { void* key[5]; WGPUBindGroup group; };
 +    TexCacheEntry           texCache[kTexCacheSize] = {};
@@ -3542,10 +3559,10 @@ index 7914093..eed2277 100644
  	GLimp_Shutdown();
  
 diff --git a/neo/renderer/draw_arb2.cpp b/neo/renderer/draw_arb2.cpp
-index c1d0d3e..322be8b 100644
+index c1d0d3e..434308e 100644
 --- a/neo/renderer/draw_arb2.cpp
 +++ b/neo/renderer/draw_arb2.cpp
-@@ -62,7 +62,141 @@ static void GL_SelectTextureNoClient( int unit ) {
+@@ -62,7 +62,153 @@ static void GL_SelectTextureNoClient( int unit ) {
  RB_ARB2_DrawInteraction
  ==================
  */
@@ -3590,6 +3607,7 @@ index c1d0d3e..322be8b 100644
 +    extern uint32_t g_capIndexBytes;
 +    extern uint32_t g_capFrameId;
 +    extern uint32_t g_capDropped;
++    extern float    g_capInvGamma;
 +    extern void* g_capImagePtrs[][5];
 +}
 +enum { kWGPUMaxCapV = 8192, kWGPUMaxCapI = 32768 };
@@ -3647,6 +3665,17 @@ index c1d0d3e..322be8b 100644
 +			// FIRST in idTech4, with their own projections; drawing their
 +			// records into the echo produces ghost geometry).
 +			r.pad0 = (uint32_t)(uintptr_t)backEnd.viewDef;
++			// Iter 8a fidelity: ambient flag + vertex-color mode + gamma —
++			// packed into the spare pad fields, expanded into the uniform
++			// params vec4s by the backend.
++			r.pad1 = din->ambientLight ? 1u : 0u;
++			r.pad2 = (uint32_t)din->vertexColor;   // 0 ignore, 1 modulate, 2 inverse
++			// brightness in pad3 (x1000 fixed-point); 1/gamma via global.
++			r.pad3 = (uint32_t)(r_brightness.GetFloat() * 1000.0f);
++			{
++				const float g = r_gamma.GetFloat();
++				g_capInvGamma = (g > 0.01f) ? (1.0f / g) : 1.0f;
++			}
 +			static const float kIdent[16] = {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
 +			// Bake the FULL MVP (projection * modelView) at capture time —
 +			// both matrices are in scope here with the correct values for
@@ -3876,7 +3905,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..360f1c4 100644
+index c83ebb5..b388c4b 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -3887,7 +3916,7 @@ index c83ebb5..360f1c4 100644
  
  /*
  
-@@ -38,6 +39,145 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +39,146 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -3954,6 +3983,7 @@ index c83ebb5..360f1c4 100644
 +    uint32_t g_capIndexBytes  = 0;
 +    uint32_t g_capFrameId     = 0;   // bumped at BeginDrawingView once we have records
 +    uint32_t g_capDropped     = 0;   // records skipped because a cap was hit (reset on consume)
++    float    g_capInvGamma    = 1.0f; // 1/r_gamma, refreshed at capture (iter 8a)
 +}
 +
 +// Iter 7: CPU image cache for the WebGPU backend. Image_load.cpp calls
@@ -3969,7 +3999,7 @@ index c83ebb5..360f1c4 100644
 +    char        name[64];   // imgName for diagnostics
 +};
 +extern "C" {
-+    enum { kWGPUImageCacheSize = 512 };
++    enum { kWGPUImageCacheSize = 2048 };
 +    WGPUImageSlot g_imgCache[kWGPUImageCacheSize] = {};
 +    int g_imgCacheCount = 0;
 +}
@@ -4033,7 +4063,7 @@ index c83ebb5..360f1c4 100644
  
  /*
  =================
-@@ -166,6 +306,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +307,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -4041,7 +4071,7 @@ index c83ebb5..360f1c4 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -557,22 +698,41 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +699,41 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
@@ -4095,10 +4125,10 @@ index c83ebb5..360f1c4 100644
  	// ensures that depth writes are enabled for the depth clear
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..0d0eeec
+index 0000000..b4b1a9c
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,349 @@
+@@ -0,0 +1,369 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -4276,6 +4306,14 @@ index 0000000..0d0eeec
 +"    light_proj_t:         vec4<f32>,\n"
 +"    light_proj_q:         vec4<f32>,\n"
 +"    light_falloff_s:      vec4<f32>,   // light falloff texgen S\n"
++"    // Iter 8a fidelity params:\n"
++"    //   params.x = isAmbient (1 = ambient light: N·L term forced to 1, no spec)\n"
++"    //   params.y = vertex color modulate (SVC: 0 ignore, 1 modulate, -1 inverse)\n"
++"    //   params.z = vertex color add      (1 for ignore/inverse, 0 for modulate)\n"
++"    //   params.w = r_brightness\n"
++"    //   params2.x = 1 / r_gamma\n"
++"    params:               vec4<f32>,\n"
++"    params2:              vec4<f32>,\n"
 +"};\n"
 +"\n"
 +"@group(0) @binding(0) var<uniform> u: Uniforms;\n"
@@ -4358,8 +4396,16 @@ index 0000000..0d0eeec
 +"    let nm = textureSample(t_normal, s_material, in.tex_bump);\n"
 +"    let N = normalize(nm.rgb * 2.0 - vec3<f32>(1.0, 1.0, 1.0));\n"
 +"\n"
-+"    let NdotL = clamp(dot(N, L), 0.0, 1.0);\n"
-+"    let NdotH = clamp(dot(N, H), 0.0, 1.0);\n"
++"    // Ambient lights have no meaningful direction: the engine renders them\n"
++"    // with a flat \"ambient normal map\" so the N·L term is ~constant. Force\n"
++"    // the diffuse term to 1 and kill specular for them.\n"
++"    let is_ambient = u.params.x > 0.5;\n"
++"    var NdotL = clamp(dot(N, L), 0.0, 1.0);\n"
++"    var NdotH = clamp(dot(N, H), 0.0, 1.0);\n"
++"    if (is_ambient) {\n"
++"        NdotL = 1.0;\n"
++"        NdotH = 0.0;\n"
++"    }\n"
 +"\n"
 +"    // Light projection cookie (perspective-corrected projection)\n"
 +"    let proj_uv = in.light_proj_uvw.xy / max(in.light_proj_uvw.z, 0.001);\n"
@@ -4377,19 +4423,23 @@ index 0000000..0d0eeec
 +"    let spec = textureSample(t_specular, s_material, in.tex_specular).rgb\n"
 +"               * u.specular_color.rgb;\n"
 +"\n"
-+"    // Phong specular (pow 12 to match the engine's interaction.vfp default)\n"
++"    // Phong specular approximating the engine's specular lookup table;\n"
++"    // vanilla also doubles the specular map (ADD R2, R2, R2).\n"
 +"    let specFalloff = pow(NdotH, 12.0);\n"
 +"\n"
-+"    let color = (diffuse + specFalloff * spec)\n"
++"    var color = (diffuse + specFalloff * spec * 2.0)\n"
 +"                * NdotL\n"
 +"                * light_proj_color\n"
 +"                * light_falloff;\n"
 +"\n"
-+"    // NOTE: deliberately NOT multiplied by vertex_color. DOOM 3 interactions\n"
-+"    // default to SVC_IGNORE (color modulate=0, add=1 → vertex color unused),\n"
-+"    // and world geometry often carries black vertex colors — multiplying\n"
-+"    // would zero the whole lit pass. Proper modulate/add support comes with\n"
-+"    // real material capture.\n"
++"    // Vertex color, engine-style: vc' = vc * modulate + add. SVC_IGNORE is\n"
++"    // (0, 1) → multiply by 1; SVC_MODULATE (1, 0); SVC_INVERSE (-1, 1).\n"
++"    let vc = in.vertex_color.rgb * u.params.y + vec3<f32>(u.params.z);\n"
++"    color = color * vc;\n"
++"\n"
++"    // Gamma/brightness term matching dhewm3's r_gammaInShader injection.\n"
++"    color = pow(max(color * u.params.w, vec3<f32>(0.0)), vec3<f32>(u.params2.x));\n"
++"\n"
 +"    return vec4<f32>(color, 1.0);\n"
 +"}\n"
 +"";
