@@ -37,8 +37,12 @@ jobs:
         continue-on-error: true
         run: |
           git clone --depth 1 https://github.com/emscripten-core/emsdk.git .build/emsdk
-          .build/emsdk/emsdk install latest
-          .build/emsdk/emsdk activate latest
+          # PINNED (2026-06-10): "latest" produced a wasm that traps with
+          # "null function" at boot under WebGPU-primary while the same
+          # source built with 6.0.0 locally runs clean. Pin to the known-good
+          # toolchain; bump deliberately with a live-boot check.
+          .build/emsdk/emsdk install 6.0.0
+          .build/emsdk/emsdk activate 6.0.0
       - name: Build GL4ES + dhewm3 engine
         id: engine
         continue-on-error: true
