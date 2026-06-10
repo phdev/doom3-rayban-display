@@ -703,3 +703,15 @@ force-add the chunks; they're gitignore-excepted like the pak). The
 runtime prefers the manifest; each chunk gets its own stall window +
 retries AND caches individually in IndexedDB for cross-reload resume
 (entries dropped once the assembled pak caches whole).
+
+**Iter 13b — sky cube stages (2026-06-10).** R_Skybox/WobbleskyTexGen
+stash their CPU-computed per-vertex cube dirs (8-entry ring, surf ptr +
+tr.frameCount validated — frame-temp ptrs recycle); pass-stage capture
+accepts SKYBOX/WOBBLESKY texgens, dirs ride a parallel vec3 vertex
+stream (record sPad1 = offset, pad3 = 2). GenerateCubeImage feeds a
+6-face CPU cube cache → 6-layer texture + Cube view. sky.wgsl samples
+along the interpolated dir; drawn first in the final pass, opaque +
+depth-tested. Wobble rotation comes free (engine computed it).
+TEXGEN COVERAGE: explicit ✓ sky ✓ wobblesky ✓; reflect/screen still
+unsupported. Remaining big items: subviews (render-to-texture),
+lightgem via WebGPU, GL4ES retirement, heat-haze, ROQ.
