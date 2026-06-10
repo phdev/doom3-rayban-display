@@ -1788,10 +1788,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..071261f
+index 0000000..8346897
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,1618 @@
+@@ -0,0 +1,1626 @@
 +/*
 +================================================================================
 +
@@ -2355,18 +2355,25 @@ index 0000000..071261f
 +        EM_ASM({ console.info("[d3] WebGPU interaction pipeline initialized"); });
 +    }
 +
-+    // Iter 7b: z-fill pre-pass pipeline (depth.wgsl). No fragment stage, no
-+    // color targets — writes depth only. The lit pass then tests LessEqual
-+    // with depth writes off, giving correct occlusion AND letting multiple
++    // Iter 8b: z-fill pre-pass pipeline. No fragment stage, no color
++    // targets — writes depth only. The lit pass then tests LessEqual with
++    // depth writes off, giving correct occlusion AND letting multiple
 +    // light passes of the same surface accumulate at equal depth.
++    //
++    // CRITICAL: built from interaction.wgsl's vs_main — the SAME module and
++    // entry point as the lit pipeline — so both compute bit-identical clip
++    // positions. A separate depth-only shader source risks the compiler
++    // ordering the position math differently between pipelines; a 1-ulp
++    // clip-z difference makes LessEqual reject every lit fragment (black
++    // echo). depth.wgsl stays in the tree for future true depth-only uses.
 +    void initDepthPipeline() {
 +        WGPUShaderSourceWGSL wgsl = {};
 +        wgsl.chain.sType = WGPUSType_ShaderSourceWGSL;
-+        wgsl.code = { kWGSL_depth, WGPU_STRLEN };
++        wgsl.code = { kWGSL_interaction, WGPU_STRLEN };
 +        WGPUShaderModuleDescriptor smd = {};
 +        smd.nextInChain = &wgsl.chain;
 +        WGPUShaderModule mod = wgpuDeviceCreateShaderModule(device, &smd);
-+        if (!mod) { fprintf(stderr, "[WebGPU] depth.wgsl create FAILED\n"); return; }
++        if (!mod) { fprintf(stderr, "[WebGPU] prepass shader create FAILED\n"); return; }
 +
 +        WGPUDepthStencilState dss = {};
 +        dss.format = WGPUTextureFormat_Depth24Plus;
@@ -2693,9 +2700,10 @@ index 0000000..071261f
 +    // into the given color/depth views. Used by both the on-screen echo and
 +    // the determinism self-test so the two stay structurally identical.
 +    void encodeRecordsPass(WGPUCommandEncoder enc, WGPUTextureView color, WGPUTextureView depth) {
-+        // DIAGNOSTIC: skip the z pre-pass to test whether the lit pass is
-+        // being depth-rejected by cross-pipeline clip-z mismatch.
-+        const bool kUsePrePass = false;
++        // Iter 8b: pre-pass enabled — the depth pipeline now shares
++        // interaction.wgsl's vs_main, so clip-z is bit-identical between
++        // the z-fill and lit passes.
++        const bool kUsePrePass = true;
 +        // Pass 1: z-fill (no color attachments)
 +        if (kUsePrePass) {
 +            WGPURenderPassDepthStencilAttachment da = {};
