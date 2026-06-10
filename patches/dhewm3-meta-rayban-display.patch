@@ -1917,10 +1917,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..2737d47
+index 0000000..d7b74c2
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,3191 @@
+@@ -0,0 +1,3204 @@
 +/*
 +================================================================================
 +
@@ -2045,6 +2045,7 @@ index 0000000..2737d47
 +struct SubLink { void* img; uint32_t viewTag; };
 +extern "C" SubLink g_subviewLinks[];
 +extern "C" uint32_t g_subviewLinkCount;
++extern "C" const char* D3_WebGPU_ImageName(const void* imgPtr);
 +
 +// ─── Backend class ──────────────────────────────────────────────────────────
 +
@@ -3236,6 +3237,18 @@ index 0000000..2737d47
 +        return wgpuTextureCreateView(tex, nullptr);
 +    }
 +
++    // Names an unresolvable image once — turns "flat tinted quad" reports
++    // into an actionable image list (helper lives in tr_render.cpp).
++    void noteImageFallback(const void* imgPtr, const char* why) {
++        static const void* seen[24] = {};
++        static int seenCount = 0;
++        for (int i = 0; i < seenCount; ++i) if (seen[i] == imgPtr) return;
++        if (seenCount >= 24) return;
++        seen[seenCount++] = imgPtr;
++        EM_ASM_({ console.info("[d3] WebGPU image FALLBACK (" + UTF8ToString($1) + "): " + UTF8ToString($0)); },
++                D3_WebGPU_ImageName(imgPtr), why);
++    }
++
 +    // Iter 7b: GPU mirror of the engine's CPU image cache. One texture per
 +    // idImage pointer, created+uploaded on first use.
 +    WGPUTextureView getEngineTextureView(const void* imgPtr, WGPUTextureView fallback) {
@@ -3248,8 +3261,8 @@ index 0000000..2737d47
 +            if (texCache[i].ptr == imgPtr) return texCache[i].view;
 +        }
 +        const ImgSlot* slot = D3_WebGPU_LookupCachedImage(imgPtr);
-+        if (!slot || !slot->pixels || slot->w <= 0 || slot->h <= 0) return fallback;
-+        if (texCacheCount >= (int)kTexCacheSize) return fallback;
++        if (!slot || !slot->pixels || slot->w <= 0 || slot->h <= 0) { noteImageFallback(imgPtr, "cpu-miss"); return fallback; }
++        if (texCacheCount >= (int)kTexCacheSize) { noteImageFallback(imgPtr, "gpu-cache-full"); return fallback; }
 +
 +        // Full mip chain (box filter) — single-mip textures shimmer badly
 +        // under minification at the echo's render scale.
@@ -4950,7 +4963,7 @@ index 0000000..2737d47
 +    // buffers + per-slot group(0) bind groups (one set for the interaction
 +    // pipeline layout, one for the depth pipeline layout). Material
 +    // textures live in group(1), cached per unique 5-image tuple.
-+    static constexpr uint32_t kMaxRecordSlots = 256;
++    static constexpr uint32_t kMaxRecordSlots = 512;   // mirrors kWGPUMaxRecords
 +    WGPUBuffer              recordVertexBuf = nullptr;
 +    WGPUBuffer              recordIndexBuf  = nullptr;
 +    uint32_t                recordVertexCap = 0;   // bytes
@@ -5832,7 +5845,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..76bb0f4 100644
+index c83ebb5..663daf8 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -5843,7 +5856,7 @@ index c83ebb5..76bb0f4 100644
  
  /*
  
-@@ -38,6 +39,676 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +39,704 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -5855,9 +5868,12 @@ index c83ebb5..76bb0f4 100644
 +// by RB_BeginDrawingView.
 +enum { kWGPUMaxCaptureVerts = 8192, kWGPUMaxCaptureIndexes = 32768 };
 +enum {
-+    kWGPUMaxRecords      = 256,                 // hard cap on per-frame draws
-+    kWGPUVertAccumBytes  = 8 * 1024 * 1024,     // 8MB vertex accumulator
-+    kWGPUIndexAccumBytes = 2 * 1024 * 1024,     // 2MB u16 index accumulator
++    // 512 was 256: heavy views (mars_city1 underground, long sightlines)
++    // overflowed the cap and the dropped interactions rendered as BLACK
++    // surfaces (in the z-prepass via one captured light, lit by none).
++    kWGPUMaxRecords      = 512,                 // hard cap on per-frame draws
++    kWGPUVertAccumBytes  = 16 * 1024 * 1024,    // vertex accumulator
++    kWGPUIndexAccumBytes = 4 * 1024 * 1024,     // u16 index accumulator
 +};
 +struct WGPUInteractionRecord {
 +    uint32_t vertOffset;
@@ -6005,6 +6021,12 @@ index c83ebb5..76bb0f4 100644
 +	g_cinPendingSlot = slot;
 +}
 +
++// Debug: resolve an idImage pointer to its name for backend fallback logs.
++extern "C" const char* D3_WebGPU_ImageName( const void* imgPtr ) {
++	if ( !imgPtr ) return "(null)";
++	return ((const idImage*)imgPtr)->imgName.c_str();
++}
++
 +extern "C" void D3_WebGPU_NoteSubviewCopy( void* img ) {
 +	if ( !backEnd.viewDef || !img ) return;
 +	const uint32_t tag = (uint32_t)(uintptr_t)backEnd.viewDef;
@@ -6104,7 +6126,12 @@ index c83ebb5..76bb0f4 100644
 +    char        name[64];   // imgName for diagnostics
 +};
 +extern "C" {
-+    enum { kWGPUImageCacheSize = 2048 };
++    // 3072 was 2048: a full playthrough loads more images than the level's
++    // initial set — HUD/GUI images load LAZILY at first draw, AFTER level
++    // textures, so when the cache overflowed they were the casualties
++    // (flat tinted HUD quads). The overflow now warns instead of silently
++    // dropping.
++    enum { kWGPUImageCacheSize = 3072 };
 +    WGPUImageSlot g_imgCache[kWGPUImageCacheSize] = {};
 +    int g_imgCacheCount = 0;
 +}
@@ -6125,7 +6152,14 @@ index c83ebb5..76bb0f4 100644
 +        if ( g_imgCache[i].ptr == (const void*)img ) { slot = i; break; }
 +    }
 +    if ( slot < 0 ) {
-+        if ( g_imgCacheCount >= kWGPUImageCacheSize ) return;
++        if ( g_imgCacheCount >= kWGPUImageCacheSize ) {
++            static bool warned = false;
++            if ( !warned ) {
++                warned = true;
++                common->Printf( "[d3] WebGPU CPU image cache FULL (%d) — later images fall back\n", (int)kWGPUImageCacheSize );
++            }
++            return;
++        }
 +        slot = g_imgCacheCount++;
 +        g_imgCache[slot].ptr = (const void*)img;
 +        g_imgCache[slot].pixels = nullptr;
@@ -6347,14 +6381,20 @@ index c83ebb5..76bb0f4 100644
 +		return;   // screen-space texgens still unsupported
 +	}
 +	// Iter 17: cinematic stages replay against the per-slot dynamic frame
-+	// noted by RB_BindVariableStageImage moments ago. No decoded frame
-+	// pending (r_skipROQ, missing video, decode idle) → skip the stage,
-+	// matching GL's blackImage bind.
++	// noted by RB_BindVariableStageImage moments ago.
 +	uint32_t cinSlot = 0;
++	idImage* cinFallback = NULL;
 +	if ( pStage->texture.cinematic ) {
-+		if ( g_cinPendingSlot < 0 ) return;
-+		cinSlot = (uint32_t)g_cinPendingSlot + 1u;   // sPad3 is 1-based; 0 = not cinematic
-+		g_cinPendingSlot = -1;
++		if ( g_cinPendingSlot >= 0 ) {
++			cinSlot = (uint32_t)g_cinPendingSlot + 1u;   // sPad3 is 1-based; 0 = not cinematic
++			g_cinPendingSlot = -1;
++		} else {
++			// GL parity: with no decoded frame (r_skipROQ, missing video,
++			// idle decoder) GL binds blackImage and DRAWS — skipping the
++			// stage instead let the GUI backcolor show through as floating
++			// teal quads on every video screen.
++			cinFallback = globalImages->blackImage;
++		}
 +	}
 +	// Stages that mask off ALL color writes (maskcolor / makealpha — they
 +	// only prime the alpha channel for a later gl_dst_alpha stage) must NOT
@@ -6362,6 +6402,7 @@ index c83ebb5..76bb0f4 100644
 +	// (found via glass1's alpha-prime stage painting the window white).
 +	if ( ( pStage->drawStateBits & GLS_COLORMASK ) == GLS_COLORMASK ) return;
 +	idImage* img = pStage->texture.image;
++	if ( cinFallback ) img = cinFallback;
 +	if ( !img && !cinSlot ) return;
 +	if ( g_passRecordCount >= (uint32_t)kWGPUMaxRecords ) { g_capDropped++; return; }
 +
@@ -6520,7 +6561,7 @@ index c83ebb5..76bb0f4 100644
  
  /*
  =================
-@@ -49,6 +720,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +748,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -6536,7 +6577,7 @@ index c83ebb5..76bb0f4 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +758,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +786,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -6552,7 +6593,7 @@ index c83ebb5..76bb0f4 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +805,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +833,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -6569,7 +6610,7 @@ index c83ebb5..76bb0f4 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +865,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +893,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -6577,7 +6618,7 @@ index c83ebb5..76bb0f4 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1092,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1120,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -6590,7 +6631,7 @@ index c83ebb5..76bb0f4 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1261,41 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1289,41 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  

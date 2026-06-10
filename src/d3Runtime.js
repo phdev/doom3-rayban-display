@@ -618,7 +618,11 @@ function buildArguments(config) {
     // shadows are the single biggest cost in DOOM 3, so disable them, run the
     // low machine spec, and downsize textures for faster uploads.
     "+set", "com_machineSpec", "0",
-    "+set", "r_shadows", "0",
+    // Stencil shadows are fully implemented in the WebGPU backend (iter 9)
+    // but off by default for perf (the CPU shadow-volume build is the cost
+    // at WASM speeds). ?shadows enables for A/B.
+    "+set", "r_shadows",
+        (/[?&]shadows\b/.test(typeof window !== "undefined" ? window.location.search : "")) ? "1" : "0",
     // Skip ROQ cinematic decoding. The RoQ decoder calls a null function pointer
     // in this WASM build (idCinematicLocal::ImageForTime, reached from
     // RB_BindVariableStageImage when a surface has a video texture), which traps

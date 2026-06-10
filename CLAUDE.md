@@ -912,3 +912,25 @@ the pak + r_skipROQ 0, walk to the reception desk — the console
 should print "cinematic frame bound" and the desk screen should show
 moving IPN news. Note videomap decls reference "sound/VO/video/..."
 (uppercase VO — engine FS is case-insensitive, zip entries lowercase).
+
+**Iter 18 — HUD teal quads + floating video quads + heavy-scene black
+surfaces (2026-06-10, from on-device report).** Three root causes:
+(1) HUD elements drew as flat mint/teal quads: the 2048-slot CPU image
+cache silently OVERFLOWED on a full playthrough — HUD/GUI images load
+LAZILY at first draw, AFTER the level's textures, so they were the
+casualties (white-fallback texture × stage tint = flat quad). Cache →
+3072 + a one-shot console warning when full; new
+`noteImageFallback`/`D3_WebGPU_ImageName` logging names every image
+that resolves to a fallback ("[d3] WebGPU image FALLBACK (why): name")
+— the instrument that cracked this in one run.
+(2) Floating teal quads on video screens: frameless cinematic stages
+were SKIPPED, letting the GUI backcolor show; GL binds blackImage and
+DRAWS. Now captured with blackImage (GL parity).
+(3) Black boxes/characters in heavy scenes (underground): record-cap
+starvation — surfaces whose interactions were dropped at the 256 cap
+rendered black (in the prepass via one captured light, lit by none).
+Caps: records 256→512, vert accum 8→16MB, index 2→4MB (mirror
+kMaxRecordSlots in the backend!). Verified: zero fallbacks at the
+reported area, correct bordered HUD, no validation errors.
+`?shadows` flag added: stencil shadows (iter 9) are implemented but
+default-off for perf — flag enables for on-device A/B.
