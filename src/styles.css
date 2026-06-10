@@ -305,3 +305,24 @@ body {
 .move-left { grid-area: 2 / 1 / 3 / 2; }
 .move-right { grid-area: 2 / 3 / 3 / 4; }
 .move-back { grid-area: 3 / 2 / 4 / 3; }
+
+/* Cutover preview (?wgpufull): the WebGPU canvas takes the #gameCanvas
+   role — fullscreen-centered square, pixelated upscale — and the GL canvas
+   goes invisible (opacity, not display:none, so SDL keeps its context and
+   sizing). */
+.webgpu-canvas.is-primary {
+  position: static;
+  width: min(100vw, 100vh, 600px);
+  height: min(100vw, 100vh, 600px);
+  max-width: none;
+  aspect-ratio: 1;
+  border: 0;
+  background: #040404;
+  image-rendering: pixelated;
+  z-index: auto;
+}
+.game-canvas.is-ghost {
+  position: fixed;
+  opacity: 0;
+  pointer-events: none;
+}
