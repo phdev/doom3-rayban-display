@@ -815,3 +815,28 @@ playback is one pak-reducer change away (include `video/` subset,
 testing: `innoextract --include "base/pak003.pk4" setup_doom_3*.exe`
 (marscity videos live in pak003; sounds for the future ?audio work
 live in pak001/pak004 as .ogg).
+
+**Pak reducer: audio + video dependency resolution (2026-06-10).**
+Two long-standing gaps closed in `reduce-d3-map-pk4.py`:
+(1) `.sndshd` bodies were kept as text but never INDEXED, and entities
+reference sound shaders by bare name (no slash, so `tokens()` filters
+them out) — the closure could never reach a single `sound/*` sample
+file. Audio "kept by default" was actually shipping EMPTY. Now sound
+shaders index name → sample paths (like materials) and resolve through
+the def-graph closure. (2) `.roq` wasn't in any keep-extension set —
+new `--keep-video` flag keeps referenced cinematics.
+MEASURED on the full GOG data (`innoextract`, /tmp/d3gog/base):
+baseline (--no-audio) 65.6 MB == current shipped pak;
++audio (11kHz mono wav, ogg as-is) 75.4 MB (+9.8);
++audio+video 95.2 MB (+29.6). The mars_city1 GUI monitors reference
+exactly TWO videos — `sound/vo/video/video_ipn_news.roq` +
+`video_uac_welcome.roq` (24.6 MB together; id parked VO-composite
+videos under sound/, NOT video/ — video/marscity/* is the skipped
+intro cinematic). SHIPPING IS A PRODUCT CALL (pak size vs content on
+cellular) — not committed. Also note: cinematic frames upload via
+`UploadScratch`, NOT GenerateImage, so the WebGPU capture path does
+NOT display videos yet — shipping videos needs the WebGPU
+dynamic-texture feature first (per-record scratch frames; the shared
+cinematicImage scratch breaks capture-replay when 2+ monitors are in
+view). GL paths (&echo, fallback) play them fine — decode verified
+clean with the real monitor videos injected locally.

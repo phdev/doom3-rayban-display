@@ -36,6 +36,7 @@ TEXT_KEEP_EXTS = {
 IMAGE_EXTS = {".tga", ".jpg", ".jpeg", ".png", ".dds", ".pcx", ".bmp"}
 MODEL_EXTS = {".md5mesh", ".md5anim", ".md5camera", ".lwo", ".ase", ".ma", ".flt", ".prt"}
 SOUND_EXTS = {".wav", ".ogg"}
+VIDEO_EXTS = {".roq"}
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_\-/\\.]+")
 
@@ -240,6 +241,9 @@ def main(argv=None):
     parser.add_argument("--keep-list", help="JSON file with extra keep globs")
     parser.add_argument("--no-audio", action="store_true",
                         help="drop all sound/* assets (smallest output; sound is off in the wearable build)")
+    parser.add_argument("--keep-video", action="store_true",
+                        help="keep referenced .roq cinematics (GUI monitor screens). Off by default; "
+                             "the engine needs r_skipROQ 0 for them to play.")
     parser.add_argument("--audio-rate", type=int, default=0, help="downsample WAV to this rate (0=skip)")
     parser.add_argument("--audio-width", type=int, default=1, help="WAV sample width in bytes")
     parser.add_argument("--max-texture", type=int, default=0,
@@ -302,13 +306,23 @@ def main(argv=None):
         #    the map and its entities actually use, not the whole game).
         materials = {}   # material name -> set(stripped image paths)
         defs = {}        # entityDef/model name -> concatenated body text
+        sndshaders = {}  # sound shader name -> set(sample paths)
         for name in decl_text:
             zpath, original = entries[name]
             ext = name[name.rfind("."):] if "." in name else ""
-            if ext not in (".mtr", ".def"):
+            if ext not in (".mtr", ".def", ".sndshd"):
                 continue
             text = pool.text(zpath, original)
             for declname, body in iter_decl_blocks(text):
+                if ext == ".sndshd":
+                    # Sound shaders list their sample files (sound/*.wav|ogg)
+                    # in the body. Entities reference the SHADER NAME (a bare
+                    # token, no slash), so without this index the closure can
+                    # never reach a single sample file — which is why audio
+                    # silently shipped empty even without --no-audio.
+                    sndshaders.setdefault(declname, set()).update(
+                        t for t in asset_tokens(body) if t.startswith("sound/"))
+                    continue
                 if ext == ".mtr":
                     materials.setdefault(declname, set()).update(
                         strip_ext(t) for t in asset_tokens(body))
@@ -370,6 +384,8 @@ def main(argv=None):
         for nm in seed_names | used:
             if nm in materials:
                 referenced |= materials[nm]
+            if nm in sndshaders:
+                referenced |= sndshaders[nm]
 
         ref_stripped = {strip_ext(t) for t in referenced}
 
@@ -381,7 +397,9 @@ def main(argv=None):
             ext = name[name.rfind("."):] if "." in name else ""
             if args.no_audio and ext in SOUND_EXTS:
                 continue
-            if ext in IMAGE_EXTS or ext in MODEL_EXTS or ext in SOUND_EXTS:
+            if ext in VIDEO_EXTS and not args.keep_video:
+                continue
+            if ext in IMAGE_EXTS or ext in MODEL_EXTS or ext in SOUND_EXTS or ext in VIDEO_EXTS:
                 if name in referenced or strip_ext(name) in ref_stripped:
                     keep.add(name)
                     continue
@@ -436,6 +454,7 @@ def main(argv=None):
         # 4. Write the reduced archive (downsampling audio on the way out).
         output_path.parent.mkdir(parents=True, exist_ok=True)
         kept_bytes = 0
+        by_dir = {}
         with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as out:
             for name in sorted(keep):
                 zpath, original = entries[name]
@@ -446,6 +465,10 @@ def main(argv=None):
                     data = downsize_image(data, name, args.max_texture)
                 out.writestr(name, data)
                 kept_bytes += len(data)
+                top = name.split("/", 1)[0] if "/" in name else "(root)"
+                by_dir[top] = by_dir.get(top, 0) + len(data)
+        for top, size in sorted(by_dir.items(), key=lambda kv: -kv[1]):
+            print(f"  {top:<14} {size/1e6:8.1f} MB (uncompressed)", file=sys.stderr)
     finally:
         pool.close()
 
