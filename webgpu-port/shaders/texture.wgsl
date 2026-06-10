@@ -16,6 +16,10 @@ struct Uniforms {
     // params.x/.y = vertex-color modulate/add (SVC_IGNORE=(0,1),
     // SVC_MODULATE=(1,0), SVC_INVERSE=(-1,1)); .zw unused.
     params: vec4<f32>,
+    // 2x3 stage texture matrix (scroll/rotate/scale), engine reg layout:
+    // u' = u*s.x + v*s.y + s.w ; v' = u*t.x + v*t.y + t.w
+    texmat_s: vec4<f32>,
+    texmat_t: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -43,7 +47,9 @@ fn vs_main(in: VSIn) -> VSOut {
     let cp = u.mvp * vec4<f32>(in.position, 1.0);
     // GL [-w, w] → WebGPU [0, w] clip-z remap. Identity MVP is unaffected.
     out.clip_pos = vec4<f32>(cp.x, cp.y, (cp.z + cp.w) * 0.5, cp.w);
-    out.uv = in.texcoord;
+    out.uv = vec2<f32>(
+        in.texcoord.x * u.texmat_s.x + in.texcoord.y * u.texmat_s.y + u.texmat_s.w,
+        in.texcoord.x * u.texmat_t.x + in.texcoord.y * u.texmat_t.y + u.texmat_t.w);
     out.vertex_color = in.color;
     return out;
 }

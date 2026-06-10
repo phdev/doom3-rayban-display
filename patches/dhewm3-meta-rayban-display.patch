@@ -1788,10 +1788,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..eb11631
+index 0000000..64f8342
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,2031 @@
+@@ -0,0 +1,2065 @@
 +/*
 +================================================================================
 +
@@ -2056,10 +2056,12 @@ index 0000000..eb11631
 +                    encodeRecordsPass(enc, v, depthView);
 +                } else {
 +                    // Boot/fallback: teal clear + textured demo quad.
-+                    float ub[24] = {
++                    float ub[32] = {
 +                        1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1,
 +                        1.0f, 1.0f, 1.0f, 1.0f,
-+                        0.0f, 1.0f, 0.0f, 0.0f   // SVC_IGNORE params
++                        0.0f, 1.0f, 0.0f, 0.0f,  // SVC_IGNORE params
++                        1.0f, 0.0f, 0.0f, 0.0f,  // identity texmat S
++                        0.0f, 1.0f, 0.0f, 0.0f   // identity texmat T
 +                    };
 +                    wgpuQueueWriteBuffer(queue, demoUniformBuf, 0, ub, sizeof(ub));
 +                    WGPURenderPassColorAttachment ca = {};
@@ -2208,7 +2210,7 @@ index 0000000..eb11631
 +
 +        // Uniform: 64 bytes mat4 + 16 bytes vec4 tint = 80 bytes
 +        WGPUBufferDescriptor ubd = {};
-+        ubd.size = 96;
++        ubd.size = 128;
 +        ubd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
 +        demoUniformBuf = wgpuDeviceCreateBuffer(device, &ubd);
 +
@@ -2254,7 +2256,7 @@ index 0000000..eb11631
 +        WGPUBindGroupEntry entries[3] = {};
 +        entries[0].binding = 0;
 +        entries[0].buffer = demoUniformBuf;
-+        entries[0].size = 96;
++        entries[0].size = 128;
 +        entries[1].binding = 1;
 +        entries[1].sampler = demoSampler;
 +        entries[2].binding = 2;
@@ -2381,7 +2383,7 @@ index 0000000..eb11631
 +        ble[0].binding = 0;
 +        ble[0].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
 +        ble[0].buffer.type = WGPUBufferBindingType_Uniform;
-+        ble[0].buffer.minBindingSize = 96;
++        ble[0].buffer.minBindingSize = 128;
 +        ble[1].binding = 1;
 +        ble[1].visibility = WGPUShaderStage_Fragment;
 +        ble[1].sampler.type = WGPUSamplerBindingType_Filtering;
@@ -2541,7 +2543,7 @@ index 0000000..eb11631
 +        }
 +        WGPUTextureView view = getEngineTextureView(imgPtr, fbWhiteView);
 +        WGPUBindGroupEntry e[3] = {};
-+        e[0].binding = 0; e[0].buffer = passUniformBufs[slot]; e[0].size = 96;
++        e[0].binding = 0; e[0].buffer = passUniformBufs[slot]; e[0].size = 128;
 +        e[1].binding = 1; e[1].sampler = demoSampler;
 +        e[2].binding = 2; e[2].textureView = view;
 +        WGPUBindGroupDescriptor bgd = {};
@@ -2643,23 +2645,53 @@ index 0000000..eb11631
 +        if (!slot || !slot->pixels || slot->w <= 0 || slot->h <= 0) return fallback;
 +        if (texCacheCount >= (int)kTexCacheSize) return fallback;
 +
++        // Full mip chain (box filter) — single-mip textures shimmer badly
++        // under minification at the echo's render scale.
++        uint32_t mips = 1;
++        { int m = slot->w > slot->h ? slot->w : slot->h; while (m > 1) { m >>= 1; mips++; } }
++
 +        WGPUTextureDescriptor td = {};
 +        td.size = { (uint32_t)slot->w, (uint32_t)slot->h, 1 };
-+        td.mipLevelCount = 1;
++        td.mipLevelCount = mips;
 +        td.sampleCount = 1;
 +        td.dimension = WGPUTextureDimension_2D;
 +        td.format = WGPUTextureFormat_RGBA8Unorm;
 +        td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
 +        WGPUTexture tex = wgpuDeviceCreateTexture(device, &td);
 +        if (!tex) return fallback;
-+        WGPUTexelCopyTextureInfo dst = {};
-+        dst.texture = tex;
-+        WGPUTexelCopyBufferLayout layout = {};
-+        layout.bytesPerRow = (uint32_t)slot->w * 4u;
-+        layout.rowsPerImage = (uint32_t)slot->h;
-+        WGPUExtent3D extent = { (uint32_t)slot->w, (uint32_t)slot->h, 1 };
-+        wgpuQueueWriteTexture(queue, &dst, slot->pixels,
-+                              (size_t)slot->w * (size_t)slot->h * 4u, &layout, &extent);
++
++        // Level 0 from the cache, then successive 2x box reductions.
++        int lw = slot->w, lh = slot->h;
++        uint8_t* cur = (uint8_t*)malloc((size_t)lw * lh * 4u);
++        memcpy(cur, slot->pixels, (size_t)lw * lh * 4u);
++        for (uint32_t level = 0; level < mips; ++level) {
++            WGPUTexelCopyTextureInfo dst = {};
++            dst.texture = tex;
++            dst.mipLevel = level;
++            WGPUTexelCopyBufferLayout layout = {};
++            layout.bytesPerRow = (uint32_t)lw * 4u;
++            layout.rowsPerImage = (uint32_t)lh;
++            WGPUExtent3D extent = { (uint32_t)lw, (uint32_t)lh, 1 };
++            wgpuQueueWriteTexture(queue, &dst, cur, (size_t)lw * lh * 4u, &layout, &extent);
++            if (level + 1 >= mips) break;
++            const int nw = lw > 1 ? lw >> 1 : 1, nh = lh > 1 ? lh >> 1 : 1;
++            uint8_t* next = (uint8_t*)malloc((size_t)nw * nh * 4u);
++            for (int y = 0; y < nh; ++y) {
++                const int sy0 = y * 2, sy1 = (sy0 + 1 < lh) ? sy0 + 1 : sy0;
++                for (int x = 0; x < nw; ++x) {
++                    const int sx0 = x * 2, sx1 = (sx0 + 1 < lw) ? sx0 + 1 : sx0;
++                    for (int c = 0; c < 4; ++c) {
++                        const int sum = cur[(sy0*lw+sx0)*4+c] + cur[(sy0*lw+sx1)*4+c]
++                                      + cur[(sy1*lw+sx0)*4+c] + cur[(sy1*lw+sx1)*4+c];
++                        next[(y*nw+x)*4+c] = (uint8_t)(sum >> 2);
++                    }
++                }
++            }
++            free(cur);
++            cur = next;
++            lw = nw; lh = nh;
++        }
++        free(cur);
 +        WGPUTextureView view = wgpuTextureCreateView(tex, nullptr);
 +        texCache[texCacheCount].ptr = imgPtr;
 +        texCache[texCacheCount].view = view;
@@ -2757,7 +2789,7 @@ index 0000000..eb11631
 +            // Iter 8c: per-slot uniform for shader-pass records (texture.wgsl
 +            // layout: mvp + tint + params = 96 bytes).
 +            WGPUBufferDescriptor pbd = {};
-+            pbd.size = 96;
++            pbd.size = 128;
 +            pbd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
 +            passUniformBufs[i] = wgpuDeviceCreateBuffer(device, &pbd);
 +
@@ -2920,13 +2952,15 @@ index 0000000..eb11631
 +                    if (sweep == 1 && !is2D) continue;
 +                    if (pn >= kMaxRecordSlots) break;
 +                    const Rec& r = g_passRecords[i];
-+                    float ub[24];
++                    float ub[32];
 +                    memcpy(ub + 0, r.modelMatrix, 64);
 +                    memcpy(ub + 16, r.diffuseColor, 16);
 +                    const float svcMod = (r.pad2 == 1u) ? 1.0f : (r.pad2 == 2u) ? -1.0f : 0.0f;
 +                    const float svcAdd = (r.pad2 == 1u) ? 0.0f : 1.0f;
 +                    ub[20] = svcMod; ub[21] = svcAdd; ub[22] = 0.0f; ub[23] = 0.0f;
-+                    wgpuQueueWriteBuffer(queue, passUniformBufs[pn], 0, ub, 96);
++                    memcpy(ub + 24, r.lightProjS, 16);   // stage texture matrix S
++                    memcpy(ub + 28, r.lightProjT, 16);   // stage texture matrix T
++                    wgpuQueueWriteBuffer(queue, passUniformBufs[pn], 0, ub, 128);
 +                    lastPassGroups[pn] = getPassBindGroup(pn, g_passImagePtrs[i]);
 +                    lastPassRecords[pn] = r;
 +                    pn++;
@@ -3972,10 +4006,10 @@ index 7914093..eed2277 100644
  	GLimp_Shutdown();
  
 diff --git a/neo/renderer/draw_arb2.cpp b/neo/renderer/draw_arb2.cpp
-index c1d0d3e..c531a02 100644
+index c1d0d3e..bc4d044 100644
 --- a/neo/renderer/draw_arb2.cpp
 +++ b/neo/renderer/draw_arb2.cpp
-@@ -62,7 +62,157 @@ static void GL_SelectTextureNoClient( int unit ) {
+@@ -62,7 +62,167 @@ static void GL_SelectTextureNoClient( int unit ) {
  RB_ARB2_DrawInteraction
  ==================
  */
@@ -4097,8 +4131,18 @@ index c1d0d3e..c531a02 100644
 +			// Bake the FULL MVP (projection * modelView) at capture time —
 +			// both matrices are in scope here with the correct values for
 +			// THIS view, so the WebGPU side uses r.modelMatrix verbatim.
-+			WGPU_MatMul4( r.modelMatrix,
-+			              backEnd.viewDef->projectionMatrix,
++			// Weapon/model depth hacks tweak the projection exactly like
++			// RB_EnterWeaponDepthHack / RB_EnterModelDepthHack do for GL.
++			float capProj[16];
++			memcpy( capProj, backEnd.viewDef->projectionMatrix, sizeof(capProj) );
++			if ( din->surf->space ) {
++				if ( din->surf->space->weaponDepthHack ) {
++					capProj[14] *= 0.25f;
++				} else if ( din->surf->space->modelDepthHack != 0.0f ) {
++					capProj[14] -= din->surf->space->modelDepthHack;
++				}
++			}
++			WGPU_MatMul4( r.modelMatrix, capProj,
 +			              din->surf->space ? din->surf->space->modelViewMatrix : kIdent );
 +			memcpy( r.localLightOrigin, din->localLightOrigin.ToFloatPtr(), 16 );
 +			memcpy( r.localViewOrigin,  din->localViewOrigin.ToFloatPtr(),  16 );
@@ -4133,7 +4177,7 @@ index c1d0d3e..c531a02 100644
  	// load all the vertex program parameters
  	qglProgramEnvParameter4fvARB( GL_VERTEX_PROGRAM_ARB, PP_LIGHT_ORIGIN, din->localLightOrigin.ToFloatPtr() );
  	qglProgramEnvParameter4fvARB( GL_VERTEX_PROGRAM_ARB, PP_VIEW_ORIGIN, din->localViewOrigin.ToFloatPtr() );
-@@ -258,6 +408,7 @@ void RB_ARB2_DrawInteractions( void ) {
+@@ -258,6 +418,7 @@ void RB_ARB2_DrawInteractions( void ) {
  	//
  	for ( vLight = backEnd.viewDef->viewLights ; vLight ; vLight = vLight->next ) {
  		backEnd.vLight = vLight;
@@ -4370,7 +4414,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..862289c 100644
+index c83ebb5..5f0bc41 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -4381,7 +4425,7 @@ index c83ebb5..862289c 100644
  
  /*
  
-@@ -38,6 +39,283 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +39,310 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -4643,10 +4687,37 @@ index c83ebb5..862289c 100644
 +	r.indexOffset = g_capIndexBytes;
 +	r.indexCount  = (uint32_t)tri->numIndexes;
 +	static const float kIdent[16] = {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
-+	WGPU_PassMatMul4( r.modelMatrix,
-+	                  backEnd.viewDef->projectionMatrix,
++	float capProj[16];
++	memcpy( capProj, backEnd.viewDef->projectionMatrix, sizeof(capProj) );
++	if ( surf->space ) {
++		if ( surf->space->weaponDepthHack ) {
++			capProj[14] *= 0.25f;
++		} else if ( surf->space->modelDepthHack != 0.0f ) {
++			capProj[14] -= surf->space->modelDepthHack;
++		}
++	}
++	WGPU_PassMatMul4( r.modelMatrix, capProj,
 +	                  surf->space ? surf->space->modelViewMatrix : kIdent );
 +	memcpy( r.diffuseColor, color, 16 );
++	// Scrolling/rotating stage textures: capture the 2x3 texture matrix
++	// (same reg layout RB_LoadShaderTextureMatrix feeds GL). Reuse the
++	// lightProjS/T record fields — pass records don't need light texgens.
++	r.lightProjS[0] = 1; r.lightProjS[1] = 0; r.lightProjS[2] = 0; r.lightProjS[3] = 0;
++	r.lightProjT[0] = 0; r.lightProjT[1] = 1; r.lightProjT[2] = 0; r.lightProjT[3] = 0;
++	if ( pStage->texture.hasMatrix ) {
++		const float* regs = surf->shaderRegisters;
++		if ( regs ) {
++			r.lightProjS[0] = regs[pStage->texture.matrix[0][0]];
++			r.lightProjS[1] = regs[pStage->texture.matrix[0][1]];
++			r.lightProjS[3] = regs[pStage->texture.matrix[0][2]];
++			r.lightProjT[0] = regs[pStage->texture.matrix[1][0]];
++			r.lightProjT[1] = regs[pStage->texture.matrix[1][1]];
++			r.lightProjT[3] = regs[pStage->texture.matrix[1][2]];
++			// keep scroll translates bounded like the engine does
++			if ( r.lightProjS[3] < -40 || r.lightProjS[3] > 40 ) r.lightProjS[3] -= (int)r.lightProjS[3];
++			if ( r.lightProjT[3] < -40 || r.lightProjT[3] > 40 ) r.lightProjT[3] -= (int)r.lightProjT[3];
++		}
++	}
 +	r.pad0 = (uint32_t)(uintptr_t)backEnd.viewDef;
 +	const int blend = pStage->drawStateBits & (GLS_SRCBLEND_BITS | GLS_DSTBLEND_BITS);
 +	if ( blend == (GLS_SRCBLEND_ONE | GLS_DSTBLEND_ONE) )                            r.pad1 = 2;
@@ -4665,7 +4736,7 @@ index c83ebb5..862289c 100644
  
  /*
  =================
-@@ -166,6 +444,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +471,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -4673,7 +4744,7 @@ index c83ebb5..862289c 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -557,22 +836,41 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +863,41 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
@@ -4727,10 +4798,10 @@ index c83ebb5..862289c 100644
  	// ensures that depth writes are enabled for the depth clear
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..cd7d9dd
+index 0000000..bec14b0
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,421 @@
+@@ -0,0 +1,427 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -5113,6 +5184,10 @@ index 0000000..cd7d9dd
 +"    // params.x/.y = vertex-color modulate/add (SVC_IGNORE=(0,1),\n"
 +"    // SVC_MODULATE=(1,0), SVC_INVERSE=(-1,1)); .zw unused.\n"
 +"    params: vec4<f32>,\n"
++"    // 2x3 stage texture matrix (scroll/rotate/scale), engine reg layout:\n"
++"    // u' = u*s.x + v*s.y + s.w ; v' = u*t.x + v*t.y + t.w\n"
++"    texmat_s: vec4<f32>,\n"
++"    texmat_t: vec4<f32>,\n"
 +"};\n"
 +"\n"
 +"@group(0) @binding(0) var<uniform> u: Uniforms;\n"
@@ -5140,7 +5215,9 @@ index 0000000..cd7d9dd
 +"    let cp = u.mvp * vec4<f32>(in.position, 1.0);\n"
 +"    // GL [-w, w] → WebGPU [0, w] clip-z remap. Identity MVP is unaffected.\n"
 +"    out.clip_pos = vec4<f32>(cp.x, cp.y, (cp.z + cp.w) * 0.5, cp.w);\n"
-+"    out.uv = in.texcoord;\n"
++"    out.uv = vec2<f32>(\n"
++"        in.texcoord.x * u.texmat_s.x + in.texcoord.y * u.texmat_s.y + u.texmat_s.w,\n"
++"        in.texcoord.x * u.texmat_t.x + in.texcoord.y * u.texmat_t.y + u.texmat_t.w);\n"
 +"    out.vertex_color = in.color;\n"
 +"    return out;\n"
 +"}\n"
