@@ -548,3 +548,21 @@ reports 0×0). See "What the Emscripten patch does to dhewm3" in `README.md`.
 - Don't commit PK4 data or engine binaries (gitignored). Don't upload PK4
   contents to third-party services (proprietary).
 - After code changes: commit + push, and update this file + `README.md`.
+
+**Iter 8c — emissive/shader-pass surfaces in the echo (2026-06-09).**
+`D3_WebGPU_CapturePassStage` (tr_render.cpp, called from
+draw_common.cpp's old-stage path before each stage draw) captures plain
+explicit-texcoord stages — emissive lamps, screens, decals — into
+`g_passRecords` (Rec reused: diffuseColor = stage color, pad1 = blend
+kind 1/2/3 = opaque/additive/alpha, pad2 = SVC). Backend draws them
+after the lit records via three texture.wgsl pipeline variants on an
+EXPLICIT shared pipeline layout. **Dawn gotcha: default (auto)
+pipeline layouts are pipeline-unique — a bind group built from one
+pipeline's getBindGroupLayout() is INVALID on another pipeline even
+with identical WGSL bindings; sharing requires an explicit
+BindGroupLayout + PipelineLayout** (first build black-screened on this
+validation error; the error-capture Playwright script found it
+instantly). texture.wgsl gained a params vec4 (SVC modulate/add);
+demo-quad uniform grew 80→96B to match. Headed Chrome: doorway glow,
+screens, fixture emissives visible; validation clean; determinism
+IDENTICAL.
