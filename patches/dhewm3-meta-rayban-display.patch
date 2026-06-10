@@ -1917,10 +1917,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..1fe8266
+index 0000000..ccde3dc
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,3399 @@
+@@ -0,0 +1,3406 @@
 +/*
 +================================================================================
 +
@@ -3919,6 +3919,13 @@ index 0000000..1fe8266
 +                }
 +            }
 +            lastShadowCount = sn;
++            if (sn > 0) {
++                static bool shAnnounced = false;
++                if (!shAnnounced) {
++                    shAnnounced = true;
++                    EM_ASM_({ console.info("[d3] WebGPU stencil shadows active: " + $0 + " volumes"); }, sn);
++                }
++            }
 +            g_shadowRecordCount = 0;
 +            g_shadowVertBytes = 0;
 +        }

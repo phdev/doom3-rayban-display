@@ -331,6 +331,79 @@ function wireTouchLook() {
   };
   document.addEventListener("touchend", endLook, { passive: true });
   document.addEventListener("touchcancel", endLook, { passive: true });
+
+  // Desktop: click-drag on the right side of the screen aims, mirroring the
+  // touch path (no pointer lock — keeps the cursor for the UI).
+  let mouseLook = false;
+  let mLastX = 0, mLastY = 0;
+  document.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    if (e.clientX < window.innerWidth * 0.45) return;
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    if (el && (el.closest("button") || el.closest("#diag") || el.closest("#fxPanel") || el.closest("input"))) return;
+    mouseLook = true;
+    mLastX = e.clientX;
+    mLastY = e.clientY;
+  });
+  document.addEventListener("mousemove", (e) => {
+    if (!mouseLook) return;
+    const dx = e.clientX - mLastX;
+    const dy = e.clientY - mLastY;
+    mLastX = e.clientX;
+    mLastY = e.clientY;
+    if (engine && typeof engine.callAddViewAngles === "function") {
+      engine.callAddViewAngles(-dx * SENS, dy * SENS);
+    }
+    e.preventDefault();
+  });
+  document.addEventListener("mouseup", () => { mouseLook = false; });
+  document.addEventListener("mouseleave", () => { mouseLook = false; });
+}
+
+// FX panel: live sliders for bloom + lighting calibration (every change runs
+// a console command next frame via d3cmd — no rebuild, works on-device too).
+function wireFxPanel() {
+  const btn = document.createElement("button");
+  btn.id = "fxToggle";
+  btn.type = "button";
+  btn.textContent = "fx";
+  btn.setAttribute("style", "position:fixed;right:8px;top:46px;z-index:10000;min-width:44px;min-height:30px;padding:4px 10px;font:600 13px/1 ui-monospace,Menlo,monospace;color:#9effa0;background:rgba(0,0,0,.8);border:1px solid #2f6f30;border-radius:7px;-webkit-appearance:none;cursor:pointer");
+  document.body.appendChild(btn);
+
+  const panel = document.createElement("div");
+  panel.id = "fxPanel";
+  panel.setAttribute("style", "position:fixed;right:8px;top:82px;z-index:10000;display:none;padding:10px 12px;font:600 12px/1.6 ui-monospace,Menlo,monospace;color:#9effa0;background:rgba(0,0,0,.85);border:1px solid #2f6f30;border-radius:7px;min-width:230px");
+  const SLIDERS = [
+    { label: "bloom scale",  cvar: "r_bloomScale",     min: 0,   max: 3,   step: 0.05, value: 1.25 },
+    { label: "bloom thresh", cvar: "r_bloomThreshold", min: 0,   max: 1,   step: 0.02, value: 0.5 },
+    { label: "gamma",        cvar: "r_gamma",          min: 0.5, max: 2,   step: 0.05, value: 1.1 },
+    { label: "brightness",   cvar: "r_brightness",     min: 0.5, max: 2,   step: 0.05, value: 1.0 },
+  ];
+  for (const s of SLIDERS) {
+    const row = document.createElement("div");
+    const cap = document.createElement("div");
+    cap.textContent = `${s.label}: ${s.value}`;
+    const input = document.createElement("input");
+    input.type = "range";
+    input.min = String(s.min);
+    input.max = String(s.max);
+    input.step = String(s.step);
+    input.value = String(s.value);
+    input.setAttribute("style", "width:100%;accent-color:#5fae61");
+    input.addEventListener("input", () => {
+      cap.textContent = `${s.label}: ${input.value}`;
+      if (typeof window.d3cmd === "function") {
+        window.d3cmd(`${s.cvar} ${input.value}`);
+      }
+    });
+    row.appendChild(cap);
+    row.appendChild(input);
+    panel.appendChild(row);
+  }
+  document.body.appendChild(panel);
+  btn.addEventListener("click", () => {
+    panel.style.display = panel.style.display === "none" ? "block" : "none";
+  });
 }
 
 refs.canvas.width = runtimeConfig.width;
@@ -1409,6 +1482,7 @@ async function start() {
     wearableInput.install();
     wireMoveControls();
     wireTouchLook();
+    wireFxPanel();
     // Show the on-screen movement pad on the touch/wearable profile (desktop has a
     // keyboard). It lives on the left so the right stays clear for head-aiming.
     if (runtimeConfig.inputMode === "wearable" && refs.moveControls) {

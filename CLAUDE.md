@@ -956,3 +956,25 @@ GL-PARITY NOTE on "black materials": the spawn-area black crate is
 near-black in GL TOO (dark material + vanilla's dark lighting, no
 working gamma) — the PC reference's visible version comes from
 RBDOOM's HDR pipeline, not something our port lost.
+
+**Iter 20 — FX slider panel + desktop mouse-look + shadow diagnostics
+(2026-06-10).** "fx" button (top right, under copy/show log) opens a
+panel of live sliders — bloom scale, bloom threshold, gamma,
+brightness — each slider runs the cvar through d3cmd next frame (no
+rebuild; works on-device). Desktop click-drag on the right 55% of the
+screen aims (mirrors touch-look; no pointer lock so the cursor stays
+for the UI; verified 32% px view change per drag). One-shot
+"[d3] WebGPU stencil shadows active: N volumes" log confirms the
+shadow path (spawn: 11 volumes; r_shadows on/off A/B = 1.4% px —
+WORKING but subtle: vanilla stencil shadows in dim scenes; the X360
+look is the same tech + brighter lighting calibration, hence the
+gamma/brightness sliders). Shadow-upgrade research (exa, 150 sources):
+The Dark Mod ships switchable stencil/maps (gold standard), fhDOOM +
+RBDOOM-3-BFG do PCF shadow mapping (12-tap Poisson; coexists with
+stencil via r_useShadowMapping); cheapest quality win for OUR backend
+= screen-space shadow-mask blur (render stencil result to a mask
+texture, bilateral blur, modulate — one fullscreen pass on existing
+volumes), full shadow mapping = new depth-pass architecture (capture
+per-light depth renders; texture_depth_2d + sampler_comparison +
+textureSampleCompare in WGSL; point lights need 6 faces) — feasible
+but a multi-session feature.
