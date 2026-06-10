@@ -741,3 +741,27 @@ Next audio session: rebuild with `--profiling-funcs` for a named WASM
 stack trace (same method that cracked the ROQ null-pointer crash),
 then stub/guard the offending call. Boot logs to reproduce:
 `?backend=webgpu&audio` → "Starting DOOM 3 main..." → trap.
+
+**LIVE OUTAGE post-mortem — CI emsdk "latest" (2026-06-10).** The
+worst incident so far: WebGPU-primary boots on the LIVE site trapped
+with "null function" at startup while the same source booted clean
+locally. Two red herrings burned hours: (1) an audio commit that set
+`com_asyncSound 0` + `s_useEAXReverb 0` UNCONDITIONALLY — touching
+sound cvars on a muted boot also traps, hotfixed to apply only with
+`?audio`; (2) after that hotfix live STILL trapped. URL-flag bisect on
+live (`&echo` boots, WebGPU-primary traps) + a CLEAN local rebuild
+(rm CMakeFiles, full make — boots fine) isolated it to **toolchain
+divergence: CI installed emsdk "latest" while local builds used
+6.0.0.** Fix: `.github/workflows/deploy-pages.yml` pins
+`emsdk install/activate 6.0.0`. Verified recovered on live: full boot,
+det self-test rounds 1-3 IDENTICAL (640px, 256 surfaces), correct
+scene render, iter 15a/15b confirmed in the same deploy.
+LESSONS: (a) PIN THE TOOLCHAIN — a floating emsdk means CI binaries
+diverge from every local repro; (b) GitHub Pages serves
+cache-control max-age=600 — a "still failing" read within ~10 min of
+a deploy may be the CDN, wait out the TTL before concluding; (c) a
+40s Playwright wait is too short for a fresh-profile boot (16-chunk
+pak download) — wait on explicit verdict lines ("DOOM 3 main
+started" vs trap regex) with a 180s deadline, not a fixed sleep;
+(d) never touch sound state on muted boots; re-validate a NORMAL
+boot after wiring any experimental flag.
