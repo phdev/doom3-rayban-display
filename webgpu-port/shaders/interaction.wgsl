@@ -57,6 +57,7 @@ struct Uniforms {
 @group(1) @binding(4) var t_diffuse: texture_2d<f32>;
 @group(1) @binding(5) var t_lightFalloff: texture_2d<f32>;
 @group(1) @binding(6) var t_lightProj: texture_2d<f32>;
+@group(1) @binding(7) var t_specLUT: texture_2d<f32>;
 
 struct VSIn {
     @location(0) position:  vec3<f32>,
@@ -156,9 +157,10 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let spec = textureSample(t_specular, s_material, in.tex_specular).rgb
                * u.specular_color.rgb;
 
-    // Phong specular approximating the engine's specular lookup table;
-    // vanilla also doubles the specular map (ADD R2, R2, R2).
-    let specFalloff = pow(NdotH, 12.0);
+    // Engine's exact specular falloff: dependent read of the baked
+    // specular table (texture 6 in interaction.vfp) by the raw half-angle
+    // dot. Vanilla also doubles the specular map (ADD R2, R2, R2).
+    let specFalloff = textureSample(t_specLUT, s_lighting, vec2<f32>(NdotH, 0.5)).r;
 
     var color = (diffuse + specFalloff * spec * 2.0)
                 * NdotL

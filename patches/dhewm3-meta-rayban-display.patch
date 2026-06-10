@@ -1788,10 +1788,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..64f8342
+index 0000000..5d71d52
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,2065 @@
+@@ -0,0 +1,2068 @@
 +/*
 +================================================================================
 +
@@ -2723,6 +2723,8 @@ index 0000000..64f8342
 +        WGPUTextureView vProj     = getEngineTextureView(imgs[2], fbWhiteView);
 +        WGPUTextureView vDiffuse  = getEngineTextureView(imgs[3], fbCheckerView);
 +        WGPUTextureView vSpecular = getEngineTextureView(imgs[4], fbWhiteView);
++        extern void* g_capSpecLUTPtr;
++        WGPUTextureView vSpecLUT  = getEngineTextureView(g_capSpecLUTPtr, fbWhiteView);
 +        // Diagnostic: per-slot fallback misses. A falloff miss = the light
 +        // extends forever along its axis (falloff=1) — giant washes.
 +        {
@@ -2742,7 +2744,7 @@ index 0000000..64f8342
 +        }
 +
 +        WGPUBindGroupLayout bgl = wgpuRenderPipelineGetBindGroupLayout(interactionPipeline, 1);
-+        WGPUBindGroupEntry e[7] = {};
++        WGPUBindGroupEntry e[8] = {};
 +        e[0].binding = 0; e[0].sampler = interactionMaterialSampler;
 +        e[1].binding = 1; e[1].sampler = interactionLightSampler;
 +        e[2].binding = 2; e[2].textureView = vNormal;
@@ -2750,9 +2752,10 @@ index 0000000..64f8342
 +        e[4].binding = 4; e[4].textureView = vDiffuse;
 +        e[5].binding = 5; e[5].textureView = vFalloff;
 +        e[6].binding = 6; e[6].textureView = vProj;
++        e[7].binding = 7; e[7].textureView = vSpecLUT;
 +        WGPUBindGroupDescriptor bgd = {};
 +        bgd.layout = bgl;
-+        bgd.entryCount = 7;
++        bgd.entryCount = 8;
 +        bgd.entries = e;
 +        WGPUBindGroup group = wgpuDeviceCreateBindGroup(device, &bgd);
 +        wgpuBindGroupLayoutRelease(bgl);
@@ -4006,10 +4009,10 @@ index 7914093..eed2277 100644
  	GLimp_Shutdown();
  
 diff --git a/neo/renderer/draw_arb2.cpp b/neo/renderer/draw_arb2.cpp
-index c1d0d3e..bc4d044 100644
+index c1d0d3e..19a540a 100644
 --- a/neo/renderer/draw_arb2.cpp
 +++ b/neo/renderer/draw_arb2.cpp
-@@ -62,7 +62,167 @@ static void GL_SelectTextureNoClient( int unit ) {
+@@ -62,7 +62,168 @@ static void GL_SelectTextureNoClient( int unit ) {
  RB_ARB2_DrawInteraction
  ==================
  */
@@ -4058,6 +4061,7 @@ index c1d0d3e..bc4d044 100644
 +    extern uint32_t g_capDropped;
 +    extern float    g_capInvGamma;
 +    extern uint32_t g_capLightId;
++    extern void* g_capSpecLUTPtr;
 +    extern void* g_capImagePtrs[][5];
 +}
 +enum { kWGPUMaxCapV = 8192, kWGPUMaxCapI = 32768 };
@@ -4177,7 +4181,15 @@ index c1d0d3e..bc4d044 100644
  	// load all the vertex program parameters
  	qglProgramEnvParameter4fvARB( GL_VERTEX_PROGRAM_ARB, PP_LIGHT_ORIGIN, din->localLightOrigin.ToFloatPtr() );
  	qglProgramEnvParameter4fvARB( GL_VERTEX_PROGRAM_ARB, PP_VIEW_ORIGIN, din->localViewOrigin.ToFloatPtr() );
-@@ -258,6 +418,7 @@ void RB_ARB2_DrawInteractions( void ) {
+@@ -190,6 +351,7 @@ void RB_ARB2_CreateDrawInteractions( const drawSurf_t *surf ) {
+ 	} else {
+ 		globalImages->specularTableImage->Bind();
+ 	}
++	g_capSpecLUTPtr = (void*)globalImages->specularTableImage;   // WebGPU echo
+ 
+ 
+ 	for ( ; surf ; surf=surf->nextOnLight ) {
+@@ -258,6 +420,7 @@ void RB_ARB2_DrawInteractions( void ) {
  	//
  	for ( vLight = backEnd.viewDef->viewLights ; vLight ; vLight = vLight->next ) {
  		backEnd.vLight = vLight;
@@ -4414,7 +4426,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..5f0bc41 100644
+index c83ebb5..6e8e46e 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -4425,7 +4437,7 @@ index c83ebb5..5f0bc41 100644
  
  /*
  
-@@ -38,6 +39,310 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +39,311 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -4508,6 +4520,7 @@ index c83ebb5..5f0bc41 100644
 +    // (shadowCache_t), accumulated separately; indexes share the main index
 +    // accumulator. lightId groups shadows with their light's interactions.
 +    uint32_t g_capLightId     = 0;   // bumped per vLight in RB_ARB2_DrawInteractions
++    void*    g_capSpecLUTPtr  = 0;   // globalImages->specularTableImage (iter 10b)
 +    enum { kWGPUShadowVertBytes = 4 * 1024 * 1024 };
 +    uint8_t  g_shadowVertsAccum[kWGPUShadowVertBytes];
 +    uint32_t g_shadowVertBytes = 0;
@@ -4736,7 +4749,7 @@ index c83ebb5..5f0bc41 100644
  
  /*
  =================
-@@ -166,6 +471,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +472,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -4744,7 +4757,7 @@ index c83ebb5..5f0bc41 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -557,22 +863,41 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +864,41 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
@@ -4798,10 +4811,10 @@ index c83ebb5..5f0bc41 100644
  	// ensures that depth writes are enabled for the depth clear
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..bec14b0
+index 0000000..01ab389
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,427 @@
+@@ -0,0 +1,429 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -4997,6 +5010,7 @@ index 0000000..bec14b0
 +"@group(1) @binding(4) var t_diffuse: texture_2d<f32>;\n"
 +"@group(1) @binding(5) var t_lightFalloff: texture_2d<f32>;\n"
 +"@group(1) @binding(6) var t_lightProj: texture_2d<f32>;\n"
++"@group(1) @binding(7) var t_specLUT: texture_2d<f32>;\n"
 +"\n"
 +"struct VSIn {\n"
 +"    @location(0) position:  vec3<f32>,\n"
@@ -5096,9 +5110,10 @@ index 0000000..bec14b0
 +"    let spec = textureSample(t_specular, s_material, in.tex_specular).rgb\n"
 +"               * u.specular_color.rgb;\n"
 +"\n"
-+"    // Phong specular approximating the engine's specular lookup table;\n"
-+"    // vanilla also doubles the specular map (ADD R2, R2, R2).\n"
-+"    let specFalloff = pow(NdotH, 12.0);\n"
++"    // Engine's exact specular falloff: dependent read of the baked\n"
++"    // specular table (texture 6 in interaction.vfp) by the raw half-angle\n"
++"    // dot. Vanilla also doubles the specular map (ADD R2, R2, R2).\n"
++"    let specFalloff = textureSample(t_specLUT, s_lighting, vec2<f32>(NdotH, 0.5)).r;\n"
 +"\n"
 +"    var color = (diffuse + specFalloff * spec * 2.0)\n"
 +"                * NdotL\n"

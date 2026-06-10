@@ -600,3 +600,30 @@ zero validation errors, det IDENTICAL. App profile keeps r_shadows 0
 (perf) so behavior matches GL either way. SECOND DAWN LESSON: pipelines
 must declare pass-compatible COLOR targets even when writing only
 stencil (fragment stage with writeMask=none, empty fs).
+
+**Iter 10/10b — fidelity batch (2026-06-10).** Weapon/model depth hacks
+baked into captured MVPs (viewmodel no longer clips); scrolling stage
+textures (2x3 texture matrix from shader regs → texture.wgsl, pass
+uniforms 96→128B); full box-filtered mip chains per cached texture
+(kills minification shimmer); exact specular falloff via the engine's
+baked specular table (captured globalImages->specularTableImage ptr →
+group(1) binding 7, dependent read by NdotH). All validated: clean,
+det IDENTICAL.
+
+**CUTOVER PLAN (iter 11+, the remaining big chunk).** Today the engine
+renders everything TWICE (GL fullscreen + WebGPU echo). To make WebGPU
+primary: (1) promote #webgpuCanvas to fullscreen main canvas, retire
+#gameCanvas + the WebGL context (keep GL fallback for non-WebGPU
+browsers via r_backend); (2) stop GL draw execution — either stub
+GL4ES (pragmatic; keep engine CPU-side vertex data the capture reads)
+or route draw_arb2/draw_common through the RenderBackend abstraction
+(clean); (3) persistent GPU vertex/index buffers keyed by
+vertexCache handles instead of per-frame 8MB re-upload; (4) Resize()
++ device-lost handling; (5) flip r_backend default, drop the
+fixFalloffSampling JS hot-patch (GL-only band-aid), eventually drop
+GL4ES from the build. Still-missing renderer features: fog/blend
+lights, skybox/reflection texgens, ARB new-stage effects (heat haze),
+mirrors/monitors (subview filter), ROQ surfaces (also broken in GL).
+Verification loop for all of it: headed Chrome (scripts in /tmp/d3-pw-*.mjs,
+recreate from CLAUDE.md if gone) + the iter 6.8 determinism self-test +
+iPhone as final gate.
