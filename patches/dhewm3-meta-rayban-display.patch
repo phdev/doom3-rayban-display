@@ -1788,10 +1788,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..5446afe
+index 0000000..597c124
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,1807 @@
+@@ -0,0 +1,1825 @@
 +/*
 +================================================================================
 +
@@ -2394,11 +2394,12 @@ index 0000000..5446afe
 +        WGPUPipelineLayout passPL = wgpuDeviceCreatePipelineLayout(device, &pld);
 +
 +        auto makeVariant = [&](WGPUBlendFactor src, WGPUBlendFactor dst,
-+                               bool depthWrite, const char* label) -> WGPURenderPipeline {
++                               bool depthWrite, WGPUCompareFunction depthCmp,
++                               const char* label) -> WGPURenderPipeline {
 +            WGPUDepthStencilState dss = {};
 +            dss.format = WGPUTextureFormat_Depth24Plus;
 +            dss.depthWriteEnabled = depthWrite ? WGPUOptionalBool_True : WGPUOptionalBool_False;
-+            dss.depthCompare = WGPUCompareFunction_LessEqual;
++            dss.depthCompare = depthCmp;
 +            dss.stencilFront.compare = WGPUCompareFunction_Always;
 +            dss.stencilBack.compare  = WGPUCompareFunction_Always;
 +            dss.stencilFront.failOp = dss.stencilFront.depthFailOp = dss.stencilFront.passOp = WGPUStencilOperation_Keep;
@@ -2430,9 +2431,12 @@ index 0000000..5446afe
 +            pd.depthStencil = &dss;
 +            return wgpuDeviceCreateRenderPipeline(device, &pd);
 +        };
-+        passOpaquePipeline = makeVariant(WGPUBlendFactor_One, WGPUBlendFactor_Zero, true,  "passOpaque");
-+        passAddPipeline    = makeVariant(WGPUBlendFactor_One, WGPUBlendFactor_One,  false, "passAdditive");
-+        passAlphaPipeline  = makeVariant(WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_OneMinusSrcAlpha, false, "passAlpha");
++        passOpaquePipeline = makeVariant(WGPUBlendFactor_One, WGPUBlendFactor_Zero, true,  WGPUCompareFunction_LessEqual, "passOpaque");
++        passAddPipeline    = makeVariant(WGPUBlendFactor_One, WGPUBlendFactor_One,  false, WGPUCompareFunction_LessEqual, "passAdditive");
++        passAlphaPipeline  = makeVariant(WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_OneMinusSrcAlpha, false, WGPUCompareFunction_LessEqual, "passAlpha");
++        // Iter 8d: 2D overlay variants (HUD/menus) — no depth dependence
++        guiAddPipeline     = makeVariant(WGPUBlendFactor_One, WGPUBlendFactor_One,  false, WGPUCompareFunction_Always, "guiAdditive");
++        guiAlphaPipeline   = makeVariant(WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_OneMinusSrcAlpha, false, WGPUCompareFunction_Always, "guiAlpha");
 +        wgpuPipelineLayoutRelease(passPL);
 +        wgpuShaderModuleRelease(mod);
 +    }
@@ -2802,8 +2806,14 @@ index 0000000..5446afe
 +            uint32_t pn = 0;
 +            if (pTotal > 0 && lastRecordCount > 0) {
 +                const uint32_t mainView = lastRecords[lastRecordCount - 1].pad0;
++                // Sweep 1: 3D records from the main view. Sweep 2: 2D GUI
++                // records from any view (HUD/menus draw after the 3D view).
++                for (uint32_t sweep = 0; sweep < 2; ++sweep)
 +                for (uint32_t i = 0; i < pTotal; ++i) {
-+                    if (g_passRecords[i].pad0 != mainView) continue;
++                    const bool is2D = g_passRecords[i].pad3 == 1u;
++                    if (sweep == 0 && (is2D || g_passRecords[i].pad0 != mainView)) continue;
++                    if (sweep == 1 && !is2D) continue;
++                    if (pn >= kMaxRecordSlots) break;
 +                    const Rec& r = g_passRecords[i];
 +                    float ub[24];
 +                    memcpy(ub + 0, r.modelMatrix, 64);
@@ -2911,9 +2921,14 @@ index 0000000..5446afe
 +            // layered over the lit scene, depth-tested against the pre-pass.
 +            for (uint32_t i = 0; i < lastPassCount; ++i) {
 +                const Rec& r = lastPassRecords[i];
-+                WGPURenderPipeline p = (r.pad1 == 1u) ? passOpaquePipeline
-+                                     : (r.pad1 == 3u) ? passAlphaPipeline
-+                                     : passAddPipeline;
++                WGPURenderPipeline p;
++                if (r.pad3 == 1u) {
++                    p = (r.pad1 == 2u) ? guiAddPipeline : guiAlphaPipeline;
++                } else {
++                    p = (r.pad1 == 1u) ? passOpaquePipeline
++                      : (r.pad1 == 3u) ? passAlphaPipeline
++                      : passAddPipeline;
++                }
 +                if (!p || !lastPassGroups[i]) continue;
 +                wgpuRenderPassEncoderSetPipeline(rp, p);
 +                wgpuRenderPassEncoderSetBindGroup(rp, 0, lastPassGroups[i], 0, nullptr);
@@ -3566,6 +3581,9 @@ index 0000000..5446afe
 +    WGPURenderPipeline      passOpaquePipeline = nullptr;
 +    WGPURenderPipeline      passAddPipeline   = nullptr;
 +    WGPURenderPipeline      passAlphaPipeline = nullptr;
++    // Iter 8d: 2D GUI/HUD variants — depth test Always (overlay)
++    WGPURenderPipeline      guiAddPipeline    = nullptr;
++    WGPURenderPipeline      guiAlphaPipeline  = nullptr;
 +    WGPUBindGroupLayout     passBGL           = nullptr;
 +    WGPUBuffer              passUniformBufs[kMaxRecordSlots] = {nullptr};
 +    Rec                     lastPassRecords[kMaxRecordSlots] = {};
@@ -4115,7 +4133,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..a69c77f 100644
+index c83ebb5..62a3e53 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -4126,7 +4144,7 @@ index c83ebb5..a69c77f 100644
  
  /*
  
-@@ -38,6 +39,222 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +39,227 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -4300,7 +4318,11 @@ index c83ebb5..a69c77f 100644
 +void D3_WebGPU_CapturePassStage( const drawSurf_t* surf, const srfTriangles_t* tri,
 +                                 const shaderStage_t* pStage, const float color[4] ) {
 +	if ( !backEnd.viewDef ) return;
-+	if ( ( backEnd.viewDef->viewport.x2 - backEnd.viewDef->viewport.x1 ) < 128 ) return;
++	// 2D GUI views (HUD, menus) have no view entities; they bypass the
++	// small-viewport filter (which exists to skip the lightgem) and are
++	// tagged so the backend draws them last with depth testing off.
++	const bool is2D = ( backEnd.viewDef->viewEntitys == NULL );
++	if ( !is2D && ( backEnd.viewDef->viewport.x2 - backEnd.viewDef->viewport.x1 ) < 128 ) return;
 +	if ( !surf || !tri || !tri->verts || !tri->indexes ) return;
 +	if ( tri->numVerts <= 0 || tri->numIndexes <= 0 ) return;
 +	if ( tri->numVerts > kWGPUMaxCaptureVerts || tri->numIndexes > kWGPUMaxCaptureIndexes ) return;
@@ -4339,6 +4361,7 @@ index c83ebb5..a69c77f 100644
 +	else if ( blend == (GLS_SRCBLEND_ONE | GLS_DSTBLEND_ZERO) )                      r.pad1 = 1;
 +	else                                                                             r.pad1 = 2;
 +	r.pad2 = (uint32_t)pStage->vertexColor;
++	r.pad3 = is2D ? 1u : 0u;
 +	g_passImagePtrs[g_passRecordCount] = (void*)img;
 +	g_capVertBytes  += vR;
 +	g_capIndexBytes += iR;
@@ -4349,7 +4372,7 @@ index c83ebb5..a69c77f 100644
  
  /*
  =================
-@@ -166,6 +383,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +388,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -4357,7 +4380,7 @@ index c83ebb5..a69c77f 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -557,22 +775,41 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +780,41 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
