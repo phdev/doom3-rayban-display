@@ -635,3 +635,16 @@ view (`.is-primary` takes the game-canvas CSS role; `#gameCanvas` goes
 engine still computes both paths; the player sees only WebGPU. This is
 the flicker-free-on-iPhone experience ahead of the engine-side cutover
 (stopping GL execution) described in the iter 11+ plan above.
+
+**Iter 11b — r_skipGLDraw (2026-06-10).** `?wgpufull` now also sets
+`r_skipGLDraw 1`: the GL draw calls (RB_DrawElements*,
+RB_DrawShadowElements*, CopyFramebuffer) early-return — captures run in
+the callers first, so the WebGPU echo is unaffected. Lightgem exception
+(<128px views keep drawing — gameplay reads its pixels for the player
+light level). Verified: GL canvas 0.0% non-black with skip forced,
+runtime cvar "1" under wgpufull, det IDENTICAL. The "Invalid copy
+texture format combination" console spam is pre-existing GL4ES-internal
+swap noise, NOT engine copies. Remaining GL-side per-frame cost: state
+calls + vertexCache uploads + lightgem. Next cutover steps: persistent
+WebGPU vertex buffers, resize/device-lost, r_backend default flip,
+GL4ES retirement; missing features per the iter 11+ plan above.
