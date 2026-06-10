@@ -1009,10 +1009,10 @@ index a4883b5..095506b 100644
  extern idCVar	r_aspectRatio;
  
 diff --git a/neo/renderer/Image_load.cpp b/neo/renderer/Image_load.cpp
-index f9ae002..00f6a10 100644
+index f9ae002..cc4e36f 100644
 --- a/neo/renderer/Image_load.cpp
 +++ b/neo/renderer/Image_load.cpp
-@@ -27,6 +27,11 @@ If you have questions concerning this license or the applicable additional terms
+@@ -27,6 +27,12 @@ If you have questions concerning this license or the applicable additional terms
  */
  
  #include "sys/platform.h"
@@ -1021,10 +1021,11 @@ index f9ae002..00f6a10 100644
 +// CPU image cache that lives in tr_render.cpp.
 +class idImage;
 +extern "C" void D3_WebGPU_CacheImage( const idImage* img, const unsigned char* rgba, int w, int h );
++extern "C" void D3_WebGPU_CacheCubeImage( const idImage* img, const unsigned char* const pic[6], int size );
  #include "idlib/hashing/MD4.h"
  #include "renderer/tr_local.h"
  
-@@ -604,6 +609,12 @@ void idImage::GenerateImage( const byte *pic, int width, int height,
+@@ -604,6 +610,12 @@ void idImage::GenerateImage( const byte *pic, int width, int height,
  	uploadWidth = scaled_width;
  	type = TT_2D;
  
@@ -1037,7 +1038,16 @@ index f9ae002..00f6a10 100644
  	// zero the border if desired, allowing clamped projection textures
  	// even after picmip resampling or careless artists.
  	if ( repeat == TR_CLAMP_TO_ZERO ) {
-@@ -1907,6 +1918,12 @@ CopyFramebuffer
+@@ -872,6 +884,8 @@ Non-square cube sides are not allowed
+ void idImage::GenerateCubeImage( const byte *pic[6], int size,
+ 					   textureFilter_t filterParm, bool allowDownSizeParm,
+ 					   textureDepth_t depthParm ) {
++	D3_WebGPU_CacheCubeImage( this, (const unsigned char* const*)pic, size );   // WebGPU echo
++
+ 	int			scaled_width, scaled_height;
+ 	int			width, height;
+ 	int			i;
+@@ -1907,6 +1921,12 @@ CopyFramebuffer
  ====================
  */
  void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bool useOversizedBuffer ) {
@@ -1050,7 +1060,7 @@ index f9ae002..00f6a10 100644
  	Bind();
  
  	if ( cvarSystem->GetCVarBool( "g_lowresFullscreenFX" ) ) {
-@@ -1932,7 +1949,12 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
+@@ -1932,7 +1952,12 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
  		uploadWidth = potWidth;
  		uploadHeight = potHeight;
  		if ( potWidth == imageWidth && potHeight == imageHeight ) {
@@ -1064,7 +1074,7 @@ index f9ae002..00f6a10 100644
  		} else {
  			byte	*junk;
  			// we need to create a dummy image with power of two dimensions,
-@@ -1945,7 +1967,10 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
+@@ -1945,7 +1970,10 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
  				junk[i+1] = 255;
  			}
  #endif
@@ -1801,10 +1811,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..69c777e
+index 0000000..ad05893
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,2362 @@
+@@ -0,0 +1,2570 @@
 +/*
 +================================================================================
 +
@@ -1922,6 +1932,9 @@ index 0000000..69c777e
 +// Iter 7b: mirrors WGPUImageSlot in tr_render.cpp (C linkage, layout-stable).
 +struct ImgSlot { const void* ptr; int w, h; uint8_t* pixels; char name[64]; };
 +extern "C" const ImgSlot* D3_WebGPU_LookupCachedImage(const void* img);
++// Iter 13b: mirrors WGPUCubeSlot in tr_render.cpp.
++struct CubeSlot { const void* ptr; int size; uint8_t* faces[6]; };
++extern "C" const CubeSlot* D3_WebGPU_LookupCubeImage(const void* img);
 +
 +// ─── Backend class ──────────────────────────────────────────────────────────
 +
@@ -2044,6 +2057,7 @@ index 0000000..69c777e
 +            initShadowPipelines();
 +            initFogPipeline();
 +            initBlendPipelines();
++            initSkyPipeline();
 +            initRecordSlots();
 +        }
 +        if (surface && demoPipeline) {
@@ -2700,6 +2714,125 @@ index 0000000..69c777e
 +        wgpuShaderModuleRelease(mod);
 +    }
 +
++    // Iter 13b: cube texture from the engine cube cache (6 RGBA8 faces).
++    WGPUTextureView getCubeTextureView(const void* imgPtr) {
++        if (!imgPtr) return nullptr;
++        for (int i = 0; i < cubeTexCacheCount; ++i) {
++            if (cubeTexCache[i].ptr == imgPtr) return cubeTexCache[i].view;
++        }
++        const CubeSlot* slot = D3_WebGPU_LookupCubeImage(imgPtr);
++        if (!slot || slot->size <= 0) return nullptr;
++        if (cubeTexCacheCount >= 32) return nullptr;
++        WGPUTextureDescriptor td = {};
++        td.size = { (uint32_t)slot->size, (uint32_t)slot->size, 6 };
++        td.mipLevelCount = 1;
++        td.sampleCount = 1;
++        td.dimension = WGPUTextureDimension_2D;
++        td.format = WGPUTextureFormat_RGBA8Unorm;
++        td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
++        WGPUTexture tex = wgpuDeviceCreateTexture(device, &td);
++        if (!tex) return nullptr;
++        for (uint32_t f = 0; f < 6; ++f) {
++            if (!slot->faces[f]) continue;
++            WGPUTexelCopyTextureInfo dst = {};
++            dst.texture = tex;
++            dst.origin = { 0, 0, f };
++            WGPUTexelCopyBufferLayout layout = {};
++            layout.bytesPerRow = (uint32_t)slot->size * 4u;
++            layout.rowsPerImage = (uint32_t)slot->size;
++            WGPUExtent3D ext = { (uint32_t)slot->size, (uint32_t)slot->size, 1 };
++            wgpuQueueWriteTexture(queue, &dst, slot->faces[f],
++                                  (size_t)slot->size * slot->size * 4u, &layout, &ext);
++        }
++        WGPUTextureViewDescriptor vd = {};
++        vd.dimension = WGPUTextureViewDimension_Cube;
++        vd.format = WGPUTextureFormat_RGBA8Unorm;
++        vd.arrayLayerCount = 6;
++        vd.mipLevelCount = 1;
++        WGPUTextureView view = wgpuTextureCreateView(tex, &vd);
++        cubeTexCache[cubeTexCacheCount].ptr = imgPtr;
++        cubeTexCache[cubeTexCacheCount].view = view;
++        cubeTexCacheCount++;
++        return view;
++    }
++
++    // Iter 13b: sky pipeline — idDrawVert stream + vec3 cube-dir stream.
++    void initSkyPipeline() {
++        WGPUShaderSourceWGSL wgsl = {};
++        wgsl.chain.sType = WGPUSType_ShaderSourceWGSL;
++        wgsl.code = { kWGSL_sky, WGPU_STRLEN };
++        WGPUShaderModuleDescriptor smd = {};
++        smd.nextInChain = &wgsl.chain;
++        WGPUShaderModule mod = wgpuDeviceCreateShaderModule(device, &smd);
++        if (!mod) { fprintf(stderr, "[WebGPU] sky.wgsl create FAILED\n"); return; }
++
++        WGPUBindGroupLayoutEntry ble[3] = {};
++        ble[0].binding = 0;
++        ble[0].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
++        ble[0].buffer.type = WGPUBufferBindingType_Uniform;
++        ble[0].buffer.minBindingSize = 80;
++        ble[1].binding = 1;
++        ble[1].visibility = WGPUShaderStage_Fragment;
++        ble[1].sampler.type = WGPUSamplerBindingType_Filtering;
++        ble[2].binding = 2;
++        ble[2].visibility = WGPUShaderStage_Fragment;
++        ble[2].texture.sampleType = WGPUTextureSampleType_Float;
++        ble[2].texture.viewDimension = WGPUTextureViewDimension_Cube;
++        WGPUBindGroupLayoutDescriptor bld = {};
++        bld.entryCount = 3;
++        bld.entries = ble;
++        skyBGL = wgpuDeviceCreateBindGroupLayout(device, &bld);
++        WGPUPipelineLayoutDescriptor pld = {};
++        pld.bindGroupLayoutCount = 1;
++        pld.bindGroupLayouts = &skyBGL;
++        WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(device, &pld);
++
++        static const WGPUVertexAttribute dirAttr = { nullptr, WGPUVertexFormat_Float32x3, 0, 6 };
++        WGPUVertexBufferLayout layouts[2] = {};
++        layouts[0] = *drawVertLayout();
++        layouts[1].stepMode = WGPUVertexStepMode_Vertex;
++        layouts[1].arrayStride = 12;
++        layouts[1].attributeCount = 1;
++        layouts[1].attributes = &dirAttr;
++
++        WGPUDepthStencilState dss = {};
++        dss.format = WGPUTextureFormat_Depth24PlusStencil8;
++        dss.depthWriteEnabled = WGPUOptionalBool_True;
++        dss.depthCompare = WGPUCompareFunction_LessEqual;
++        dss.stencilFront.compare = WGPUCompareFunction_Always;
++        dss.stencilBack.compare  = WGPUCompareFunction_Always;
++        dss.stencilFront.failOp = dss.stencilFront.depthFailOp = dss.stencilFront.passOp = WGPUStencilOperation_Keep;
++        dss.stencilBack.failOp  = dss.stencilBack.depthFailOp  = dss.stencilBack.passOp  = WGPUStencilOperation_Keep;
++        WGPUColorTargetState target = {};
++        target.format = surfaceFormat;
++        target.writeMask = WGPUColorWriteMask_All;
++        WGPUBlendState blend = {};
++        blend.color.srcFactor = WGPUBlendFactor_One; blend.color.dstFactor = WGPUBlendFactor_Zero;
++        blend.alpha.srcFactor = WGPUBlendFactor_One; blend.alpha.dstFactor = WGPUBlendFactor_Zero;
++        target.blend = &blend;
++        WGPUFragmentState frag = {};
++        frag.module = mod;
++        frag.entryPoint = { "fs_main", WGPU_STRLEN };
++        frag.targetCount = 1;
++        frag.targets = &target;
++        WGPURenderPipelineDescriptor pd = {};
++        pd.label = { "sky", WGPU_STRLEN };
++        pd.layout = pl;
++        pd.vertex.module = mod;
++        pd.vertex.entryPoint = { "vs_main", WGPU_STRLEN };
++        pd.vertex.bufferCount = 2;
++        pd.vertex.buffers = layouts;
++        pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
++        pd.primitive.cullMode = WGPUCullMode_None;
++        pd.multisample.count = 1;
++        pd.multisample.mask = 0xFFFFFFFF;
++        pd.fragment = &frag;
++        pd.depthStencil = &dss;
++        skyPipeline = wgpuDeviceCreateRenderPipeline(device, &pd);
++        wgpuPipelineLayoutRelease(pl);
++        wgpuShaderModuleRelease(mod);
++    }
++
 +    // Iter 8c: bind group for a shader-pass record slot — texture.wgsl
 +    // group(0) = uniform + sampler + texture. Cached per (slot, image).
 +    WGPUBindGroup getPassBindGroup(uint32_t slot, const void* imgPtr) {
@@ -3102,6 +3235,26 @@ index 0000000..69c777e
 +        outCount = n;
 +        lastUploadedCapFrameId = g_capFrameId;
 +
++        // Iter 13b: upload the sky cube-dir stream before the pass sweep.
++        {
++            extern uint8_t  g_skyDirsAccum[];
++            extern uint32_t g_skyDirBytes;
++            if (g_skyDirBytes > 0 && skyPipeline) {
++                const uint32_t need = (g_skyDirBytes + 3u) & ~3u;
++                if (need > skyDirCap) {
++                    if (skyDirBuf) wgpuBufferRelease(skyDirBuf);
++                    uint32_t cap = need; if (cap < 64*1024) cap = 64*1024;
++                    WGPUBufferDescriptor d = {};
++                    d.size = cap;
++                    d.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
++                    skyDirBuf = wgpuDeviceCreateBuffer(device, &d);
++                    skyDirCap = cap;
++                }
++                if (skyDirBuf) wgpuQueueWriteBuffer(queue, skyDirBuf, 0, g_skyDirsAccum, need);
++            }
++            g_skyDirBytes = 0;
++        }
++
 +        // Iter 8c: drain shader-pass (emissive/decal) records the same way —
 +        // filter to the main view, write 96-byte texture.wgsl uniforms
 +        // (mvp + tint + SVC params), resolve per-(slot,image) bind groups.
@@ -3111,12 +3264,49 @@ index 0000000..69c777e
 +            extern uint32_t g_passRecordCount;
 +            uint32_t pTotal = (g_passRecordCount < kMaxRecordSlots) ? g_passRecordCount : kMaxRecordSlots;
 +            uint32_t pn = 0;
++            uint32_t skyN = 0;
 +            if (pTotal > 0 && lastRecordCount > 0) {
 +                const uint32_t mainView = lastRecords[lastRecordCount - 1].pad0;
 +                // Sweep 1: 3D records from the main view. Sweep 2: 2D GUI
 +                // records from any view (HUD/menus draw after the 3D view).
 +                for (uint32_t sweep = 0; sweep < 2; ++sweep)
 +                for (uint32_t i = 0; i < pTotal; ++i) {
++                    // Iter 13b: sky records get their own pipeline + stream.
++                    if (sweep == 0 && g_passRecords[i].pad3 == 2u &&
++                        g_passRecords[i].pad0 == mainView && skyN < 16 && skyBGL) {
++                        const Rec& sr = g_passRecords[i];
++                        if (!skyUniformBufs[skyN]) {
++                            WGPUBufferDescriptor d = {};
++                            d.size = 80;
++                            d.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
++                            skyUniformBufs[skyN] = wgpuDeviceCreateBuffer(device, &d);
++                        }
++                        const void* cubeImg = g_passImagePtrs[i];
++                        if (!skyBindGroups[skyN] || skyGroupImg[skyN] != cubeImg) {
++                            WGPUTextureView cv = getCubeTextureView(cubeImg);
++                            if (cv) {
++                                WGPUBindGroupEntry e[3] = {};
++                                e[0].binding = 0; e[0].buffer = skyUniformBufs[skyN]; e[0].size = 80;
++                                e[1].binding = 1; e[1].sampler = interactionLightSampler;
++                                e[2].binding = 2; e[2].textureView = cv;
++                                WGPUBindGroupDescriptor bgd = {};
++                                bgd.layout = skyBGL;
++                                bgd.entryCount = 3;
++                                bgd.entries = e;
++                                skyBindGroups[skyN] = wgpuDeviceCreateBindGroup(device, &bgd);
++                                skyGroupImg[skyN] = cubeImg;
++                            }
++                        }
++                        if (skyBindGroups[skyN]) {
++                            float ub[20];
++                            memcpy(ub + 0, sr.modelMatrix, 64);
++                            memcpy(ub + 16, sr.diffuseColor, 16);
++                            wgpuQueueWriteBuffer(queue, skyUniformBufs[skyN], 0, ub, 80);
++                            lastSkyRecords[skyN] = sr;
++                            skyN++;
++                        }
++                        continue;
++                    }
 +                    const bool is2D = g_passRecords[i].pad3 == 1u;
 +                    if (sweep == 0 && (is2D || g_passRecords[i].pad0 != mainView)) continue;
 +                    if (sweep == 1 && !is2D) continue;
@@ -3137,6 +3327,7 @@ index 0000000..69c777e
 +                }
 +            }
 +            lastPassCount = pn;
++            lastSkyCount = skyN;
 +            g_passRecordCount = 0;
 +        }
 +
@@ -3417,6 +3608,20 @@ index 0000000..69c777e
 +            rpd.colorAttachments = &ca;
 +            rpd.depthStencilAttachment = &da;
 +            WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
++            // Iter 13b: sky surfaces (opaque, depth-tested — visible where
++            // nothing lit covered them).
++            if (skyPipeline && skyDirBuf && lastSkyCount > 0) {
++                wgpuRenderPassEncoderSetPipeline(rp, skyPipeline);
++                for (uint32_t i = 0; i < lastSkyCount; ++i) {
++                    const Rec& r = lastSkyRecords[i];
++                    if (!skyBindGroups[i]) continue;
++                    wgpuRenderPassEncoderSetBindGroup(rp, 0, skyBindGroups[i], 0, nullptr);
++                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
++                    wgpuRenderPassEncoderSetVertexBuffer(rp, 1, skyDirBuf, r.sPad1, (uint64_t)r.vertCount * 12u);
++                    wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
++                    wgpuRenderPassEncoderDrawIndexed(rp, r.indexCount, 1, 0, 0, 0);
++                }
++            }
 +            // Iter 12b: fog lights blend over the lit scene first.
 +            if (fogPipeline && lastFogCount > 0) {
 +                wgpuRenderPassEncoderSetPipeline(rp, fogPipeline);
@@ -4144,6 +4349,19 @@ index 0000000..69c777e
 +    const void*             blendGroupImgs[64][2] = {};
 +    Rec                     lastBlendRecords[64] = {};
 +    uint32_t                lastBlendCount = 0;
++    // Iter 13b: sky cube stages — second vertex stream of cube directions.
++    WGPURenderPipeline      skyPipeline = nullptr;
++    WGPUBindGroupLayout     skyBGL = nullptr;
++    WGPUBuffer              skyDirBuf = nullptr;
++    uint32_t                skyDirCap = 0;
++    WGPUBuffer              skyUniformBufs[16] = {nullptr};
++    WGPUBindGroup           skyBindGroups[16]  = {nullptr};
++    const void*             skyGroupImg[16] = {};
++    Rec                     lastSkyRecords[16] = {};
++    uint32_t                lastSkyCount = 0;
++    struct CubeTexEntry { const void* ptr; WGPUTextureView view; };
++    CubeTexEntry            cubeTexCache[32] = {};
++    int                     cubeTexCacheCount = 0;
 +    // Iter 6.8: on-device determinism self-test. Renders the identical
 +    // record set twice into two offscreen textures, reads both back,
 +    // byte-compares. Sidesteps the canvas-readback trap (WebGPU canvases
@@ -4792,6 +5010,36 @@ index cf1c571..47c0571 100644
  		qglFinish();
  	}
  
+diff --git a/neo/renderer/tr_light.cpp b/neo/renderer/tr_light.cpp
+index 6b2db54..4e17b2c 100644
+--- a/neo/renderer/tr_light.cpp
++++ b/neo/renderer/tr_light.cpp
+@@ -35,6 +35,9 @@ If you have questions concerning this license or the applicable additional terms
+ 
+ #include "renderer/tr_local.h"
+ 
++// Iter 13b (WebGPU echo): defined in tr_render.cpp.
++void D3_WebGPU_StashSkyTexCoords( const void* surf, const void* coords, int numVerts );
++
+ #include "Model_local.h"
+ 
+ 
+@@ -216,6 +219,7 @@ void R_SkyboxTexGen( drawSurf_t *surf, const idVec3 &viewOrg ) {
+ 		texCoords[i][2] = verts[i].xyz[2] - localViewOrigin[2];
+ 	}
+ 
++	D3_WebGPU_StashSkyTexCoords( surf, texCoords, numVerts );   // WebGPU echo
+ 	surf->dynamicTexCoords = vertexCache.AllocFrameTemp( texCoords, size );
+ }
+ 
+@@ -298,6 +302,7 @@ void R_WobbleskyTexGen( drawSurf_t *surf, const idVec3 &viewOrg ) {
+ 		R_LocalPointToGlobal( transform, v, texCoords[i] );
+ 	}
+ 
++	D3_WebGPU_StashSkyTexCoords( surf, texCoords, numVerts );   // WebGPU echo
+ 	surf->dynamicTexCoords = vertexCache.AllocFrameTemp( texCoords, size );
+ }
+ 
 diff --git a/neo/renderer/tr_local.h b/neo/renderer/tr_local.h
 index 0e40f19..e201948 100644
 --- a/neo/renderer/tr_local.h
@@ -4805,7 +5053,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..ea7c9e5 100644
+index c83ebb5..b809e2e 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -4816,7 +5064,7 @@ index c83ebb5..ea7c9e5 100644
  
  /*
  
-@@ -38,6 +39,415 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +39,508 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -4919,6 +5167,85 @@ index c83ebb5..ea7c9e5 100644
 +    uint32_t g_blendRecordCount = 0;
 +    void*    g_capBlendProjImgPtr = 0;
 +    uint32_t g_capBlendKind = 2;
++    // Iter 13b: sky cube stages. Per-vertex cube directions (computed by the
++    // engine's sky texgens, wobble baked in) accumulate as a parallel vec3
++    // stream; records store the dir offset in sPad1 and pad3 = 2 marks sky.
++    enum { kWGPUSkyDirBytes = 1024 * 1024 };
++    uint8_t  g_skyDirsAccum[kWGPUSkyDirBytes];
++    uint32_t g_skyDirBytes = 0;
++}
++
++// Iter 13b: frontend texgen stash — R_Skybox/WobbleskyTexGen hand us their
++// CPU dir arrays here; the backend pass-stage capture looks them up by surf
++// pointer (validated by frame count — frame-temp pointers recycle).
++struct WGPUSkyStash { const void* surf; int frame; int numVerts; idVec3 coords[8192]; };
++static WGPUSkyStash g_skyStash[8];
++static int g_skyStashNext = 0;
++
++void D3_WebGPU_StashSkyTexCoords( const void* surf, const void* coords, int numVerts ) {
++	if ( numVerts <= 0 || numVerts > 8192 ) return;
++	WGPUSkyStash& st = g_skyStash[g_skyStashNext];
++	g_skyStashNext = ( g_skyStashNext + 1 ) % 8;
++	st.surf = surf;
++	st.frame = tr.frameCount;
++	st.numVerts = numVerts;
++	memcpy( st.coords, coords, numVerts * sizeof( idVec3 ) );
++}
++
++static const WGPUSkyStash* WGPU_FindSkyStash( const void* surf ) {
++	for ( int i = 0; i < 8; ++i ) {
++		if ( g_skyStash[i].surf == surf && g_skyStash[i].frame == tr.frameCount ) {
++			return &g_skyStash[i];
++		}
++	}
++	return nullptr;
++}
++
++// Iter 13b: cube image CPU cache (6 faces, RGBA8, downsampled to <=128).
++struct WGPUCubeSlot { const void* ptr; int size; uint8_t* faces[6]; };
++extern "C" {
++    WGPUCubeSlot g_cubeCache[32] = {};
++    int g_cubeCacheCount = 0;
++}
++
++extern "C" void D3_WebGPU_CacheCubeImage( const class idImage* img, const unsigned char* const pic[6], int size ) {
++	if ( !img || size <= 0 || size > 2048 ) return;
++	for ( int i = 0; i < 6; ++i ) if ( !pic[i] ) return;
++	int slot = -1;
++	for ( int i = 0; i < g_cubeCacheCount; ++i ) {
++		if ( g_cubeCache[i].ptr == (const void*)img ) { slot = i; break; }
++	}
++	if ( slot < 0 ) {
++		if ( g_cubeCacheCount >= 32 ) return;
++		slot = g_cubeCacheCount++;
++		g_cubeCache[slot].ptr = (const void*)img;
++		for ( int f = 0; f < 6; ++f ) g_cubeCache[slot].faces[f] = nullptr;
++	}
++	int step = 1;
++	while ( size / step > 128 ) step <<= 1;
++	const int ds = size / step;
++	for ( int f = 0; f < 6; ++f ) {
++		free( g_cubeCache[slot].faces[f] );
++		g_cubeCache[slot].faces[f] = (uint8_t*)malloc( (size_t)ds * ds * 4u );
++		if ( !g_cubeCache[slot].faces[f] ) { g_cubeCache[slot].ptr = nullptr; return; }
++		uint8_t* dst = g_cubeCache[slot].faces[f];
++		for ( int y = 0; y < ds; ++y ) {
++			const unsigned char* row = pic[f] + (size_t)(y * step) * size * 4u;
++			for ( int x = 0; x < ds; ++x ) {
++				const unsigned char* sp = row + (size_t)(x * step) * 4u;
++				*dst++ = sp[0]; *dst++ = sp[1]; *dst++ = sp[2]; *dst++ = sp[3];
++			}
++		}
++	}
++	g_cubeCache[slot].size = ds;
++}
++
++extern "C" const WGPUCubeSlot* D3_WebGPU_LookupCubeImage( const void* img ) {
++	if ( !img ) return nullptr;
++	for ( int i = 0; i < g_cubeCacheCount; ++i ) {
++		if ( g_cubeCache[i].ptr == img ) return &g_cubeCache[i];
++	}
++	return nullptr;
 +}
 +
 +// Iter 7: CPU image cache for the WebGPU backend. Image_load.cpp calls
@@ -5159,7 +5486,15 @@ index c83ebb5..ea7c9e5 100644
 +	if ( !surf || !tri || !tri->verts || !tri->indexes ) return;
 +	if ( tri->numVerts <= 0 || tri->numIndexes <= 0 ) return;
 +	if ( tri->numVerts > kWGPUMaxCaptureVerts || tri->numIndexes > kWGPUMaxCaptureIndexes ) return;
-+	if ( pStage->texture.texgen != TG_EXPLICIT ) return;   // skip skybox/reflect/screen texgens
++	// Iter 13b: sky cube stages — capture with the stashed per-vertex dirs.
++	const WGPUSkyStash* skyStash = nullptr;
++	if ( pStage->texture.texgen == TG_SKYBOX_CUBE || pStage->texture.texgen == TG_WOBBLESKY_CUBE ) {
++		skyStash = WGPU_FindSkyStash( surf );
++		if ( !skyStash || skyStash->numVerts != tri->numVerts ) return;
++		if ( g_skyDirBytes + (uint32_t)tri->numVerts * 12u > (uint32_t)kWGPUSkyDirBytes ) { g_capDropped++; return; }
++	} else if ( pStage->texture.texgen != TG_EXPLICIT ) {
++		return;   // other texgens (reflect/screen) still unsupported
++	}
 +	if ( pStage->texture.cinematic ) return;               // skip ROQ video surfaces
 +	idImage* img = pStage->texture.image;
 +	if ( !img ) return;
@@ -5222,6 +5557,12 @@ index c83ebb5..ea7c9e5 100644
 +	else                                                                             r.pad1 = 2;
 +	r.pad2 = (uint32_t)pStage->vertexColor;
 +	r.pad3 = is2D ? 1u : 0u;
++	if ( skyStash ) {
++		r.pad3 = 2u;   // sky cube record
++		r.sPad1 = g_skyDirBytes;
++		memcpy( g_skyDirsAccum + g_skyDirBytes, skyStash->coords, (size_t)tri->numVerts * 12u );
++		g_skyDirBytes += (uint32_t)tri->numVerts * 12u;
++	}
 +	g_passImagePtrs[g_passRecordCount] = (void*)img;
 +	g_capVertBytes  += vR;
 +	g_capIndexBytes += iR;
@@ -5232,7 +5573,7 @@ index c83ebb5..ea7c9e5 100644
  
  /*
  =================
-@@ -49,6 +459,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +552,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -5248,7 +5589,7 @@ index c83ebb5..ea7c9e5 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +497,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +590,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -5264,7 +5605,7 @@ index c83ebb5..ea7c9e5 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +544,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +637,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -5281,7 +5622,7 @@ index c83ebb5..ea7c9e5 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +604,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +697,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -5289,7 +5630,7 @@ index c83ebb5..ea7c9e5 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -557,22 +996,41 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1089,41 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
@@ -5343,10 +5684,10 @@ index c83ebb5..ea7c9e5 100644
  	// ensures that depth writes are enabled for the depth clear
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..652e18a
+index 0000000..5732c3c
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,543 @@
+@@ -0,0 +1,589 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -5823,6 +6164,52 @@ index 0000000..652e18a
 +"// compatible color target (writeMask = none) even though nothing is written.\n"
 +"@fragment\n"
 +"fn fs_main() {\n"
++"}\n"
++"";
++
++// sky.wgsl
++static const char* const kWGSL_sky = "// sky.wgsl — skybox / wobblesky cube stages.\n"
++"//\n"
++"// The engine computes per-vertex cube direction vectors on the CPU\n"
++"// (R_SkyboxTexGen / R_WobbleskyTexGen — the wobble rotation is baked in),\n"
++"// which the capture stashes; this shader just samples the cube map along\n"
++"// the interpolated direction. Opaque, depth-tested like any pass stage.\n"
++"\n"
++"struct Uniforms {\n"
++"    mvp:   mat4x4<f32>,\n"
++"    tint:  vec4<f32>,\n"
++"};\n"
++"@group(0) @binding(0) var<uniform> u: Uniforms;\n"
++"@group(0) @binding(1) var samp: sampler;\n"
++"@group(0) @binding(2) var tcube: texture_cube<f32>;\n"
++"\n"
++"struct VSIn {\n"
++"    @location(0) position:  vec3<f32>,\n"
++"    @location(1) texcoord:  vec2<f32>,\n"
++"    @location(2) normal:    vec3<f32>,\n"
++"    @location(3) tangent:   vec3<f32>,\n"
++"    @location(4) bitangent: vec3<f32>,\n"
++"    @location(5) color:     vec4<f32>,\n"
++"    @location(6) cubedir:   vec3<f32>,   // second vertex stream\n"
++"};\n"
++"\n"
++"struct VSOut {\n"
++"    @builtin(position) clip_pos: vec4<f32>,\n"
++"    @location(0) dir: vec3<f32>,\n"
++"};\n"
++"\n"
++"@vertex\n"
++"fn vs_main(in: VSIn) -> VSOut {\n"
++"    var out: VSOut;\n"
++"    let cp = u.mvp * vec4<f32>(in.position, 1.0);\n"
++"    out.clip_pos = vec4<f32>(cp.x, cp.y, (cp.z + cp.w) * 0.5, cp.w);\n"
++"    out.dir = in.cubedir;\n"
++"    return out;\n"
++"}\n"
++"\n"
++"@fragment\n"
++"fn fs_main(in: VSOut) -> @location(0) vec4<f32> {\n"
++"    return textureSample(tcube, samp, normalize(in.dir)) * u.tint;\n"
 +"}\n"
 +"";
 +
