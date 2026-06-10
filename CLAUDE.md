@@ -655,3 +655,21 @@ add). dyaw = -dx*sens, dpitch = dy*sens (idTech: yaw+ = left, pitch+ =
 down, engine clamps ±89). Button/diag/left-side touches ignored;
 preventDefault during the drag kills Safari scroll-bounce.
 `?looksens=<deg/px>` tunes (default 0.25).
+
+**Iter 12a/12b (2026-06-10).** (a) WebGPU-primary is the DEFAULT for
+`?backend=webgpu` — fullscreen WebGPU view + r_skipGLDraw 1; `&echo`
+restores the side-by-side debug layout. WebGPU device.lost surfaces to
+diag/console with a reload instruction. Persistent-vertex-buffer perf
+item DEPRIORITIZED: uploads are ~0.6MB/frame at ~7fps (trivial); the
+WASM game loop is the bottleneck. (b) Fog lights: RB_T_BasicFog
+captures per-record localized fog planes + the two global fog images;
+fog.wgsl blends fogColor with alpha = fogRamp(s0).a * enterRamp(s1,t1).a
+at the start of the final pass. Touch-look also landed today (drag the
+right side to aim; ?looksens= tunes).
+
+**Honest remaining list (iter 13+):** blend lights (RB_T_BlendLight —
+rarer cousin of fog), skybox/reflection texgens (needs cubemap capture:
+GenerateCubeImage is NOT hooked into the CPU image cache), ARB
+new-stage effects (heat haze), subviews/mirrors/monitors (needs
+render-to-texture echo architecture), lightgem via WebGPU (so GL can
+fully retire), GL4ES build retirement, ROQ video (broken in GL too).
