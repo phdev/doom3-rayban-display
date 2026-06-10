@@ -1081,13 +1081,30 @@ async function fetchChunkedBytes(candidate, progress, log) {
       ? 6 * (expectedSize / totalSize)
       : 6 / chunks.length;
     const label = `Fetching chunk ${index + 1}/${chunks.length}`;
-    const bytes = await fetchBytesWithRetries(chunk.url, {
-      cache: "no-store",
-      progress,
-      progressBase: base,
-      progressSpan: span,
-      progressLabel: label
-    });
+    // Cross-reload resume: completed chunks are cached individually, so a
+    // boot that dies at chunk 12/16 resumes there on the next reload
+    // instead of refetching everything. Cache entries validate by size and
+    // are cleared once the assembled pak is cached whole.
+    let bytes = null;
+    try {
+      const cached = await readCachedUrlPk4(chunk.url);
+      if (cached && (!expectedSize || cached.byteLength === expectedSize)) {
+        bytes = cached;
+        log?.(`Chunk ${index + 1}/${chunks.length} from cache`);
+      }
+    } catch { /* cache miss/fail → network */ }
+    if (!bytes) {
+      bytes = await fetchBytesWithRetries(chunk.url, {
+        cache: "no-store",
+        progress,
+        progressBase: base,
+        progressSpan: span,
+        progressLabel: label
+      });
+      if (bytes && (!expectedSize || bytes.byteLength === expectedSize)) {
+        saveCachedUrlPk4(chunk.url, bytes, { name: `chunk ${index}` }).catch(() => {});
+      }
+    }
 
     if (!bytes) {
       throw new Error(`Missing PK4 chunk ${index + 1}/${chunks.length}`);
@@ -1116,6 +1133,11 @@ async function fetchChunkedBytes(candidate, progress, log) {
   for (const buffer of buffers) {
     bytes.set(buffer, offset);
     offset += buffer.byteLength;
+  }
+
+  // Assembly complete — the caller caches the whole pak; drop chunk entries.
+  for (const chunk of chunks) {
+    clearCachedUrlPk4(chunk.url).catch(() => {});
   }
 
   return bytes;
