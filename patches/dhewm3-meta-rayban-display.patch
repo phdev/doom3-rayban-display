@@ -1801,10 +1801,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..9f1e88e
+index 0000000..69c777e
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,2212 @@
+@@ -0,0 +1,2362 @@
 +/*
 +================================================================================
 +
@@ -2043,6 +2043,7 @@ index 0000000..9f1e88e
 +            initPassPipelines();
 +            initShadowPipelines();
 +            initFogPipeline();
++            initBlendPipelines();
 +            initRecordSlots();
 +        }
 +        if (surface && demoPipeline) {
@@ -2622,6 +2623,83 @@ index 0000000..9f1e88e
 +        wgpuShaderModuleRelease(mod);
 +    }
 +
++    // Iter 13a: blend light pipelines (blend.wgsl) — filter multiplies the
++    // framebuffer (DstColor/Zero), additive adds. Depth EQUAL-ish via
++    // LessEqual without writes, over the lit scene.
++    void initBlendPipelines() {
++        WGPUShaderSourceWGSL wgsl = {};
++        wgsl.chain.sType = WGPUSType_ShaderSourceWGSL;
++        wgsl.code = { kWGSL_blend, WGPU_STRLEN };
++        WGPUShaderModuleDescriptor smd = {};
++        smd.nextInChain = &wgsl.chain;
++        WGPUShaderModule mod = wgpuDeviceCreateShaderModule(device, &smd);
++        if (!mod) { fprintf(stderr, "[WebGPU] blend.wgsl create FAILED\n"); return; }
++
++        WGPUBindGroupLayoutEntry ble[4] = {};
++        ble[0].binding = 0;
++        ble[0].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
++        ble[0].buffer.type = WGPUBufferBindingType_Uniform;
++        ble[0].buffer.minBindingSize = 160;
++        ble[1].binding = 1;
++        ble[1].visibility = WGPUShaderStage_Fragment;
++        ble[1].sampler.type = WGPUSamplerBindingType_Filtering;
++        ble[2].binding = 2;
++        ble[2].visibility = WGPUShaderStage_Fragment;
++        ble[2].texture.sampleType = WGPUTextureSampleType_Float;
++        ble[2].texture.viewDimension = WGPUTextureViewDimension_2D;
++        ble[3] = ble[2];
++        ble[3].binding = 3;
++        WGPUBindGroupLayoutDescriptor bld = {};
++        bld.entryCount = 4;
++        bld.entries = ble;
++        blendBGL = wgpuDeviceCreateBindGroupLayout(device, &bld);
++        WGPUPipelineLayoutDescriptor pld = {};
++        pld.bindGroupLayoutCount = 1;
++        pld.bindGroupLayouts = &blendBGL;
++        WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(device, &pld);
++
++        auto makeBlend = [&](WGPUBlendFactor src, WGPUBlendFactor dst, const char* label) -> WGPURenderPipeline {
++            WGPUDepthStencilState dss = {};
++            dss.format = WGPUTextureFormat_Depth24PlusStencil8;
++            dss.depthWriteEnabled = WGPUOptionalBool_False;
++            dss.depthCompare = WGPUCompareFunction_LessEqual;
++            dss.stencilFront.compare = WGPUCompareFunction_Always;
++            dss.stencilBack.compare  = WGPUCompareFunction_Always;
++            dss.stencilFront.failOp = dss.stencilFront.depthFailOp = dss.stencilFront.passOp = WGPUStencilOperation_Keep;
++            dss.stencilBack.failOp  = dss.stencilBack.depthFailOp  = dss.stencilBack.passOp  = WGPUStencilOperation_Keep;
++            WGPUColorTargetState target = {};
++            target.format = surfaceFormat;
++            target.writeMask = WGPUColorWriteMask_All;
++            WGPUBlendState blend = {};
++            blend.color.srcFactor = src; blend.color.dstFactor = dst;
++            blend.alpha.srcFactor = src; blend.alpha.dstFactor = dst;
++            target.blend = &blend;
++            WGPUFragmentState frag = {};
++            frag.module = mod;
++            frag.entryPoint = { "fs_main", WGPU_STRLEN };
++            frag.targetCount = 1;
++            frag.targets = &target;
++            WGPURenderPipelineDescriptor pd = {};
++            pd.label = { label, WGPU_STRLEN };
++            pd.layout = pl;
++            pd.vertex.module = mod;
++            pd.vertex.entryPoint = { "vs_main", WGPU_STRLEN };
++            pd.vertex.bufferCount = 1;
++            pd.vertex.buffers = drawVertLayout();
++            pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
++            pd.primitive.cullMode = WGPUCullMode_None;
++            pd.multisample.count = 1;
++            pd.multisample.mask = 0xFFFFFFFF;
++            pd.fragment = &frag;
++            pd.depthStencil = &dss;
++            return wgpuDeviceCreateRenderPipeline(device, &pd);
++        };
++        blendFilterPipeline = makeBlend(WGPUBlendFactor_Dst, WGPUBlendFactor_Zero, "blendFilter");
++        blendAddPipeline    = makeBlend(WGPUBlendFactor_One, WGPUBlendFactor_One,  "blendAdd");
++        wgpuPipelineLayoutRelease(pl);
++        wgpuShaderModuleRelease(mod);
++    }
++
 +    // Iter 8c: bind group for a shader-pass record slot — texture.wgsl
 +    // group(0) = uniform + sampler + texture. Cached per (slot, image).
 +    WGPUBindGroup getPassBindGroup(uint32_t slot, const void* imgPtr) {
@@ -3150,6 +3228,58 @@ index 0000000..9f1e88e
 +            g_fogRecordCount = 0;
 +        }
 +
++        // Iter 13a: drain blend-light records.
++        {
++            extern Rec      g_blendRecords[];
++            extern void*    g_blendImagePtrs[][2];
++            extern uint32_t g_blendRecordCount;
++            uint32_t bn = 0;
++            if (g_blendRecordCount > 0 && lastRecordCount > 0 && blendBGL) {
++                const uint32_t mainView = lastRecords[lastRecordCount - 1].pad0;
++                const uint32_t bTotal = (g_blendRecordCount < 64u) ? g_blendRecordCount : 64u;
++                for (uint32_t i = 0; i < bTotal; ++i) {
++                    if (g_blendRecords[i].pad0 != mainView) continue;
++                    const Rec& r = g_blendRecords[i];
++                    if (!blendUniformBufs[bn]) {
++                        WGPUBufferDescriptor d = {};
++                        d.size = 160;
++                        d.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
++                        blendUniformBufs[bn] = wgpuDeviceCreateBuffer(device, &d);
++                    }
++                    // Rebuild the bind group when this slot's images change.
++                    if (!blendBindGroups[bn] ||
++                        blendGroupImgs[bn][0] != g_blendImagePtrs[i][0] ||
++                        blendGroupImgs[bn][1] != g_blendImagePtrs[i][1]) {
++                        WGPUBindGroupEntry e[4] = {};
++                        e[0].binding = 0; e[0].buffer = blendUniformBufs[bn]; e[0].size = 160;
++                        e[1].binding = 1; e[1].sampler = interactionLightSampler;
++                        e[2].binding = 2; e[2].textureView = getEngineTextureView(g_blendImagePtrs[i][0], fbWhiteView);
++                        e[3].binding = 3; e[3].textureView = getEngineTextureView(g_blendImagePtrs[i][1], fbWhiteView);
++                        WGPUBindGroupDescriptor bgd = {};
++                        bgd.layout = blendBGL;
++                        bgd.entryCount = 4;
++                        bgd.entries = e;
++                        blendBindGroups[bn] = wgpuDeviceCreateBindGroup(device, &bgd);
++                        blendGroupImgs[bn][0] = g_blendImagePtrs[i][0];
++                        blendGroupImgs[bn][1] = g_blendImagePtrs[i][1];
++                    }
++                    float ub[40];
++                    memcpy(ub +  0, r.modelMatrix,   64);
++                    memcpy(ub + 16, r.diffuseColor,  16);
++                    memcpy(ub + 20, r.lightProjS,    16);
++                    memcpy(ub + 24, r.lightProjT,    16);
++                    memcpy(ub + 28, r.lightProjQ,    16);
++                    memcpy(ub + 32, r.lightFalloffS, 16);
++                    ub[36] = ub[37] = ub[38] = ub[39] = 0.0f;
++                    wgpuQueueWriteBuffer(queue, blendUniformBufs[bn], 0, ub, 160);
++                    lastBlendRecords[bn] = r;
++                    bn++;
++                }
++            }
++            lastBlendCount = bn;
++            g_blendRecordCount = 0;
++        }
++
 +        // CONSUME: drain the accumulator so next frame starts fresh.
 +        g_capRecordCount = 0;
 +        g_capVertBytes   = 0;
@@ -3298,6 +3428,17 @@ index 0000000..9f1e88e
 +                    wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
 +                    wgpuRenderPassEncoderDrawIndexed(rp, r.indexCount, 1, 0, 0, 0);
 +                }
++            }
++            // Iter 13a: blend lights (filter/additive framebuffer tints).
++            for (uint32_t i = 0; i < lastBlendCount; ++i) {
++                const Rec& r = lastBlendRecords[i];
++                WGPURenderPipeline p = (r.pad1 == 1u) ? blendFilterPipeline : blendAddPipeline;
++                if (!p || !blendBindGroups[i]) continue;
++                wgpuRenderPassEncoderSetPipeline(rp, p);
++                wgpuRenderPassEncoderSetBindGroup(rp, 0, blendBindGroups[i], 0, nullptr);
++                wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
++                wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
++                wgpuRenderPassEncoderDrawIndexed(rp, r.indexCount, 1, 0, 0, 0);
 +            }
 +            for (uint32_t i = 0; i < lastPassCount; ++i) {
 +                const Rec& r = lastPassRecords[i];
@@ -3994,6 +4135,15 @@ index 0000000..9f1e88e
 +    WGPUBindGroup           fogBindGroups[64]  = {nullptr};
 +    Rec                     lastFogRecords[64] = {};
 +    uint32_t                lastFogCount = 0;
++    // Iter 13a: blend lights — filter (DstColor/Zero) + additive variants.
++    WGPURenderPipeline      blendFilterPipeline = nullptr;
++    WGPURenderPipeline      blendAddPipeline = nullptr;
++    WGPUBindGroupLayout     blendBGL = nullptr;
++    WGPUBuffer              blendUniformBufs[64] = {nullptr};
++    WGPUBindGroup           blendBindGroups[64]  = {nullptr};
++    const void*             blendGroupImgs[64][2] = {};
++    Rec                     lastBlendRecords[64] = {};
++    uint32_t                lastBlendCount = 0;
 +    // Iter 6.8: on-device determinism self-test. Renders the identical
 +    // record set twice into two offscreen textures, reads both back,
 +    // byte-compares. Sidesteps the canvas-readback trap (WebGPU canvases
@@ -4358,10 +4508,10 @@ index c1d0d3e..19a540a 100644
  		// do fogging later
  		if ( vLight->lightShader->IsFogLight() ) {
 diff --git a/neo/renderer/draw_common.cpp b/neo/renderer/draw_common.cpp
-index 0cabbfd..9263fe2 100644
+index 0cabbfd..0cb1bd6 100644
 --- a/neo/renderer/draw_common.cpp
 +++ b/neo/renderer/draw_common.cpp
-@@ -30,10 +30,21 @@ If you have questions concerning this license or the applicable additional terms
+@@ -30,10 +30,26 @@ If you have questions concerning this license or the applicable additional terms
  #include "renderer/VertexCache.h"
  
  #include "renderer/tr_local.h"
@@ -4378,12 +4528,17 @@ index 0cabbfd..9263fe2 100644
 +void D3_WebGPU_CaptureFog( const drawSurf_t* surf, const srfTriangles_t* tri,
 +                           const float planeS0[4], const float planeT1[4],
 +                           const float planeS1[4], const float color[4] );
-+extern "C" { extern void* g_capFogImgPtr; extern void* g_capFogEnterImgPtr; }
++extern "C" { extern void* g_capFogImgPtr; extern void* g_capFogEnterImgPtr;
++             extern void* g_capBlendProjImgPtr; extern uint32_t g_capBlendKind; }
++void D3_WebGPU_CaptureBlendLight( const drawSurf_t* surf, const srfTriangles_t* tri,
++                                  const float pS[4], const float pT[4],
++                                  const float pQ[4], const float pF[4],
++                                  const float color[4], void* falloffImg );
 +
  /*
  =====================
  RB_BakeTextureMatrixIntoTexgen
-@@ -774,12 +785,19 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
+@@ -774,12 +790,19 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
  	}
  
  	// change the scissor if needed
@@ -4407,7 +4562,7 @@ index 0cabbfd..9263fe2 100644
  	}
  
  	// some deforms may disable themselves by setting numIndexes = 0
-@@ -1175,6 +1193,12 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
+@@ -1175,6 +1198,12 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
  
  		RB_PrepareStageTexturing( pStage, surf, ac );
  
@@ -4420,7 +4575,7 @@ index 0cabbfd..9263fe2 100644
  		// draw it
  		RB_DrawElementsWithCounters( tri );
  
-@@ -1345,6 +1369,16 @@ static void RB_T_Shadow( const drawSurf_t *surf ) {
+@@ -1345,6 +1374,16 @@ static void RB_T_Shadow( const drawSurf_t *surf ) {
  		qglDepthBoundsEXT( surf->scissorRect.zmin, surf->scissorRect.zmax );
  	}
  
@@ -4437,7 +4592,38 @@ index 0cabbfd..9263fe2 100644
  	// debug visualization
  	if ( r_showShadows.GetInteger() ) {
  		if ( r_showShadows.GetInteger() == 3 ) {
-@@ -1700,6 +1734,19 @@ local[0] = local[1] = local[2] = 0; local[3] = 0.5;
+@@ -1568,6 +1607,18 @@ static void RB_T_BlendLight( const drawSurf_t *surf ) {
+ 		qglTexGenfv( GL_S, GL_OBJECT_PLANE, lightProject[3].ToFloatPtr() );
+ 	}
+ 
++	// Iter 13a (WebGPU echo): capture this blend-light surface with freshly
++	// localized projection planes.
++	if ( tri->verts ) {
++		idPlane lp[4];
++		for ( int pi = 0; pi < 4; pi++ ) {
++			R_GlobalPlaneToLocal( surf->space->modelMatrix, backEnd.vLight->lightProject[pi], lp[pi] );
++		}
++		D3_WebGPU_CaptureBlendLight( surf, tri,
++			lp[0].ToFloatPtr(), lp[1].ToFloatPtr(), lp[2].ToFloatPtr(), lp[3].ToFloatPtr(),
++			backEnd.lightColor, (void*)backEnd.vLight->falloffImage );
++	}
++
+ 	// this gets used for both blend lights and shadow draws
+ 	if ( tri->ambientCache ) {
+ 		idDrawVert	*ac = (idDrawVert *)vertexCache.Position( tri->ambientCache );
+@@ -1630,6 +1681,11 @@ static void RB_BlendLight( const drawSurf_t *drawSurfs,  const drawSurf_t *drawS
+ 
+ 		GL_SelectTexture( 0 );
+ 		stage->texture.image->Bind();
++		g_capBlendProjImgPtr = (void*)stage->texture.image;   // WebGPU echo
++		{
++			const int b = stage->drawStateBits & (GLS_SRCBLEND_BITS | GLS_DSTBLEND_BITS);
++			g_capBlendKind = (b == (GLS_SRCBLEND_DST_COLOR | GLS_DSTBLEND_ZERO)) ? 1u : 2u;
++		}
+ 
+ 		if ( stage->texture.hasMatrix ) {
+ 			RB_LoadShaderTextureMatrix( regs, &stage->texture );
+@@ -1700,6 +1756,19 @@ local[0] = local[1] = local[2] = 0; local[3] = 0.5;
  		qglTexGenfv( GL_S, GL_OBJECT_PLANE, local.ToFloatPtr() );
  	}
  
@@ -4457,7 +4643,7 @@ index 0cabbfd..9263fe2 100644
  	RB_T_RenderTriangleSurface( surf );
  }
  
-@@ -1758,6 +1805,8 @@ static void RB_FogPass( const drawSurf_t *drawSurfs,  const drawSurf_t *drawSurf
+@@ -1758,6 +1827,8 @@ static void RB_FogPass( const drawSurf_t *drawSurfs,  const drawSurf_t *drawSurf
  	// texture 0 is the falloff image
  	GL_SelectTexture( 0 );
  	globalImages->fogImage->Bind();
@@ -4466,7 +4652,7 @@ index 0cabbfd..9263fe2 100644
  	//GL_Bind( tr.whiteImage );
  	qglDisableClientState( GL_TEXTURE_COORD_ARRAY );
  	qglEnable( GL_TEXTURE_GEN_S );
-@@ -1851,10 +1900,15 @@ void RB_STD_FogAllLights( void ) {
+@@ -1851,10 +1922,15 @@ void RB_STD_FogAllLights( void ) {
  			// units from the origin
  			backEnd.currentScissor = vLight->scissorRect;
  			if ( r_useScissor.GetBool() ) {
@@ -4486,7 +4672,7 @@ index 0cabbfd..9263fe2 100644
  			}
  			qglClear( GL_STENCIL_BUFFER_BIT );
  
-@@ -1903,10 +1957,15 @@ void RB_STD_LightScale( void ) {
+@@ -1903,10 +1979,15 @@ void RB_STD_LightScale( void ) {
  
  	// the scissor may be smaller than the viewport for subviews
  	if ( r_useScissor.GetBool() ) {
@@ -4619,7 +4805,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..07f6c69 100644
+index c83ebb5..ea7c9e5 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -4630,7 +4816,7 @@ index c83ebb5..07f6c69 100644
  
  /*
  
-@@ -38,6 +39,360 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +39,415 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -4725,6 +4911,14 @@ index c83ebb5..07f6c69 100644
 +    uint32_t g_fogRecordCount = 0;
 +    void*    g_capFogImgPtr      = 0;
 +    void*    g_capFogEnterImgPtr = 0;
++    // Iter 13a: blend light records. lightProjS/T/Q + lightFalloffS hold the
++    // LOCAL light projection planes; diffuseColor = stage color; pad1 = blend
++    // kind (1 filter DstColor/Zero, 2 additive). Image ptrs parallel array.
++    WGPUInteractionRecord g_blendRecords[64];
++    void*    g_blendImagePtrs[64][2];
++    uint32_t g_blendRecordCount = 0;
++    void*    g_capBlendProjImgPtr = 0;
++    uint32_t g_capBlendKind = 2;
 +}
 +
 +// Iter 7: CPU image cache for the WebGPU backend. Image_load.cpp calls
@@ -4864,6 +5058,53 @@ index c83ebb5..07f6c69 100644
 +	g_capFrameId++;
 +}
 +
++// Iter 13a: capture one blend-light surface. Local planes computed by caller.
++void D3_WebGPU_CaptureBlendLight( const drawSurf_t* surf, const srfTriangles_t* tri,
++                                  const float pS[4], const float pT[4],
++                                  const float pQ[4], const float pF[4],
++                                  const float color[4], void* falloffImg ) {
++	if ( !backEnd.viewDef || backEnd.viewDef->viewEntitys == NULL ) return;
++	if ( ( backEnd.viewDef->viewport.x2 - backEnd.viewDef->viewport.x1 ) < 128 ) return;
++	if ( !surf || !tri || !tri->verts || !tri->indexes ) return;
++	if ( tri->numVerts <= 0 || tri->numIndexes <= 0 ) return;
++	if ( tri->numVerts > kWGPUMaxCaptureVerts || tri->numIndexes > kWGPUMaxCaptureIndexes ) return;
++	if ( g_blendRecordCount >= 64 ) { g_capDropped++; return; }
++
++	const uint32_t vbytes = (uint32_t)tri->numVerts * 60u;
++	const uint32_t ibytes = (uint32_t)tri->numIndexes * 2u;
++	const uint32_t vR = (vbytes + 3u) & ~3u, iR = (ibytes + 3u) & ~3u;
++	if ( g_capVertBytes + vR > (uint32_t)kWGPUVertAccumBytes ||
++	     g_capIndexBytes + iR > (uint32_t)kWGPUIndexAccumBytes ) { g_capDropped++; return; }
++	memcpy( g_capVertsAccum + g_capVertBytes, tri->verts, vbytes );
++	for ( int i = 0; i < tri->numIndexes; ++i ) {
++		g_capIndexesAccum[(g_capIndexBytes / 2) + i] = (uint16_t)tri->indexes[i];
++	}
++
++	WGPUInteractionRecord& r = g_blendRecords[g_blendRecordCount];
++	memset( &r, 0, sizeof(r) );
++	r.vertOffset  = g_capVertBytes;
++	r.vertCount   = (uint32_t)tri->numVerts;
++	r.indexOffset = g_capIndexBytes;
++	r.indexCount  = (uint32_t)tri->numIndexes;
++	static const float kIdent[16] = {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
++	WGPU_PassMatMul4( r.modelMatrix,
++	                  backEnd.viewDef->projectionMatrix,
++	                  surf->space ? surf->space->modelViewMatrix : kIdent );
++	memcpy( r.lightProjS,   pS, 16 );
++	memcpy( r.lightProjT,   pT, 16 );
++	memcpy( r.lightProjQ,   pQ, 16 );
++	memcpy( r.lightFalloffS, pF, 16 );
++	memcpy( r.diffuseColor, color, 16 );
++	r.pad0 = (uint32_t)(uintptr_t)backEnd.viewDef;
++	r.pad1 = g_capBlendKind;
++	g_blendImagePtrs[g_blendRecordCount][0] = g_capBlendProjImgPtr;
++	g_blendImagePtrs[g_blendRecordCount][1] = falloffImg;
++	g_capVertBytes  += vR;
++	g_capIndexBytes += iR;
++	g_blendRecordCount++;
++	g_capFrameId++;
++}
++
 +// Iter 12b: capture one fog-pass surface. Local planes are computed by the
 +// caller (draw_common.cpp, where FOG_ENTER and the GL texgen quirks live).
 +void D3_WebGPU_CaptureFog( const drawSurf_t* surf, const srfTriangles_t* tri,
@@ -4991,7 +5232,7 @@ index c83ebb5..07f6c69 100644
  
  /*
  =================
-@@ -49,6 +404,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +459,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -5007,7 +5248,7 @@ index c83ebb5..07f6c69 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +442,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +497,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -5023,7 +5264,7 @@ index c83ebb5..07f6c69 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +489,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +544,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -5040,7 +5281,7 @@ index c83ebb5..07f6c69 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +549,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +604,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -5048,7 +5289,7 @@ index c83ebb5..07f6c69 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -557,22 +941,41 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +996,41 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
@@ -5102,10 +5343,10 @@ index c83ebb5..07f6c69 100644
  	// ensures that depth writes are enabled for the depth clear
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..e561fc1
+index 0000000..652e18a
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,487 @@
+@@ -0,0 +1,543 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -5188,6 +5429,62 @@ index 0000000..e561fc1
 +"        discard;\n"
 +"    }\n"
 +"    return result;\n"
++"}\n"
++"";
++
++// blend.wgsl
++static const char* const kWGSL_blend = "// blend.wgsl — DOOM 3 blend light pass (RB_BlendLight / RB_T_BlendLight).\n"
++"//\n"
++"// Blend lights tint/filter whatever is already in the framebuffer instead\n"
++"// of interacting with surface materials: projected cookie (projective\n"
++"// S/T/Q texgens) x falloff ramp x stage color. The blend factor variant\n"
++"// (filter = DstColor/Zero, additive = One/One) is chosen per record.\n"
++"\n"
++"struct Uniforms {\n"
++"    mvp:       mat4x4<f32>,\n"
++"    color:     vec4<f32>,\n"
++"    proj_s:    vec4<f32>,\n"
++"    proj_t:    vec4<f32>,\n"
++"    proj_q:    vec4<f32>,\n"
++"    falloff_s: vec4<f32>,\n"
++"};\n"
++"@group(0) @binding(0) var<uniform> u: Uniforms;\n"
++"@group(0) @binding(1) var samp: sampler;\n"
++"@group(0) @binding(2) var t_proj: texture_2d<f32>;\n"
++"@group(0) @binding(3) var t_falloff: texture_2d<f32>;\n"
++"\n"
++"struct VSIn {\n"
++"    @location(0) position:  vec3<f32>,\n"
++"    @location(1) texcoord:  vec2<f32>,\n"
++"    @location(2) normal:    vec3<f32>,\n"
++"    @location(3) tangent:   vec3<f32>,\n"
++"    @location(4) bitangent: vec3<f32>,\n"
++"    @location(5) color:     vec4<f32>,\n"
++"};\n"
++"\n"
++"struct VSOut {\n"
++"    @builtin(position) clip_pos: vec4<f32>,\n"
++"    @location(0) uvq: vec3<f32>,\n"
++"    @location(1) sF:  f32,\n"
++"};\n"
++"\n"
++"@vertex\n"
++"fn vs_main(in: VSIn) -> VSOut {\n"
++"    var out: VSOut;\n"
++"    let cp = u.mvp * vec4<f32>(in.position, 1.0);\n"
++"    out.clip_pos = vec4<f32>(cp.x, cp.y, (cp.z + cp.w) * 0.5, cp.w);\n"
++"    let pos4 = vec4<f32>(in.position, 1.0);\n"
++"    out.uvq = vec3<f32>(dot(pos4, u.proj_s), dot(pos4, u.proj_t), dot(pos4, u.proj_q));\n"
++"    out.sF  = dot(pos4, u.falloff_s);\n"
++"    return out;\n"
++"}\n"
++"\n"
++"@fragment\n"
++"fn fs_main(in: VSOut) -> @location(0) vec4<f32> {\n"
++"    let uv = in.uvq.xy / max(in.uvq.z, 0.001);\n"
++"    let c0 = textureSample(t_proj, samp, uv);\n"
++"    let c1 = textureSample(t_falloff, samp, vec2<f32>(in.sF, 0.5));\n"
++"    return c0 * c1 * u.color;\n"
 +"}\n"
 +"";
 +
