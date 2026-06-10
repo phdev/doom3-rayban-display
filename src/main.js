@@ -378,6 +378,9 @@ function wireFxPanel() {
     { label: "bloom thresh", cvar: "r_bloomThreshold", min: 0,   max: 1,   step: 0.02, value: 0.5 },
     { label: "gamma",        cvar: "r_gamma",          min: 0.5, max: 2,   step: 0.05, value: 1.1 },
     { label: "brightness",   cvar: "r_brightness",     min: 0.5, max: 2,   step: 0.05, value: 1.0 },
+    // The real "X360 look" lever: multiplies LIGHT energy (pools brighten,
+    // shadow contrast scales with it) instead of lifting the whole frame.
+    { label: "light scale",  cvar: "r_lightScale",     min: 1,   max: 6,   step: 0.25, value: 2 },
   ];
   for (const s of SLIDERS) {
     const row = document.createElement("div");

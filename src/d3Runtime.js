@@ -609,7 +609,12 @@ function buildArguments(config) {
     // CRITICAL: terminal/stdin console input blocks forever in the browser
     // (Sys_ConsoleInput reads a tty that never delivers). Disable it.
     "+set", "in_tty", "0",
-    "+set", "g_showPlayerShadow", "0",
+    // The player's own shadow is the single most visible shadow in DOOM 3 —
+    // on under WebGPU-primary (stencil shadows are on there too).
+    "+set", "g_showPlayerShadow",
+        (/[?&]backend=webgpu\b/.test(typeof window !== "undefined" ? window.location.search : "")
+         && !/[?&]echo\b/.test(typeof window !== "undefined" ? window.location.search : "")
+         && !/[?&]noshadows\b/.test(typeof window !== "undefined" ? window.location.search : "")) ? "1" : "0",
     // The shell mounts PK4 + config under /base in the Emscripten FS; point the
     // engine's base path there (default would be the executable dir).
     "+set", "fs_basepath", "/",
