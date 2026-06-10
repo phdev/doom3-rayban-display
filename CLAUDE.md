@@ -882,3 +882,33 @@ confirmed via shader probe, zero validation errors, det rounds
 IDENTICAL, spawn scene unchanged. Visual fidelity eyeball at a
 haze-rich location (dropship pad vents) = on-device follow-up; the
 glass-pane vantage is record-cap-starved (256) and not representative.
+
+**Iter 17 — cinematic (ROQ) textures in the WebGPU path (2026-06-10).**
+GL uploads each decoded video frame into ONE shared scratch image
+right before each draw (`RB_BindVariableStageImage` →
+`cinematicImage->UploadScratch`) — capture-replay can't share that
+(two monitors in view would both show the LAST upload). Now:
+`D3_WebGPU_NoteCinematicFrame` (called right after UploadScratch, so
+the same stage's pass capture — 11 lines later in the stage loop —
+consumes it) copies the decoded RGBA frame into a 4-slot ring
+(512px cap/slot); the pass record carries slot+1 in sPad3; the
+backend uploads the slots to per-slot RGBA8 dynamic textures via
+writeTexture at drain time and binds them through per-frame transient
+bind groups (released at the NEXT drain, after the submit completed).
+No decoded frame pending → the stage is skipped, matching GL's
+blackImage bind (the small TEAL squares seen in screenshots = video
+GUI surfaces' backcolor showing through — pre-existing, now
+explained). One-shot log when live: "[d3] WebGPU cinematic frame
+bound: WxH".
+STATUS: implemented + runs clean with the real monitor videos in a
+local test pak (no validation errors, det IDENTICAL, normal scenes
+unchanged). The bind-path has NOT yet fired in a test: mars_city1's
+looping video (the hanging IPN monitor, entity tim_func_mover_1 at
+-2789 -1247 233) defeated four setviewpos framing attempts (pillars/
+ducts), the welcome-kiosk movie (gui2, entity func_static_5074) is
+script-triggered and idle at boot, and the receptionist's IPN screen
+triggers during gameplay. VERIFY ON-DEVICE/GAMEPLAY: with videos in
+the pak + r_skipROQ 0, walk to the reception desk — the console
+should print "cinematic frame bound" and the desk screen should show
+moving IPN news. Note videomap decls reference "sound/VO/video/..."
+(uppercase VO — engine FS is case-insensitive, zip entries lowercase).

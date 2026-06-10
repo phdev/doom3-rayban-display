@@ -1917,10 +1917,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..8be710e
+index 0000000..2737d47
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,3106 @@
+@@ -0,0 +1,3191 @@
 +/*
 +================================================================================
 +
@@ -3144,6 +3144,27 @@ index 0000000..8be710e
 +        return g;
 +    }
 +
++    // Iter 17: pass bind group sampling a per-slot cinematic frame texture.
++    // Built fresh each frame (the frame content changes every frame anyway);
++    // retired at the next drain once the prior submit completed.
++    WGPUBindGroup getCinPassBindGroup(uint32_t slot, uint32_t cin) {
++        if (cin >= kCinSlots || !cinView[cin] || !passUniformBufs[slot]) return nullptr;
++        WGPUBindGroupEntry e[3] = {};
++        e[0].binding = 0; e[0].buffer = passUniformBufs[slot]; e[0].size = 128;
++        e[1].binding = 1; e[1].sampler = demoSampler;
++        e[2].binding = 2; e[2].textureView = cinView[cin];
++        WGPUBindGroupDescriptor bgd = {};
++        bgd.layout = passBGL;
++        bgd.entryCount = 3;
++        bgd.entries = e;
++        WGPUBindGroup g = wgpuDeviceCreateBindGroup(device, &bgd);
++        // park it for release at the next drain (one transient per cin slot
++        // per frame is the common case; extras replace and release eagerly)
++        if (cinFrameGroups[cin]) wgpuBindGroupRelease(cinFrameGroups[cin]);
++        cinFrameGroups[cin] = g;
++        return g;
++    }
++
 +    // Iter 8b: z-fill pre-pass pipeline. No fragment stage, no color
 +    // targets — writes depth only. The lit pass then tests LessEqual with
 +    // depth writes off, giving correct occlusion AND letting multiple
@@ -3563,6 +3584,50 @@ index 0000000..8be710e
 +            g_skyDirBytes = 0;
 +        }
 +
++        // Iter 17: upload this frame's decoded cinematic frames into the
++        // per-slot dynamic textures BEFORE the pass-record sweep builds
++        // bind groups against them, and retire last frame's transient
++        // groups (their submit has completed).
++        {
++            extern uint8_t  g_cinFrameBytes[][512 * 512 * 4];
++            extern int      g_cinFrameW[];
++            extern int      g_cinFrameH[];
++            extern uint32_t g_cinFrameCount;
++            for (uint32_t s = 0; s < kCinSlots; ++s) {
++                if (cinFrameGroups[s]) { wgpuBindGroupRelease(cinFrameGroups[s]); cinFrameGroups[s] = nullptr; }
++            }
++            const uint32_t cn = (g_cinFrameCount < kCinSlots) ? g_cinFrameCount : kCinSlots;
++            for (uint32_t s = 0; s < cn; ++s) {
++                const int w = g_cinFrameW[s], h = g_cinFrameH[s];
++                if (w <= 0 || h <= 0) continue;
++                if (!cinTex[s] || cinTexW[s] != w || cinTexH[s] != h) {
++                    if (cinView[s]) { wgpuTextureViewRelease(cinView[s]); cinView[s] = nullptr; }
++                    if (cinTex[s])  { wgpuTextureRelease(cinTex[s]); cinTex[s] = nullptr; }
++                    WGPUTextureDescriptor td = {};
++                    td.size = { (uint32_t)w, (uint32_t)h, 1 };
++                    td.mipLevelCount = 1;
++                    td.sampleCount = 1;
++                    td.dimension = WGPUTextureDimension_2D;
++                    td.format = WGPUTextureFormat_RGBA8Unorm;
++                    td.usage = WGPUTextureUsage_CopyDst | WGPUTextureUsage_TextureBinding;
++                    td.label = { "cinFrame", WGPU_STRLEN };
++                    cinTex[s] = wgpuDeviceCreateTexture(device, &td);
++                    cinView[s] = cinTex[s] ? wgpuTextureCreateView(cinTex[s], nullptr) : nullptr;
++                    cinTexW[s] = w; cinTexH[s] = h;
++                }
++                if (cinTex[s]) {
++                    WGPUTexelCopyTextureInfo dst = {};
++                    dst.texture = cinTex[s];
++                    WGPUTexelCopyBufferLayout layout = {};
++                    layout.bytesPerRow = (uint32_t)w * 4u;
++                    layout.rowsPerImage = (uint32_t)h;
++                    WGPUExtent3D ext = { (uint32_t)w, (uint32_t)h, 1 };
++                    wgpuQueueWriteTexture(queue, &dst, g_cinFrameBytes[s], (size_t)w * h * 4u, &layout, &ext);
++                }
++            }
++            g_cinFrameCount = 0;
++        }
++
 +        // Iter 8c: drain shader-pass (emissive/decal) records the same way —
 +        // filter to the main view, write 96-byte texture.wgsl uniforms
 +        // (mvp + tint + SVC params), resolve per-(slot,image) bind groups.
@@ -3680,7 +3745,20 @@ index 0000000..8be710e
 +                    memcpy(ub + 24, r.lightProjS, 16);   // stage texture matrix S
 +                    memcpy(ub + 28, r.lightProjT, 16);   // stage texture matrix T
 +                    wgpuQueueWriteBuffer(queue, passUniformBufs[pn], 0, ub, 128);
-+                    lastPassGroups[pn] = getPassBindGroup(pn, g_passImagePtrs[i]);
++                    // Iter 17: cinematic records bind this frame's decoded
++                    // video frame (per-slot dynamic texture) instead of a
++                    // cached engine image.
++                    lastPassGroups[pn] = (r.sPad3 > 0)
++                        ? getCinPassBindGroup(pn, r.sPad3 - 1u)
++                        : getPassBindGroup(pn, g_passImagePtrs[i]);
++                    if (r.sPad3 > 0) {
++                        static bool cinAnnounced = false;
++                        if (!cinAnnounced && lastPassGroups[pn]) {
++                            cinAnnounced = true;
++                            EM_ASM_({ console.info("[d3] WebGPU cinematic frame bound: " + $0 + "x" + $1); },
++                                    cinTexW[r.sPad3 - 1u], cinTexH[r.sPad3 - 1u]);
++                        }
++                    }
 +                    lastPassRecords[pn] = r;
 +                    pn++;
 +                }
@@ -5004,6 +5082,13 @@ index 0000000..8be710e
 +    WGPUTextureView         currentRenderView = nullptr;
 +    uint32_t                currentRenderW = 0, currentRenderH = 0;
 +    uint32_t                currentRenderGen = 0;   // bumps on recreate → bind groups rebuild
++    // Iter 17: per-slot dynamic textures for decoded cinematic (ROQ) frames.
++    static constexpr uint32_t kCinSlots = 4;
++    WGPUTexture             cinTex[kCinSlots] = {nullptr};
++    WGPUTextureView         cinView[kCinSlots] = {nullptr};
++    int                     cinTexW[kCinSlots] = {0};
++    int                     cinTexH[kCinSlots] = {0};
++    WGPUBindGroup           cinFrameGroups[kCinSlots] = {nullptr};   // transient, per frame
 +    // Iter 6.8: on-device determinism self-test. Renders the identical
 +    // record set twice into two offscreen textures, reads both back,
 +    // byte-compares. Sidesteps the canvas-readback trap (WebGPU canvases
@@ -5747,7 +5832,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..6cf925d 100644
+index c83ebb5..76bb0f4 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -5758,7 +5843,7 @@ index c83ebb5..6cf925d 100644
  
  /*
  
-@@ -38,6 +39,640 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +39,676 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -5892,6 +5977,32 @@ index c83ebb5..6cf925d 100644
 +    uint16_t g_hazeIndexesAccum[kWGPUHazeIndexBytes / 2];
 +    uint32_t g_hazeVertBytes = 0;
 +    uint32_t g_hazeIndexBytes = 0;
++    // Iter 17: cinematic (ROQ) frames for the WebGPU path. The GL path
++    // uploads decoded frames into ONE shared scratch image right before
++    // each draw — capture-replay can't share it (two monitors in view
++    // would both sample the last upload), so each decoded frame gets its
++    // own ring slot this frame; the pass record stores slot+1 in sPad3
++    // and the backend samples a per-slot dynamic texture.
++    enum { kWGPUCinSlots = 4, kWGPUCinMaxDim = 512 };
++    uint8_t  g_cinFrameBytes[kWGPUCinSlots][kWGPUCinMaxDim * kWGPUCinMaxDim * 4];
++    int      g_cinFrameW[kWGPUCinSlots];
++    int      g_cinFrameH[kWGPUCinSlots];
++    uint32_t g_cinFrameCount = 0;
++    int      g_cinPendingSlot = -1;
++}
++
++// Iter 17: stash a decoded cinematic frame (called from
++// RB_BindVariableStageImage right after UploadScratch, i.e. just BEFORE
++// the same stage's D3_WebGPU_CapturePassStage call consumes the slot).
++extern "C" void D3_WebGPU_NoteCinematicFrame( const void* rgba, int w, int h ) {
++	g_cinPendingSlot = -1;
++	if ( !rgba || w <= 0 || h <= 0 || w > kWGPUCinMaxDim || h > kWGPUCinMaxDim ) return;
++	if ( g_cinFrameCount >= (uint32_t)kWGPUCinSlots ) { g_capDropped++; return; }
++	const int slot = (int)g_cinFrameCount++;
++	memcpy( g_cinFrameBytes[slot], rgba, (size_t)w * (size_t)h * 4u );
++	g_cinFrameW[slot] = w;
++	g_cinFrameH[slot] = h;
++	g_cinPendingSlot = slot;
 +}
 +
 +extern "C" void D3_WebGPU_NoteSubviewCopy( void* img ) {
@@ -6235,14 +6346,23 @@ index c83ebb5..6cf925d 100644
 +	} else if ( pStage->texture.texgen != TG_EXPLICIT ) {
 +		return;   // screen-space texgens still unsupported
 +	}
-+	if ( pStage->texture.cinematic ) return;               // skip ROQ video surfaces
++	// Iter 17: cinematic stages replay against the per-slot dynamic frame
++	// noted by RB_BindVariableStageImage moments ago. No decoded frame
++	// pending (r_skipROQ, missing video, decode idle) → skip the stage,
++	// matching GL's blackImage bind.
++	uint32_t cinSlot = 0;
++	if ( pStage->texture.cinematic ) {
++		if ( g_cinPendingSlot < 0 ) return;
++		cinSlot = (uint32_t)g_cinPendingSlot + 1u;   // sPad3 is 1-based; 0 = not cinematic
++		g_cinPendingSlot = -1;
++	}
 +	// Stages that mask off ALL color writes (maskcolor / makealpha — they
 +	// only prime the alpha channel for a later gl_dst_alpha stage) must NOT
 +	// be replayed: our pipelines write RGB, so they'd paint opaque blocks
 +	// (found via glass1's alpha-prime stage painting the window white).
 +	if ( ( pStage->drawStateBits & GLS_COLORMASK ) == GLS_COLORMASK ) return;
 +	idImage* img = pStage->texture.image;
-+	if ( !img ) return;
++	if ( !img && !cinSlot ) return;
 +	if ( g_passRecordCount >= (uint32_t)kWGPUMaxRecords ) { g_capDropped++; return; }
 +
 +	const uint32_t vbytes = (uint32_t)tri->numVerts * 60u;
@@ -6303,6 +6423,7 @@ index c83ebb5..6cf925d 100644
 +	else                                                                             r.pad1 = 2;
 +	r.pad2 = (uint32_t)pStage->vertexColor;
 +	r.pad3 = is2D ? 1u : 0u;
++	r.sPad3 = cinSlot;   // iter 17: 1-based dynamic-frame slot, 0 = static image
 +	if ( skyStash ) {
 +		r.pad3 = 2u;   // sky cube record
 +		r.sPad1 = g_skyDirBytes;
@@ -6399,7 +6520,7 @@ index c83ebb5..6cf925d 100644
  
  /*
  =================
-@@ -49,6 +684,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +720,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -6415,7 +6536,7 @@ index c83ebb5..6cf925d 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +722,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +758,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -6431,7 +6552,7 @@ index c83ebb5..6cf925d 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +769,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +805,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -6448,7 +6569,7 @@ index c83ebb5..6cf925d 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +829,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +865,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -6456,7 +6577,20 @@ index c83ebb5..6cf925d 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -557,22 +1221,41 @@ void RB_BeginDrawingView (void) {
+@@ -392,8 +1092,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+ 
+ 		if ( cin.image ) {
+ 			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
++			// Iter 17: stash the decoded frame for the WebGPU replay (the
++			// pass-stage capture for this same stage consumes the slot).
++			D3_WebGPU_NoteCinematicFrame( cin.image, cin.imageWidth, cin.imageHeight );
+ 		} else {
+ 			globalImages->blackImage->Bind();
++			D3_WebGPU_NoteCinematicFrame( NULL, 0, 0 );   // clears any stale slot
+ 		}
+ 	} else {
+ 		//FIXME: see why image is invalid
+@@ -557,22 +1261,41 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
