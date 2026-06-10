@@ -715,3 +715,15 @@ depth-tested. Wobble rotation comes free (engine computed it).
 TEXGEN COVERAGE: explicit ✓ sky ✓ wobblesky ✓; reflect/screen still
 unsupported. Remaining big items: subviews (render-to-texture),
 lightgem via WebGPU, GL4ES retirement, heat-haze, ROQ.
+
+**640px + Iter 14 subviews (2026-06-10).** Render res bumped 448→640
+when WebGPU-primary (the GL-era GPU-pressure cap doesn't bind; ?lowres
+restores, ?render2x/4x still scale). Subview render-to-texture: the
+gated CopyFramebuffer records (image, subview viewDef) links; drained
+records partition into main + per-link slot ranges; linked groups
+render into 256px offscreen targets (z-fill + lit) before the main
+passes; getEngineTextureView overrides linked images with the live
+target. Monitors/mirrors now show live WebGPU subview renders.
+ECHO FEATURE SET COMPLETE for the demo's scope. Remaining niche:
+lightgem via WebGPU + GL4ES build retirement (the true finish line),
+reflect/screen texgens, heat-haze new-stages, ROQ.
