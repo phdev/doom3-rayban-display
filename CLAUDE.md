@@ -627,3 +627,11 @@ mirrors/monitors (subview filter), ROQ surfaces (also broken in GL).
 Verification loop for all of it: headed Chrome (scripts in /tmp/d3-pw-*.mjs,
 recreate from CLAUDE.md if gone) + the iter 6.8 determinism self-test +
 iPhone as final gate.
+
+**Iter 11a — `?wgpufull` cutover preview (2026-06-10).** With
+`?backend=webgpu&wgpufull` the WebGPU canvas IS the fullscreen game
+view (`.is-primary` takes the game-canvas CSS role; `#gameCanvas` goes
+`.is-ghost` opacity-0 — NOT display:none, SDL keeps its context). The
+engine still computes both paths; the player sees only WebGPU. This is
+the flicker-free-on-iPhone experience ahead of the engine-side cutover
+(stopping GL execution) described in the iter 11+ plan above.
