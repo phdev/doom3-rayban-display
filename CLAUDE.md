@@ -416,6 +416,22 @@ logger. "GL not better lit" from the same report is likely positional
 (the catwalk-area lights use falloffs that were already in the pak);
 the new pak is confirmed live (deployed pak central directory contains
 all 53 lights/*.tga; boot line reads "62.8 MB" vs old "61.7 MB").
+**Iter 8a confirmed on device: "Echo box looks good!"**
+
+**Iter 8b — z pre-pass enabled via shared-VS invariance (2026-06-09).**
+The earlier pre-pass black-screen was cross-pipeline clip-z
+non-invariance: depth.wgsl's separately-compiled position math
+differed from interaction.wgsl's by enough to fail LessEqual
+everywhere. Fix: build the depth pipeline from interaction.wgsl's
+vs_main — the SAME module and entry point as the lit pipeline
+(fragment=nullptr, no color targets) — making clip positions
+bit-identical by construction. kUsePrePass=true: the echo has proper
+inter-surface occlusion (z-fill writes depth; additive lit pass tests
+LessEqual with depth writes off). Headed Chrome: crisper, correctly
+layered, matches GL depth structure; determinism IDENTICAL with both
+passes. Lesson for the full port: any multi-pass depth-dependent
+rendering must share the position-computing VS across pipelines (the
+WebGPU equivalent of GL's ARB_position_invariant).
 
 ### Mobile / iOS (hard-won)
 
