@@ -269,6 +269,61 @@ function wireMoveControls() {
   window.addEventListener("blur", () => { for (const d of Object.keys(MOVE_KEYS)) setMove(d, false); });
 }
 
+// Touch-look: dragging on the RIGHT side of the screen aims the camera,
+// feeding the same engine hook head tracking uses (D3_AddViewAngles).
+// idTech sign convention: yaw+ = turn left, pitch+ = look down — so
+// dyaw = -dx * sens (drag left → look left) and dpitch = dy * sens
+// (drag up → look up). Coexists with head tracking (both add deltas).
+// Touches that start on buttons/overlays or the left side (movement pad
+// territory) are ignored. ?looksens=<deg/px> tunes sensitivity.
+function wireTouchLook() {
+  const SENS = (() => {
+    const m = location.search.match(/[?&]looksens=([0-9.]+)/);
+    const v = m ? parseFloat(m[1]) : NaN;
+    return Number.isFinite(v) && v > 0 && v <= 2 ? v : 0.25;
+  })();
+  let lookId = null;
+  let lastX = 0;
+  let lastY = 0;
+
+  document.addEventListener("touchstart", (e) => {
+    if (lookId !== null) return;
+    for (const t of e.changedTouches) {
+      if (t.clientX < window.innerWidth * 0.45) continue;        // left = move pad side
+      const el = document.elementFromPoint(t.clientX, t.clientY);
+      if (el && (el.closest("button") || el.closest("#diag"))) continue;
+      lookId = t.identifier;
+      lastX = t.clientX;
+      lastY = t.clientY;
+      break;
+    }
+  }, { passive: true });
+
+  document.addEventListener("touchmove", (e) => {
+    if (lookId === null) return;
+    for (const t of e.changedTouches) {
+      if (t.identifier !== lookId) continue;
+      const dx = t.clientX - lastX;
+      const dy = t.clientY - lastY;
+      lastX = t.clientX;
+      lastY = t.clientY;
+      if (engine && typeof engine.callAddViewAngles === "function") {
+        engine.callAddViewAngles(-dx * SENS, dy * SENS);
+      }
+      e.preventDefault();   // stop Safari scroll/bounce while aiming
+      break;
+    }
+  }, { passive: false });
+
+  const endLook = (e) => {
+    for (const t of e.changedTouches) {
+      if (t.identifier === lookId) { lookId = null; break; }
+    }
+  };
+  document.addEventListener("touchend", endLook, { passive: true });
+  document.addEventListener("touchcancel", endLook, { passive: true });
+}
+
 refs.canvas.width = runtimeConfig.width;
 refs.canvas.height = runtimeConfig.height;
 refs.canvas.style.aspectRatio = `${runtimeConfig.width} / ${runtimeConfig.height}`;
@@ -1344,6 +1399,7 @@ async function start() {
 
     wearableInput.install();
     wireMoveControls();
+    wireTouchLook();
     // Show the on-screen movement pad on the touch/wearable profile (desktop has a
     // keyboard). It lives on the left so the right stays clear for head-aiming.
     if (runtimeConfig.inputMode === "wearable" && refs.moveControls) {
