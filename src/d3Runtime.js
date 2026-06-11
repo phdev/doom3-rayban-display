@@ -638,12 +638,12 @@ function buildArguments(config) {
     // ALSO pinned in autoexec.cfg — r_shadows is CVAR_ARCHIVE and the
     // engine's per-boot machineSpec detection can stomp the command line.
     "+set", "r_shadows", shadowsEnabledForBoot() ? "1" : "0",
-    // Iter 19: WebGPU bloom — ON under WebGPU-primary; ?nobloom opts out.
-    // Live-tune: d3cmd("r_bloomThreshold 0.5"), d3cmd("r_bloomScale 1.2").
+    // Iter 32: bloom now DEFAULT OFF (vanilla parity — neither classic
+    // dhewm3 nor stock BFG has bloom; it's an RBDOOM-fork feature we added
+    // in iter 19 while chasing reference shots). ?bloom opts in;
+    // live-tune with d3cmd("r_bloomScale 1.2") etc.
     "+set", "r_bloom",
-        (/[?&]backend=webgpu\b/.test(typeof window !== "undefined" ? window.location.search : "")
-         && !/[?&]echo\b/.test(typeof window !== "undefined" ? window.location.search : "")
-         && !/[?&]nobloom\b/.test(typeof window !== "undefined" ? window.location.search : "")) ? "1" : "0",
+        /[?&]bloom\b/.test(typeof window !== "undefined" ? window.location.search : "") ? "1" : "0",
     // Iter 28: WebGPU GPU-memory diet. iOS Safari kills the whole TAB when
     // total GPU memory tips over (the "82% Starting DOOM 3" crash: WebGL
     // context lost + GPUDevice.createBindGroup InvalidStateError during the
