@@ -647,6 +647,13 @@ function buildArguments(config) {
     // native dhewm3 parity (classic LUT, no darken pass).
     "+set", "r_bfgSpecular", bfgLookEnabled() ? "1" : "0",
     "+set", "r_shadowDarken", bfgLookEnabled() ? "0.6" : "1.0",
+    // Iter 35: keep the vertex cache in CPU memory under WebGPU — VBO mode
+    // leaves deformed surfaces (flare halos: textures/sfx/flare) GPU-only,
+    // so the capture-replay could never see their verts and light fixtures
+    // lost their glow aura. GL draw perf doesn't matter here (draws are
+    // skipped under WebGPU-primary; echo is a debug harness).
+    ...(/[?&]backend=webgpu\b/.test(typeof window !== "undefined" ? window.location.search : "")
+        ? ["+set", "r_useVertexBuffers", "0"] : []),
     // Iter 28: WebGPU GPU-memory diet. iOS Safari kills the whole TAB when
     // total GPU memory tips over (the "82% Starting DOOM 3" crash: WebGL
     // context lost + GPUDevice.createBindGroup InvalidStateError during the

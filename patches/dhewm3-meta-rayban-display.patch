@@ -2073,10 +2073,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..708c25d
+index 0000000..912c3fd
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,3886 @@
+@@ -0,0 +1,3933 @@
 +/*
 +================================================================================
 +
@@ -2373,8 +2373,14 @@ index 0000000..708c25d
 +                // we read them) and resolves per-record material bind groups
 +                // from the engine image cache.
 +                uint32_t multiCount = 0;
-+                bool multiOk = recordSlotsReady && interactionPipeline && depthPipeline &&
-+                               uploadCapturedRecords(multiCount) && multiCount > 0;
++                // Iter 35: multiOk no longer requires LIT records — a frame
++                // can be emissives/GUI-only (dark scenes, loading screens);
++                // encodeRecordsPass handles empty interaction sets (clears +
++                // draws the pass content). The demo quad remains only for
++                // the true pre-content boot window.
++                bool drained = recordSlotsReady && interactionPipeline && depthPipeline &&
++                               uploadCapturedRecords(multiCount);
++                bool multiOk = drained && (multiCount > 0 || lastPassCount > 0);
 +
 +                if (multiOk) {
 +                    // Full echo: depth pre-pass + additive lit pass, exactly
@@ -3939,9 +3945,21 @@ index 0000000..708c25d
 +
 +        outCount = 0;
 +        if (g_capRecordCount == 0) {
-+            // No fresh capture — keep showing last frame's records if any.
-+            outCount = lastRecordCount;
-+            return lastRecordCount > 0;
++            extern uint32_t g_passRecordCount;
++            extern uint32_t g_shadowRecordCount;
++            if (g_passRecordCount == 0 && g_shadowRecordCount == 0) {
++                // Truly nothing fresh — keep showing last frame's records
++                // (EndFrame's submit-skip usually prevents even reaching
++                // here; this remains for surfaces-pending edge cases).
++                outCount = lastRecordCount;
++                return lastRecordCount > 0;
++            }
++            // Iter 35: ZERO lit records but emissive/pass or shadow content
++            // is LIVE (pitch-dark scenes with glowing surfaces,
++            // r_singleLight with the light out of view). The old early
++            // return froze the entire canvas on the stale last frame while
++            // GL kept rendering the emissives. Fall through to a normal
++            // drain with an empty interaction set so passes stay live.
 +        }
 +
 +        // Iter 28: fresh drain — slots written below land in the CPU stages;
@@ -4188,8 +4206,26 @@ index 0000000..708c25d
 +            uint32_t pn = 0;
 +            uint32_t skyN = 0;
 +            lastReflectCount = 0;
-+            if (pTotal > 0 && lastRecordCount > 0) {
-+                const uint32_t mainView = lastRecords[lastRecordCount - 1].pad0;
++            if (pTotal > 0) {
++                // Main-view tag: normally from the interaction records; with
++                // an empty interaction set (iter 35: dark scenes / light-
++                // suppressed views) fall back to the last *3D-kind* pass
++                // record's view tag (pad3: 0=3D, 2=sky, 3=reflect — NOT the
++                // 2D GUI records, whose views are their own; subviews render
++                // first, so the last 3D record belongs to the main view).
++                uint32_t mainView;
++                if (lastRecordCount > 0) {
++                    mainView = lastRecords[lastRecordCount - 1].pad0;
++                } else {
++                    mainView = g_passRecords[pTotal - 1].pad0;
++                    for (int i = (int)pTotal - 1; i >= 0; --i) {
++                        const uint32_t kind = g_passRecords[i].pad3;
++                        if (kind == 0u || kind == 2u || kind == 3u) {
++                            mainView = g_passRecords[i].pad0;
++                            break;
++                        }
++                    }
++                }
 +                // Sweep 1: 3D records from the main view. Sweep 2: 2D GUI
 +                // records from any view (HUD/menus draw after the 3D view).
 +                for (uint32_t sweep = 0; sweep < 2; ++sweep)
@@ -4293,6 +4329,17 @@ index 0000000..708c25d
 +                    ub[20] = svcMod; ub[21] = svcAdd; ub[22] = 0.0f; ub[23] = 0.0f;
 +                    memcpy(ub + 24, r.lightProjS, 16);   // stage texture matrix S
 +                    memcpy(ub + 28, r.lightProjT, 16);   // stage texture matrix T
++                    // pass-record probe (d3cmd r_wgpuSingleLight 998): name +
++                    // stage color + blend kind for every drawn pass record.
++                    if (g_capWgpuSingleLight == 998 && pn < 24) {
++                        EM_ASM_({
++                            console.info("[d3] pass[" + $0 + "] img=" + UTF8ToString($1) +
++                                         " color=(" + $2.toFixed(2) + "," + $3.toFixed(2) + "," + $4.toFixed(2) + "," + $5.toFixed(2) + ")" +
++                                         " blend=" + $6 + " svc=" + $7 + " kind=" + $8);
++                        }, pn, D3_WebGPU_ImageName(g_passImagePtrs[i]),
++                           r.diffuseColor[0], r.diffuseColor[1], r.diffuseColor[2], r.diffuseColor[3],
++                           r.pad1, r.pad2, r.pad3);
++                    }
 +                    memcpy(passUBStage + (size_t)pn * kUBStride, ub, 128);
 +                    if (pn + 1 > passUBHigh) passUBHigh = pn + 1;
 +                    // Iter 17: cinematic records bind this frame's decoded
@@ -6784,10 +6831,25 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..82b5bdd 100644
+index c83ebb5..07e0a1b 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
-@@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
+@@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
+ */
+ 
+ #include "sys/platform.h"
++
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++#endif
++
++#define WGPU_PASS_REJECT(reason) do { \
++	if ( g_capWgpuSingleLight == 997 ) { \
++		EM_ASM_({ console.info("[d3] stageREJECT " + UTF8ToString($0) + " mat=" + UTF8ToString($1)); }, \
++		         reason, surf && surf->material ? surf->material->GetName() : "?" ); \
++	} \
++} while (0)
+ #include "renderer/VertexCache.h"
  #include "renderer/Cinematic.h"
  
  #include "renderer/tr_local.h"
@@ -6795,7 +6857,7 @@ index c83ebb5..82b5bdd 100644
  
  /*
  
-@@ -38,6 +39,766 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,807 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -7270,9 +7332,17 @@ index c83ebb5..82b5bdd 100644
 +                                  const float color[4], void* falloffImg ) {
 +	if ( !backEnd.viewDef || backEnd.viewDef->viewEntitys == NULL ) return;
 +	if ( ( backEnd.viewDef->viewport.x2 - backEnd.viewDef->viewport.x1 ) < 128 ) return;
-+	if ( !surf || !tri || !tri->verts || !tri->indexes ) return;
-+	if ( tri->numVerts <= 0 || tri->numIndexes <= 0 ) return;
-+	if ( tri->numVerts > kWGPUMaxCaptureVerts || tri->numIndexes > kWGPUMaxCaptureIndexes ) return;
++	if ( !surf || !tri || !tri->indexes ) { WGPU_PASS_REJECT("null-tri"); return; }
++	// Iter 35: flare-deformed surfaces (light halos, textures/sfx/flare)
++	// carry verts only in the vertex cache — tri->verts is NULL. GL reads
++	// the cache; do the same here (cache is CPU memory in this build).
++	const idDrawVert* capVerts = tri->verts;
++	if ( !capVerts && tri->ambientCache ) {
++		capVerts = (const idDrawVert*)vertexCache.Position( tri->ambientCache );
++	}
++	if ( !capVerts ) { WGPU_PASS_REJECT("null-verts"); return; }
++	if ( tri->numVerts <= 0 || tri->numIndexes <= 0 ) { WGPU_PASS_REJECT("empty-tri"); return; }
++	if ( tri->numVerts > kWGPUMaxCaptureVerts || tri->numIndexes > kWGPUMaxCaptureIndexes ) { WGPU_PASS_REJECT("too-big"); return; }
 +	if ( g_blendRecordCount >= 64 ) { g_capDropped++; return; }
 +
 +	const uint32_t vbytes = (uint32_t)tri->numVerts * 60u;
@@ -7317,9 +7387,17 @@ index c83ebb5..82b5bdd 100644
 +                           const float planeS1[4], const float color[4] ) {
 +	if ( !backEnd.viewDef || backEnd.viewDef->viewEntitys == NULL ) return;
 +	if ( ( backEnd.viewDef->viewport.x2 - backEnd.viewDef->viewport.x1 ) < 128 ) return;
-+	if ( !surf || !tri || !tri->verts || !tri->indexes ) return;
-+	if ( tri->numVerts <= 0 || tri->numIndexes <= 0 ) return;
-+	if ( tri->numVerts > kWGPUMaxCaptureVerts || tri->numIndexes > kWGPUMaxCaptureIndexes ) return;
++	if ( !surf || !tri || !tri->indexes ) { WGPU_PASS_REJECT("null-tri"); return; }
++	// Iter 35: flare-deformed surfaces (light halos, textures/sfx/flare)
++	// carry verts only in the vertex cache — tri->verts is NULL. GL reads
++	// the cache; do the same here (cache is CPU memory in this build).
++	const idDrawVert* capVerts = tri->verts;
++	if ( !capVerts && tri->ambientCache ) {
++		capVerts = (const idDrawVert*)vertexCache.Position( tri->ambientCache );
++	}
++	if ( !capVerts ) { WGPU_PASS_REJECT("null-verts"); return; }
++	if ( tri->numVerts <= 0 || tri->numIndexes <= 0 ) { WGPU_PASS_REJECT("empty-tri"); return; }
++	if ( tri->numVerts > kWGPUMaxCaptureVerts || tri->numIndexes > kWGPUMaxCaptureIndexes ) { WGPU_PASS_REJECT("too-big"); return; }
 +	if ( g_fogRecordCount >= 64 ) { g_capDropped++; return; }
 +
 +	const uint32_t vbytes = (uint32_t)tri->numVerts * 60u;
@@ -7356,14 +7434,38 @@ index c83ebb5..82b5bdd 100644
 +void D3_WebGPU_CapturePassStage( const drawSurf_t* surf, const srfTriangles_t* tri,
 +                                 const shaderStage_t* pStage, const float color[4] ) {
 +	if ( !backEnd.viewDef ) return;
++	// entry probe (d3cmd r_wgpuSingleLight 997): every stage that REACHES
++	// the hook, with material/texgen/blend — absence from this log means a
++	// call-site coverage gap in draw_common.cpp, not a capture reject.
++	if ( g_capWgpuSingleLight == 997 ) {
++		static int probeN = 0;
++		if ( probeN < 40 ) {
++			probeN++;
++			EM_ASM_({
++				console.info("[d3] stageProbe mat=" + UTF8ToString($0) + " texgen=" + $1 +
++				             " blend=" + $2 + " 2d=" + $3);
++			}, surf && surf->material ? surf->material->GetName() : "?",
++			   (int)pStage->texture.texgen,
++			   (int)(pStage->drawStateBits & (GLS_SRCBLEND_BITS | GLS_DSTBLEND_BITS)),
++			   backEnd.viewDef->viewEntitys == NULL ? 1 : 0);
++		}
++	}
 +	// 2D GUI views (HUD, menus) have no view entities; they bypass the
 +	// small-viewport filter (which exists to skip the lightgem) and are
 +	// tagged so the backend draws them last with depth testing off.
 +	const bool is2D = ( backEnd.viewDef->viewEntitys == NULL );
 +	if ( !is2D && ( backEnd.viewDef->viewport.x2 - backEnd.viewDef->viewport.x1 ) < 128 ) return;
-+	if ( !surf || !tri || !tri->verts || !tri->indexes ) return;
-+	if ( tri->numVerts <= 0 || tri->numIndexes <= 0 ) return;
-+	if ( tri->numVerts > kWGPUMaxCaptureVerts || tri->numIndexes > kWGPUMaxCaptureIndexes ) return;
++	if ( !surf || !tri || !tri->indexes ) { WGPU_PASS_REJECT("null-tri"); return; }
++	// Iter 35: flare-deformed surfaces (light halos, textures/sfx/flare)
++	// carry verts only in the vertex cache — tri->verts is NULL. GL reads
++	// the cache; do the same here (cache is CPU memory in this build).
++	const idDrawVert* capVerts = tri->verts;
++	if ( !capVerts && tri->ambientCache ) {
++		capVerts = (const idDrawVert*)vertexCache.Position( tri->ambientCache );
++	}
++	if ( !capVerts ) { WGPU_PASS_REJECT("null-verts"); return; }
++	if ( tri->numVerts <= 0 || tri->numIndexes <= 0 ) { WGPU_PASS_REJECT("empty-tri"); return; }
++	if ( tri->numVerts > kWGPUMaxCaptureVerts || tri->numIndexes > kWGPUMaxCaptureIndexes ) { WGPU_PASS_REJECT("too-big"); return; }
 +	// Iter 13b: sky cube stages — capture with the stashed per-vertex dirs.
 +	const WGPUSkyStash* skyStash = nullptr;
 +	if ( pStage->texture.texgen == TG_SKYBOX_CUBE || pStage->texture.texgen == TG_WOBBLESKY_CUBE ) {
@@ -7379,6 +7481,7 @@ index c83ebb5..82b5bdd 100644
 +			return;
 +		}
 +	} else if ( pStage->texture.texgen != TG_EXPLICIT ) {
++		WGPU_PASS_REJECT("texgen");
 +		return;   // screen-space texgens still unsupported
 +	}
 +	// Iter 17: cinematic stages replay against the per-slot dynamic frame
@@ -7401,11 +7504,11 @@ index c83ebb5..82b5bdd 100644
 +	// only prime the alpha channel for a later gl_dst_alpha stage) must NOT
 +	// be replayed: our pipelines write RGB, so they'd paint opaque blocks
 +	// (found via glass1's alpha-prime stage painting the window white).
-+	if ( ( pStage->drawStateBits & GLS_COLORMASK ) == GLS_COLORMASK ) return;
++	if ( ( pStage->drawStateBits & GLS_COLORMASK ) == GLS_COLORMASK ) { WGPU_PASS_REJECT("colormask"); return; }
 +	idImage* img = pStage->texture.image;
 +	if ( cinFallback ) img = cinFallback;
-+	if ( !img && !cinSlot ) return;
-+	if ( g_passRecordCount >= (uint32_t)kWGPUMaxRecords ) { g_capDropped++; return; }
++	if ( !img && !cinSlot ) { WGPU_PASS_REJECT("no-image"); return; }
++	if ( g_passRecordCount >= (uint32_t)kWGPUMaxRecords ) { g_capDropped++; WGPU_PASS_REJECT("cap"); return; }
 +
 +	const uint32_t vbytes = (uint32_t)tri->numVerts * 60u;
 +	const uint32_t ibytes = (uint32_t)tri->numIndexes * 2u;
@@ -7413,7 +7516,7 @@ index c83ebb5..82b5bdd 100644
 +	const uint32_t iR = (ibytes + 3u) & ~3u;
 +	if ( g_capVertBytes + vR > (uint32_t)kWGPUVertAccumBytes ||
 +	     g_capIndexBytes + iR > (uint32_t)kWGPUIndexAccumBytes ) { g_capDropped++; return; }
-+	memcpy( g_capVertsAccum + g_capVertBytes, tri->verts, vbytes );
++	memcpy( g_capVertsAccum + g_capVertBytes, capVerts, vbytes );
 +	for ( int i = 0; i < tri->numIndexes; ++i ) {
 +		g_capIndexesAccum[(g_capIndexBytes / 2) + i] = (uint16_t)tri->indexes[i];
 +	}
@@ -7562,7 +7665,7 @@ index c83ebb5..82b5bdd 100644
  
  /*
  =================
-@@ -49,6 +810,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +862,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -7578,7 +7681,7 @@ index c83ebb5..82b5bdd 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +848,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +900,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -7594,7 +7697,7 @@ index c83ebb5..82b5bdd 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +895,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +947,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -7611,7 +7714,7 @@ index c83ebb5..82b5bdd 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +955,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1007,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -7619,7 +7722,7 @@ index c83ebb5..82b5bdd 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1182,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1234,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -7632,7 +7735,7 @@ index c83ebb5..82b5bdd 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1351,57 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1403,57 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
