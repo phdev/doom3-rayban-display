@@ -21,10 +21,10 @@ const URL_PK4_PARAM = "pk4";
 // investigation), whereas an in-game map renders correctly. Override the map
 // with ?args=+map <name>, or force the menu with ?args=+disconnect.
 const D3_AUTO_MAP = true;
-// Boots into DOOM 3's third level (game/admin): the progression is
-// mars_city1 → mars_city2 → admin. The bundled pak is reduced for this map.
-// Override with ?args=%2Bmap%20game/<name>.
-const D3_DEFAULT_MAP = "game/mars_city1";
+// Level 10 of the campaign: game/commoutside (Communications Transfer —
+// the outdoor Mars-surface level). The bundled pak is reduced for this
+// map; D3_DEFAULT_MAP must match it. Override with ?args=%2Bmap%20game/<name>.
+const D3_DEFAULT_MAP = "game/commoutside";
 const TIMEOUTS = {
   probe: 15000,
   script: 20000,
@@ -1008,6 +1008,7 @@ async function readBundledPk4Bytes(onStatus, log, progress) {
     const cached = await readCachedUrlPk4(BUNDLED_PK4_URL);
     if (cached && isPk4Payload(cached)) {
       let fresh = true;
+      let headChecked = false;
       try {
         const head = await fetch(BUNDLED_PK4_URL, {
           method: "HEAD",
@@ -1015,11 +1016,30 @@ async function readBundledPk4Bytes(onStatus, log, progress) {
           signal: AbortSignal.timeout(4000)
         });
         const len = Number(head.headers.get("content-length") || 0);
-        if (head.ok && len > 0 && len !== cached.byteLength) {
-          fresh = false;
+        if (head.ok && len > 0) {
+          headChecked = true;
+          if (len !== cached.byteLength) fresh = false;
         }
       } catch {
-        // offline / flaky — use the cache
+        // offline / flaky — fall through to the manifest check
+      }
+      if (!headChecked) {
+        // The monolithic pak may not be hosted at all (GitHub's 100MB file
+        // limit — only the 4MB chunks + manifest ship). Key freshness off
+        // the manifest's totalSize instead; offline keeps trusting the cache.
+        try {
+          const mr = await fetch(appendPathSuffix(BUNDLED_PK4_URL, ".manifest.json"), {
+            cache: "no-store",
+            signal: AbortSignal.timeout(4000)
+          });
+          if (mr.ok) {
+            const m = await mr.json();
+            const total = Number(m && m.totalSize);
+            if (total > 0 && total !== cached.byteLength) fresh = false;
+          }
+        } catch {
+          // offline / flaky — use the cache
+        }
       }
       if (fresh) {
         log?.(`Using cached bundled PK4 (${formatByteCount(cached.byteLength)})`);
