@@ -1338,3 +1338,16 @@ remotely; the shdw counter is the on-device truth instrument. When a
 user reports state contradicting the shipped code, FIRST suspect a
 stale cached bundle: check the diag build stamp against the latest
 deploy time.
+
+**Iter 31b — stale-bundle self-detection (2026-06-11).** The build
+emits `version.txt` (same id Vite bakes into __ENGINE_VER__); main.js
+fetches it with cache:"no-store" at boot. Newer id than the running
+bundle → auto-refresh ONCE per version (location.replace with
+&fresh=<id>, which also busts the index.html cache entry;
+sessionStorage guard prevents loops while the CDN itself lags) — then
+just a diag warning. Verified on vite preview: exactly one reload, no
+loop. Manual cache-bypass for reference: iPhone = any new query param
+or a Private tab; Mac Safari = Cmd+Opt+R or Develop → Empty Caches
+(caches only, no history). NOTE: URLSearchParams serializes bare
+flags as "flag=" (e.g. nodiag → nodiag=) — our \b-anchored flag
+regexes still match, keep it that way.
