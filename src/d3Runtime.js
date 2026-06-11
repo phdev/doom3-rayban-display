@@ -400,6 +400,11 @@ export async function bootDoom3({
     progress(82, "Starting DOOM 3");
     log("DOOM 3 main started");
 
+    // Live wasm-heap readout for the diag (iOS Safari kills tabs on memory;
+    // this puts the number on screen). HEAP8 is re-created on memory growth,
+    // so read it fresh each call.
+    try { window.__d3HeapMB = () => (module.HEAP8 ? (module.HEAP8.length >> 20) : 0); } catch {}
+
     // Live console-command hook for on-device renderer tuning, callable from the
     // app or straight from the Safari Web Inspector console, e.g.:
     //   d3cmd("r_lightScale 20"); d3cmd("r_gamma 3"); d3cmd("reloadARBprograms")

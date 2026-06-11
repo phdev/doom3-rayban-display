@@ -1118,3 +1118,16 @@ shadows at the CEILING — vantages matter). The X360-style shadow
 spots come from body-height lights like light_5252 by the crates.
 PHONE NOTE: "A problem repeatedly occurred" on iOS = Safari TAB
 CRASH (memory), not slowness — memory diet is the open phone item.
+
+**Iter 26 — iPhone memory diet (2026-06-11).** "A problem repeatedly
+occurred" on iOS = Safari jetsam TAB CRASH on total memory.
+INITIAL_MEMORY was 512MB — committed before the pak even downloaded,
+half of a typical iOS tab budget gone up front. Now 256MB +
+ALLOW_MEMORY_GROWTH (unchanged): measured steady-state wasm heap is
+**307MB** with the full level loaded (grew once past 256). ~200MB
+returned to iOS at boot. The diag's first line now also shows the live
+wasm heap ("| wasm 307MB") via window.__d3HeapMB (HEAP8 added to
+EXPORTED_RUNTIME_METHODS — HEAP views aren't exported by default).
+With the build stamp + fps + heap on the first diag line, a single
+phone screenshot now answers: which build, frozen-or-slow, and how
+close to the memory cliff.

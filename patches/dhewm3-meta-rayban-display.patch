@@ -1,5 +1,5 @@
 diff --git a/neo/CMakeLists.txt b/neo/CMakeLists.txt
-index 69f1892..dd9f071 100644
+index 69f1892..f917b3e 100644
 --- a/neo/CMakeLists.txt
 +++ b/neo/CMakeLists.txt
 @@ -194,29 +194,46 @@ if(CMAKE_MAJOR_VERSION LESS 3 OR ( CMAKE_MAJOR_VERSION EQUAL 3 AND CMAKE_MINOR_V
@@ -83,7 +83,7 @@ index 69f1892..dd9f071 100644
  	else()
  		set(OPT_LEVEL "-O2")
  	endif()
-@@ -535,6 +559,55 @@ set(CMAKE_CXX_FLAGS_RELWITHDEBINFO ${CMAKE_C_FLAGS_RELWITHDEBINFO})
+@@ -535,6 +559,58 @@ set(CMAKE_CXX_FLAGS_RELWITHDEBINFO ${CMAKE_C_FLAGS_RELWITHDEBINFO})
  set(CMAKE_CXX_FLAGS_RELEASE "-DNDEBUG ${CMAKE_C_FLAGS_RELEASE}")
  set(CMAKE_CXX_FLAGS_MINSIZEREL "-DNDEBUG ${CMAKE_C_FLAGS_MINSIZEREL}")
  
@@ -110,9 +110,12 @@ index 69f1892..dd9f071 100644
 +		# SDL3 creates the WebGL context directly on the "#gameCanvas" element
 +		# (selected via SDL_HINT_EMSCRIPTEN_CANVAS_SELECTOR in GLimp_Init) and
 +		# presents it with SDL_GL_SwapWindow, matching the proven Qwasm2 GL4ES path.
-+		"-sINITIAL_MEMORY=512MB -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2GB -sSTACK_SIZE=8MB"
++		# 256MB initial (was 512): iOS Safari jetsam-kills tabs on total memory —
++		# committing 512MB before the pak even loads ate half the budget up
++		# front. Growth covers actual demand (~400MB peak with the 66MB pak).
++		"-sINITIAL_MEMORY=256MB -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2GB -sSTACK_SIZE=8MB"
 +		"-sEXPORTED_FUNCTIONS=${d3_wasm_exports}"
-+		"-sEXPORTED_RUNTIME_METHODS=[\"ccall\",\"cwrap\",\"FS\",\"callMain\"]"
++		"-sEXPORTED_RUNTIME_METHODS=[\"ccall\",\"cwrap\",\"FS\",\"callMain\",\"HEAP8\"]"
 +		"-sEXIT_RUNTIME=0 -sINVOKE_RUN=0 -sERROR_ON_UNDEFINED_SYMBOLS=0"
 +		"--post-js ${CMAKE_SOURCE_DIR}/sys/wasm/d3_runtime_exports.js"
 +		"--preload-file ${D3_EMSCRIPTEN_EMBED}@/"
@@ -139,7 +142,7 @@ index 69f1892..dd9f071 100644
  # mingw and msvc
  if(WIN32)
  	add_definitions(-DWINVER=0x0501)
-@@ -633,6 +706,9 @@ set(src_renderer
+@@ -633,6 +709,9 @@ set(src_renderer
  	renderer/Model_md5.cpp
  	renderer/Model_prt.cpp
  	renderer/Model_sprite.cpp
@@ -149,7 +152,7 @@ index 69f1892..dd9f071 100644
  	renderer/RenderEntity.cpp
  	renderer/RenderSystem.cpp
  	renderer/RenderSystem_init.cpp
-@@ -699,6 +775,7 @@ set(src_framework
+@@ -699,6 +778,7 @@ set(src_framework
  	framework/FileSystem.cpp
  	framework/KeyInput.cpp
  	framework/UsercmdGen.cpp
@@ -157,7 +160,7 @@ index 69f1892..dd9f071 100644
  	framework/Session_menu.cpp
  	framework/Session.cpp
  	framework/async/AsyncClient.cpp
-@@ -909,6 +986,7 @@ set(src_game
+@@ -909,6 +989,7 @@ set(src_game
  	game/AF.cpp
  	game/AFEntity.cpp
  	game/Actor.cpp
@@ -165,7 +168,7 @@ index 69f1892..dd9f071 100644
  	game/Camera.cpp
  	game/Entity.cpp
  	game/BrittleFracture.cpp
-@@ -1280,7 +1358,7 @@ include_directories(${CMAKE_BINARY_DIR})
+@@ -1280,7 +1361,7 @@ include_directories(${CMAKE_BINARY_DIR})
  include_directories(${CMAKE_SOURCE_DIR})
  
  add_library(idlib STATIC ${src_idlib})

@@ -467,7 +467,8 @@ try { console.info("[d3] build:", BUILD_STAMP, "UTC"); } catch {}
     frames++;
     const now = performance.now();
     if (now - last >= 2000) {
-      fpsLine = `build ${BUILD_STAMP} UTC | fps ${(frames * 1000 / (now - last)).toFixed(1)}`;
+      const mem = (typeof window.__d3HeapMB === "function") ? ` | wasm ${window.__d3HeapMB()}MB` : "";
+      fpsLine = `build ${BUILD_STAMP} UTC | fps ${(frames * 1000 / (now - last)).toFixed(1)}${mem}`;
       frames = 0;
       last = now;
       renderDiag();
