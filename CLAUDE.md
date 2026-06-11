@@ -1139,3 +1139,10 @@ preferred chunks). Cache freshness now keys off the manifest's
 totalSize whenever the whole-pak HEAD fails — without that, repeat
 visitors would trust a stale cached level forever after a level
 switch.
+
+**Level switch → game/enpro (2026-06-11, user request).** Campaign
+level 9 (EnPro Plant). Pak: 57.4MB, 14 chunks (smaller than both
+mars_city1 and commoutside). Stale chunks from the previous level
+beyond .013 deleted — THE CHUNKER DOESN'T REMOVE OLD CHUNK FILES when
+the count shrinks; always `ls` the chunk set after rechunking a
+smaller pak or dead chunks ship in git.

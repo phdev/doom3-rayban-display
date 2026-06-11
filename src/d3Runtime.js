@@ -21,10 +21,10 @@ const URL_PK4_PARAM = "pk4";
 // investigation), whereas an in-game map renders correctly. Override the map
 // with ?args=+map <name>, or force the menu with ?args=+disconnect.
 const D3_AUTO_MAP = true;
-// Level 10 of the campaign: game/commoutside (Communications Transfer —
-// the outdoor Mars-surface level). The bundled pak is reduced for this
-// map; D3_DEFAULT_MAP must match it. Override with ?args=%2Bmap%20game/<name>.
-const D3_DEFAULT_MAP = "game/commoutside";
+// Level 9 of the campaign: game/enpro (EnPro Plant). The bundled pak is
+// reduced for this map; D3_DEFAULT_MAP must match it. Override with
+// ?args=%2Bmap%20game/<name>.
+const D3_DEFAULT_MAP = "game/enpro";
 const TIMEOUTS = {
   probe: 15000,
   script: 20000,
