@@ -1339,6 +1339,30 @@ user reports state contradicting the shipped code, FIRST suspect a
 stale cached bundle: check the diag build stamp against the latest
 deploy time.
 
+**PLAYER-SHADOW VISIBILITY (2026-06-11, recurring user question).**
+"I don't see a player shadow" at the enpro spawn is EXPECTED, not a
+bug: the AUTO-FLASHLIGHT is the dominant nearby light, and a light
+carried at the player's own origin cannot cast the player's shadow —
+its point-blank glare also floods the floor (blown-white grates when
+looking down). The player shadow appears from STATIC lights: turn the
+flashlight OFF ('f'), stand with a corridor light behind, look
+down-forward → a person-shaped silhouette on the floor (proven by
+r_shadows 0/1 A/B diff: 1.5% px coherent silhouette region; red-mask
+visualization /tmp/ps-shadow-highlight.png method). Verified on the
+LIVE build. Vanilla native behaves identically. Safari/WebKit also
+verified: build current, shdw counter 3-4 at spawn, zero WebGPU
+validation errors in a 539-line log (the "err 69" line is the idle
+GL probe, not WebGPU). Safari fps ~17 vs Chrome ~60 — open perf
+question, not a correctness one.
+
+**Iter 32 — bloom default OFF (2026-06-11, vanilla parity).** User
+call: the game doesn't have bloom (confirmed by the iter-29 research:
+bloom is RBDOOM-fork-only — neither classic dhewm3 nor stock BFG has
+it; we added it in iter 19 chasing reference shots). r_bloom now
+defaults 0; `?bloom` opts in; the fx bloom sliders only matter when
+it's on. The shadow-darken pass is UNAFFECTED (it shares bloom.wgsl's
+module/BGL but its pipelines init unconditionally).
+
 **Iter 31b — stale-bundle self-detection (2026-06-11).** The build
 emits `version.txt` (same id Vite bakes into __ENGINE_VER__); main.js
 fetches it with cache:"no-store" at boot. Newer id than the running
