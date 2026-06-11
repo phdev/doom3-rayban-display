@@ -6179,6 +6179,23 @@ index 7914093..6865145 100644
  	// free the context and close the window
  	GLimp_Shutdown();
  
+diff --git a/neo/renderer/VertexCache.cpp b/neo/renderer/VertexCache.cpp
+index ec0184e..2cfe895 100644
+--- a/neo/renderer/VertexCache.cpp
++++ b/neo/renderer/VertexCache.cpp
+@@ -246,6 +246,12 @@ void idVertexCache::Alloc( void *data, int size, vertCache_t **buffer, bool inde
+ 
+ 			if( !virtualMemory ) {
+ 				qglGenBuffersARB( 1, & block->vbo );
++			} else {
++				// Iter 35: headerAllocator memory is uninitialized — in
++				// virtual-memory mode vbo was never assigned, so Position()
++				// could take the VBO branch on garbage and return a junk
++				// offset instead of the real pointer (broke flare capture).
++				block->vbo = 0;
+ 			}
+ 		}
+ 	}
 diff --git a/neo/renderer/draw_arb2.cpp b/neo/renderer/draw_arb2.cpp
 index c1d0d3e..99a7f6b 100644
 --- a/neo/renderer/draw_arb2.cpp
@@ -6831,7 +6848,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..07e0a1b 100644
+index c83ebb5..4c2751d 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -6857,7 +6874,7 @@ index c83ebb5..07e0a1b 100644
  
  /*
  
-@@ -38,6 +50,807 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,840 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -7340,7 +7357,18 @@ index c83ebb5..07e0a1b 100644
 +	if ( !capVerts && tri->ambientCache ) {
 +		capVerts = (const idDrawVert*)vertexCache.Position( tri->ambientCache );
 +	}
-+	if ( !capVerts ) { WGPU_PASS_REJECT("null-verts"); return; }
++	if ( !capVerts ) {
++		if ( g_capWgpuSingleLight == 997 ) {
++			EM_ASM_({
++				console.info("[d3] nullverts-detail mat=" + UTF8ToString($0) +
++				             " verts=" + $1 + " cache=" + $2 + " nv=" + $3 + " ni=" + $4);
++			}, surf && surf->material ? surf->material->GetName() : "?",
++			   tri->verts ? 1 : 0, tri->ambientCache ? 1 : 0,
++			   tri->numVerts, tri->numIndexes);
++		}
++		WGPU_PASS_REJECT("null-verts");
++		return;
++	}
 +	if ( tri->numVerts <= 0 || tri->numIndexes <= 0 ) { WGPU_PASS_REJECT("empty-tri"); return; }
 +	if ( tri->numVerts > kWGPUMaxCaptureVerts || tri->numIndexes > kWGPUMaxCaptureIndexes ) { WGPU_PASS_REJECT("too-big"); return; }
 +	if ( g_blendRecordCount >= 64 ) { g_capDropped++; return; }
@@ -7395,7 +7423,18 @@ index c83ebb5..07e0a1b 100644
 +	if ( !capVerts && tri->ambientCache ) {
 +		capVerts = (const idDrawVert*)vertexCache.Position( tri->ambientCache );
 +	}
-+	if ( !capVerts ) { WGPU_PASS_REJECT("null-verts"); return; }
++	if ( !capVerts ) {
++		if ( g_capWgpuSingleLight == 997 ) {
++			EM_ASM_({
++				console.info("[d3] nullverts-detail mat=" + UTF8ToString($0) +
++				             " verts=" + $1 + " cache=" + $2 + " nv=" + $3 + " ni=" + $4);
++			}, surf && surf->material ? surf->material->GetName() : "?",
++			   tri->verts ? 1 : 0, tri->ambientCache ? 1 : 0,
++			   tri->numVerts, tri->numIndexes);
++		}
++		WGPU_PASS_REJECT("null-verts");
++		return;
++	}
 +	if ( tri->numVerts <= 0 || tri->numIndexes <= 0 ) { WGPU_PASS_REJECT("empty-tri"); return; }
 +	if ( tri->numVerts > kWGPUMaxCaptureVerts || tri->numIndexes > kWGPUMaxCaptureIndexes ) { WGPU_PASS_REJECT("too-big"); return; }
 +	if ( g_fogRecordCount >= 64 ) { g_capDropped++; return; }
@@ -7463,7 +7502,18 @@ index c83ebb5..07e0a1b 100644
 +	if ( !capVerts && tri->ambientCache ) {
 +		capVerts = (const idDrawVert*)vertexCache.Position( tri->ambientCache );
 +	}
-+	if ( !capVerts ) { WGPU_PASS_REJECT("null-verts"); return; }
++	if ( !capVerts ) {
++		if ( g_capWgpuSingleLight == 997 ) {
++			EM_ASM_({
++				console.info("[d3] nullverts-detail mat=" + UTF8ToString($0) +
++				             " verts=" + $1 + " cache=" + $2 + " nv=" + $3 + " ni=" + $4);
++			}, surf && surf->material ? surf->material->GetName() : "?",
++			   tri->verts ? 1 : 0, tri->ambientCache ? 1 : 0,
++			   tri->numVerts, tri->numIndexes);
++		}
++		WGPU_PASS_REJECT("null-verts");
++		return;
++	}
 +	if ( tri->numVerts <= 0 || tri->numIndexes <= 0 ) { WGPU_PASS_REJECT("empty-tri"); return; }
 +	if ( tri->numVerts > kWGPUMaxCaptureVerts || tri->numIndexes > kWGPUMaxCaptureIndexes ) { WGPU_PASS_REJECT("too-big"); return; }
 +	// Iter 13b: sky cube stages — capture with the stashed per-vertex dirs.
@@ -7665,7 +7715,7 @@ index c83ebb5..07e0a1b 100644
  
  /*
  =================
-@@ -49,6 +862,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +895,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -7681,7 +7731,7 @@ index c83ebb5..07e0a1b 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +900,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +933,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -7697,7 +7747,7 @@ index c83ebb5..07e0a1b 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +947,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +980,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -7714,7 +7764,7 @@ index c83ebb5..07e0a1b 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1007,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1040,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -7722,7 +7772,7 @@ index c83ebb5..07e0a1b 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1234,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1267,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -7735,7 +7785,7 @@ index c83ebb5..07e0a1b 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1403,57 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1436,57 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
