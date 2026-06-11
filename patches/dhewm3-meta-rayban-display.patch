@@ -1917,10 +1917,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..bda5d23
+index 0000000..16a3b30
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,3425 @@
+@@ -0,0 +1,3445 @@
 +/*
 +================================================================================
 +
@@ -2048,6 +2048,7 @@ index 0000000..bda5d23
 +extern "C" const char* D3_WebGPU_ImageName(const void* imgPtr);
 +extern "C" void D3_WebGPU_ReportImageCache(void);
 +extern "C" uint32_t g_capBloomOn;
++extern "C" int g_capWgpuSingleLight;
 +extern "C" float    g_capBloomThresh;
 +extern "C" float    g_capBloomScale;
 +
@@ -3626,8 +3627,27 @@ index 0000000..bda5d23
 +            static void* scratchImgs[kMaxRecordSlots][5];
 +            memcpy(scratch, g_capRecords, total * sizeof(Rec));
 +            memcpy(scratchImgs, g_capImagePtrs, total * sizeof(void*) * 5);
++            // debug isolation: r_wgpuSingleLight N keeps only the Nth light
++            // of THIS frame (g_capLightId grows monotonically across frames,
++            // so filter on the frame-relative id).
++            uint32_t frameMinLightId = 0xFFFFFFFFu;
++            if (g_capWgpuSingleLight >= 0) {
++                for (uint32_t i = 0; i < total; ++i) {
++                    if (scratch[i].pad0 != mainView) continue;
++                    if (scratch[i].lightId < frameMinLightId) frameMinLightId = scratch[i].lightId;
++                }
++            }
 +            for (uint32_t i = 0; i < total; ++i) {
 +                if (scratch[i].pad0 != mainView) continue;
++                if (g_capWgpuSingleLight >= 0) {
++                    const int rel = (int)(scratch[i].lightId - frameMinLightId);
++                    if (g_capWgpuSingleLight >= 1000) {
++                        // prefix mode: keep lights 0..(N-1000) — bisect tool
++                        if (rel > g_capWgpuSingleLight - 1000) continue;
++                    } else if (rel != g_capWgpuSingleLight) {
++                        continue;
++                    }
++                }
 +                g_capRecords[n] = scratch[i];
 +                memcpy(g_capImagePtrs[n], scratchImgs[i], sizeof(void*) * 5);
 +                n++;
@@ -5171,7 +5191,7 @@ index 0000000..bda5d23
 +    // buffers + per-slot group(0) bind groups (one set for the interaction
 +    // pipeline layout, one for the depth pipeline layout). Material
 +    // textures live in group(1), cached per unique 5-image tuple.
-+    static constexpr uint32_t kMaxRecordSlots = 512;   // mirrors kWGPUMaxRecords
++    static constexpr uint32_t kMaxRecordSlots = 896;   // mirrors kWGPUMaxRecords
 +    WGPUBuffer              recordVertexBuf = nullptr;
 +    WGPUBuffer              recordIndexBuf  = nullptr;
 +    uint32_t                recordVertexCap = 0;   // bytes
@@ -5379,7 +5399,7 @@ index 0000000..0f9c8e6
 +    return nullptr;
 +}
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
-index 7914093..cb4f589 100644
+index 7914093..ab1a3e8 100644
 --- a/neo/renderer/RenderSystem_init.cpp
 +++ b/neo/renderer/RenderSystem_init.cpp
 @@ -39,6 +39,11 @@ If you have questions concerning this license or the applicable additional terms
@@ -5394,7 +5414,7 @@ index 7914093..cb4f589 100644
  
  #include "framework/GameCallbacks_local.h"
  #include "framework/Game.h"
-@@ -102,6 +107,21 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
+@@ -102,6 +107,22 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
  
  idCVar r_skipSuppress( "r_skipSuppress", "0", CVAR_RENDERER | CVAR_BOOL, "ignore the per-view suppressions" );
  idCVar r_skipPostProcess( "r_skipPostProcess", "0", CVAR_RENDERER | CVAR_BOOL, "skip all post-process renderings" );
@@ -5408,6 +5428,7 @@ index 7914093..cb4f589 100644
 +// on-device via d3cmd("r_bloomThreshold 0.5") etc — exported to the backend
 +// each view by RB_BeginDrawingView.
 +idCVar r_bloom( "r_bloom", "0", CVAR_RENDERER | CVAR_BOOL, "WebGPU bloom post-process" );
++idCVar r_wgpuSingleLight( "r_wgpuSingleLight", "-1", CVAR_RENDERER | CVAR_INTEGER, "debug: draw only the WebGPU capture lightId N (per-frame vLight order)" );
 +idCVar r_bloomThreshold( "r_bloomThreshold", "0.5", CVAR_RENDERER | CVAR_FLOAT, "bloom bright-pass threshold (0..1)" );
 +idCVar r_bloomScale( "r_bloomScale", "1.25", CVAR_RENDERER | CVAR_FLOAT, "bloom intensity" );
 +idCVar r_skipGLDraw( "r_skipGLDraw", "0", CVAR_RENDERER | CVAR_BOOL,
@@ -5416,7 +5437,7 @@ index 7914093..cb4f589 100644
  idCVar r_skipLightScale( "r_skipLightScale", "0", CVAR_RENDERER | CVAR_BOOL, "don't do any post-interaction light scaling, makes things dim on low-dynamic range cards" );
  idCVar r_skipInteractions( "r_skipInteractions", "0", CVAR_RENDERER | CVAR_BOOL, "skip all light/surface interaction drawing" );
  idCVar r_skipDynamicTextures( "r_skipDynamicTextures", "0", CVAR_RENDERER | CVAR_BOOL, "don't dynamically create textures" );
-@@ -158,6 +178,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
+@@ -158,6 +179,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
  idCVar r_useExternalShadows( "r_useExternalShadows", "1", CVAR_RENDERER | CVAR_INTEGER, "1 = skip drawing caps when outside the light volume, 2 = force to no caps for testing", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
  idCVar r_useOptimizedShadows( "r_useOptimizedShadows", "1", CVAR_RENDERER | CVAR_BOOL, "use the dmap generated static shadow volumes" );
  idCVar r_useScissor( "r_useScissor", "1", CVAR_RENDERER | CVAR_BOOL, "scissor clip as portals and lights are processed" );
@@ -5424,7 +5445,7 @@ index 7914093..cb4f589 100644
  idCVar r_useCombinerDisplayLists( "r_useCombinerDisplayLists", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "put all nvidia register combiner programming in display lists" );
  idCVar r_useDepthBoundsTest( "r_useDepthBoundsTest", "1", CVAR_RENDERER | CVAR_BOOL, "use depth bounds test to reduce shadow fill" );
  
-@@ -819,11 +840,63 @@ void R_InitOpenGL( void ) {
+@@ -819,11 +841,63 @@ void R_InitOpenGL( void ) {
  		r_multiSamples.SetInteger( 0 );
  	}
  
@@ -5488,7 +5509,7 @@ index 7914093..cb4f589 100644
  
  #include "renderer/qgl_proc.h"
  
-@@ -2505,6 +2578,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
+@@ -2505,6 +2579,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
  	// is destroyed (relevant when starting a mod which also recreates window)
  	Sys_ShutdownInput();
  
@@ -5504,7 +5525,7 @@ index 7914093..cb4f589 100644
  	GLimp_Shutdown();
  
 diff --git a/neo/renderer/draw_arb2.cpp b/neo/renderer/draw_arb2.cpp
-index c1d0d3e..9a64c28 100644
+index c1d0d3e..9b81372 100644
 --- a/neo/renderer/draw_arb2.cpp
 +++ b/neo/renderer/draw_arb2.cpp
 @@ -62,7 +62,174 @@ static void GL_SelectTextureNoClient( int unit ) {
@@ -5565,7 +5586,7 @@ index c1d0d3e..9a64c28 100644
 +// kWGPUIndexAccumBytes (and the backend's kMaxRecordSlots) — these gates
 +// going stale at 256 while the arrays grew was why CHARACTERS (drawn after
 +// the world) stayed black through two cap raises.
-+enum { kWGPUMaxRec = 512, kWGPUVertCap = 24*1024*1024, kWGPUIdxCap = 6*1024*1024 };
++enum { kWGPUMaxRec = 896, kWGPUVertCap = 24*1024*1024, kWGPUIdxCap = 6*1024*1024 };
 +
 +// Column-major 4x4 multiply (out = lhs * rhs), matching OpenGL storage.
 +// Used to bake the full MVP per record at capture time — records can span
@@ -6076,7 +6097,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..2598b95 100644
+index c83ebb5..66e4df5 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -6087,7 +6108,7 @@ index c83ebb5..2598b95 100644
  
  /*
  
-@@ -38,6 +39,726 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +39,727 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -6105,7 +6126,7 @@ index c83ebb5..2598b95 100644
 +    // 1024 was 512 was 256: entity surfaces (CHARACTERS) draw after the
 +    // world, so they are the consistent victims when a heavy view overflows
 +    // the cap — black people/crates with a lit world is the signature.
-+    kWGPUMaxRecords      = 512,                 // hard cap on per-frame draws
++    kWGPUMaxRecords      = 896,                 // hard cap on per-frame draws
 +    kWGPUVertAccumBytes  = 24 * 1024 * 1024,    // vertex accumulator
 +    kWGPUIndexAccumBytes = 6 * 1024 * 1024,     // u16 index accumulator
 +};
@@ -6244,6 +6265,7 @@ index c83ebb5..2598b95 100644
 +    uint32_t g_capBloomOn = 0;
 +    float    g_capBloomThresh = 0.62f;
 +    float    g_capBloomScale = 0.9f;
++    int      g_capWgpuSingleLight = -1;   // debug: backend draws only this lightId
 +}
 +
 +// Iter 17: stash a decoded cinematic frame (called from
@@ -6814,7 +6836,7 @@ index c83ebb5..2598b95 100644
  
  /*
  =================
-@@ -49,6 +770,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +771,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -6830,7 +6852,7 @@ index c83ebb5..2598b95 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +808,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +809,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -6846,7 +6868,7 @@ index c83ebb5..2598b95 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +855,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +856,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -6863,7 +6885,7 @@ index c83ebb5..2598b95 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +915,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +916,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -6871,7 +6893,7 @@ index c83ebb5..2598b95 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1142,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1143,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -6884,7 +6906,7 @@ index c83ebb5..2598b95 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1311,48 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1312,49 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
@@ -6894,10 +6916,11 @@ index c83ebb5..2598b95 100644
 +	g_captureSlotUsedThisFrame = 0;
 +	// Iter 19: export the bloom tunables for the backend (live d3cmd tuning).
 +	{
-+		extern idCVar r_bloom, r_bloomThreshold, r_bloomScale;
++		extern idCVar r_bloom, r_bloomThreshold, r_bloomScale, r_wgpuSingleLight;
 +		g_capBloomOn = r_bloom.GetBool() ? 1u : 0u;
 +		g_capBloomThresh = r_bloomThreshold.GetFloat();
 +		g_capBloomScale = r_bloomScale.GetFloat();
++		g_capWgpuSingleLight = r_wgpuSingleLight.GetInteger();
 +	}
 +	// Iter 6.6: the multi-surface accumulator is intentionally NOT reset
 +	// here. RB_BeginDrawingView runs once per VIEW (main view, lightgem,

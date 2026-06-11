@@ -1028,3 +1028,26 @@ SESSION: r_singleLight sweep at that vantage in BOTH paths to find
 which light lights him in GL and what it produces in WebGPU; check
 ambient-light records (cloudscroll might be an ambientLight); check
 falloff for lights with origin BELOW the surface.
+
+**Iter 22 — the "black character defect" RETIRED + X360 calibration
+baked (2026-06-10).** The r_singleLight hunt concluded: there is NO
+WebGPU character-lighting defect. Quantified at the X360 vantage
+(identical camera, regional luma): GL marine 1.37 / WebGPU 2.35 —
+WebGPU is BRIGHTER in every region (crate 20.2/24.1, floor
+21.6/25.7). The marine is near-black in BOTH paths: vanilla data
+leaves him outside the light pools; the X360 shot's visible marine is
+its global presentation lift. (Earlier "lit in GL" reads were a few
+specular pixels + contrast illusion — REGION MEANS, not eyeballs, for
+dark-scene comparisons.) Cap theories also dead: this vantage runs
+~107 records (512+ is ample); the steady "34 dropped" are structural
+per-surface skips (>8192-vert surfaces etc.), CONSTANT vs cap size.
+Hunt tooling kept: `r_wgpuSingleLight N` draws only the Nth light of
+the frame (frame-relative — g_capLightId grows monotonically across
+frames!); `1000+N` = prefix mode (lights 0..N) for bisecting. Records
+cap now 896 ALL THREE mirrors (1024 still breaks record flow —
+unsolved; do not raise past 896 without solving it).
+CALIBRATION BAKED (the X360 recipe, measured): r_lightScale 2→4
+(floor pool 25.7→71.0 luma ≈ the X360 pools) + r_gamma 1.1→1.3 (lifts
+the data's genuinely-dark zones incl. characters). fx sliders synced
+to the new defaults. Result at the X360 vantage: lit crate + readable
+decals + visible marine + floor pools — the closest match yet.
