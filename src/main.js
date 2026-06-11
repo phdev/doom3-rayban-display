@@ -452,9 +452,33 @@ function applyDiagVisibility() {
 // The full overlay text — GL diagnostics + probe pinned on top, live log below.
 // Shared by renderDiag (display) and the copy button so what you copy is exactly
 // what you see (and it works even while the overlay is collapsed).
+// Build stamp + live fps — the first line of the diag, so a phone screenshot
+// always tells us WHICH build it runs (iOS Safari serves stale builds
+// relentlessly) and whether the engine is frozen (fps 0) or just slow.
+const BUILD_STAMP = (typeof __ENGINE_VER__ !== "undefined")
+  ? new Date(Number(__ENGINE_VER__)).toISOString().slice(5, 16).replace("T", " ")
+  : "dev";
+let fpsLine = `build ${BUILD_STAMP} UTC | fps —`;
+try { console.info("[d3] build:", BUILD_STAMP, "UTC"); } catch {}
+(() => {
+  let frames = 0;
+  let last = performance.now();
+  const tick = () => {
+    frames++;
+    const now = performance.now();
+    if (now - last >= 2000) {
+      fpsLine = `build ${BUILD_STAMP} UTC | fps ${(frames * 1000 / (now - last)).toFixed(1)}`;
+      frames = 0;
+      last = now;
+      renderDiag();
+    }
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+})();
 function buildDiagText() {
   const tail = diagProgLine ? diagLines.concat(`▸ ${diagProgLine}`) : diagLines;
-  const head = [];
+  const head = [fpsLine];
   if (glInfo.length) head.push("═══ GL DIAGNOSTICS ═══", ...glInfo);
   if (glProbeLine) head.push(glProbeLine);
   if (framePxLine) head.push(framePxLine);
