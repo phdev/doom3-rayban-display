@@ -1,5 +1,5 @@
 diff --git a/neo/CMakeLists.txt b/neo/CMakeLists.txt
-index 69f1892..b9d600f 100644
+index 69f1892..dd9f071 100644
 --- a/neo/CMakeLists.txt
 +++ b/neo/CMakeLists.txt
 @@ -194,29 +194,46 @@ if(CMAKE_MAJOR_VERSION LESS 3 OR ( CMAKE_MAJOR_VERSION EQUAL 3 AND CMAKE_MINOR_V
@@ -71,7 +71,19 @@ index 69f1892..b9d600f 100644
  		add_compile_options(-march=native)
  	elseif(NOT APPLE AND cpu STREQUAL "x86")
  		add_compile_options(-march=pentium3)
-@@ -535,6 +554,55 @@ set(CMAKE_CXX_FLAGS_RELWITHDEBINFO ${CMAKE_C_FLAGS_RELWITHDEBINFO})
+@@ -377,6 +396,11 @@ if(D3_COMPILER_IS_GCC_OR_CLANG)
+ 	if(cpu STREQUAL "e2k" AND CMAKE_COMPILER_IS_GNUCC)
+ 		# O3 on E2K mcst-lcc approximately equal to O2 at X86/ARM gcc
+ 		set(OPT_LEVEL "-O3")
++	elseif(EMSCRIPTEN)
++		# WASM: take every optimization we can get — the iPhone runs the
++		# game loop ~8x slower than desktop. -msimd128 (wasm SIMD, Safari
++		# 16.4+) enables autovectorization across idLib/renderer math.
++		set(OPT_LEVEL "-O3 -msimd128")
+ 	else()
+ 		set(OPT_LEVEL "-O2")
+ 	endif()
+@@ -535,6 +559,55 @@ set(CMAKE_CXX_FLAGS_RELWITHDEBINFO ${CMAKE_C_FLAGS_RELWITHDEBINFO})
  set(CMAKE_CXX_FLAGS_RELEASE "-DNDEBUG ${CMAKE_C_FLAGS_RELEASE}")
  set(CMAKE_CXX_FLAGS_MINSIZEREL "-DNDEBUG ${CMAKE_C_FLAGS_MINSIZEREL}")
  
@@ -127,7 +139,7 @@ index 69f1892..b9d600f 100644
  # mingw and msvc
  if(WIN32)
  	add_definitions(-DWINVER=0x0501)
-@@ -633,6 +701,9 @@ set(src_renderer
+@@ -633,6 +706,9 @@ set(src_renderer
  	renderer/Model_md5.cpp
  	renderer/Model_prt.cpp
  	renderer/Model_sprite.cpp
@@ -137,7 +149,7 @@ index 69f1892..b9d600f 100644
  	renderer/RenderEntity.cpp
  	renderer/RenderSystem.cpp
  	renderer/RenderSystem_init.cpp
-@@ -699,6 +770,7 @@ set(src_framework
+@@ -699,6 +775,7 @@ set(src_framework
  	framework/FileSystem.cpp
  	framework/KeyInput.cpp
  	framework/UsercmdGen.cpp
@@ -145,7 +157,7 @@ index 69f1892..b9d600f 100644
  	framework/Session_menu.cpp
  	framework/Session.cpp
  	framework/async/AsyncClient.cpp
-@@ -909,6 +981,7 @@ set(src_game
+@@ -909,6 +986,7 @@ set(src_game
  	game/AF.cpp
  	game/AFEntity.cpp
  	game/Actor.cpp
@@ -153,7 +165,7 @@ index 69f1892..b9d600f 100644
  	game/Camera.cpp
  	game/Entity.cpp
  	game/BrittleFracture.cpp
-@@ -1280,7 +1353,7 @@ include_directories(${CMAKE_BINARY_DIR})
+@@ -1280,7 +1358,7 @@ include_directories(${CMAKE_BINARY_DIR})
  include_directories(${CMAKE_SOURCE_DIR})
  
  add_library(idlib STATIC ${src_idlib})
@@ -163,7 +175,7 @@ index 69f1892..b9d600f 100644
  endif()
  if (AROS)
 diff --git a/neo/framework/Common.cpp b/neo/framework/Common.cpp
-index dbf6c54..f630b02 100644
+index dbf6c54..834da42 100644
 --- a/neo/framework/Common.cpp
 +++ b/neo/framework/Common.cpp
 @@ -874,7 +874,7 @@ doom set test blah + map test
@@ -215,7 +227,27 @@ index dbf6c54..f630b02 100644
  			// normal, in-sequence screen update
  			session->UpdateScreen( false );
  		}
-@@ -3175,8 +3191,14 @@ void idCommonLocal::Init( int argc, char **argv ) {
+@@ -2560,8 +2576,17 @@ void idCommonLocal::Frame( void ) {
+ 		if ( com_editors == 0 )
+ #endif
+ 		{
+-			if ( com_timescale.GetFloat() == 1.0f && GLimp_GetSwapInterval() != 0
+-				&& fabsf(60.0f - GLimp_GetDisplayRefresh()) < 1.0f ) {
++			bool vsynced60 = ( GLimp_GetSwapInterval() != 0
++				&& fabsf(60.0f - GLimp_GetDisplayRefresh()) < 1.0f );
++#ifdef __EMSCRIPTEN__
++			// The browser main loop IS vsync: requestAnimationFrame paces
++			// frames at display rate. The GLimp swap/refresh queries don't
++			// report that here, so the code fell into Com_WaitForNextTicStart,
++			// which on WASM cannot sleep and BUSY-SPINS on the clock until
++			// the next 60Hz tic boundary (~35-45% of ALL CPU in profiles).
++			vsynced60 = true;
++#endif
++			if ( com_timescale.GetFloat() == 1.0f && vsynced60 ) {
+ 				// if we're using vsync and the display is running at about 60Hz, start next tic
+ 				// immediately so our internal tic time and vsync don't drift apart
+ 				double now = Sys_MillisecondsPrecise();
+@@ -3175,8 +3200,14 @@ void idCommonLocal::Init( int argc, char **argv ) {
  		Sys_Error( "Error during initialization" );
  	}
  
@@ -8169,6 +8201,35 @@ index 3468d39..2cefde6 100644
 +#endif
  	return 0;
  }
+diff --git a/neo/sys/posix/posix_main.cpp b/neo/sys/posix/posix_main.cpp
+index bb0232b..7975128 100644
+--- a/neo/sys/posix/posix_main.cpp
++++ b/neo/sys/posix/posix_main.cpp
+@@ -565,6 +565,16 @@ Sys_SleepUntilPrecise
+ =====================
+ */
+ void Sys_SleepUntilPrecise( double targetTimeMS ) {
++#ifdef __EMSCRIPTEN__
++	// On WASM there is no real sleep without ASYNCIFY: usleep() AND the
++	// precision busy-loop below both SPIN on the clock, each read a
++	// wasm->JS crossing. Profiling showed ~45% of ALL CPU time burned in
++	// Com_WaitForNextTicStart -> here (emscripten_get_now + nanosleep
++	// spin). The browser's rAF already paces frames — waiting inside the
++	// rAF callback is pure waste (and heat -> throttling on the phone).
++	(void)targetTimeMS;
++	return;
++#else
+ 	double msec = targetTimeMS - Sys_MillisecondsPrecise();
+ 	if ( msec < 0.01 ) // don't bother for less than 10usec
+ 		return;
+@@ -590,6 +600,7 @@ void Sys_SleepUntilPrecise( double targetTimeMS ) {
+ 
+ 		msec = targetTimeMS - Sys_MillisecondsPrecise();
+ 	} while ( msec >= 0.01 );
++#endif
+ }
+ 
+ // ----------- lots of signal handling stuff ------------
 diff --git a/neo/sys/posix/posix_net.cpp b/neo/sys/posix/posix_net.cpp
 index 746a945..315c675 100644
 --- a/neo/sys/posix/posix_net.cpp

@@ -1071,3 +1071,27 @@ the X360 vantage: 10.7% px darkened in geometric shadow shapes; det
 self-test unaffected (pass is deterministic, runs in det rounds too).
 Reuses bloom's module/BGL/fullscreen triangle — pipelines init
 unconditionally so the pass works with r_bloom 0.
+
+**Iter 24 — WASM PERF DEEP-DIVE: the busy-sleep (2026-06-10/11).**
+CPU-profiled the engine (CDP Profiler on a -DD3_PROFILING_FUNCS=ON
+build, headed Chrome): **~45% of ALL CPU time was clock reads** —
+`Com_WaitForNextTicStart → Sys_SleepUntilPrecise → usleep/busy-loop`.
+On WASM there is NO real sleep without ASYNCIFY: usleep AND the
+precision loop both SPIN on emscripten_get_now (a wasm→JS crossing,
+plus clock_time_get's BigInt conversions). First fix (no-op the
+sleep) just moved the spin to the CALLER's tic-wait loop. REAL FIX:
+the tic system's vsync branch (`nextTicTime = now` when vsynced at
+~60Hz) is EXACTLY the browser situation — rAF IS vsync — but
+GLimp_GetSwapInterval/GetDisplayRefresh don't report it on Emscripten,
+so the engine fell into the wait path. Forced `vsynced60 = true`
+under __EMSCRIPTEN__ in idCommonLocal::Frame.
+RESULT: profile idle 24% → 46.3%, clock functions GONE from the top
+list — the engine does identical work with ~HALF the CPU. Also:
+Emscripten builds now compile **-O3 -msimd128** (was -O2, no SIMD;
+Safari 16.4+ supports wasm SIMD). Det test IDENTICAL post-change.
+Top remaining real costs (desktop): writeBuffer 4.4% (per-frame
+uploads), R_CreateShadowVolume 3.5%, RB_ARB2_DrawInteraction 2.2%.
+iPhone should gain the spin elimination + SIMD/O3 — re-test shadows
+on-device (?shadows) after this lands; classic dhewm3 has NO
+com_engineHz (that's RBDOOM), so tic-rate reduction isn't a lever
+without deeper surgery.
