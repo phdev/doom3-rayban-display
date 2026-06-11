@@ -1303,3 +1303,38 @@ down — BELOW the old shadows-OFF steady state. Shadows stay ON for
 the phone. Measurement recipe for future regressions: open the URL in
 Mac Safari, `ps -axo pid,rss,comm | grep WebKit.GPU` every 3s — a
 climb past ~1GB within a minute = the iPhone will die.
+
+**Iter 31 — "r_shadows reads 0" forensics + hardening (2026-06-11).**
+User saw r_shadows 0 in the console while the code ships 1. Verified
+the LIVE build on a fresh profile: shadows ON, 23 volumes captured —
+the 0 reading was DEVICE-LOCAL STALE STATE (Safari serves cached
+older bundles; pre-iter-29 phone bundles and pre-iter-19 desktop
+bundles legitimately passed r_shadows 0). Forensics established the
+override landscape (engine source + Exa cross-check + empirical
+three-way boot test):
+- dhewm3 init order (Common.cpp ~3300-3340): execMachineSpec (only on
+  sysDetect, which for us is EVERY boot — /save is MEMFS so the
+  _spec.cfg marker never persists) → default.cfg → DoomConfig.cfg →
+  autoexec.cfg → StartupVariable re-applies command-line +sets LAST.
+  So +set beats everything; configs beat each other in exec order.
+- dhewm3's execMachineSpec touches r_shadows ONLY under #if MACOS_X
+  (not compiled in wasm) — exonerated. It DOES stomp a pile of
+  image_* ARCHIVE cvars every boot (we re-+set the ones we care
+  about).
+- EMPIRICAL (three-way boot): +set r_shadows 0 via ?args beats the
+  autoexec pin (StartupVariable is last) — ?args overrides stay
+  possible; ?noshadows works; default = ON.
+HARDENING: (1) r_shadows + g_showPlayerShadow now ALSO pinned in
+autoexec.cfg via the shared shadowsEnabledForBoot() helper (single
+source of truth with the +set args; ?noshadows beats ?shadows) — any
+config-file-class zero (stale DoomConfig, machineSpec writes) now
+loses. (2) The diag stats line shows LIVE shadow state: "| shdw N"
+(backend publishes the per-frame captured volume count via
+window.__d3ShadowVols) — "shdw 0" when shadows are expected = the
+override class returned; N varies per frame with visible volumes.
+LESSON: engine console prints (cvar echo) do NOT reach the JS
+console/diag in this build — d3cmd("r_shadows") shows nothing
+remotely; the shdw counter is the on-device truth instrument. When a
+user reports state contradicting the shipped code, FIRST suspect a
+stale cached bundle: check the diag build stamp against the latest
+deploy time.

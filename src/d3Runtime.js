@@ -619,12 +619,8 @@ function buildArguments(config) {
     // (Sys_ConsoleInput reads a tty that never delivers). Disable it.
     "+set", "in_tty", "0",
     // The player's own shadow is the single most visible shadow in DOOM 3 —
-    // follows the same default as r_shadows.
-    "+set", "g_showPlayerShadow",
-        ((/[?&]backend=webgpu\b/.test(typeof window !== "undefined" ? window.location.search : "")
-          && !/[?&]echo\b/.test(typeof window !== "undefined" ? window.location.search : "")
-          && !/[?&]noshadows\b/.test(typeof window !== "undefined" ? window.location.search : ""))
-         || /[?&]shadows\b/.test(typeof window !== "undefined" ? window.location.search : "")) ? "1" : "0",
+    // follows the same default as r_shadows (also pinned in autoexec.cfg).
+    "+set", "g_showPlayerShadow", shadowsEnabledForBoot() ? "1" : "0",
     // The shell mounts PK4 + config under /base in the Emscripten FS; point the
     // engine's base path there (default would be the executable dir).
     "+set", "fs_basepath", "/",
@@ -639,11 +635,9 @@ function buildArguments(config) {
     // iPhone runs 46.5fps and can afford the CPU volume build. The BFG-look
     // gap (user reference screenshots) is mostly missing cast shadows +
     // flat tone curve. ?noshadows forces off anywhere if a device can't.
-    "+set", "r_shadows",
-        ((/[?&]backend=webgpu\b/.test(typeof window !== "undefined" ? window.location.search : "")
-          && !/[?&]echo\b/.test(typeof window !== "undefined" ? window.location.search : "")
-          && !/[?&]noshadows\b/.test(typeof window !== "undefined" ? window.location.search : ""))
-         || /[?&]shadows\b/.test(typeof window !== "undefined" ? window.location.search : "")) ? "1" : "0",
+    // ALSO pinned in autoexec.cfg — r_shadows is CVAR_ARCHIVE and the
+    // engine's per-boot machineSpec detection can stomp the command line.
+    "+set", "r_shadows", shadowsEnabledForBoot() ? "1" : "0",
     // Iter 19: WebGPU bloom — ON under WebGPU-primary; ?nobloom opts out.
     // Live-tune: d3cmd("r_bloomThreshold 0.5"), d3cmd("r_bloomScale 1.2").
     "+set", "r_bloom",
@@ -765,6 +759,17 @@ const FLASHLIGHT_FIX_MTR = [
   ""
 ].join("\n");
 
+// Iter 31: single source of truth for the shadow default — used by BOTH the
+// +set command-line args and the autoexec.cfg pin (r_shadows is CVAR_ARCHIVE
+// and the engine's per-boot machineSpec detection can stomp it; the autoexec
+// assert wins because it execs after every config). ?noshadows beats ?shadows.
+function shadowsEnabledForBoot() {
+  const qs = typeof window !== "undefined" ? window.location.search : "";
+  if (/[?&]noshadows\b/.test(qs)) return false;
+  if (/[?&]shadows\b/.test(qs)) return true;
+  return /[?&]backend=webgpu\b/.test(qs) && !/[?&]echo\b/.test(qs);
+}
+
 function buildAutoexecConfig(config) {
   return [
     "// DOOM 3 Display runtime configuration (auto-executed by id Tech 4)",
@@ -781,6 +786,15 @@ function buildAutoexecConfig(config) {
     `seta r_gamma "${getNumericConfig(config.rGamma, 1.1)}"`,
     `seta r_brightness "${getNumericConfig(config.rBrightness, 1)}"`,
     `seta r_lightScale "${getNumericConfig(config.rLightScale, 2)}"`,
+    // Iter 31: PIN shadows here, not just in the +set args. r_shadows is
+    // CVAR_ARCHIVE, and the engine's first-run sysDetect path (which fires
+    // EVERY boot — /save is MEMFS, so the _spec.cfg marker never persists)
+    // runs execMachineSpec, and a low com_machineSpec sets r_shadows 0,
+    // fighting the command line. autoexec.cfg execs after default.cfg AND
+    // DoomConfig.cfg, so values asserted here survive every config-side
+    // override. Same flag logic as the +set args (?shadows/?noshadows).
+    `seta r_shadows "${shadowsEnabledForBoot() ? 1 : 0}"`,
+    `seta g_showPlayerShadow "${shadowsEnabledForBoot() ? 1 : 0}"`,
     "seta r_skipBump \"0\"",
     "seta image_downSize \"1\"",
     "seta image_useCompression \"1\"",

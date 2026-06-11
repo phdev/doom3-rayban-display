@@ -1981,10 +1981,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..4213026
+index 0000000..ac231f3
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,3806 @@
+@@ -0,0 +1,3814 @@
 +/*
 +================================================================================
 +
@@ -4195,6 +4195,13 @@ index 0000000..4213026
 +                }
 +            }
 +            lastShadowCount = sn;
++            // Iter 31: live shadow state for the diag stats line — "is
++            // r_shadows actually on, on THIS device?" answerable from a
++            // phone screenshot (engine console prints don't reach JS).
++            if (sn != lastPublishedShadowVols) {
++                lastPublishedShadowVols = sn;
++                EM_ASM_({ window.__d3ShadowVols = $0; }, sn);
++            }
 +            if (sn > 0) {
 +                static bool shAnnounced = false;
 +                if (!shAnnounced) {
@@ -5632,6 +5639,7 @@ index 0000000..4213026
 +    int                     matCacheCount = 0;
 +    size_t                  gpuTexBytes = 0;     // iter 28: bytes resident in texCache (incl. mips)
 +    int                     gpuTexDropped = 0;   // iter 28: images denied by r_wgpuTexBudgetMB
++    uint32_t                lastPublishedShadowVols = 0xFFFFFFFFu;   // iter 31: diag shadow state
 +    // Iter 30: delta-upload mirrors (CPU copy of last-uploaded accumulator
 +    // contents; uploads send only changed 256KB chunks).
 +    uint8_t*                vertMirror = nullptr;

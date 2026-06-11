@@ -491,7 +491,10 @@ try {
       const wtex = (typeof window.__d3WgpuTexMB === "number")
         ? ` | wgpu-tex ${window.__d3WgpuTexMB.toFixed(0)}MB/${window.__d3WgpuTexN}${window.__d3WgpuTexDrop ? ` (drop ${window.__d3WgpuTexDrop})` : ""}`
         : "";
-      fpsLine = `build ${BUILD_STAMP} UTC | fps ${(frames * 1000 / (now - last)).toFixed(1)}${mem}${wtex}`;
+      // Live stencil-shadow volume count (published by the backend each
+      // drain) — "shdw 0" with shadows expected = r_shadows got overridden.
+      const shdw = (typeof window.__d3ShadowVols === "number") ? ` | shdw ${window.__d3ShadowVols}` : "";
+      fpsLine = `build ${BUILD_STAMP} UTC | fps ${(frames * 1000 / (now - last)).toFixed(1)}${mem}${wtex}${shdw}`;
       try { localStorage.setItem("d3_prev_session", JSON.stringify({ t: Date.now(), line: fpsLine })); } catch {}
       frames = 0;
       last = now;
