@@ -647,6 +647,22 @@ function buildArguments(config) {
         (/[?&]backend=webgpu\b/.test(typeof window !== "undefined" ? window.location.search : "")
          && !/[?&]echo\b/.test(typeof window !== "undefined" ? window.location.search : "")
          && !/[?&]nobloom\b/.test(typeof window !== "undefined" ? window.location.search : "")) ? "1" : "0",
+    // Iter 28: WebGPU GPU-memory diet. iOS Safari kills the whole TAB when
+    // total GPU memory tips over (the "82% Starting DOOM 3" crash: WebGL
+    // context lost + GPUDevice.createBindGroup InvalidStateError during the
+    // first-frame texture flood). The phone profile budgets the backend's
+    // GPU texture cache (over-budget images bind a fallback — an artifact,
+    // not a tab kill), caps upload dimensions at 128 to match its
+    // image_downSizeLimit, and skips the det self-test's offscreen targets
+    // + readback buffers. ?texbudget=N / ?texdim=N override anywhere (0 =
+    // unlimited/uncapped).
+    "+set", "r_wgpuTexBudgetMB",
+        String((() => { const m = /[?&]texbudget=(\d+)\b/.exec(typeof window !== "undefined" ? window.location.search : "");
+                        return m ? Number(m[1]) : (config.inputMode === "wearable" ? 80 : 0); })()),
+    "+set", "r_wgpuTexMaxDim",
+        String((() => { const m = /[?&]texdim=(\d+)\b/.exec(typeof window !== "undefined" ? window.location.search : "");
+                        return m ? Number(m[1]) : (config.inputMode === "wearable" ? 128 : 0); })()),
+    "+set", "r_wgpuDetTest", config.inputMode === "wearable" ? "0" : "1",
     // Skip ROQ cinematic decoding. The RoQ decoder calls a null function pointer
     // in this WASM build (idCinematicLocal::ImageForTime, reached from
     // RB_BindVariableStageImage when a surface has a video texture), which traps

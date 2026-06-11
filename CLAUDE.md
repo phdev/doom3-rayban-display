@@ -1174,4 +1174,56 @@ that diff because they are STAGED in the engine checkout's index. Any
 `git reset` there silently drops every new file from the next patch
 regen (a 6105-line patch shrink pushed a build with NO WebGPU
 backend). Regenerate with `git add -A` first and `diff --cached`, and
-CHECK `wc -l` (~8300 lines) before committing the patch.
+CHECK `wc -l` (~8500 lines) before committing the patch.
+
+**Iter 28 — iPhone crash round 3: the memory autopsy + diet
+(2026-06-11).** The user's pasted crash log (crash telemetry working
+as designed) finally gave hard numbers at death: `fps 46.5 | wasm
+307MB | gpu-tex: 86 uploads ~4MB … ⚠CTX-LOST | ERR:
+InvalidStateError: GPUDevice.createBindGroup`. Reading: GL-upload
+skip works (4MB), heap matches full-load (the map LOADED and rendered
+seconds before death — "82%" just means no later milestone logged),
+and BOTH GPU contexts died together = iOS reclaimed the tab's GPU
+resources on TOTAL process memory, not a WebGL-specific OOM. Measured
+on desktop Chrome: the WebGPU texture cache is only ~22MB (496
+textures) — NOT the eater. Remaining suspects were WebKit-side
+per-call overhead and total-process memory; all addressed:
+- **GPU texture budget + dim cap + accounting** — new cvars
+  `r_wgpuTexBudgetMB` (phone 80, 0=off), `r_wgpuTexMaxDim` (phone
+  128), exported via g_capTex* globals. Over-budget images bind a
+  fallback (artifact, not a tab kill); `?texbudget=N`/`?texdim=N`
+  override. The diag stats line (and therefore CRASH TELEMETRY) now
+  shows `wgpu-tex NMB/T` via window.__d3WgpuTexMB — the next death
+  reports its WebGPU texture footprint.
+- **r_wgpuTexMaxDim also applies at CACHE time** (D3_WebGPU_CacheImage
+  caps to min(256, dim)) — CPU cache pixels live in the wasm heap.
+  GOTCHA FOUND: a 256x1 LUT (_specularTable) at cap 128 computed
+  dh=0 and was silently REJECTED (white-fallback speculars on phone);
+  clamp dims to >=1, never reject.
+- **Uniform-buffer consolidation** — the record/pass/shadow slot
+  families were 896 tiny GPUBuffers EACH (2688 total; WebKit backs
+  every GPUBuffer with its own page-padded MTLBuffer) written by
+  ~700 tiny writeBuffer calls per frame (each a staging copy — the
+  same per-call disease class as the WebKit GL blit storm). Now ONE
+  buffer per family at a 256B slot stride; bind groups address their
+  slot via static offsets; drains memcpy into a CPU stage and flush
+  with ONE writeBuffer per family. Det rounds 1-6 IDENTICAL after.
+- **Per-frame VERTEX dedup** — per-light interaction tris are
+  distinct srfTriangles_t but REFERENCE the same ambient vertex array
+  (R_CreateLightTris → R_ReferenceStaticTriSurfVerts), so a surface
+  lit by N lights re-appended identical verts N times. Dedup keys on
+  the verts POINTER (a first attempt keyed on the geo pointer hit
+  ZERO times — lightTris are per-light objects); indexes are
+  per-light culled subsets and always append. Measured: vbytes
+  15.96MB → 11.25MB/frame (-30%) at enpro spawn.
+- **Wasm heap growth steps** — default geometric growth is +20%, so
+  one grow past 256MB committed 307MB regardless of real peak. Now
+  `-sMEMORY_GROWTH_GEOMETRIC_STEP=0.05 -sMEMORY_GROWTH_GEOMETRIC_CAP=
+  16MB`: committed heap tracks the peak (measured 307 → 296MB).
+- **Det self-test skippable** — `r_wgpuDetTest 0` on the phone profile
+  skips the offscreen targets + MapRead readback buffers.
+All validated headed-Chrome both profiles: det IDENTICAL ×6, scene
+correct, zero validation errors, zero fallbacks, no budget drops
+(desktop AND phone-config land ~20MB GPU textures, well under the
+80MB guard). iPhone retest = the open question; if it still dies, the
+crash line now carries fps + wasm heap + WebGPU texture MB.

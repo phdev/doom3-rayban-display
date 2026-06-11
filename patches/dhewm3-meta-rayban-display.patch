@@ -1,5 +1,5 @@
 diff --git a/neo/CMakeLists.txt b/neo/CMakeLists.txt
-index 69f1892..f917b3e 100644
+index 69f1892..57b3f82 100644
 --- a/neo/CMakeLists.txt
 +++ b/neo/CMakeLists.txt
 @@ -194,29 +194,46 @@ if(CMAKE_MAJOR_VERSION LESS 3 OR ( CMAKE_MAJOR_VERSION EQUAL 3 AND CMAKE_MINOR_V
@@ -83,7 +83,7 @@ index 69f1892..f917b3e 100644
  	else()
  		set(OPT_LEVEL "-O2")
  	endif()
-@@ -535,6 +559,58 @@ set(CMAKE_CXX_FLAGS_RELWITHDEBINFO ${CMAKE_C_FLAGS_RELWITHDEBINFO})
+@@ -535,6 +559,62 @@ set(CMAKE_CXX_FLAGS_RELWITHDEBINFO ${CMAKE_C_FLAGS_RELWITHDEBINFO})
  set(CMAKE_CXX_FLAGS_RELEASE "-DNDEBUG ${CMAKE_C_FLAGS_RELEASE}")
  set(CMAKE_CXX_FLAGS_MINSIZEREL "-DNDEBUG ${CMAKE_C_FLAGS_MINSIZEREL}")
  
@@ -113,7 +113,11 @@ index 69f1892..f917b3e 100644
 +		# 256MB initial (was 512): iOS Safari jetsam-kills tabs on total memory —
 +		# committing 512MB before the pak even loads ate half the budget up
 +		# front. Growth covers actual demand (~400MB peak with the 66MB pak).
++		# Iter 28: default geometric growth is +20% (one grow past 256MB
++		# commits 307MB even if the peak was 260MB) — grow in small steps so
++		# committed wasm pages track the real peak, not the overshoot.
 +		"-sINITIAL_MEMORY=256MB -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2GB -sSTACK_SIZE=8MB"
++		"-sMEMORY_GROWTH_GEOMETRIC_STEP=0.05 -sMEMORY_GROWTH_GEOMETRIC_CAP=16MB"
 +		"-sEXPORTED_FUNCTIONS=${d3_wasm_exports}"
 +		"-sEXPORTED_RUNTIME_METHODS=[\"ccall\",\"cwrap\",\"FS\",\"callMain\",\"HEAP8\"]"
 +		"-sEXIT_RUNTIME=0 -sINVOKE_RUN=0 -sERROR_ON_UNDEFINED_SYMBOLS=0"
@@ -142,7 +146,7 @@ index 69f1892..f917b3e 100644
  # mingw and msvc
  if(WIN32)
  	add_definitions(-DWINVER=0x0501)
-@@ -633,6 +709,9 @@ set(src_renderer
+@@ -633,6 +713,9 @@ set(src_renderer
  	renderer/Model_md5.cpp
  	renderer/Model_prt.cpp
  	renderer/Model_sprite.cpp
@@ -152,7 +156,7 @@ index 69f1892..f917b3e 100644
  	renderer/RenderEntity.cpp
  	renderer/RenderSystem.cpp
  	renderer/RenderSystem_init.cpp
-@@ -699,6 +778,7 @@ set(src_framework
+@@ -699,6 +782,7 @@ set(src_framework
  	framework/FileSystem.cpp
  	framework/KeyInput.cpp
  	framework/UsercmdGen.cpp
@@ -160,7 +164,7 @@ index 69f1892..f917b3e 100644
  	framework/Session_menu.cpp
  	framework/Session.cpp
  	framework/async/AsyncClient.cpp
-@@ -909,6 +989,7 @@ set(src_game
+@@ -909,6 +993,7 @@ set(src_game
  	game/AF.cpp
  	game/AFEntity.cpp
  	game/Actor.cpp
@@ -168,7 +172,7 @@ index 69f1892..f917b3e 100644
  	game/Camera.cpp
  	game/Entity.cpp
  	game/BrittleFracture.cpp
-@@ -1280,7 +1361,7 @@ include_directories(${CMAKE_BINARY_DIR})
+@@ -1280,7 +1365,7 @@ include_directories(${CMAKE_BINARY_DIR})
  include_directories(${CMAKE_SOURCE_DIR})
  
  add_library(idlib STATIC ${src_idlib})
@@ -1977,10 +1981,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..0fa0f64
+index 0000000..f585c65
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,3558 @@
+@@ -0,0 +1,3650 @@
 +/*
 +================================================================================
 +
@@ -2112,6 +2116,10 @@ index 0000000..0fa0f64
 +extern "C" float g_capShadowDarken;
 +extern "C" float    g_capBloomThresh;
 +extern "C" float    g_capBloomScale;
++extern "C" int      g_capTexBudgetMB;   // iter 28: GPU texture-cache byte budget (0 = unlimited)
++extern "C" int      g_capTexMaxDim;     // iter 28: pre-upload dimension cap (0 = uncapped)
++extern "C" uint32_t g_capDetTest;       // iter 28: determinism self-test gate
++extern "C" uint32_t g_capVertDedupCount; // iter 28: frame geometry-dedup table fill (reset on drain)
 +
 +// ─── Backend class ──────────────────────────────────────────────────────────
 +
@@ -2315,7 +2323,9 @@ index 0000000..0fa0f64
 +                // engine is in different scenes across rounds.
 +                if (multiOk && lastRecordCount > 0) {
 +                    detFrameCounter++;
-+                    if (detMapsPending == 0 && detRoundsDone < kDetMaxRounds &&
++                    // Iter 28: r_wgpuDetTest 0 (phone profile) skips the test —
++                    // and with it the lazy offscreen targets + readback buffers.
++                    if (g_capDetTest && detMapsPending == 0 && detRoundsDone < kDetMaxRounds &&
 +                        detFrameCounter >= 90 && (detFrameCounter - 90) % 240 == 0) {
 +                        runDeterminismRound();
 +                    }
@@ -3335,7 +3345,7 @@ index 0000000..0fa0f64
 +        }
 +        WGPUTextureView view = getEngineTextureView(imgPtr, fbWhiteView);
 +        WGPUBindGroupEntry e[3] = {};
-+        e[0].binding = 0; e[0].buffer = passUniformBufs[slot]; e[0].size = 128;
++        e[0].binding = 0; e[0].buffer = passUBuf; e[0].offset = (uint64_t)slot * kUBStride; e[0].size = 128;
 +        e[1].binding = 1; e[1].sampler = demoSampler;
 +        e[2].binding = 2; e[2].textureView = view;
 +        WGPUBindGroupDescriptor bgd = {};
@@ -3359,9 +3369,9 @@ index 0000000..0fa0f64
 +    // Built fresh each frame (the frame content changes every frame anyway);
 +    // retired at the next drain once the prior submit completed.
 +    WGPUBindGroup getCinPassBindGroup(uint32_t slot, uint32_t cin) {
-+        if (cin >= kCinSlots || !cinView[cin] || !passUniformBufs[slot]) return nullptr;
++        if (cin >= kCinSlots || !cinView[cin] || !passUBuf) return nullptr;
 +        WGPUBindGroupEntry e[3] = {};
-+        e[0].binding = 0; e[0].buffer = passUniformBufs[slot]; e[0].size = 128;
++        e[0].binding = 0; e[0].buffer = passUBuf; e[0].offset = (uint64_t)slot * kUBStride; e[0].size = 128;
 +        e[1].binding = 1; e[1].sampler = demoSampler;
 +        e[2].binding = 2; e[2].textureView = cinView[cin];
 +        WGPUBindGroupDescriptor bgd = {};
@@ -3459,6 +3469,32 @@ index 0000000..0fa0f64
 +                D3_WebGPU_ImageName(imgPtr), why);
 +    }
 +
++    // 2x box reduction (shared by the mip chain and the iter-28 pre-reduce).
++    static void boxReduceHalf(const uint8_t* src, int lw, int lh, uint8_t* dst, int nw, int nh) {
++        for (int y = 0; y < nh; ++y) {
++            const int sy0 = y * 2, sy1 = (sy0 + 1 < lh) ? sy0 + 1 : sy0;
++            for (int x = 0; x < nw; ++x) {
++                const int sx0 = x * 2, sx1 = (sx0 + 1 < lw) ? sx0 + 1 : sx0;
++                for (int c = 0; c < 4; ++c) {
++                    const int sum = src[(sy0*lw+sx0)*4+c] + src[(sy0*lw+sx1)*4+c]
++                                  + src[(sy1*lw+sx0)*4+c] + src[(sy1*lw+sx1)*4+c];
++                    dst[(y*nw+x)*4+c] = (uint8_t)(sum >> 2);
++                }
++            }
++        }
++    }
++
++    // Iter 28: surface the GPU texture footprint to JS — the diag stats line
++    // persists it via crash telemetry, so a dead iOS tab now reports exactly
++    // how much WebGPU texture memory it held.
++    void publishTexStats() {
++        EM_ASM_({
++            window.__d3WgpuTexN = $0;
++            window.__d3WgpuTexMB = $1;
++            window.__d3WgpuTexDrop = $2;
++        }, texCacheCount, (double)gpuTexBytes / (1024.0 * 1024.0), gpuTexDropped);
++    }
++
 +    // Iter 7b: GPU mirror of the engine's CPU image cache. One texture per
 +    // idImage pointer, created+uploaded on first use.
 +    WGPUTextureView getEngineTextureView(const void* imgPtr, WGPUTextureView fallback) {
@@ -3474,25 +3510,54 @@ index 0000000..0fa0f64
 +        if (!slot || !slot->pixels || slot->w <= 0 || slot->h <= 0) { noteImageFallback(imgPtr, "cpu-miss"); return fallback; }
 +        if (texCacheCount >= (int)kTexCacheSize) { noteImageFallback(imgPtr, "gpu-cache-full"); return fallback; }
 +
++        // Level 0 from the cache.
++        int lw = slot->w, lh = slot->h;
++        uint8_t* cur = (uint8_t*)malloc((size_t)lw * lh * 4u);
++        memcpy(cur, slot->pixels, (size_t)lw * lh * 4u);
++
++        // Iter 28: pre-reduce oversized images (r_wgpuTexMaxDim) before any
++        // GPU allocation — the phone profile caps at 128 to match its
++        // image_downSizeLimit, quartering the cost of the >128 entries
++        // (injected lights/, GUI art the reducer left at 256).
++        while (g_capTexMaxDim > 0 && (lw > g_capTexMaxDim || lh > g_capTexMaxDim)) {
++            const int nw = lw > 1 ? lw >> 1 : 1, nh = lh > 1 ? lh >> 1 : 1;
++            uint8_t* next = (uint8_t*)malloc((size_t)nw * nh * 4u);
++            boxReduceHalf(cur, lw, lh, next, nw, nh);
++            free(cur);
++            cur = next;
++            lw = nw; lh = nh;
++            if (lw <= 1 && lh <= 1) break;
++        }
++
 +        // Full mip chain (box filter) — single-mip textures shimmer badly
 +        // under minification at the echo's render scale.
 +        uint32_t mips = 1;
-+        { int m = slot->w > slot->h ? slot->w : slot->h; while (m > 1) { m >>= 1; mips++; } }
++        { int m = lw > lh ? lw : lh; while (m > 1) { m >>= 1; mips++; } }
++
++        // Iter 28: GPU byte budget (r_wgpuTexBudgetMB). iOS Safari kills the
++        // whole tab when total GPU memory tips over — an over-budget image
++        // binding a fallback is an artifact, not a crash.
++        size_t newBytes = 0;
++        { int w = lw, h = lh; for (uint32_t l = 0; l < mips; ++l) { newBytes += (size_t)w * h * 4u; w = w > 1 ? w >> 1 : 1; h = h > 1 ? h >> 1 : 1; } }
++        if (g_capTexBudgetMB > 0 && gpuTexBytes + newBytes > ((size_t)g_capTexBudgetMB << 20)) {
++            free(cur);
++            gpuTexDropped++;
++            publishTexStats();
++            noteImageFallback(imgPtr, "gpu-budget");
++            return fallback;
++        }
 +
 +        WGPUTextureDescriptor td = {};
-+        td.size = { (uint32_t)slot->w, (uint32_t)slot->h, 1 };
++        td.size = { (uint32_t)lw, (uint32_t)lh, 1 };
 +        td.mipLevelCount = mips;
 +        td.sampleCount = 1;
 +        td.dimension = WGPUTextureDimension_2D;
 +        td.format = WGPUTextureFormat_RGBA8Unorm;
 +        td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
 +        WGPUTexture tex = wgpuDeviceCreateTexture(device, &td);
-+        if (!tex) return fallback;
++        if (!tex) { free(cur); return fallback; }
 +
-+        // Level 0 from the cache, then successive 2x box reductions.
-+        int lw = slot->w, lh = slot->h;
-+        uint8_t* cur = (uint8_t*)malloc((size_t)lw * lh * 4u);
-+        memcpy(cur, slot->pixels, (size_t)lw * lh * 4u);
++        // Successive 2x box reductions per mip level.
 +        for (uint32_t level = 0; level < mips; ++level) {
 +            WGPUTexelCopyTextureInfo dst = {};
 +            dst.texture = tex;
@@ -3505,17 +3570,7 @@ index 0000000..0fa0f64
 +            if (level + 1 >= mips) break;
 +            const int nw = lw > 1 ? lw >> 1 : 1, nh = lh > 1 ? lh >> 1 : 1;
 +            uint8_t* next = (uint8_t*)malloc((size_t)nw * nh * 4u);
-+            for (int y = 0; y < nh; ++y) {
-+                const int sy0 = y * 2, sy1 = (sy0 + 1 < lh) ? sy0 + 1 : sy0;
-+                for (int x = 0; x < nw; ++x) {
-+                    const int sx0 = x * 2, sx1 = (sx0 + 1 < lw) ? sx0 + 1 : sx0;
-+                    for (int c = 0; c < 4; ++c) {
-+                        const int sum = cur[(sy0*lw+sx0)*4+c] + cur[(sy0*lw+sx1)*4+c]
-+                                      + cur[(sy1*lw+sx0)*4+c] + cur[(sy1*lw+sx1)*4+c];
-+                        next[(y*nw+x)*4+c] = (uint8_t)(sum >> 2);
-+                    }
-+                }
-+            }
++            boxReduceHalf(cur, lw, lh, next, nw, nh);
 +            free(cur);
 +            cur = next;
 +            lw = nw; lh = nh;
@@ -3525,6 +3580,8 @@ index 0000000..0fa0f64
 +        texCache[texCacheCount].ptr = imgPtr;
 +        texCache[texCacheCount].view = view;
 +        texCacheCount++;
++        gpuTexBytes += newBytes;
++        publishTexStats();
 +        // Diagnostic inventory: name, size, mid-pixel RGBA (first 12 uploads
 +        // only — enough to validate the cache without flooding the console).
 +        if (texCacheCount <= 12) {
@@ -3626,22 +3683,26 @@ index 0000000..0fa0f64
 +
 +        WGPUBindGroupLayout bglInteraction = wgpuRenderPipelineGetBindGroupLayout(interactionPipeline, 0);
 +        WGPUBindGroupLayout bglDepth       = wgpuRenderPipelineGetBindGroupLayout(depthPipeline, 0);
-+        for (uint32_t i = 0; i < kMaxRecordSlots; ++i) {
-+            // Iter 8c: per-slot uniform for shader-pass records (texture.wgsl
-+            // layout: mvp + tint + params = 96 bytes).
-+            WGPUBufferDescriptor pbd = {};
-+            pbd.size = 128;
-+            pbd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
-+            passUniformBufs[i] = wgpuDeviceCreateBuffer(device, &pbd);
-+
-+            // Iter 9: per-slot shadow uniform (mvp + light origin = 80B)
++        // Iter 28: one consolidated buffer per family; bind groups address
++        // their slot at a static 256B-stride offset (no dynamic offsets).
++        {
++            WGPUBufferDescriptor bd = {};
++            bd.size = (uint64_t)kMaxRecordSlots * kUBStride;
++            bd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
++            bd.label = { "passUBuf", WGPU_STRLEN };
++            passUBuf = wgpuDeviceCreateBuffer(device, &bd);
++            bd.label = { "recordUBuf", WGPU_STRLEN };
++            recordUBuf = wgpuDeviceCreateBuffer(device, &bd);
 +            if (shadowBGL) {
-+                WGPUBufferDescriptor sbd = {};
-+                sbd.size = 80;
-+                sbd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
-+                shadowUniformBufs[i] = wgpuDeviceCreateBuffer(device, &sbd);
++                bd.label = { "shadowUBuf", WGPU_STRLEN };
++                shadowUBuf = wgpuDeviceCreateBuffer(device, &bd);
++            }
++        }
++        for (uint32_t i = 0; i < kMaxRecordSlots; ++i) {
++            // Iter 9: per-slot shadow uniform view (mvp + light origin = 80B)
++            if (shadowBGL) {
 +                WGPUBindGroupEntry se = {};
-+                se.binding = 0; se.buffer = shadowUniformBufs[i]; se.size = 80;
++                se.binding = 0; se.buffer = shadowUBuf; se.offset = (uint64_t)i * kUBStride; se.size = 80;
 +                WGPUBindGroupDescriptor sgd = {};
 +                sgd.layout = shadowBGL;
 +                sgd.entryCount = 1;
@@ -3649,12 +3710,8 @@ index 0000000..0fa0f64
 +                shadowBindGroups[i] = wgpuDeviceCreateBindGroup(device, &sgd);
 +            }
 +
-+            WGPUBufferDescriptor ubd = {};
-+            ubd.size = 224;
-+            ubd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
-+            recordUniformBufs[i] = wgpuDeviceCreateBuffer(device, &ubd);
 +            WGPUBindGroupEntry e = {};
-+            e.binding = 0; e.buffer = recordUniformBufs[i]; e.size = 224;
++            e.binding = 0; e.buffer = recordUBuf; e.offset = (uint64_t)i * kUBStride; e.size = 224;
 +            WGPUBindGroupDescriptor bgd = {};
 +            bgd.entryCount = 1;
 +            bgd.entries = &e;
@@ -3692,6 +3749,10 @@ index 0000000..0fa0f64
 +            outCount = lastRecordCount;
 +            return lastRecordCount > 0;
 +        }
++
++        // Iter 28: fresh drain — slots written below land in the CPU stages;
++        // one writeBuffer per family flushes them at the end of this drain.
++        recordUBHigh = passUBHigh = shadowUBHigh = 0;
 +
 +        const uint32_t vNeed = (g_capVertBytes + 3u) & ~3u;
 +        const uint32_t iNeed = (g_capIndexBytes + 3u) & ~3u;
@@ -3801,7 +3862,8 @@ index 0000000..0fa0f64
 +            ub[51] = (float)r.pad3 / 1000.0f;
 +            ub[52] = g_capInvGamma;
 +            ub[53] = 0.0f; ub[54] = 0.0f; ub[55] = 0.0f;
-+            wgpuQueueWriteBuffer(queue, recordUniformBufs[i], 0, ub, 224);
++            memcpy(recordUBStage + (size_t)i * kUBStride, ub, 224);
++            if (i + 1 > recordUBHigh) recordUBHigh = i + 1;
 +            // Iter 7b: resolve the material bind group (creates GPU textures
 +            // from the CPU image cache on first sight of each image).
 +            lastMatGroups[i] = getMaterialBindGroup(g_capImagePtrs[i]);
@@ -3995,7 +4057,8 @@ index 0000000..0fa0f64
 +                    ub[20] = svcMod; ub[21] = svcAdd; ub[22] = 0.0f; ub[23] = 0.0f;
 +                    memcpy(ub + 24, r.lightProjS, 16);   // stage texture matrix S
 +                    memcpy(ub + 28, r.lightProjT, 16);   // stage texture matrix T
-+                    wgpuQueueWriteBuffer(queue, passUniformBufs[pn], 0, ub, 128);
++                    memcpy(passUBStage + (size_t)pn * kUBStride, ub, 128);
++                    if (pn + 1 > passUBHigh) passUBHigh = pn + 1;
 +                    // Iter 17: cinematic records bind this frame's decoded
 +                    // video frame (per-slot dynamic texture) instead of a
 +                    // cached engine image.
@@ -4049,7 +4112,8 @@ index 0000000..0fa0f64
 +                    float ub[20];
 +                    memcpy(ub + 0, r.modelMatrix, 64);
 +                    memcpy(ub + 16, r.localLightOrigin, 16);
-+                    wgpuQueueWriteBuffer(queue, shadowUniformBufs[sn], 0, ub, 80);
++                    memcpy(shadowUBStage + (size_t)sn * kUBStride, ub, 80);
++                    if (sn + 1 > shadowUBHigh) shadowUBHigh = sn + 1;
 +                    lastShadowRecords[sn] = r;
 +                    sn++;
 +                }
@@ -4262,10 +4326,22 @@ index 0000000..0fa0f64
 +            }
 +        }
 +
-+        // CONSUME: drain the accumulator so next frame starts fresh.
++        // Iter 28: flush the slot-uniform stages — ONE writeBuffer per family
++        // (replaces the per-record writes; ~700 staging copies → ≤3).
++        if (recordUBHigh && recordUBuf)
++            wgpuQueueWriteBuffer(queue, recordUBuf, 0, recordUBStage, (uint64_t)recordUBHigh * kUBStride);
++        if (passUBHigh && passUBuf)
++            wgpuQueueWriteBuffer(queue, passUBuf, 0, passUBStage, (uint64_t)passUBHigh * kUBStride);
++        if (shadowUBHigh && shadowUBuf)
++            wgpuQueueWriteBuffer(queue, shadowUBuf, 0, shadowUBStage, (uint64_t)shadowUBHigh * kUBStride);
++
++        // CONSUME: drain the accumulator so next frame starts fresh. The
++        // geometry-dedup table keys on frame-temp pointers — reset with the
++        // accumulator it indexes into (iter 28).
 +        g_capRecordCount = 0;
 +        g_capVertBytes   = 0;
 +        g_capIndexBytes  = 0;
++        g_capVertDedupCount = 0;
 +        // One-shot cache-budget report once the level + HUD have loaded
 +        // (texture-resolution measurement instrument).
 +        {
@@ -4273,6 +4349,10 @@ index 0000000..0fa0f64
 +            if (!cacheReported && detFrameCounter >= 300) {
 +                cacheReported = true;
 +                D3_WebGPU_ReportImageCache();
++                EM_ASM_({
++                    console.info("[d3] WebGPU GPU texture cache: " + $0 + " textures, " +
++                                 ($1).toFixed(1) + " MB, " + $2 + " budget-dropped");
++                }, texCacheCount, (double)gpuTexBytes / (1024.0 * 1024.0), gpuTexDropped);
 +            }
 +        }
 +        static bool announcedOnce = false;
@@ -5365,7 +5445,23 @@ index 0000000..0fa0f64
 +    WGPUBuffer              recordIndexBuf  = nullptr;
 +    uint32_t                recordVertexCap = 0;   // bytes
 +    uint32_t                recordIndexCap  = 0;   // bytes
-+    WGPUBuffer              recordUniformBufs[kMaxRecordSlots] = {nullptr};
++    // Iter 28: ONE uniform buffer per slot family (record/pass/shadow) at a
++    // 256B stride instead of kMaxRecordSlots tiny buffers each. WebKit's
++    // WebGPU backs every GPUBuffer with its own page-padded MTLBuffer and
++    // every writeBuffer call with a staging copy — 2688 buffers + ~700 tiny
++    // writes/frame was the same per-call disease class as the WebKit GL
++    // blit storm. Slots write into a CPU stage; one writeBuffer per family
++    // per frame flushes the used range. Bind groups keep static offsets.
++    static constexpr uint32_t kUBStride = 256;
++    WGPUBuffer              recordUBuf = nullptr;
++    WGPUBuffer              passUBuf   = nullptr;
++    WGPUBuffer              shadowUBuf = nullptr;
++    uint8_t                 recordUBStage[kMaxRecordSlots * kUBStride] = {};
++    uint8_t                 passUBStage[kMaxRecordSlots * kUBStride] = {};
++    uint8_t                 shadowUBStage[kMaxRecordSlots * kUBStride] = {};
++    uint32_t                recordUBHigh = 0;   // slots used this drain (flush range)
++    uint32_t                passUBHigh = 0;
++    uint32_t                shadowUBHigh = 0;
 +    WGPUBindGroup           recordBindGroups[kMaxRecordSlots]  = {nullptr};
 +    WGPUBindGroup           recordDepthBindGroups[kMaxRecordSlots] = {nullptr};
 +    bool                    recordSlotsReady = false;
@@ -5386,6 +5482,8 @@ index 0000000..0fa0f64
 +    MatCacheEntry           matCache[kMatCacheSize] = {};
 +    int                     texCacheCount = 0;
 +    int                     matCacheCount = 0;
++    size_t                  gpuTexBytes = 0;     // iter 28: bytes resident in texCache (incl. mips)
++    int                     gpuTexDropped = 0;   // iter 28: images denied by r_wgpuTexBudgetMB
 +    bool                    matCacheOverflowWarned = false;
 +    WGPUTextureView         fbFlatNormalView = nullptr;
 +    WGPUTextureView         fbWhiteView      = nullptr;
@@ -5403,7 +5501,6 @@ index 0000000..0fa0f64
 +    WGPURenderPipeline      guiAddPipeline    = nullptr;
 +    WGPURenderPipeline      guiAlphaPipeline  = nullptr;
 +    WGPUBindGroupLayout     passBGL           = nullptr;
-+    WGPUBuffer              passUniformBufs[kMaxRecordSlots] = {nullptr};
 +    Rec                     lastPassRecords[kMaxRecordSlots] = {};
 +    WGPUBindGroup           lastPassGroups[kMaxRecordSlots]  = {nullptr};
 +    uint32_t                lastPassCount = 0;
@@ -5418,7 +5515,6 @@ index 0000000..0fa0f64
 +    WGPURenderPipeline      shadowZFailPipeline = nullptr;
 +    WGPURenderPipeline      shadowZPassPipeline = nullptr;
 +    WGPUBindGroupLayout     shadowBGL = nullptr;
-+    WGPUBuffer              shadowUniformBufs[kMaxRecordSlots] = {nullptr};
 +    WGPUBindGroup           shadowBindGroups[kMaxRecordSlots]  = {nullptr};
 +    WGPUBuffer              shadowVertexBuf = nullptr;
 +    uint32_t                shadowVertexCap = 0;
@@ -5572,7 +5668,7 @@ index 0000000..0f9c8e6
 +    return nullptr;
 +}
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
-index 7914093..0d20e0e 100644
+index 7914093..c200bf0 100644
 --- a/neo/renderer/RenderSystem_init.cpp
 +++ b/neo/renderer/RenderSystem_init.cpp
 @@ -39,6 +39,11 @@ If you have questions concerning this license or the applicable additional terms
@@ -5587,7 +5683,7 @@ index 7914093..0d20e0e 100644
  
  #include "framework/GameCallbacks_local.h"
  #include "framework/Game.h"
-@@ -102,6 +107,23 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
+@@ -102,6 +107,28 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
  
  idCVar r_skipSuppress( "r_skipSuppress", "0", CVAR_RENDERER | CVAR_BOOL, "ignore the per-view suppressions" );
  idCVar r_skipPostProcess( "r_skipPostProcess", "0", CVAR_RENDERER | CVAR_BOOL, "skip all post-process renderings" );
@@ -5605,13 +5701,18 @@ index 7914093..0d20e0e 100644
 +idCVar r_shadowDarken( "r_shadowDarken", "0.6", CVAR_RENDERER | CVAR_FLOAT, "WebGPU: multiply shadowed pixels by this factor (1 = off; Quest-style visible shadows)" );
 +idCVar r_bloomThreshold( "r_bloomThreshold", "0.5", CVAR_RENDERER | CVAR_FLOAT, "bloom bright-pass threshold (0..1)" );
 +idCVar r_bloomScale( "r_bloomScale", "1.25", CVAR_RENDERER | CVAR_FLOAT, "bloom intensity" );
++// Iter 28: WebGPU GPU-memory diet for iOS Safari (the tab dies on total GPU
++// memory — WebGL context lost + createBindGroup InvalidStateError at load).
++idCVar r_wgpuTexBudgetMB( "r_wgpuTexBudgetMB", "0", CVAR_RENDERER | CVAR_INTEGER, "WebGPU texture-cache GPU byte budget in MB (0 = unlimited); over-budget images bind a fallback instead of crashing the device" );
++idCVar r_wgpuTexMaxDim( "r_wgpuTexMaxDim", "0", CVAR_RENDERER | CVAR_INTEGER, "WebGPU texture-cache max dimension (0 = uncapped); larger cached images are box-reduced before GPU upload" );
++idCVar r_wgpuDetTest( "r_wgpuDetTest", "1", CVAR_RENDERER | CVAR_BOOL, "run the WebGPU determinism self-test (extra offscreen targets + readback buffers; disable on memory-tight devices)" );
 +idCVar r_skipGLDraw( "r_skipGLDraw", "0", CVAR_RENDERER | CVAR_BOOL,
 +	"skip GL draw calls (WebGPU-primary cutover; the WebGPU echo renders instead). "
 +	"Tiny views (lightgem) keep drawing so gameplay light readback works." );
  idCVar r_skipLightScale( "r_skipLightScale", "0", CVAR_RENDERER | CVAR_BOOL, "don't do any post-interaction light scaling, makes things dim on low-dynamic range cards" );
  idCVar r_skipInteractions( "r_skipInteractions", "0", CVAR_RENDERER | CVAR_BOOL, "skip all light/surface interaction drawing" );
  idCVar r_skipDynamicTextures( "r_skipDynamicTextures", "0", CVAR_RENDERER | CVAR_BOOL, "don't dynamically create textures" );
-@@ -158,6 +180,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
+@@ -158,6 +185,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
  idCVar r_useExternalShadows( "r_useExternalShadows", "1", CVAR_RENDERER | CVAR_INTEGER, "1 = skip drawing caps when outside the light volume, 2 = force to no caps for testing", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
  idCVar r_useOptimizedShadows( "r_useOptimizedShadows", "1", CVAR_RENDERER | CVAR_BOOL, "use the dmap generated static shadow volumes" );
  idCVar r_useScissor( "r_useScissor", "1", CVAR_RENDERER | CVAR_BOOL, "scissor clip as portals and lights are processed" );
@@ -5619,7 +5720,7 @@ index 7914093..0d20e0e 100644
  idCVar r_useCombinerDisplayLists( "r_useCombinerDisplayLists", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "put all nvidia register combiner programming in display lists" );
  idCVar r_useDepthBoundsTest( "r_useDepthBoundsTest", "1", CVAR_RENDERER | CVAR_BOOL, "use depth bounds test to reduce shadow fill" );
  
-@@ -819,11 +842,63 @@ void R_InitOpenGL( void ) {
+@@ -819,11 +847,63 @@ void R_InitOpenGL( void ) {
  		r_multiSamples.SetInteger( 0 );
  	}
  
@@ -5683,7 +5784,7 @@ index 7914093..0d20e0e 100644
  
  #include "renderer/qgl_proc.h"
  
-@@ -2505,6 +2580,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
+@@ -2505,6 +2585,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
  	// is destroyed (relevant when starting a mod which also recreates window)
  	Sys_ShutdownInput();
  
@@ -5699,10 +5800,10 @@ index 7914093..0d20e0e 100644
  	GLimp_Shutdown();
  
 diff --git a/neo/renderer/draw_arb2.cpp b/neo/renderer/draw_arb2.cpp
-index c1d0d3e..9b81372 100644
+index c1d0d3e..24a3af8 100644
 --- a/neo/renderer/draw_arb2.cpp
 +++ b/neo/renderer/draw_arb2.cpp
-@@ -62,7 +62,174 @@ static void GL_SelectTextureNoClient( int unit ) {
+@@ -62,7 +62,204 @@ static void GL_SelectTextureNoClient( int unit ) {
  RB_ARB2_DrawInteraction
  ==================
  */
@@ -5754,6 +5855,11 @@ index c1d0d3e..9b81372 100644
 +    extern void* g_capSpecLUTPtr;
 +    extern uint32_t g_capTranslucent;
 +    extern void* g_capImagePtrs[][5];
++    // Iter 28: per-frame vertex dedup table (defined in tr_render.cpp;
++    // layout must mirror its WGPUVertDedupEntry).
++    typedef struct { const void* verts; uint32_t vertOffset; uint32_t vertCount; } WGPUVertDedupEntry;
++    extern WGPUVertDedupEntry g_capVertDedup[];
++    extern uint32_t g_capVertDedupCount;
 +}
 +enum { kWGPUMaxCapV = 8192, kWGPUMaxCapI = 32768 };
 +// MUST mirror tr_render.cpp's kWGPUMaxRecords/kWGPUVertAccumBytes/
@@ -5798,16 +5904,43 @@ index c1d0d3e..9b81372 100644
 +		const uint32_t ibytes = (uint32_t)din->surf->geo->numIndexes * 2u;
 +		const uint32_t vbytesRound = (vbytes + 3u) & ~3u;
 +		const uint32_t ibytesRound = (ibytes + 3u) & ~3u;
-+		if ( g_capVertBytes + vbytesRound <= (uint32_t)kWGPUVertCap
++		// Iter 28: per-frame VERTEX dedup — per-light interaction tris are
++		// distinct srfTriangles_t but reference the SAME ambient vertex
++		// array (R_CreateLightTris → R_ReferenceStaticTriSurfVerts), so a
++		// surface lit by N lights re-appended identical verts N times
++		// (~96% of the ~16MB/frame re-upload). Indexes are per-light culled
++		// subsets and always append. Table resets when the backend drains.
++		int dedupHit = -1;
++		for ( uint32_t k = 0; k < g_capVertDedupCount; ++k ) {
++			if ( g_capVertDedup[k].verts == (const void*)din->surf->geo->verts
++				 && g_capVertDedup[k].vertCount == (uint32_t)din->surf->geo->numVerts ) {
++				dedupHit = (int)k;
++				break;
++			}
++		}
++		const uint32_t vGrow = ( dedupHit >= 0 ) ? 0u : vbytesRound;
++		if ( g_capVertBytes + vGrow <= (uint32_t)kWGPUVertCap
 +			 && g_capIndexBytes + ibytesRound <= (uint32_t)kWGPUIdxCap ) {
-+			memcpy( g_capVertsAccum + g_capVertBytes, din->surf->geo->verts, vbytes );
++			WGPUInteractionRecord& r = g_capRecords[g_capRecordCount];
++			if ( dedupHit >= 0 ) {
++				r.vertOffset = g_capVertDedup[dedupHit].vertOffset;
++			} else {
++				memcpy( g_capVertsAccum + g_capVertBytes, din->surf->geo->verts, vbytes );
++				r.vertOffset = g_capVertBytes;
++				if ( g_capVertDedupCount < (uint32_t)kWGPUMaxRec ) {
++					g_capVertDedup[g_capVertDedupCount].verts = (const void*)din->surf->geo->verts;
++					g_capVertDedup[g_capVertDedupCount].vertOffset = g_capVertBytes;
++					g_capVertDedup[g_capVertDedupCount].vertCount = (uint32_t)din->surf->geo->numVerts;
++					g_capVertDedupCount++;
++				}
++				g_capVertBytes += vbytesRound;
++			}
 +			for ( int i = 0; i < din->surf->geo->numIndexes; ++i ) {
 +				g_capIndexesAccum[(g_capIndexBytes / 2) + i] = (uint16_t)din->surf->geo->indexes[i];
 +			}
-+			WGPUInteractionRecord& r = g_capRecords[g_capRecordCount];
-+			r.vertOffset  = g_capVertBytes;
-+			r.vertCount   = (uint32_t)din->surf->geo->numVerts;
 +			r.indexOffset = g_capIndexBytes;
++			g_capIndexBytes += ibytesRound;
++			r.vertCount   = (uint32_t)din->surf->geo->numVerts;
 +			r.indexCount  = (uint32_t)din->surf->geo->numIndexes;
 +			// Tag with the owning view so the backend can keep only the main
 +			// view's records (subviews — mirrors, security monitors — render
@@ -5859,8 +5992,6 @@ index c1d0d3e..9b81372 100644
 +			g_capImagePtrs[g_capRecordCount][2] = (void*)din->lightImage;
 +			g_capImagePtrs[g_capRecordCount][3] = (void*)din->diffuseImage;
 +			g_capImagePtrs[g_capRecordCount][4] = (void*)din->specularImage;
-+			g_capVertBytes  += vbytesRound;
-+			g_capIndexBytes += ibytesRound;
 +			g_capRecordCount++;
 +			g_capFrameId++;
 +		} else {
@@ -5877,7 +6008,7 @@ index c1d0d3e..9b81372 100644
  	// load all the vertex program parameters
  	qglProgramEnvParameter4fvARB( GL_VERTEX_PROGRAM_ARB, PP_LIGHT_ORIGIN, din->localLightOrigin.ToFloatPtr() );
  	qglProgramEnvParameter4fvARB( GL_VERTEX_PROGRAM_ARB, PP_VIEW_ORIGIN, din->localViewOrigin.ToFloatPtr() );
-@@ -190,6 +357,7 @@ void RB_ARB2_CreateDrawInteractions( const drawSurf_t *surf ) {
+@@ -190,6 +387,7 @@ void RB_ARB2_CreateDrawInteractions( const drawSurf_t *surf ) {
  	} else {
  		globalImages->specularTableImage->Bind();
  	}
@@ -5885,7 +6016,7 @@ index c1d0d3e..9b81372 100644
  
  
  	for ( ; surf ; surf=surf->nextOnLight ) {
-@@ -258,6 +426,7 @@ void RB_ARB2_DrawInteractions( void ) {
+@@ -258,6 +456,7 @@ void RB_ARB2_DrawInteractions( void ) {
  	//
  	for ( vLight = backEnd.viewDef->viewLights ; vLight ; vLight = vLight->next ) {
  		backEnd.vLight = vLight;
@@ -5893,7 +6024,7 @@ index c1d0d3e..9b81372 100644
  
  		// do fogging later
  		if ( vLight->lightShader->IsFogLight() ) {
-@@ -314,7 +483,9 @@ void RB_ARB2_DrawInteractions( void ) {
+@@ -314,7 +513,9 @@ void RB_ARB2_DrawInteractions( void ) {
  		qglStencilFunc( GL_ALWAYS, 128, 255 );
  
  		backEnd.depthFunc = GLS_DEPTHFUNC_LESS;
@@ -5903,7 +6034,7 @@ index c1d0d3e..9b81372 100644
  
  		backEnd.depthFunc = GLS_DEPTHFUNC_EQUAL;
  	}
-@@ -757,6 +928,26 @@ int R_FindARBProgram( GLenum target, const char *program ) {
+@@ -757,6 +958,26 @@ int R_FindARBProgram( GLenum target, const char *program ) {
  	return progs[i].ident;
  }
  
@@ -6271,7 +6402,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..0f6d74c 100644
+index c83ebb5..413afa0 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -6282,7 +6413,7 @@ index c83ebb5..0f6d74c 100644
  
  /*
  
-@@ -38,6 +39,735 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +39,762 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -6366,6 +6497,17 @@ index c83ebb5..0f6d74c 100644
 +    uint32_t g_capIndexBytes  = 0;
 +    uint32_t g_capFrameId     = 0;   // bumped at BeginDrawingView once we have records
 +    uint32_t g_capDropped     = 0;   // records skipped because a cap was hit (reset on consume)
++    // Iter 28: per-frame VERTEX dedup. Per-light interaction tris are
++    // distinct srfTriangles_t but REFERENCE the same ambient vertex array
++    // (R_CreateLightTris → R_ReferenceStaticTriSurfVerts), so a surface lit
++    // by N lights re-appended identical verts N times — ~96% of the
++    // ~16MB/frame accumulator re-upload. Keyed by the verts pointer
++    // (stable within a frame; the table resets when the backend drains, so
++    // cross-frame recycling is safe). Indexes are per-light culled subsets
++    // and always append.
++    typedef struct { const void* verts; uint32_t vertOffset; uint32_t vertCount; } WGPUVertDedupEntry;
++    WGPUVertDedupEntry g_capVertDedup[kWGPUMaxRecords];
++    uint32_t g_capVertDedupCount = 0;
 +    float    g_capInvGamma    = 1.0f; // 1/r_gamma, refreshed at capture (iter 8a)
 +    // Iter 9: stencil shadows. Shadow volumes use 16-byte vec4 verts
 +    // (shadowCache_t), accumulated separately; indexes share the main index
@@ -6441,6 +6583,11 @@ index c83ebb5..0f6d74c 100644
 +    float    g_capBloomScale = 0.9f;
 +    int      g_capWgpuSingleLight = -1;   // debug: backend draws only this lightId
 +    float    g_capShadowDarken = 0.6f;    // Quest-style shadow darkening factor (1 = off)
++    // Iter 28: WebGPU GPU-memory diet (iOS Safari kills the tab on total GPU
++    // memory). Budget/dim-cap for the backend's texture cache + det-test gate.
++    int      g_capTexBudgetMB = 0;        // 0 = unlimited
++    int      g_capTexMaxDim = 0;          // 0 = uncapped
++    uint32_t g_capDetTest = 1;
 +}
 +
 +// Iter 17: stash a decoded cinematic frame (called from
@@ -6584,13 +6731,24 @@ index c83ebb5..0f6d74c 100644
 +
 +extern "C" void D3_WebGPU_CacheImage( const class idImage* img, const unsigned char* rgba, int w, int h ) {
 +    if ( !img || !rgba || w <= 0 || h <= 0 || w > 4096 || h > 4096 ) return;
-+    // Nearest-downsample anything above 256 so the cache RAM stays bounded
-+    // even on desktop profiles with no image_downSizeLimit (the wearable
-+    // profile already caps GPU textures at 128 so this is a no-op there).
++    // Nearest-downsample anything above the cap so the cache RAM stays
++    // bounded. Default cap 256; iter 28: r_wgpuTexMaxDim lowers it (phone
++    // profile: 128) — these pixel buffers live in the wasm heap, and iOS
++    // jetsam kills the tab on TOTAL process memory, so shrinking the cache
++    // at cache time (not just at GPU-upload time) lowers the heap peak.
++    int cap = 256;
++    {
++        extern idCVar r_wgpuTexMaxDim;
++        const int d = r_wgpuTexMaxDim.GetInteger();
++        if ( d > 0 && d < cap ) cap = d;
++    }
 +    int step = 1;
-+    while ( (w / step) > 256 || (h / step) > 256 ) step <<= 1;
-+    const int dw = w / step, dh = h / step;
-+    if ( dw <= 0 || dh <= 0 ) return;
++    while ( (w / step) > cap || (h / step) > cap ) step <<= 1;
++    // Clamp, don't reject: a 256x1 LUT (_specularTable) at cap 128 computes
++    // dh=0 — rejecting it silently broke specular on the phone profile.
++    int dw = w / step, dh = h / step;
++    if ( dw < 1 ) dw = 1;
++    if ( dh < 1 ) dh = 1;
 +    // Find existing slot or allocate
 +    int slot = -1;
 +    for ( int i = 0; i < g_imgCacheCount; ++i ) {
@@ -7018,7 +7176,7 @@ index c83ebb5..0f6d74c 100644
  
  /*
  =================
-@@ -49,6 +779,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +806,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -7034,7 +7192,7 @@ index c83ebb5..0f6d74c 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +817,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +844,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -7050,7 +7208,7 @@ index c83ebb5..0f6d74c 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +864,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +891,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -7067,7 +7225,7 @@ index c83ebb5..0f6d74c 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +924,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +951,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -7075,7 +7233,7 @@ index c83ebb5..0f6d74c 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1151,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1178,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -7088,7 +7246,7 @@ index c83ebb5..0f6d74c 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1320,51 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1347,55 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
@@ -7105,6 +7263,10 @@ index c83ebb5..0f6d74c 100644
 +		g_capWgpuSingleLight = r_wgpuSingleLight.GetInteger();
 +		extern idCVar r_shadowDarken;
 +		g_capShadowDarken = r_shadowDarken.GetFloat();
++		extern idCVar r_wgpuTexBudgetMB, r_wgpuTexMaxDim, r_wgpuDetTest;
++		g_capTexBudgetMB = r_wgpuTexBudgetMB.GetInteger();
++		g_capTexMaxDim = r_wgpuTexMaxDim.GetInteger();
++		g_capDetTest = r_wgpuDetTest.GetBool() ? 1u : 0u;
 +	}
 +	// Iter 6.6: the multi-surface accumulator is intentionally NOT reset
 +	// here. RB_BeginDrawingView runs once per VIEW (main view, lightgem,

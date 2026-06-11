@@ -483,7 +483,13 @@ try {
     const now = performance.now();
     if (now - last >= 2000) {
       const mem = (typeof window.__d3HeapMB === "function") ? ` | wasm ${window.__d3HeapMB()}MB` : "";
-      fpsLine = `build ${BUILD_STAMP} UTC | fps ${(frames * 1000 / (now - last)).toFixed(1)}${mem}`;
+      // WebGPU texture footprint (set by the backend on every cache insert) —
+      // persisted with the rest of the line by crash telemetry, so a dead iOS
+      // tab reports how much GPU texture memory it held.
+      const wtex = (typeof window.__d3WgpuTexMB === "number")
+        ? ` | wgpu-tex ${window.__d3WgpuTexMB.toFixed(0)}MB/${window.__d3WgpuTexN}${window.__d3WgpuTexDrop ? ` (drop ${window.__d3WgpuTexDrop})` : ""}`
+        : "";
+      fpsLine = `build ${BUILD_STAMP} UTC | fps ${(frames * 1000 / (now - last)).toFixed(1)}${mem}${wtex}`;
       try { localStorage.setItem("d3_prev_session", JSON.stringify({ t: Date.now(), line: fpsLine })); } catch {}
       frames = 0;
       last = now;
