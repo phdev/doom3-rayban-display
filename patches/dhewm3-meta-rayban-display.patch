@@ -1917,10 +1917,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..16a3b30
+index 0000000..042a9fa
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,3445 @@
+@@ -0,0 +1,3552 @@
 +/*
 +================================================================================
 +
@@ -2049,6 +2049,7 @@ index 0000000..16a3b30
 +extern "C" void D3_WebGPU_ReportImageCache(void);
 +extern "C" uint32_t g_capBloomOn;
 +extern "C" int g_capWgpuSingleLight;
++extern "C" float g_capShadowDarken;
 +extern "C" float    g_capBloomThresh;
 +extern "C" float    g_capBloomScale;
 +
@@ -2920,6 +2921,51 @@ index 0000000..16a3b30
 +        bloomBrightPipeline    = makeBloom("fs_bright", false, "bloomBright");
 +        bloomBlurPipeline      = makeBloom("fs_blur", false, "bloomBlur");
 +        bloomCompositePipeline = makeBloom("fs_composite", true, "bloomComposite");
++
++        // Iter 23: shadow-darkening fullscreen multiply — stencil-gated
++        // (NotEqual 128 = inside the union of shadow volumes), blend
++        // dst*src, drawn inside a pass that has the depth-stencil attached.
++        {
++            WGPUDepthStencilState dss = {};
++            dss.format = WGPUTextureFormat_Depth24PlusStencil8;
++            dss.depthWriteEnabled = WGPUOptionalBool_False;
++            dss.depthCompare = WGPUCompareFunction_Always;
++            dss.stencilFront.compare = WGPUCompareFunction_NotEqual;
++            dss.stencilBack.compare  = WGPUCompareFunction_NotEqual;
++            dss.stencilFront.failOp = dss.stencilFront.depthFailOp = dss.stencilFront.passOp = WGPUStencilOperation_Keep;
++            dss.stencilBack.failOp  = dss.stencilBack.depthFailOp  = dss.stencilBack.passOp  = WGPUStencilOperation_Keep;
++            WGPUColorTargetState target = {};
++            target.format = surfaceFormat;
++            target.writeMask = WGPUColorWriteMask_All;
++            WGPUBlendState blend = {};
++            blend.color.srcFactor = WGPUBlendFactor_Dst;
++            blend.color.dstFactor = WGPUBlendFactor_Zero;
++            blend.alpha.srcFactor = WGPUBlendFactor_Dst;
++            blend.alpha.dstFactor = WGPUBlendFactor_Zero;
++            target.blend = &blend;
++            WGPUFragmentState frag = {};
++            frag.module = mod;
++            frag.entryPoint = { "fs_darken", WGPU_STRLEN };
++            frag.targetCount = 1;
++            frag.targets = &target;
++            WGPURenderPipelineDescriptor pd = {};
++            pd.label = { "shadowDarken", WGPU_STRLEN };
++            pd.layout = pl;
++            pd.vertex.module = mod;
++            pd.vertex.entryPoint = { "vs_main", WGPU_STRLEN };
++            pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
++            pd.primitive.cullMode = WGPUCullMode_None;
++            pd.multisample.count = 1;
++            pd.multisample.mask = 0xFFFFFFFF;
++            pd.fragment = &frag;
++            pd.depthStencil = &dss;
++            shadowDarkenPipeline = wgpuDeviceCreateRenderPipeline(device, &pd);
++
++            WGPUBufferDescriptor d = {};
++            d.size = 32;
++            d.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
++            shadowDarkenUB = wgpuDeviceCreateBuffer(device, &d);
++        }
 +        wgpuPipelineLayoutRelease(pl);
 +        wgpuShaderModuleRelease(mod);
 +
@@ -4370,6 +4416,63 @@ index 0000000..16a3b30
 +                wgpuRenderPassEncoderRelease(rp);
 +            }
 +        }
++        // Iter 23: Quest-style visible shadows — re-mark the union of ALL
++        // shadow volumes in a fresh stencil, then multiply every shadowed
++        // pixel by r_shadowDarken. Not physically per-light (vanilla only
++        // masks each light's own contribution) but it makes shadows READ
++        // the way they do on consoles/Quest, independent of light energy.
++        if (shadowDarkenPipeline && shadowDarkenUB && bloomBGL && shadowVertexBuf &&
++            shadowZFailPipeline && shadowZPassPipeline &&
++            lastShadowCount > 0 && g_capShadowDarken < 0.999f && colorCleared) {
++            if (!shadowDarkenBG && fbWhiteView) {
++                WGPUBindGroupEntry e[3] = {};
++                e[0].binding = 0; e[0].buffer = shadowDarkenUB; e[0].size = 32;
++                e[1].binding = 1; e[1].sampler = interactionLightSampler;
++                e[2].binding = 2; e[2].textureView = fbWhiteView;
++                WGPUBindGroupDescriptor bgd = {};
++                bgd.layout = bloomBGL;
++                bgd.entryCount = 3;
++                bgd.entries = e;
++                shadowDarkenBG = wgpuDeviceCreateBindGroup(device, &bgd);
++            }
++            if (shadowDarkenBG) {
++                float k = g_capShadowDarken; if (k < 0.0f) k = 0.0f;
++                float ub[8] = { k, 0, 0, 0, 0, 0, 0, 0 };
++                wgpuQueueWriteBuffer(queue, shadowDarkenUB, 0, ub, 32);
++                WGPURenderPassColorAttachment ca = {};
++                ca.view = color;
++                ca.loadOp = WGPULoadOp_Load;
++                ca.storeOp = WGPUStoreOp_Store;
++                ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
++                WGPURenderPassDepthStencilAttachment da = {};
++                da.view = depth;
++                da.depthLoadOp = WGPULoadOp_Load;
++                da.depthStoreOp = WGPUStoreOp_Store;
++                da.stencilLoadOp = WGPULoadOp_Clear;
++                da.stencilStoreOp = WGPUStoreOp_Store;
++                da.stencilClearValue = 128;
++                WGPURenderPassDescriptor rpd = {};
++                rpd.colorAttachmentCount = 1;
++                rpd.colorAttachments = &ca;
++                rpd.depthStencilAttachment = &da;
++                WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
++                wgpuRenderPassEncoderSetStencilReference(rp, 128);
++                for (uint32_t sIdx = 0; sIdx < lastShadowCount; ++sIdx) {
++                    const Rec& sr = lastShadowRecords[sIdx];
++                    wgpuRenderPassEncoderSetPipeline(rp, sr.pad1 ? shadowZPassPipeline : shadowZFailPipeline);
++                    wgpuRenderPassEncoderSetBindGroup(rp, 0, shadowBindGroups[sIdx], 0, nullptr);
++                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, shadowVertexBuf, sr.vertOffset, (uint64_t)sr.vertCount * 16u);
++                    wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, sr.indexOffset, (uint64_t)sr.indexCount * 2u);
++                    wgpuRenderPassEncoderDrawIndexed(rp, sr.indexCount, 1, 0, 0, 0);
++                }
++                wgpuRenderPassEncoderSetPipeline(rp, shadowDarkenPipeline);
++                wgpuRenderPassEncoderSetBindGroup(rp, 0, shadowDarkenBG, 0, nullptr);
++                wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
++                wgpuRenderPassEncoderEnd(rp);
++                wgpuRenderPassEncoderRelease(rp);
++            }
++        }
++
 +        // Final pass: emissive shader passes + 2D HUD over the lit result.
 +        // With heat-haze records it splits in two around a canvas copy:
 +        // part A = sky/reflect/fog/blend/3D passes, then the frame so far is
@@ -5343,6 +5446,10 @@ index 0000000..16a3b30
 +    WGPUBuffer              bloomUB[4] = {nullptr};      // bright, blurH, blurV, composite
 +    WGPUBindGroup           bloomBG[4] = {nullptr};
 +    uint32_t                bloomBGGen = 0, bloomBGCurGen = 0;
++    // Iter 23: Quest-style shadow darkening (union-of-volumes multiply).
++    WGPURenderPipeline      shadowDarkenPipeline = nullptr;
++    WGPUBuffer              shadowDarkenUB = nullptr;
++    WGPUBindGroup           shadowDarkenBG = nullptr;
 +    // Iter 6.8: on-device determinism self-test. Renders the identical
 +    // record set twice into two offscreen textures, reads both back,
 +    // byte-compares. Sidesteps the canvas-readback trap (WebGPU canvases
@@ -5399,7 +5506,7 @@ index 0000000..0f9c8e6
 +    return nullptr;
 +}
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
-index 7914093..ab1a3e8 100644
+index 7914093..0d20e0e 100644
 --- a/neo/renderer/RenderSystem_init.cpp
 +++ b/neo/renderer/RenderSystem_init.cpp
 @@ -39,6 +39,11 @@ If you have questions concerning this license or the applicable additional terms
@@ -5414,7 +5521,7 @@ index 7914093..ab1a3e8 100644
  
  #include "framework/GameCallbacks_local.h"
  #include "framework/Game.h"
-@@ -102,6 +107,22 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
+@@ -102,6 +107,23 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
  
  idCVar r_skipSuppress( "r_skipSuppress", "0", CVAR_RENDERER | CVAR_BOOL, "ignore the per-view suppressions" );
  idCVar r_skipPostProcess( "r_skipPostProcess", "0", CVAR_RENDERER | CVAR_BOOL, "skip all post-process renderings" );
@@ -5429,6 +5536,7 @@ index 7914093..ab1a3e8 100644
 +// each view by RB_BeginDrawingView.
 +idCVar r_bloom( "r_bloom", "0", CVAR_RENDERER | CVAR_BOOL, "WebGPU bloom post-process" );
 +idCVar r_wgpuSingleLight( "r_wgpuSingleLight", "-1", CVAR_RENDERER | CVAR_INTEGER, "debug: draw only the WebGPU capture lightId N (per-frame vLight order)" );
++idCVar r_shadowDarken( "r_shadowDarken", "0.6", CVAR_RENDERER | CVAR_FLOAT, "WebGPU: multiply shadowed pixels by this factor (1 = off; Quest-style visible shadows)" );
 +idCVar r_bloomThreshold( "r_bloomThreshold", "0.5", CVAR_RENDERER | CVAR_FLOAT, "bloom bright-pass threshold (0..1)" );
 +idCVar r_bloomScale( "r_bloomScale", "1.25", CVAR_RENDERER | CVAR_FLOAT, "bloom intensity" );
 +idCVar r_skipGLDraw( "r_skipGLDraw", "0", CVAR_RENDERER | CVAR_BOOL,
@@ -5437,7 +5545,7 @@ index 7914093..ab1a3e8 100644
  idCVar r_skipLightScale( "r_skipLightScale", "0", CVAR_RENDERER | CVAR_BOOL, "don't do any post-interaction light scaling, makes things dim on low-dynamic range cards" );
  idCVar r_skipInteractions( "r_skipInteractions", "0", CVAR_RENDERER | CVAR_BOOL, "skip all light/surface interaction drawing" );
  idCVar r_skipDynamicTextures( "r_skipDynamicTextures", "0", CVAR_RENDERER | CVAR_BOOL, "don't dynamically create textures" );
-@@ -158,6 +179,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
+@@ -158,6 +180,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
  idCVar r_useExternalShadows( "r_useExternalShadows", "1", CVAR_RENDERER | CVAR_INTEGER, "1 = skip drawing caps when outside the light volume, 2 = force to no caps for testing", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
  idCVar r_useOptimizedShadows( "r_useOptimizedShadows", "1", CVAR_RENDERER | CVAR_BOOL, "use the dmap generated static shadow volumes" );
  idCVar r_useScissor( "r_useScissor", "1", CVAR_RENDERER | CVAR_BOOL, "scissor clip as portals and lights are processed" );
@@ -5445,7 +5553,7 @@ index 7914093..ab1a3e8 100644
  idCVar r_useCombinerDisplayLists( "r_useCombinerDisplayLists", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "put all nvidia register combiner programming in display lists" );
  idCVar r_useDepthBoundsTest( "r_useDepthBoundsTest", "1", CVAR_RENDERER | CVAR_BOOL, "use depth bounds test to reduce shadow fill" );
  
-@@ -819,11 +841,63 @@ void R_InitOpenGL( void ) {
+@@ -819,11 +842,63 @@ void R_InitOpenGL( void ) {
  		r_multiSamples.SetInteger( 0 );
  	}
  
@@ -5509,7 +5617,7 @@ index 7914093..ab1a3e8 100644
  
  #include "renderer/qgl_proc.h"
  
-@@ -2505,6 +2579,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
+@@ -2505,6 +2580,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
  	// is destroyed (relevant when starting a mod which also recreates window)
  	Sys_ShutdownInput();
  
@@ -6097,7 +6205,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..66e4df5 100644
+index c83ebb5..4cfa923 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -6108,7 +6216,7 @@ index c83ebb5..66e4df5 100644
  
  /*
  
-@@ -38,6 +39,727 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +39,728 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -6266,6 +6374,7 @@ index c83ebb5..66e4df5 100644
 +    float    g_capBloomThresh = 0.62f;
 +    float    g_capBloomScale = 0.9f;
 +    int      g_capWgpuSingleLight = -1;   // debug: backend draws only this lightId
++    float    g_capShadowDarken = 0.6f;    // Quest-style shadow darkening factor (1 = off)
 +}
 +
 +// Iter 17: stash a decoded cinematic frame (called from
@@ -6836,7 +6945,7 @@ index c83ebb5..66e4df5 100644
  
  /*
  =================
-@@ -49,6 +771,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +772,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -6852,7 +6961,7 @@ index c83ebb5..66e4df5 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +809,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +810,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -6868,7 +6977,7 @@ index c83ebb5..66e4df5 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +856,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +857,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -6885,7 +6994,7 @@ index c83ebb5..66e4df5 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +916,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +917,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -6893,7 +7002,7 @@ index c83ebb5..66e4df5 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1143,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1144,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -6906,7 +7015,7 @@ index c83ebb5..66e4df5 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1312,49 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1313,51 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
@@ -6921,6 +7030,8 @@ index c83ebb5..66e4df5 100644
 +		g_capBloomThresh = r_bloomThreshold.GetFloat();
 +		g_capBloomScale = r_bloomScale.GetFloat();
 +		g_capWgpuSingleLight = r_wgpuSingleLight.GetInteger();
++		extern idCVar r_shadowDarken;
++		g_capShadowDarken = r_shadowDarken.GetFloat();
 +	}
 +	// Iter 6.6: the multi-surface accumulator is intentionally NOT reset
 +	// here. RB_BeginDrawingView runs once per VIEW (main view, lightgem,
@@ -6968,10 +7079,10 @@ index c83ebb5..66e4df5 100644
  	// ensures that depth writes are enabled for the depth clear
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..864e8b2
+index 0000000..579d28a
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,822 @@
+@@ -0,0 +1,831 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -7179,6 +7290,15 @@ index 0000000..864e8b2
 +"fn fs_composite(in: VSOut) -> @location(0) vec4<f32> {\n"
 +"    let b = textureSampleLevel(tex, samp, in.uv, 0.0).rgb;\n"
 +"    return vec4<f32>(b * u.params.y, 1.0);   // pipeline blend is additive\n"
++"}\n"
++"\n"
++"// Iter 23: Quest-style shadow darkening — a fullscreen multiply applied\n"
++"// where the union of all shadow volumes marked the stencil (≠128).\n"
++"// params.x = darken factor (0.6 = shadows at 60% brightness).\n"
++"@fragment\n"
++"fn fs_darken(in: VSOut) -> @location(0) vec4<f32> {\n"
++"    let k = u.params.x;\n"
++"    return vec4<f32>(k, k, k, 1.0);   // pipeline blend: dst * src\n"
 +"}\n"
 +"";
 +

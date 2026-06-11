@@ -1051,3 +1051,23 @@ CALIBRATION BAKED (the X360 recipe, measured): r_lightScale 2→4
 the data's genuinely-dark zones incl. characters). fx sliders synced
 to the new defaults. Result at the X360 vantage: lit crate + readable
 decals + visible marine + floor pools — the closest match yet.
+
+**Iter 23 — Quest-style visible shadows (r_shadowDarken, 2026-06-10).**
+Exa research on Doom3Quest (DrBeef / d3es-multithread lineage)
+concluded its "lighting model" IS vanilla idTech4: same interaction
+math (their analytic specular `clamp((NdotH-.75)*4)^2` is the function
+our exact LUT encodes), same stencil z-fail volumes (Quest 3 ships
+them ON). Their shadows READ because strong stencil shadows composite
+over a punchy output curve. Ours read poorly because vanilla stencil
+only masks EACH LIGHT'S OWN contribution — in low-key scenes there is
+little to subtract. NEW: after the per-light passes, the union of ALL
+shadow volumes is re-marked in a fresh stencil (z-fail/z-pass per
+record, clear 128) and a fullscreen Dst*Src multiply
+(bloom.wgsl fs_darken, stencil NotEqual 128) darkens every shadowed
+pixel by `r_shadowDarken` (default 0.6; 1.0 = vanilla-only; fx-panel
+"shadow dark" slider). Not physically per-light, but it makes shadows
+read like the X360/Quest builds independent of light energy. A/B at
+the X360 vantage: 10.7% px darkened in geometric shadow shapes; det
+self-test unaffected (pass is deterministic, runs in det rounds too).
+Reuses bloom's module/BGL/fullscreen triangle — pipelines init
+unconditionally so the pass works with r_bloom 0.

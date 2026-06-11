@@ -64,3 +64,12 @@ fn fs_composite(in: VSOut) -> @location(0) vec4<f32> {
     let b = textureSampleLevel(tex, samp, in.uv, 0.0).rgb;
     return vec4<f32>(b * u.params.y, 1.0);   // pipeline blend is additive
 }
+
+// Iter 23: Quest-style shadow darkening — a fullscreen multiply applied
+// where the union of all shadow volumes marked the stencil (≠128).
+// params.x = darken factor (0.6 = shadows at 60% brightness).
+@fragment
+fn fs_darken(in: VSOut) -> @location(0) vec4<f32> {
+    let k = u.params.x;
+    return vec4<f32>(k, k, k, 1.0);   // pipeline blend: dst * src
+}

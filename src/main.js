@@ -381,6 +381,9 @@ function wireFxPanel() {
     // The real "X360 look" lever: multiplies LIGHT energy (pools brighten,
     // shadow contrast scales with it) instead of lifting the whole frame.
     { label: "light scale",  cvar: "r_lightScale",     min: 1,   max: 6,   step: 0.25, value: 4 },
+    // Quest-style visible shadows: shadowed pixels multiply by this
+    // (1 = vanilla per-light masking only, lower = darker shadows).
+    { label: "shadow dark",  cvar: "r_shadowDarken",   min: 0.2, max: 1,   step: 0.05, value: 0.6 },
   ];
   for (const s of SLIDERS) {
     const row = document.createElement("div");
