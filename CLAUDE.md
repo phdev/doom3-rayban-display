@@ -1166,3 +1166,12 @@ then committed onto the ENGINE checkout's detached HEAD (recovered
 via `git -C .build/dhewm3 reset HEAD~1`, files intact). Always run
 repo git commands with absolute -C paths or cd first in the SAME
 command.
+
+**PATCH-GENERATION GOTCHA (2026-06-11, bit us hard):** the engine
+patch is `git -C .build/dhewm3 diff <pinned>` — but the port's NEW
+files (RenderBackend_WebGPU.cpp, wgsl/, d3_wearable.*) only appear in
+that diff because they are STAGED in the engine checkout's index. Any
+`git reset` there silently drops every new file from the next patch
+regen (a 6105-line patch shrink pushed a build with NO WebGPU
+backend). Regenerate with `git add -A` first and `diff --cached`, and
+CHECK `wc -l` (~8300 lines) before committing the patch.
