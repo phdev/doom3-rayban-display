@@ -1131,3 +1131,11 @@ EXPORTED_RUNTIME_METHODS — HEAP views aren't exported by default).
 With the build stamp + fps + heap on the first diag line, a single
 phone screenshot now answers: which build, frozen-or-slow, and how
 close to the memory cliff.
+
+**Pak hosting gotcha (2026-06-11):** the commoutside pak (107MB)
+EXCEEDS GitHub's 100MB per-file limit — the monolithic .pk4 no longer
+ships in git; only the 4MB chunks + manifest do (the runtime always
+preferred chunks). Cache freshness now keys off the manifest's
+totalSize whenever the whole-pak HEAD fails — without that, repeat
+visitors would trust a stale cached level forever after a level
+switch.
