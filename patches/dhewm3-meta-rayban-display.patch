@@ -1917,10 +1917,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..482efce
+index 0000000..bda5d23
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,3416 @@
+@@ -0,0 +1,3425 @@
 +/*
 +================================================================================
 +
@@ -2036,7 +2036,7 @@ index 0000000..482efce
 +};
 +
 +// Iter 7b: mirrors WGPUImageSlot in tr_render.cpp (C linkage, layout-stable).
-+struct ImgSlot { const void* ptr; int w, h; uint8_t* pixels; char name[64]; };
++struct ImgSlot { const void* ptr; int w, h; uint8_t* pixels; char name[64]; int repeat; };
 +extern "C" const ImgSlot* D3_WebGPU_LookupCachedImage(const void* img);
 +// Iter 13b: mirrors WGPUCubeSlot in tr_render.cpp.
 +struct CubeSlot { const void* ptr; int size; uint8_t* faces[6]; };
@@ -3466,9 +3466,18 @@ index 0000000..482efce
 +        }
 +
 +        WGPUBindGroupLayout bgl = wgpuRenderPipelineGetBindGroupLayout(interactionPipeline, 1);
++        // Scrolling light projections (lights/cloudscroll*: 'translate time')
++        // grow their texcoords unboundedly and MUST wrap — the single
++        // clamp-to-edge light sampler pinned them to the texture edge after
++        // ~30s of map time, silently killing those lights (the X360-vs-ours
++        // missing hangar floor pool + black marine). Honor the image's
++        // repeat mode for the projection; zeroClamp cookies keep clamp
++        // (WebGPU has no border color; edge-black cookies are equivalent).
++        const ImgSlot* projSlot = D3_WebGPU_LookupCachedImage(imgs[2]);
++        const bool projRepeats = projSlot && projSlot->repeat == 0;   // TR_REPEAT
 +        WGPUBindGroupEntry e[8] = {};
 +        e[0].binding = 0; e[0].sampler = interactionMaterialSampler;
-+        e[1].binding = 1; e[1].sampler = interactionLightSampler;
++        e[1].binding = 1; e[1].sampler = projRepeats ? interactionMaterialSampler : interactionLightSampler;
 +        e[2].binding = 2; e[2].textureView = vNormal;
 +        e[3].binding = 3; e[3].textureView = vSpecular;
 +        e[4].binding = 4; e[4].textureView = vDiffuse;
@@ -5495,10 +5504,10 @@ index 7914093..cb4f589 100644
  	GLimp_Shutdown();
  
 diff --git a/neo/renderer/draw_arb2.cpp b/neo/renderer/draw_arb2.cpp
-index c1d0d3e..bf3ce6d 100644
+index c1d0d3e..9a64c28 100644
 --- a/neo/renderer/draw_arb2.cpp
 +++ b/neo/renderer/draw_arb2.cpp
-@@ -62,7 +62,170 @@ static void GL_SelectTextureNoClient( int unit ) {
+@@ -62,7 +62,174 @@ static void GL_SelectTextureNoClient( int unit ) {
  RB_ARB2_DrawInteraction
  ==================
  */
@@ -5552,7 +5561,11 @@ index c1d0d3e..bf3ce6d 100644
 +    extern void* g_capImagePtrs[][5];
 +}
 +enum { kWGPUMaxCapV = 8192, kWGPUMaxCapI = 32768 };
-+enum { kWGPUMaxRec = 256, kWGPUVertCap = 8*1024*1024, kWGPUIdxCap = 2*1024*1024 };
++// MUST mirror tr_render.cpp's kWGPUMaxRecords/kWGPUVertAccumBytes/
++// kWGPUIndexAccumBytes (and the backend's kMaxRecordSlots) — these gates
++// going stale at 256 while the arrays grew was why CHARACTERS (drawn after
++// the world) stayed black through two cap raises.
++enum { kWGPUMaxRec = 512, kWGPUVertCap = 24*1024*1024, kWGPUIdxCap = 6*1024*1024 };
 +
 +// Column-major 4x4 multiply (out = lhs * rhs), matching OpenGL storage.
 +// Used to bake the full MVP per record at capture time — records can span
@@ -5669,7 +5682,7 @@ index c1d0d3e..bf3ce6d 100644
  	// load all the vertex program parameters
  	qglProgramEnvParameter4fvARB( GL_VERTEX_PROGRAM_ARB, PP_LIGHT_ORIGIN, din->localLightOrigin.ToFloatPtr() );
  	qglProgramEnvParameter4fvARB( GL_VERTEX_PROGRAM_ARB, PP_VIEW_ORIGIN, din->localViewOrigin.ToFloatPtr() );
-@@ -190,6 +353,7 @@ void RB_ARB2_CreateDrawInteractions( const drawSurf_t *surf ) {
+@@ -190,6 +357,7 @@ void RB_ARB2_CreateDrawInteractions( const drawSurf_t *surf ) {
  	} else {
  		globalImages->specularTableImage->Bind();
  	}
@@ -5677,7 +5690,7 @@ index c1d0d3e..bf3ce6d 100644
  
  
  	for ( ; surf ; surf=surf->nextOnLight ) {
-@@ -258,6 +422,7 @@ void RB_ARB2_DrawInteractions( void ) {
+@@ -258,6 +426,7 @@ void RB_ARB2_DrawInteractions( void ) {
  	//
  	for ( vLight = backEnd.viewDef->viewLights ; vLight ; vLight = vLight->next ) {
  		backEnd.vLight = vLight;
@@ -5685,7 +5698,7 @@ index c1d0d3e..bf3ce6d 100644
  
  		// do fogging later
  		if ( vLight->lightShader->IsFogLight() ) {
-@@ -314,7 +479,9 @@ void RB_ARB2_DrawInteractions( void ) {
+@@ -314,7 +483,9 @@ void RB_ARB2_DrawInteractions( void ) {
  		qglStencilFunc( GL_ALWAYS, 128, 255 );
  
  		backEnd.depthFunc = GLS_DEPTHFUNC_LESS;
@@ -5695,7 +5708,7 @@ index c1d0d3e..bf3ce6d 100644
  
  		backEnd.depthFunc = GLS_DEPTHFUNC_EQUAL;
  	}
-@@ -757,6 +924,26 @@ int R_FindARBProgram( GLenum target, const char *program ) {
+@@ -757,6 +928,26 @@ int R_FindARBProgram( GLenum target, const char *program ) {
  	return progs[i].ident;
  }
  
@@ -6063,7 +6076,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..4ab2be1 100644
+index c83ebb5..2598b95 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -6074,7 +6087,7 @@ index c83ebb5..4ab2be1 100644
  
  /*
  
-@@ -38,6 +39,720 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +39,726 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -6089,9 +6102,12 @@ index c83ebb5..4ab2be1 100644
 +    // 512 was 256: heavy views (mars_city1 underground, long sightlines)
 +    // overflowed the cap and the dropped interactions rendered as BLACK
 +    // surfaces (in the z-prepass via one captured light, lit by none).
++    // 1024 was 512 was 256: entity surfaces (CHARACTERS) draw after the
++    // world, so they are the consistent victims when a heavy view overflows
++    // the cap — black people/crates with a lit world is the signature.
 +    kWGPUMaxRecords      = 512,                 // hard cap on per-frame draws
-+    kWGPUVertAccumBytes  = 16 * 1024 * 1024,    // vertex accumulator
-+    kWGPUIndexAccumBytes = 4 * 1024 * 1024,     // u16 index accumulator
++    kWGPUVertAccumBytes  = 24 * 1024 * 1024,    // vertex accumulator
++    kWGPUIndexAccumBytes = 6 * 1024 * 1024,     // u16 index accumulator
 +};
 +struct WGPUInteractionRecord {
 +    uint32_t vertOffset;
@@ -6347,6 +6363,8 @@ index c83ebb5..4ab2be1 100644
 +    int         w, h;
 +    uint8_t*    pixels;     // malloc'd RGBA8 buffer, owned
 +    char        name[64];   // imgName for diagnostics
++    int         repeat;     // textureRepeat_t (0 = TR_REPEAT) — scrolling
++                            // light projections (cloudscroll) MUST wrap
 +};
 +extern "C" {
 +    // 3072 was 2048: a full playthrough loads more images than the level's
@@ -6398,6 +6416,7 @@ index c83ebb5..4ab2be1 100644
 +        memcpy( g_imgCache[slot].name, nm, nl );
 +        g_imgCache[slot].name[nl] = 0;
 +    }
++    g_imgCache[slot].repeat = (int)img->repeat;
 +    // Reallocate if size changed (e.g. reloaded at different mip level)
 +    const size_t bytes = (size_t)dw * (size_t)dh * 4u;
 +    if ( !g_imgCache[slot].pixels || g_imgCache[slot].w != dw || g_imgCache[slot].h != dh ) {
@@ -6795,7 +6814,7 @@ index c83ebb5..4ab2be1 100644
  
  /*
  =================
-@@ -49,6 +764,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +770,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -6811,7 +6830,7 @@ index c83ebb5..4ab2be1 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +802,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +808,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -6827,7 +6846,7 @@ index c83ebb5..4ab2be1 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +849,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +855,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -6844,7 +6863,7 @@ index c83ebb5..4ab2be1 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +909,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +915,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -6852,7 +6871,7 @@ index c83ebb5..4ab2be1 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1136,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1142,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -6865,7 +6884,7 @@ index c83ebb5..4ab2be1 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1305,48 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1311,48 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  

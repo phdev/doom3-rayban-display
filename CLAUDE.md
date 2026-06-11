@@ -1001,3 +1001,30 @@ shows the demo-quad checker (zero records). ALWAYS include all 9 paks
 in the reducer input.** Shipping the 256 pak = user product call
 (cellular download cost); rebuild recipe: reduce from /tmp/d3gog/base
 (9 paks) --max-texture 256 --no-audio, then scripts/chunk-pk4.py.
+
+**Iter 21 — capture-gate fix, repeat-aware light sampler, X360 hunt
+notes (2026-06-10).** (1) REAL BUG FIXED: draw_arb2.cpp's capture-gate
+mirrors (kWGPUMaxRec/kWGPUVertCap/kWGPUIdxCap) were never raised with
+the others — interactions stayed capped at 256/8MB through TWO
+"cap raises" (the THREE-WAY mirror: tr_render enums + draw_arb2 enums
++ backend kMaxRecordSlots — grep ALL THREE). Now 512/24MB/6MB
+everywhere. (2) kMaxRecordSlots=1024 BREAKS record flow entirely
+(zero captures, demo checker; pipelines+slots init fine — cause
+unknown, bisected and reverted to 512; investigate before raising
+again). (3) Light-projection samplers now honor the image's repeat
+mode (slot.repeat captured from idImage): repeat-mode projections get
+the wrap sampler — note light materials parse stages with
+TR_CLAMP_TO_ZERO by default, so most cookies keep clamp (WebGPU has
+no border color; edge-black cookies are equivalent).
+OPEN — THE BLACK-CHARACTER DEFECT (X360-look blocker): at
+`setviewpos 1090 -1430 68 140` (hangar crates, the X360 reference
+vantage) the marine NPC renders PITCH BLACK in WebGPU but shows lit
+face/shoulders in GL (&echo) — independent of shadows (?noshadows
+same), caps (512 fix didn't change it), lightScale (4 doesn't lift
+him), and time (black from spawn). The hangar floor also lacks the
+X360's cool mottled pool (lights/cloudscroll2, a scrolling
+'translate time*.03' projection from light_5253 at z=-172). NEXT
+SESSION: r_singleLight sweep at that vantage in BOTH paths to find
+which light lights him in GL and what it produces in WebGPU; check
+ambient-light records (cloudscroll might be an ambientLight); check
+falloff for lights with origin BELOW the surface.
