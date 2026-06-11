@@ -1225,5 +1225,49 @@ per-call overhead and total-process memory; all addressed:
 All validated headed-Chrome both profiles: det IDENTICAL ×6, scene
 correct, zero validation errors, zero fallbacks, no budget drops
 (desktop AND phone-config land ~20MB GPU textures, well under the
-80MB guard). iPhone retest = the open question; if it still dies, the
-crash line now carries fps + wasm heap + WebGPU texture MB.
+80MB guard). RESULT (user screenshot, 2026-06-11): **the iPhone runs
+the game** — iter 28 closed the tab-kill crash.
+
+**Iter 29 — the BFG look: verified recipe + implementation
+(2026-06-11).** User reference = DOOM 3 BFG Edition PC screenshot of
+the ENPRO SPAWN CORRIDOR (same scene our build boots into — direct
+A/B). A 5-agent research workflow (stock-BFG source vs RBDOOM fork
+vs our repo audit vs screenshot quantification, all claims
+adversarially fact-checked against the actual id-Software/DOOM-3-BFG
++ DOOM-3 + RBDOOM repos) established, with file:line evidence:
+- STOCK BFG's "brighter" = **r_lightScale 3** (classic 2) with NO
+  clamp — there is NO forced ambient, NO bloom, NO tonemap, NO gamma
+  change in stock BFG (those are all RBDOOM-fork features; r_gamma
+  default 1.0 both eras, hardware ramps).
+- STOCK BFG specular = **analytic pow(N·H, 10) ×2** replacing the
+  2004 LUT ramp (zero below N·H 0.75 then (4(x-.75))²) — this is the
+  floor/wall sheen in BFG screenshots (interaction.pixel:68-70).
+- STOCK BFG shadows = stencil volumes, effectively ALWAYS ON
+  (r_shadows cvar removed; preload two-pass z-pass algorithm).
+- Screenshot quantification (game-region luma): ours-before was ~1
+  stop brighter than the reference with washed relative contrast
+  (std/mean 0.67 vs 1.03, median 82.7 vs 32.1) — the corrective map
+  was almost exactly a γ=2.0 power curve, i.e. our gamma 1.3 lift
+  was the wash; the BFG look needs deep blacks, not more lift.
+IMPLEMENTED: (1) r_shadows + g_showPlayerShadow now default ON under
+WebGPU-primary EVERYWHERE incl. phone (the wearable gate dated from
+the 7fps busy-spin era; post-iter-24 the iPhone runs 46.5fps;
+?noshadows = escape hatch). (2) interaction.wgsl specular falloff is
+dual-mode: mix(LUT, pow(N·H,10), params2.y) — new cvar
+**r_bfgSpecular** (default 1; 0 = exact classic LUT) exported via
+g_capBfgSpec → ub[53]. (3) Calibration defaults: **r_lightScale 3 +
+r_gamma 1.0** (was 4/1.3) in both profiles + fx sliders. Classic
+parity mode for A/B: ?args=+set r_bfgSpecular 0 +set r_lightScale 2.
+MEASURED (same-corridor luma, headed Chrome): median 82.7→42.3
+(target 32.1), std/mean 0.67→0.92 (target 1.03), deep-shadow
+fraction 14%→37% (target 48%) — the reference now sits between our
+classic and BFG modes instead of a stop darker than everything.
+NATIVE GROUND TRUTH: /Applications/dhewm3.app (user-installed) +
+/tmp/dhewm3-native (vanilla build of our pinned commit) drive the
+GOG data at /tmp/d3gog for reference renders — GOTCHA: vanilla has
+no g_skipCinematics (that's OUR patch), and enpro's intro cinematic
+runs >160s, so timed-screenshot cfgs mostly catch the cutscene;
+System-Events ESC injection didn't land (accessibility). A patched-
+tree NATIVE build fails to link (port files aren't native-clean) —
+deleted build-native from the engine checkout BEFORE patch regen
+(git add -A would have shipped it into the patch).

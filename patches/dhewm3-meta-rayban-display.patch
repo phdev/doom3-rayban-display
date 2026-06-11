@@ -1981,10 +1981,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..f585c65
+index 0000000..e9ff5c9
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,3650 @@
+@@ -0,0 +1,3652 @@
 +/*
 +================================================================================
 +
@@ -2120,6 +2120,7 @@ index 0000000..f585c65
 +extern "C" int      g_capTexMaxDim;     // iter 28: pre-upload dimension cap (0 = uncapped)
 +extern "C" uint32_t g_capDetTest;       // iter 28: determinism self-test gate
 +extern "C" uint32_t g_capVertDedupCount; // iter 28: frame geometry-dedup table fill (reset on drain)
++extern "C" float    g_capBfgSpec;       // iter 29: 1 = BFG analytic specular, 0 = classic LUT
 +
 +// ─── Backend class ──────────────────────────────────────────────────────────
 +
@@ -3861,7 +3862,8 @@ index 0000000..f585c65
 +            ub[50] = svcAdd;
 +            ub[51] = (float)r.pad3 / 1000.0f;
 +            ub[52] = g_capInvGamma;
-+            ub[53] = 0.0f; ub[54] = 0.0f; ub[55] = 0.0f;
++            ub[53] = g_capBfgSpec;   // iter 29: 1 = BFG pow(N·H,10) specular
++            ub[54] = 0.0f; ub[55] = 0.0f;
 +            memcpy(recordUBStage + (size_t)i * kUBStride, ub, 224);
 +            if (i + 1 > recordUBHigh) recordUBHigh = i + 1;
 +            // Iter 7b: resolve the material bind group (creates GPU textures
@@ -5668,7 +5670,7 @@ index 0000000..0f9c8e6
 +    return nullptr;
 +}
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
-index 7914093..c200bf0 100644
+index 7914093..353af81 100644
 --- a/neo/renderer/RenderSystem_init.cpp
 +++ b/neo/renderer/RenderSystem_init.cpp
 @@ -39,6 +39,11 @@ If you have questions concerning this license or the applicable additional terms
@@ -5683,7 +5685,7 @@ index 7914093..c200bf0 100644
  
  #include "framework/GameCallbacks_local.h"
  #include "framework/Game.h"
-@@ -102,6 +107,28 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
+@@ -102,6 +107,33 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
  
  idCVar r_skipSuppress( "r_skipSuppress", "0", CVAR_RENDERER | CVAR_BOOL, "ignore the per-view suppressions" );
  idCVar r_skipPostProcess( "r_skipPostProcess", "0", CVAR_RENDERER | CVAR_BOOL, "skip all post-process renderings" );
@@ -5706,13 +5708,18 @@ index 7914093..c200bf0 100644
 +idCVar r_wgpuTexBudgetMB( "r_wgpuTexBudgetMB", "0", CVAR_RENDERER | CVAR_INTEGER, "WebGPU texture-cache GPU byte budget in MB (0 = unlimited); over-budget images bind a fallback instead of crashing the device" );
 +idCVar r_wgpuTexMaxDim( "r_wgpuTexMaxDim", "0", CVAR_RENDERER | CVAR_INTEGER, "WebGPU texture-cache max dimension (0 = uncapped); larger cached images are box-reduced before GPU upload" );
 +idCVar r_wgpuDetTest( "r_wgpuDetTest", "1", CVAR_RENDERER | CVAR_BOOL, "run the WebGPU determinism self-test (extra offscreen targets + readback buffers; disable on memory-tight devices)" );
++// Iter 29: BFG-presentation specular. Verified against the id-Software
++// DOOM-3-BFG source: BFG replaced the 2004 specular table (zero below
++// N·H 0.75, then (4(x-.75))²) with analytic pow(N·H, 10) — broader, always-
++// visible highlights (the floor sheen in BFG screenshots).
++idCVar r_bfgSpecular( "r_bfgSpecular", "1", CVAR_RENDERER | CVAR_BOOL, "WebGPU: BFG-style analytic pow(N·H,10) specular falloff (0 = classic LUT ramp)" );
 +idCVar r_skipGLDraw( "r_skipGLDraw", "0", CVAR_RENDERER | CVAR_BOOL,
 +	"skip GL draw calls (WebGPU-primary cutover; the WebGPU echo renders instead). "
 +	"Tiny views (lightgem) keep drawing so gameplay light readback works." );
  idCVar r_skipLightScale( "r_skipLightScale", "0", CVAR_RENDERER | CVAR_BOOL, "don't do any post-interaction light scaling, makes things dim on low-dynamic range cards" );
  idCVar r_skipInteractions( "r_skipInteractions", "0", CVAR_RENDERER | CVAR_BOOL, "skip all light/surface interaction drawing" );
  idCVar r_skipDynamicTextures( "r_skipDynamicTextures", "0", CVAR_RENDERER | CVAR_BOOL, "don't dynamically create textures" );
-@@ -158,6 +185,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
+@@ -158,6 +190,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
  idCVar r_useExternalShadows( "r_useExternalShadows", "1", CVAR_RENDERER | CVAR_INTEGER, "1 = skip drawing caps when outside the light volume, 2 = force to no caps for testing", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
  idCVar r_useOptimizedShadows( "r_useOptimizedShadows", "1", CVAR_RENDERER | CVAR_BOOL, "use the dmap generated static shadow volumes" );
  idCVar r_useScissor( "r_useScissor", "1", CVAR_RENDERER | CVAR_BOOL, "scissor clip as portals and lights are processed" );
@@ -5720,7 +5727,7 @@ index 7914093..c200bf0 100644
  idCVar r_useCombinerDisplayLists( "r_useCombinerDisplayLists", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "put all nvidia register combiner programming in display lists" );
  idCVar r_useDepthBoundsTest( "r_useDepthBoundsTest", "1", CVAR_RENDERER | CVAR_BOOL, "use depth bounds test to reduce shadow fill" );
  
-@@ -819,11 +847,63 @@ void R_InitOpenGL( void ) {
+@@ -819,11 +852,63 @@ void R_InitOpenGL( void ) {
  		r_multiSamples.SetInteger( 0 );
  	}
  
@@ -5784,7 +5791,7 @@ index 7914093..c200bf0 100644
  
  #include "renderer/qgl_proc.h"
  
-@@ -2505,6 +2585,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
+@@ -2505,6 +2590,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
  	// is destroyed (relevant when starting a mod which also recreates window)
  	Sys_ShutdownInput();
  
@@ -6402,7 +6409,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..413afa0 100644
+index c83ebb5..82b5bdd 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -6413,7 +6420,7 @@ index c83ebb5..413afa0 100644
  
  /*
  
-@@ -38,6 +39,762 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +39,766 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -6588,6 +6595,10 @@ index c83ebb5..413afa0 100644
 +    int      g_capTexBudgetMB = 0;        // 0 = unlimited
 +    int      g_capTexMaxDim = 0;          // 0 = uncapped
 +    uint32_t g_capDetTest = 1;
++    // Iter 29: BFG-presentation specular — the BFG edition replaced the
++    // classic specular LUT (zero below N·H 0.75) with analytic pow(N·H,10),
++    // which is most of its visible floor/wall sheen.
++    float    g_capBfgSpec = 1.0f;
 +}
 +
 +// Iter 17: stash a decoded cinematic frame (called from
@@ -7176,7 +7187,7 @@ index c83ebb5..413afa0 100644
  
  /*
  =================
-@@ -49,6 +806,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +810,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -7192,7 +7203,7 @@ index c83ebb5..413afa0 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +844,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +848,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -7208,7 +7219,7 @@ index c83ebb5..413afa0 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +891,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +895,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -7225,7 +7236,7 @@ index c83ebb5..413afa0 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +951,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +955,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -7233,7 +7244,7 @@ index c83ebb5..413afa0 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1178,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1182,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -7246,7 +7257,7 @@ index c83ebb5..413afa0 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1347,55 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1351,57 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
@@ -7267,6 +7278,8 @@ index c83ebb5..413afa0 100644
 +		g_capTexBudgetMB = r_wgpuTexBudgetMB.GetInteger();
 +		g_capTexMaxDim = r_wgpuTexMaxDim.GetInteger();
 +		g_capDetTest = r_wgpuDetTest.GetBool() ? 1u : 0u;
++		extern idCVar r_bfgSpecular;
++		g_capBfgSpec = r_bfgSpecular.GetBool() ? 1.0f : 0.0f;
 +	}
 +	// Iter 6.6: the multi-surface accumulator is intentionally NOT reset
 +	// here. RB_BeginDrawingView runs once per VIEW (main view, lightgem,
@@ -7314,10 +7327,10 @@ index c83ebb5..413afa0 100644
  	// ensures that depth writes are enabled for the depth clear
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..579d28a
+index 0000000..43bc27f
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,831 @@
+@@ -0,0 +1,840 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -7800,6 +7813,7 @@ index 0000000..579d28a
 +"    //   params.z = vertex color add      (1 for ignore/inverse, 0 for modulate)\n"
 +"    //   params.w = r_brightness\n"
 +"    //   params2.x = 1 / r_gamma\n"
++"    //   params2.y = BFG specular (0 = classic LUT ramp, 1 = pow(N·H,10))\n"
 +"    params:               vec4<f32>,\n"
 +"    params2:              vec4<f32>,\n"
 +"};\n"
@@ -7912,10 +7926,18 @@ index 0000000..579d28a
 +"    let spec = textureSample(t_specular, s_material, in.tex_specular).rgb\n"
 +"               * u.specular_color.rgb;\n"
 +"\n"
-+"    // Engine's exact specular falloff: dependent read of the baked\n"
-+"    // specular table (texture 6 in interaction.vfp) by the raw half-angle\n"
-+"    // dot. Vanilla also doubles the specular map (ADD R2, R2, R2).\n"
-+"    let specFalloff = textureSample(t_specLUT, s_lighting, vec2<f32>(NdotH, 0.5)).r;\n"
++"    // Specular falloff, two modes (iter 29):\n"
++"    //  - classic (params2.y = 0): dependent read of the engine's baked\n"
++"    //    specular table (texture 6 in interaction.vfp) — zero below\n"
++"    //    N·H 0.75, then (4(x-0.75))²: tight, sparse highlights.\n"
++"    //  - BFG (params2.y = 1): the BFG edition rewrote this to an analytic\n"
++"    //    pow(N·H, 10) (interaction.pixel:68-70, verified against the\n"
++"    //    id-Software/DOOM-3-BFG source) — broader highlights, the floor\n"
++"    //    sheen the BFG reference screenshots show.\n"
++"    // Vanilla also doubles the specular map (ADD R2, R2, R2) — both modes.\n"
++"    let specLUT = textureSample(t_specLUT, s_lighting, vec2<f32>(NdotH, 0.5)).r;\n"
++"    let specBFG = pow(NdotH, 10.0);\n"
++"    let specFalloff = mix(specLUT, specBFG, u.params2.y);\n"
 +"\n"
 +"    var color = (diffuse + specFalloff * spec * 2.0)\n"
 +"                * NdotL\n"

@@ -45,6 +45,7 @@ struct Uniforms {
     //   params.z = vertex color add      (1 for ignore/inverse, 0 for modulate)
     //   params.w = r_brightness
     //   params2.x = 1 / r_gamma
+    //   params2.y = BFG specular (0 = classic LUT ramp, 1 = pow(N·H,10))
     params:               vec4<f32>,
     params2:              vec4<f32>,
 };
@@ -157,10 +158,18 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let spec = textureSample(t_specular, s_material, in.tex_specular).rgb
                * u.specular_color.rgb;
 
-    // Engine's exact specular falloff: dependent read of the baked
-    // specular table (texture 6 in interaction.vfp) by the raw half-angle
-    // dot. Vanilla also doubles the specular map (ADD R2, R2, R2).
-    let specFalloff = textureSample(t_specLUT, s_lighting, vec2<f32>(NdotH, 0.5)).r;
+    // Specular falloff, two modes (iter 29):
+    //  - classic (params2.y = 0): dependent read of the engine's baked
+    //    specular table (texture 6 in interaction.vfp) — zero below
+    //    N·H 0.75, then (4(x-0.75))²: tight, sparse highlights.
+    //  - BFG (params2.y = 1): the BFG edition rewrote this to an analytic
+    //    pow(N·H, 10) (interaction.pixel:68-70, verified against the
+    //    id-Software/DOOM-3-BFG source) — broader highlights, the floor
+    //    sheen the BFG reference screenshots show.
+    // Vanilla also doubles the specular map (ADD R2, R2, R2) — both modes.
+    let specLUT = textureSample(t_specLUT, s_lighting, vec2<f32>(NdotH, 0.5)).r;
+    let specBFG = pow(NdotH, 10.0);
+    let specFalloff = mix(specLUT, specBFG, u.params2.y);
 
     var color = (diffuse + specFalloff * spec * 2.0)
                 * NdotL

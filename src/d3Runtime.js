@@ -92,8 +92,12 @@ export function createRuntimeConfig() {
         displayBrightness: 1.15,
         displayContrast: 1.0,
         displaySaturate: 1.05,
-        rLightScale: 4,
-        rGamma: 1.3,
+        // Iter 29 — BFG calibration (verified against the id BFG source +
+        // screenshot quantile mapping): BFG = lightScale 3, gamma 1.0
+        // (its "brighter" is the raised lightScale, NOT a gamma lift; our
+        // old 4/1.3 was ~1 stop brighter with washed relative contrast).
+        rLightScale: 3,
+        rGamma: 1.0,
         rBrightness: 1.0,
         skill: 1,
         yawSensitivity: 2.4,
@@ -111,8 +115,8 @@ export function createRuntimeConfig() {
         displayBrightness: 1,
         displayContrast: 1,
         displaySaturate: 1,
-        rLightScale: 4,
-        rGamma: 1.3,
+        rLightScale: 3,
+        rGamma: 1.0,
         rBrightness: 1,
         skill: 1,
         yawSensitivity: 1.8,
@@ -615,11 +619,10 @@ function buildArguments(config) {
     // (Sys_ConsoleInput reads a tty that never delivers). Disable it.
     "+set", "in_tty", "0",
     // The player's own shadow is the single most visible shadow in DOOM 3 —
-    // follows the same desktop-only default as r_shadows.
+    // follows the same default as r_shadows.
     "+set", "g_showPlayerShadow",
         ((/[?&]backend=webgpu\b/.test(typeof window !== "undefined" ? window.location.search : "")
           && !/[?&]echo\b/.test(typeof window !== "undefined" ? window.location.search : "")
-          && config.inputMode !== "wearable"
           && !/[?&]noshadows\b/.test(typeof window !== "undefined" ? window.location.search : ""))
          || /[?&]shadows\b/.test(typeof window !== "undefined" ? window.location.search : "")) ? "1" : "0",
     // The shell mounts PK4 + config under /base in the Emscripten FS; point the
@@ -631,14 +634,14 @@ function buildArguments(config) {
     // low machine spec, and downsize textures for faster uploads.
     "+set", "com_machineSpec", "0",
     // Stencil shadows (iter 9, WebGPU) — ON by default under WebGPU-primary
-    // on DESKTOP only. The CPU shadow-volume build is the single biggest
-    // engine cost: at iPhone WASM speeds it drops ~7fps to ~1fps (reported
-    // as "scene frozen, sliders dead"). Phone profile keeps them OFF;
-    // ?shadows forces on for testing, ?noshadows forces off anywhere.
+    // EVERYWHERE (iter 29). The phone gate dated from the busy-spin era
+    // (~7fps engine, shadow volumes froze it); post iter-24 perf work the
+    // iPhone runs 46.5fps and can afford the CPU volume build. The BFG-look
+    // gap (user reference screenshots) is mostly missing cast shadows +
+    // flat tone curve. ?noshadows forces off anywhere if a device can't.
     "+set", "r_shadows",
         ((/[?&]backend=webgpu\b/.test(typeof window !== "undefined" ? window.location.search : "")
           && !/[?&]echo\b/.test(typeof window !== "undefined" ? window.location.search : "")
-          && config.inputMode !== "wearable"
           && !/[?&]noshadows\b/.test(typeof window !== "undefined" ? window.location.search : ""))
          || /[?&]shadows\b/.test(typeof window !== "undefined" ? window.location.search : "")) ? "1" : "0",
     // Iter 19: WebGPU bloom — ON under WebGPU-primary; ?nobloom opts out.
