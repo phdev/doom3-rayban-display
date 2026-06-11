@@ -477,6 +477,35 @@ try {
   localStorage.setItem("d3_clean_exit", "0");
   addEventListener("pagehide", () => { try { localStorage.setItem("d3_clean_exit", "1"); } catch {} });
 } catch {}
+// Stale-bundle self-detection (iter 31): iOS Safari serves cached bundles far
+// past the Pages 600s TTL — that's how a device read "r_shadows 0" from a
+// pre-iter-29 bundle while the deploy shipped 1. version.txt is emitted at
+// build time with the same id baked into __ENGINE_VER__; a newer value there
+// means THIS bundle is stale. Auto-refresh once per newer version (the URL
+// gains &fresh=<id>, which also busts the index.html cache entry); a
+// sessionStorage guard prevents reload loops while the CDN itself still
+// serves the old files — then it just warns in the diag.
+(async () => {
+  if (typeof __ENGINE_VER__ === "undefined") return;
+  try {
+    const base = (import.meta.env && import.meta.env.BASE_URL) || "/";
+    const r = await fetch(base + "version.txt", { cache: "no-store" });
+    if (!r.ok) return;                                   // dev server / missing
+    const latest = (await r.text()).trim();
+    if (!/^\d{10,}$/.test(latest) || Number(latest) <= Number(__ENGINE_VER__)) return;
+    const stamp = new Date(Number(latest)).toISOString().slice(5, 16).replace("T", " ");
+    const key = "d3_fresh_" + latest;
+    if (sessionStorage.getItem(key)) {
+      diag(`⚠ STALE BUILD: running ${BUILD_STAMP}, latest is ${stamp} UTC — refresh didn't take; CDN may need a few minutes`);
+      return;
+    }
+    sessionStorage.setItem(key, "1");
+    diag(`⚠ newer build ${stamp} UTC available — refreshing…`);
+    const u = new URL(location.href);
+    u.searchParams.set("fresh", latest);
+    location.replace(u.toString());
+  } catch {}
+})();
 (() => {
   let frames = 0;
   let last = performance.now();
