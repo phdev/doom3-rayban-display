@@ -460,6 +460,21 @@ const BUILD_STAMP = (typeof __ENGINE_VER__ !== "undefined")
   : "dev";
 let fpsLine = `build ${BUILD_STAMP} UTC | fps —`;
 try { console.info("[d3] build:", BUILD_STAMP, "UTC"); } catch {}
+// Crash telemetry: iOS Safari kills the tab on memory ("a problem
+// repeatedly occurred") and takes the evidence with it. Persist the live
+// stats every beat; if the previous session didn't end cleanly, surface
+// its last-known state at the top of this session's log.
+try {
+  const prev = localStorage.getItem("d3_prev_session");
+  if (prev && localStorage.getItem("d3_clean_exit") !== "1") {
+    const p = JSON.parse(prev);
+    const line = `⚠ previous session DIED: ${p.line} (${Math.round((Date.now() - p.t) / 1000)}s ago)`;
+    diagLines.push(line);
+    console.warn("[d3]", line);
+  }
+  localStorage.setItem("d3_clean_exit", "0");
+  addEventListener("pagehide", () => { try { localStorage.setItem("d3_clean_exit", "1"); } catch {} });
+} catch {}
 (() => {
   let frames = 0;
   let last = performance.now();
@@ -469,6 +484,7 @@ try { console.info("[d3] build:", BUILD_STAMP, "UTC"); } catch {}
     if (now - last >= 2000) {
       const mem = (typeof window.__d3HeapMB === "function") ? ` | wasm ${window.__d3HeapMB()}MB` : "";
       fpsLine = `build ${BUILD_STAMP} UTC | fps ${(frames * 1000 / (now - last)).toFixed(1)}${mem}`;
+      try { localStorage.setItem("d3_prev_session", JSON.stringify({ t: Date.now(), line: fpsLine })); } catch {}
       frames = 0;
       last = now;
       renderDiag();

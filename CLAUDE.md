@@ -1146,3 +1146,23 @@ mars_city1 and commoutside). Stale chunks from the previous level
 beyond .013 deleted — THE CHUNKER DOESN'T REMOVE OLD CHUNK FILES when
 the count shrinks; always `ls` the chunk set after rechunking a
 smaller pak or dead chunks ship in git.
+
+**Iter 27 — iPhone crash hunt round 2 (2026-06-11).** Crash persists
+("a few seconds after boot") despite the 256MB-initial diet. Two new
+measures: (1) GL TEXTURE UPLOADS SKIPPED under r_skipGLDraw — every
+texture was resident TWICE on the GPU (WebGL via GL4ES + WebGPU);
+GenerateImage now frees the staging buffer and returns after the
+CPU-cache hook + Bind() when WebGPU-primary (texture objects exist,
+no storage allocated; &echo/GL-fallback boots upload normally).
+Halves GPU texture residency. (2) CRASH TELEMETRY: the diag stats
+line persists to localStorage every 2s with a clean-exit flag set on
+pagehide; the next boot surfaces "⚠ previous session DIED: build … |
+fps … | wasm …MB (Ns ago)" in the diag + console — every iOS tab
+kill now leaves evidence instead of eating it. Verified locally:
+renders identically with GL uploads skipped, heap 307MB.
+SHELL GOTCHA that bit here: a `cd` into the engine build dir earlier
+in a chain left cwd inside .build/dhewm3 — `git add -A && git commit`
+then committed onto the ENGINE checkout's detached HEAD (recovered
+via `git -C .build/dhewm3 reset HEAD~1`, files intact). Always run
+repo git commands with absolute -C paths or cd first in the SAME
+command.
