@@ -610,11 +610,13 @@ function buildArguments(config) {
     // (Sys_ConsoleInput reads a tty that never delivers). Disable it.
     "+set", "in_tty", "0",
     // The player's own shadow is the single most visible shadow in DOOM 3 —
-    // on under WebGPU-primary (stencil shadows are on there too).
+    // follows the same desktop-only default as r_shadows.
     "+set", "g_showPlayerShadow",
-        (/[?&]backend=webgpu\b/.test(typeof window !== "undefined" ? window.location.search : "")
-         && !/[?&]echo\b/.test(typeof window !== "undefined" ? window.location.search : "")
-         && !/[?&]noshadows\b/.test(typeof window !== "undefined" ? window.location.search : "")) ? "1" : "0",
+        ((/[?&]backend=webgpu\b/.test(typeof window !== "undefined" ? window.location.search : "")
+          && !/[?&]echo\b/.test(typeof window !== "undefined" ? window.location.search : "")
+          && config.inputMode !== "wearable"
+          && !/[?&]noshadows\b/.test(typeof window !== "undefined" ? window.location.search : ""))
+         || /[?&]shadows\b/.test(typeof window !== "undefined" ? window.location.search : "")) ? "1" : "0",
     // The shell mounts PK4 + config under /base in the Emscripten FS; point the
     // engine's base path there (default would be the executable dir).
     "+set", "fs_basepath", "/",
@@ -624,12 +626,14 @@ function buildArguments(config) {
     // low machine spec, and downsize textures for faster uploads.
     "+set", "com_machineSpec", "0",
     // Stencil shadows (iter 9, WebGPU) — ON by default under WebGPU-primary
-    // per user direction; ?noshadows opts out (the CPU shadow-volume build
-    // is the perf cost at WASM speeds). GL paths keep them off unless
-    // ?shadows forces.
+    // on DESKTOP only. The CPU shadow-volume build is the single biggest
+    // engine cost: at iPhone WASM speeds it drops ~7fps to ~1fps (reported
+    // as "scene frozen, sliders dead"). Phone profile keeps them OFF;
+    // ?shadows forces on for testing, ?noshadows forces off anywhere.
     "+set", "r_shadows",
         ((/[?&]backend=webgpu\b/.test(typeof window !== "undefined" ? window.location.search : "")
           && !/[?&]echo\b/.test(typeof window !== "undefined" ? window.location.search : "")
+          && config.inputMode !== "wearable"
           && !/[?&]noshadows\b/.test(typeof window !== "undefined" ? window.location.search : ""))
          || /[?&]shadows\b/.test(typeof window !== "undefined" ? window.location.search : "")) ? "1" : "0",
     // Iter 19: WebGPU bloom — ON under WebGPU-primary; ?nobloom opts out.
