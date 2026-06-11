@@ -92,11 +92,10 @@ export function createRuntimeConfig() {
         displayBrightness: 1.15,
         displayContrast: 1.0,
         displaySaturate: 1.05,
-        // Iter 29 — BFG calibration (verified against the id BFG source +
-        // screenshot quantile mapping): BFG = lightScale 3, gamma 1.0
-        // (its "brighter" is the raised lightScale, NOT a gamma lift; our
-        // old 4/1.3 was ~1 stop brighter with washed relative contrast).
-        rLightScale: 3,
+        // Iter 35 — NATIVE dhewm3 parity by default (lightScale 2, classic
+        // LUT specular); ?bfg opts into the verified BFG recipe (3 + pow
+        // specular + shadow darken). bfgLookEnabled() is the single source.
+        rLightScale: bfgLookEnabled() ? 3 : 2,
         rGamma: 1.0,
         rBrightness: 1.0,
         skill: 1,
@@ -115,7 +114,7 @@ export function createRuntimeConfig() {
         displayBrightness: 1,
         displayContrast: 1,
         displaySaturate: 1,
-        rLightScale: 3,
+        rLightScale: bfgLookEnabled() ? 3 : 2,
         rGamma: 1.0,
         rBrightness: 1,
         skill: 1,
@@ -644,6 +643,10 @@ function buildArguments(config) {
     // live-tune with d3cmd("r_bloomScale 1.2") etc.
     "+set", "r_bloom",
         /[?&]bloom\b/.test(typeof window !== "undefined" ? window.location.search : "") ? "1" : "0",
+    // Iter 35: specular + shadow-darken follow the ?bfg preset; defaults =
+    // native dhewm3 parity (classic LUT, no darken pass).
+    "+set", "r_bfgSpecular", bfgLookEnabled() ? "1" : "0",
+    "+set", "r_shadowDarken", bfgLookEnabled() ? "0.6" : "1.0",
     // Iter 28: WebGPU GPU-memory diet. iOS Safari kills the whole TAB when
     // total GPU memory tips over (the "82% Starting DOOM 3" crash: WebGL
     // context lost + GPUDevice.createBindGroup InvalidStateError during the
@@ -758,6 +761,16 @@ const FLASHLIGHT_FIX_MTR = [
   "models/items/flashlight/bulb   { noShadows noSelfShadow translucent { blend add map _black } }",
   ""
 ].join("\n");
+
+// Iter 35: the BFG presentation is now OPT-IN via ?bfg (lightScale 3 +
+// analytic pow(N·H,10) specular + shadow-darken 0.6 — the verified stock-BFG
+// recipe from iter 29). DEFAULT = native dhewm3 parity: lightScale 2, the
+// classic specular LUT, no darken pass (measured within ~2% of the native
+// macOS app's channel balance).
+function bfgLookEnabled() {
+  const qs = typeof window !== "undefined" ? window.location.search : "";
+  return /[?&]bfg\b/.test(qs);
+}
 
 // Iter 31: single source of truth for the shadow default — used by BOTH the
 // +set command-line args and the autoexec.cfg pin (r_shadows is CVAR_ARCHIVE

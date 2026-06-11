@@ -376,16 +376,18 @@ function wireFxPanel() {
   const SLIDERS = [
     { label: "bloom scale",  cvar: "r_bloomScale",     min: 0,   max: 3,   step: 0.05, value: 1.25 },
     { label: "bloom thresh", cvar: "r_bloomThreshold", min: 0,   max: 1,   step: 0.02, value: 0.5 },
-    // Iter 29 BFG calibration: gamma 1.0 + lightScale 3 (the verified BFG
-    // defaults; BFG's "brighter" is the lightScale, not a gamma lift).
+    // Iter 35: defaults = native dhewm3 parity; ?bfg preset shifts
+    // lightScale 3 + shadow-darken 0.6 (sliders show the active preset).
     { label: "gamma",        cvar: "r_gamma",          min: 0.5, max: 2,   step: 0.05, value: 1.0 },
     { label: "brightness",   cvar: "r_brightness",     min: 0.5, max: 2,   step: 0.05, value: 1.0 },
     // Multiplies LIGHT energy (pools brighten, shadow contrast scales with
-    // it) instead of lifting the whole frame. BFG default = 3 (classic 2).
-    { label: "light scale",  cvar: "r_lightScale",     min: 1,   max: 6,   step: 0.25, value: 3 },
+    // it) instead of lifting the whole frame. Native = 2, BFG preset = 3.
+    { label: "light scale",  cvar: "r_lightScale",     min: 1,   max: 6,   step: 0.25,
+      value: /[?&]bfg\b/.test(location.search) ? 3 : 2 },
     // Quest-style visible shadows: shadowed pixels multiply by this
     // (1 = vanilla per-light masking only, lower = darker shadows).
-    { label: "shadow dark",  cvar: "r_shadowDarken",   min: 0.2, max: 1,   step: 0.05, value: 0.6 },
+    { label: "shadow dark",  cvar: "r_shadowDarken",   min: 0.2, max: 1,   step: 0.05,
+      value: /[?&]bfg\b/.test(location.search) ? 0.6 : 1.0 },
   ];
   for (const s of SLIDERS) {
     const row = document.createElement("div");

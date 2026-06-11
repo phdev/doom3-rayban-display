@@ -5996,7 +5996,7 @@ index 0000000..0f9c8e6
 +    return nullptr;
 +}
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
-index 7914093..353af81 100644
+index 7914093..6865145 100644
 --- a/neo/renderer/RenderSystem_init.cpp
 +++ b/neo/renderer/RenderSystem_init.cpp
 @@ -39,6 +39,11 @@ If you have questions concerning this license or the applicable additional terms
@@ -6026,7 +6026,7 @@ index 7914093..353af81 100644
 +// each view by RB_BeginDrawingView.
 +idCVar r_bloom( "r_bloom", "0", CVAR_RENDERER | CVAR_BOOL, "WebGPU bloom post-process" );
 +idCVar r_wgpuSingleLight( "r_wgpuSingleLight", "-1", CVAR_RENDERER | CVAR_INTEGER, "debug: draw only the WebGPU capture lightId N (per-frame vLight order)" );
-+idCVar r_shadowDarken( "r_shadowDarken", "0.6", CVAR_RENDERER | CVAR_FLOAT, "WebGPU: multiply shadowed pixels by this factor (1 = off; Quest-style visible shadows)" );
++idCVar r_shadowDarken( "r_shadowDarken", "1.0", CVAR_RENDERER | CVAR_FLOAT, "WebGPU: multiply shadowed pixels by this factor (1 = off; Quest-style visible shadows)" );
 +idCVar r_bloomThreshold( "r_bloomThreshold", "0.5", CVAR_RENDERER | CVAR_FLOAT, "bloom bright-pass threshold (0..1)" );
 +idCVar r_bloomScale( "r_bloomScale", "1.25", CVAR_RENDERER | CVAR_FLOAT, "bloom intensity" );
 +// Iter 28: WebGPU GPU-memory diet for iOS Safari (the tab dies on total GPU
@@ -6038,7 +6038,7 @@ index 7914093..353af81 100644
 +// DOOM-3-BFG source: BFG replaced the 2004 specular table (zero below
 +// N·H 0.75, then (4(x-.75))²) with analytic pow(N·H, 10) — broader, always-
 +// visible highlights (the floor sheen in BFG screenshots).
-+idCVar r_bfgSpecular( "r_bfgSpecular", "1", CVAR_RENDERER | CVAR_BOOL, "WebGPU: BFG-style analytic pow(N·H,10) specular falloff (0 = classic LUT ramp)" );
++idCVar r_bfgSpecular( "r_bfgSpecular", "0", CVAR_RENDERER | CVAR_BOOL, "WebGPU: BFG-style analytic pow(N·H,10) specular falloff (0 = classic LUT ramp)" );
 +idCVar r_skipGLDraw( "r_skipGLDraw", "0", CVAR_RENDERER | CVAR_BOOL,
 +	"skip GL draw calls (WebGPU-primary cutover; the WebGPU echo renders instead). "
 +	"Tiny views (lightgem) keep drawing so gameplay light readback works." );
