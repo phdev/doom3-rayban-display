@@ -46,6 +46,11 @@ struct Uniforms {
     //   params.w = r_brightness
     //   params2.x = 1 / r_gamma
     //   params2.y = BFG specular (0 = classic LUT ramp, 1 = pow(N·H,10))
+    //   params2.z = zeroClamp projection (1 = cookie is TR_CLAMP_TO_ZERO:
+    //               zero light outside the projection's [0,1] uv box —
+    //               WebGPU has no border-clamp sampler, and without this
+    //               the cookie's edge texels smear across the whole light
+    //               volume; see the enpro warm-wash bug)
     params:               vec4<f32>,
     params2:              vec4<f32>,
 };
@@ -144,7 +149,15 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
 
     // Light projection cookie (perspective-corrected projection)
     let proj_uv = in.light_proj_uvw.xy / max(in.light_proj_uvw.z, 0.001);
-    let light_proj_color = textureSample(t_lightProj, s_lighting, proj_uv).rgb;
+    var light_proj_color = textureSample(t_lightProj, s_lighting, proj_uv).rgb;
+    // zeroClamp emulation (params2.z): vanilla GL gives these cookies a
+    // black border + border-clamp sampler, so the light is ZERO outside its
+    // projection frustum (and behind the light, w<=0). Mask explicitly —
+    // edge-clamp alone smears the cookie's edge texels everywhere.
+    let zc_in = step(0.0, proj_uv.x) * step(proj_uv.x, 1.0)
+              * step(0.0, proj_uv.y) * step(proj_uv.y, 1.0)
+              * step(0.0001, in.light_proj_uvw.z);
+    light_proj_color = light_proj_color * mix(1.0, zc_in, u.params2.z);
     // Falloff ramp: vanilla interaction.vfp does `MUL light, light, falloff`
     // with the full RGBA sample — the ramp lives in RGB (TGA / makeintensity
     // images replicate intensity across channels). Sampling .a here was a

@@ -1355,6 +1355,56 @@ validation errors in a 539-line log (the "err 69" line is the idle
 GL probe, not WebGPU). Safari fps ~17 vs Chrome ~60 — open perf
 question, not a correctness one.
 
+**Iters 33-34 — THE WARM-WASH HUNT (2026-06-11): a forensic chain
+worth rereading before any future "lighting differs from native"
+work.** User: "native dhewm3 shows shadows/darkness ours lacks."
+The hunt's twists, in order, each with the instrument that cracked it:
+1. r_wgpuSingleLight prefix-sweep + per-channel RGB metric → ONE light
+   carried the warm wash (R-B jump at prefix 3).
+2. New light-inventory dump (d3cmd r_wgpuSingleLight 999 → names every
+   frame light: shader/origin/view/shaderParms) + zcProbe (cookie
+   cached-pixel sampler) → cookie content + repeat modes were CORRECT.
+3. REAL FIXES SHIPPED along the way (all vanilla-parity wins, keep):
+   (a) cache hook moved AFTER R_SetBorderTexels — zeroClamp cookies'
+   baked black border never reached the WebGPU copies; (b) zeroClamp
+   uv-box mask in interaction.wgsl (params2.z; WebGPU has no
+   border-clamp samplers) + per-mip border re-stamp in the backend's
+   mip builder; (c) LIGHT SAMPLERS ARE LOD-0 ONLY (vanilla samples
+   cookies/falloffs GL_LINEAR no-mip; our mip chains averaged
+   dark-edged cookies toward gray at glancing angles) — separate wrap
+   LOD-0 sampler for scrolling cookies.
+4. g_debugCinematic + condump-to-MEMFS + FS.readFile (engine console
+   never reaches JS — this is THE way to read it from Playwright) →
+   the skip-mode and played-intro cinematic traces are FRAME-IDENTICAL
+   (the enpro intro is 42 game-seconds; the end-teleport fires in
+   both; D3 4-arg setviewpos≠5-arg, whatever). The "player stranded at
+   the dock" theory died: early inventory dumps had fired
+   MID-CINEMATIC (frame>600 ≈ inside the intro) — the "view" was the
+   cinematic camera, not the player. INSTRUMENT TIMING IS PART OF THE
+   MEASUREMENT.
+5. Final truth: the lingering tone delta between fast-forwarded and
+   played boots = (a) THE AUTO-FLASHLIGHT — its 2.6s JS timer lands
+   MID-cinematic in a played intro (impulse swallowed → flashlight
+   off) but post-skip in a fast-forwarded one (flashlight on; white
+   close light on warm-albedo walls reads as "warm wash", R/B 1.40 vs
+   1.26); (b) wall GUI screens stay dark after fast-forward (GUIs only
+   process events when RENDERED — known cosmetic issue, accepted).
+   The staging dock genuinely IS warm-flooded by four huge spot01s —
+   authored data, not a bug.
+FIXES: SetCamera now publishes window.__d3InCinematic; the JS
+auto-flashlight polls it and waits out cinematics (consistent state
+both modes). g_skipCinematics now arms in SetCamera and applies in
+RunFrame one frame later (vanilla-ESC-equivalent timing). Light
+samplers/zeroClamp/cache-order fixes as above. Det rounds 1-6
+IDENTICAL after all of it.
+LESSONS: (a) compare channel MEANS (R/B ratio) not eyeballs — "warm
+wash" vs "missing shadows" read identically to the eye; (b) every
+same-vantage comparison must pin BOTH the flashlight state AND the
+capture time relative to map start (machinery transits run ~80s);
+(c) the reduced pak was byte-identical to GOG for every suspected
+asset (cookies, materials, tables, scripts, default.cfg) — pak
+paranoia wasted three rounds; check engine-state divergence first.
+
 **Iter 32 — bloom default OFF (2026-06-11, vanilla parity).** User
 call: the game doesn't have bloom (confirmed by the iter-29 research:
 bloom is RBDOOM-fork-only — neither classic dhewm3 nor stock BFG has

@@ -1662,13 +1662,22 @@ function armAutoFlashlight() {
   autoFlashlightArmed = true;
   // Small delay so the player has fully spawned and the first frames are ticking
   // before the latched toggle is sent (an impulse sent pre-spawn would be dropped).
-  window.setTimeout(() => {
+  // Iter 34: ALSO wait out any intro cinematic (window.__d3InCinematic is
+  // published by the engine's SetCamera) — a flashlight impulse sent during a
+  // cinematic is swallowed, and the toggle landing mid-intro left the
+  // fast-forwarded boot with a different flashlight state than a played one.
+  const tryEnable = (attempt) => {
     if (!wearableInput || wearableInput.getState?.().flashlight) {
+      return;
+    }
+    if (window.__d3InCinematic === 1 && attempt < 120) {
+      window.setTimeout(() => tryEnable(attempt + 1), 1000);
       return;
     }
     wearableInput.toggleFlashlight();
     diag("flashlight: auto-enabled for the dark spawn room (long-pinch to toggle)");
-  }, 2600);
+  };
+  window.setTimeout(() => tryEnable(0), 2600);
 }
 
 function startEnemyIndicatorPolling() {

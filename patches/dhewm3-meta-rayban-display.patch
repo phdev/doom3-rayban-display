@@ -963,27 +963,99 @@ index 0000000..bd37bff
 +
 +#endif // __D3_WEARABLE_GAME_H__
 diff --git a/neo/game/Game_local.cpp b/neo/game/Game_local.cpp
-index 1fca78f..6357ac5 100644
+index 1fca78f..c95f168 100644
 --- a/neo/game/Game_local.cpp
 +++ b/neo/game/Game_local.cpp
-@@ -3963,6 +3963,17 @@ void idGameLocal::SetCamera( idCamera *cam ) {
+@@ -27,6 +27,10 @@ If you have questions concerning this license or the applicable additional terms
+ */
+ 
+ #include "sys/platform.h"
++
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++#endif
+ #include "idlib/LangDict.h"
+ #include "idlib/Timer.h"
+ #include "framework/async/NetworkSystem.h"
+@@ -216,6 +220,7 @@ void idGameLocal::Clear( void ) {
+ 	cinematicSkipTime = 0;
+ 	cinematicStopTime = 0;
+ 	cinematicMaxSkipTime = 0;
++	cinSkipArmedFrame = -1;
+ 	framenum = 0;
+ 	previousTime = 0;
+ 	time = 0;
+@@ -972,6 +977,7 @@ void idGameLocal::LoadMap( const char *mapName, int randseed ) {
+ 	cinematicSkipTime = 0;
+ 	cinematicStopTime = 0;
+ 	cinematicMaxSkipTime = 0;
++	cinSkipArmedFrame = -1;
+ 
+ 	clip.Init();
+ 	pvs.Init();
+@@ -2273,6 +2279,19 @@ gameReturn_t idGameLocal::RunFrame( const usercmd_t *clientCmds ) {
+ 			player->Think();
+ 		}
+ 	} else do {
++		// Iter 34 (g_skipCinematics): apply the deferred auto-skip armed by
++		// SetCamera once the camera has run at least one full game frame —
++		// firing at camera-start frame zero truncated multi-camera intros
++		// before their end-of-sequence teleport (see SetCamera).
++		if ( cinSkipArmedFrame >= 0 && framenum > cinSkipArmedFrame ) {
++			cinSkipArmedFrame = -1;
++			if ( inCinematic && !skipCinematic ) {
++				soundSystem->SetMute( true );
++				skipCinematic = true;
++				cinematicMaxSkipTime = time + SEC2MS( g_cinematicMaxSkipTime.GetFloat() );
++			}
++		}
++
+ 		// update the game time
+ 		framenum++;
+ 		previousTime = time;
+@@ -3960,9 +3979,30 @@ void idGameLocal::SetCamera( idCamera *cam ) {
+ 	}
+ 
+ 	camera = cam;
++#ifdef __EMSCRIPTEN__
++	// Iter 34: cinematic state for the web shell (the auto-flashlight must
++	// wait — its impulse is swallowed during cinematics, which made the
++	// fast-forwarded boot KEEP the flashlight while a played intro lost it).
++	EM_ASM_({ window.__d3InCinematic = $0; }, cam ? 1 : 0);
++#endif
  	if ( camera ) {
  		inCinematic = true;
  
-+		// Wearable/kiosk build (g_skipCinematics 1): fast-forward every cinematic the
-+		// instant it starts, since a touchscreen has no ESC key to skip it and the
-+		// reduced data set renders cinematics poorly. Mirrors SkipCinematic()'s
-+		// non-disconnect path; the existing 'disconnect' check right below then runs
-+		// with skipCinematic already set, so disconnect cameras still behave correctly.
++		// Wearable/kiosk build (g_skipCinematics 1): fast-forward cinematics,
++		// since a touchscreen has no ESC key and the reduced data renders
++		// them poorly. Iter 34: do NOT set skipCinematic here at camera-start
++		// frame zero — that truncated multi-camera intros (enpro's arrival
++		// sequence) before their end-of-sequence triggers/teleport ran,
++		// stranding the player in the cinematic STAGING AREA with its warm
++		// machinery lights on (the "wrong lighting vs native" bug: the
++		// fast-forwarded boot ended in a DIFFERENT corridor than a played
++		// intro). Instead arm a deferred skip; RunFrame applies it after the
++		// camera has run a frame — the earliest possible human ESC, the code
++		// path the sequences were authored against.
 +		if ( g_skipCinematics.GetBool() && !skipCinematic ) {
-+			soundSystem->SetMute( true );
-+			skipCinematic = true;
-+			cinematicMaxSkipTime = time + SEC2MS( g_cinematicMaxSkipTime.GetFloat() );
++			cinSkipArmedFrame = framenum;
 +		}
 +
  		if ( skipCinematic && camera->spawnArgs.GetBool( "disconnect" ) ) {
  			camera->spawnArgs.SetBool( "disconnect", false );
  			cvarSystem->SetCVarFloat( "r_znear", 3.0f );
+diff --git a/neo/game/Game_local.h b/neo/game/Game_local.h
+index 60b0b88..b249b5b 100644
+--- a/neo/game/Game_local.h
++++ b/neo/game/Game_local.h
+@@ -265,6 +265,7 @@ public:
+ 	int						cinematicSkipTime;		// don't allow skipping cinemetics until this time has passed so player doesn't skip out accidently from a firefight
+ 	int						cinematicStopTime;		// cinematics have several camera changes, so keep track of when we stop them so that we don't reset cinematicSkipTime unnecessarily
+ 	int						cinematicMaxSkipTime;	// time to end cinematic when skipping.  there's a possibility of an infinite loop if the map isn't set up right.
++	int						cinSkipArmedFrame;		// iter 34 (g_skipCinematics): SetCamera arms, RunFrame applies one frame later (-1 = unarmed)
+ 	bool					inCinematic;			// game is playing cinematic (player controls frozen)
+ 	bool					skipCinematic;
+ 
 diff --git a/neo/game/Item.cpp b/neo/game/Item.cpp
 index 97ae952..ac0a910 100644
 --- a/neo/game/Item.cpp
@@ -1005,6 +1077,19 @@ index 97ae952..ac0a910 100644
  	}
  
  	// if the model should be shrinked
+diff --git a/neo/game/Misc.cpp b/neo/game/Misc.cpp
+index e0c0e89..5dab569 100644
+--- a/neo/game/Misc.cpp
++++ b/neo/game/Misc.cpp
+@@ -226,7 +226,7 @@ idPlayerStart::Event_TeleportPlayer
+ void idPlayerStart::Event_TeleportPlayer( idEntity *activator ) {
+ 	idPlayer *player;
+ 
+-	if ( activator->IsType( idPlayer::Type ) ) {
++	if ( activator && activator->IsType( idPlayer::Type ) ) {
+ 		player = static_cast<idPlayer*>( activator );
+ 	} else {
+ 		player = gameLocal.GetLocalPlayer();
 diff --git a/neo/game/Moveable.cpp b/neo/game/Moveable.cpp
 index e3458b3..4443dad 100644
 --- a/neo/game/Moveable.cpp
@@ -1143,7 +1228,7 @@ index e6bb4aa..e173c9f 100644
  	if ( RoQPlayed >= ROQSize ) {
  		if (looping) {
 diff --git a/neo/renderer/Image_load.cpp b/neo/renderer/Image_load.cpp
-index f9ae002..cc999ce 100644
+index f9ae002..9430a1e 100644
 --- a/neo/renderer/Image_load.cpp
 +++ b/neo/renderer/Image_load.cpp
 @@ -27,6 +27,13 @@ If you have questions concerning this license or the applicable additional terms
@@ -1160,20 +1245,27 @@ index f9ae002..cc999ce 100644
  #include "idlib/hashing/MD4.h"
  #include "renderer/tr_local.h"
  
-@@ -604,6 +611,12 @@ void idImage::GenerateImage( const byte *pic, int width, int height,
- 	uploadWidth = scaled_width;
- 	type = TT_2D;
+@@ -621,6 +628,19 @@ void idImage::GenerateImage( const byte *pic, int width, int height,
+ 		R_SetBorderTexels( (byte *)scaledBuffer, width, height, rgba );
+ 	}
  
 +	// Iter 7 (WebGPU): stash the RGBA8 source pixels so the WebGPU backend
 +	// can upload them to its own textures. Without this hook the data lives
 +	// only on the GL texture object and isn't readable from outside the GL
 +	// context. Forward-declared above; defined in tr_render.cpp.
++	// Iter 33: MUST run AFTER the zero-clamp border bake above — vanilla's
++	// zeroClamp (lights/spot01 etc) works via these baked black border
++	// texels + GL border clamp; WebGPU/WebGL have no border clamp, so an
++	// un-bordered cookie smears its warm edge texels across the whole light
++	// volume under edge-clamp (THE enpro warm-wash bug: light projections
++	// reached everywhere, filling in the scene's darkness). Still before
++	// the rxgb red/alpha swap below (normal maps decode RGB in the cache).
 +	D3_WebGPU_CacheImage( this, (const unsigned char*)scaledBuffer, scaled_width, scaled_height );
 +
- 	// zero the border if desired, allowing clamped projection textures
- 	// even after picmip resampling or careless artists.
- 	if ( repeat == TR_CLAMP_TO_ZERO ) {
-@@ -665,6 +678,24 @@ void idImage::GenerateImage( const byte *pic, int width, int height,
+ 	if ( generatorFunction == NULL && ( (depth == TD_BUMP && globalImages->image_writeNormalTGA.GetBool()) || (depth != TD_BUMP && globalImages->image_writeTGA.GetBool()) ) ) {
+ 		// Optionally write out the texture to a .tga
+ 		char filename[MAX_IMAGE_NAME];
+@@ -665,6 +685,24 @@ void idImage::GenerateImage( const byte *pic, int width, int height,
  	// upload the main image level
  	Bind();
  
@@ -1198,7 +1290,7 @@ index f9ae002..cc999ce 100644
  
  	if ( internalFormat == GL_COLOR_INDEX8_EXT ) {
  		/*
-@@ -872,6 +903,8 @@ Non-square cube sides are not allowed
+@@ -872,6 +910,8 @@ Non-square cube sides are not allowed
  void idImage::GenerateCubeImage( const byte *pic[6], int size,
  					   textureFilter_t filterParm, bool allowDownSizeParm,
  					   textureDepth_t depthParm ) {
@@ -1207,7 +1299,7 @@ index f9ae002..cc999ce 100644
  	int			scaled_width, scaled_height;
  	int			width, height;
  	int			i;
-@@ -1907,6 +1940,22 @@ CopyFramebuffer
+@@ -1907,6 +1947,22 @@ CopyFramebuffer
  ====================
  */
  void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bool useOversizedBuffer ) {
@@ -1230,7 +1322,7 @@ index f9ae002..cc999ce 100644
  	Bind();
  
  	if ( cvarSystem->GetCVarBool( "g_lowresFullscreenFX" ) ) {
-@@ -1932,7 +1981,12 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
+@@ -1932,7 +1988,12 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
  		uploadWidth = potWidth;
  		uploadHeight = potHeight;
  		if ( potWidth == imageWidth && potHeight == imageHeight ) {
@@ -1244,7 +1336,7 @@ index f9ae002..cc999ce 100644
  		} else {
  			byte	*junk;
  			// we need to create a dummy image with power of two dimensions,
-@@ -1945,7 +1999,10 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
+@@ -1945,7 +2006,10 @@ void idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight, bo
  				junk[i+1] = 255;
  			}
  #endif
@@ -1981,10 +2073,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..ac231f3
+index 0000000..708c25d
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,3814 @@
+@@ -0,0 +1,3886 @@
 +/*
 +================================================================================
 +
@@ -2592,10 +2684,23 @@ index 0000000..ac231f3
 +        msd.addressModeW = WGPUAddressMode_Repeat;
 +        msd.maxAnisotropy = 1;
 +        interactionMaterialSampler = wgpuDeviceCreateSampler(device, &msd);
++        // Iter 33: LIGHT samplers are LOD-0 ONLY. Vanilla samples light
++        // cookies/falloffs with GL_LINEAR (no mip filter); our full mip
++        // chains average a dark-edged cookie toward warm gray, and glancing
++        // surfaces then sample that gray everywhere — THE enpro warm-wash
++        // (lights/squareishlight read 0.2-0.4 across walls its pool never
++        // touches; native reads ~0 there).
 +        WGPUSamplerDescriptor lsd = msd;
 +        lsd.addressModeU = WGPUAddressMode_ClampToEdge;
 +        lsd.addressModeV = WGPUAddressMode_ClampToEdge;
++        lsd.mipmapFilter = WGPUMipmapFilterMode_Nearest;
++        lsd.lodMinClamp = 0.0f;
++        lsd.lodMaxClamp = 0.0f;
 +        interactionLightSampler = wgpuDeviceCreateSampler(device, &lsd);
++        WGPUSamplerDescriptor lwd = lsd;
++        lwd.addressModeU = WGPUAddressMode_Repeat;
++        lwd.addressModeV = WGPUAddressMode_Repeat;
++        interactionLightWrapSampler = wgpuDeviceCreateSampler(device, &lwd);
 +
 +        EM_ASM({ console.info("[d3] WebGPU interaction pipeline initialized"); });
 +    }
@@ -3586,6 +3691,25 @@ index 0000000..ac231f3
 +            const int nw = lw > 1 ? lw >> 1 : 1, nh = lh > 1 ? lh >> 1 : 1;
 +            uint8_t* next = (uint8_t*)malloc((size_t)nw * nh * 4u);
 +            boxReduceHalf(cur, lw, lh, next, nw, nh);
++            // Iter 33: zeroClamp images carry a baked black border (vanilla's
++            // border-clamp substitute) — re-stamp it per mip level or the box
++            // filter averages it away and edge-clamp smears the cookie again.
++            if (slot->repeat == 3 || slot->repeat == 4) {
++                const bool alphaMode = (slot->repeat == 4);
++                const uint8_t br = alphaMode ? 255 : 0, ba = alphaMode ? 0 : 255;
++                for (int x = 0; x < nw; ++x) {
++                    uint8_t* t = next + (size_t)x * 4u;            // top row
++                    uint8_t* b = next + ((size_t)(nh - 1) * nw + x) * 4u;
++                    t[0] = t[1] = t[2] = br; t[3] = ba;
++                    b[0] = b[1] = b[2] = br; b[3] = ba;
++                }
++                for (int y = 0; y < nh; ++y) {
++                    uint8_t* l = next + (size_t)y * nw * 4u;       // left col
++                    uint8_t* r2 = next + ((size_t)y * nw + (nw - 1)) * 4u;
++                    l[0] = l[1] = l[2] = br; l[3] = ba;
++                    r2[0] = r2[1] = r2[2] = br; r2[3] = ba;
++                }
++            }
 +            free(cur);
 +            cur = next;
 +            lw = nw; lh = nh;
@@ -3656,7 +3780,10 @@ index 0000000..ac231f3
 +        const bool projRepeats = projSlot && projSlot->repeat == 0;   // TR_REPEAT
 +        WGPUBindGroupEntry e[8] = {};
 +        e[0].binding = 0; e[0].sampler = interactionMaterialSampler;
-+        e[1].binding = 1; e[1].sampler = projRepeats ? interactionMaterialSampler : interactionLightSampler;
++        // Iter 33: both lighting-sampler variants are LOD-0 only (vanilla
++        // GL_LINEAR semantics) — repeat cookies (scrolling lights) get the
++        // wrap LOD-0 sampler, NOT the mipped material sampler.
++        e[1].binding = 1; e[1].sampler = projRepeats ? interactionLightWrapSampler : interactionLightSampler;
 +        e[2].binding = 2; e[2].textureView = vNormal;
 +        e[3].binding = 3; e[3].textureView = vSpecular;
 +        e[4].binding = 4; e[4].textureView = vDiffuse;
@@ -3934,7 +4061,43 @@ index 0000000..ac231f3
 +            ub[51] = (float)r.pad3 / 1000.0f;
 +            ub[52] = g_capInvGamma;
 +            ub[53] = g_capBfgSpec;   // iter 29: 1 = BFG pow(N·H,10) specular
-+            ub[54] = 0.0f; ub[55] = 0.0f;
++            // Iter 33: zeroClamp cookie flag — TR_CLAMP_TO_ZERO(3) /
++            // TR_CLAMP_TO_ZERO_ALPHA(4) projections must be ZERO outside
++            // their [0,1] uv box (no border-clamp samplers in WebGPU).
++            {
++                const ImgSlot* ps = D3_WebGPU_LookupCachedImage(g_capImagePtrs[i][2]);
++                ub[54] = (ps && (ps->repeat == 3 || ps->repeat == 4)) ? 1.0f : 0.0f;
++                // zeroClamp probe (single-light hunts only): name the cookie,
++                // its cached repeat mode, and the flag we just set.
++                if (g_capWgpuSingleLight >= 0) {
++                    static const void* probed[16] = {};
++                    static int probedN = 0;
++                    bool seen = false;
++                    for (int k = 0; k < probedN; ++k) if (probed[k] == g_capImagePtrs[i][2]) { seen = true; break; }
++                    if (!seen && probedN < 16) {
++                        probed[probedN++] = g_capImagePtrs[i][2];
++                        int cx = 0, e0 = 0, e1 = 0, e2 = 0, pw = 0, phh = 0;
++                        if (ps && ps->pixels) {
++                            pw = ps->w; phh = ps->h;
++                            const uint8_t* px = ps->pixels;
++                            const int mid = ((phh/2) * pw + pw/2) * 4;
++                            cx = px[mid];
++                            e0 = px[((phh/2) * pw + 1) * 4];            // left edge
++                            e1 = px[((phh/2) * pw + pw - 2) * 4];        // right edge
++                            e2 = px[(1 * pw + pw/2) * 4];                // top edge
++                        }
++                        EM_ASM_({
++                            console.info("[d3] zcProbe proj=" + UTF8ToString($0) +
++                                         " cached=" + $1 + " repeat=" + $2 + " zcFlag=" + $3 +
++                                         " size=" + $4 + "x" + $5 +
++                                         " centerR=" + $6 + " edgesR=(" + $7 + "," + $8 + "," + $9 + ")");
++                        }, D3_WebGPU_ImageName(g_capImagePtrs[i][2]),
++                           ps ? 1 : 0, ps ? ps->repeat : -1, (int)(ub[54]),
++                           pw, phh, cx, e0, e1, e2);
++                    }
++                }
++            }
++            ub[55] = 0.0f;
 +            memcpy(recordUBStage + (size_t)i * kUBStride, ub, 224);
 +            if (i + 1 > recordUBHigh) recordUBHigh = i + 1;
 +            // Iter 7b: resolve the material bind group (creates GPU textures
@@ -5584,6 +5747,7 @@ index 0000000..ac231f3
 +    WGPURenderPipeline      interactionPipeline = nullptr;
 +    WGPUSampler             interactionMaterialSampler = nullptr;
 +    WGPUSampler             interactionLightSampler = nullptr;
++    WGPUSampler             interactionLightWrapSampler = nullptr;   // iter 33: repeat cookies, LOD-0
 +    // Iter 7b: z-fill pre-pass pipeline (depth.wgsl, no fragment stage)
 +    WGPURenderPipeline      depthPipeline = nullptr;
 +    // Iter 5: depth buffer (canvas-sized; shared by pre-pass + lit pass)
@@ -5969,10 +6133,21 @@ index 7914093..353af81 100644
  	GLimp_Shutdown();
  
 diff --git a/neo/renderer/draw_arb2.cpp b/neo/renderer/draw_arb2.cpp
-index c1d0d3e..24a3af8 100644
+index c1d0d3e..99a7f6b 100644
 --- a/neo/renderer/draw_arb2.cpp
 +++ b/neo/renderer/draw_arb2.cpp
-@@ -62,7 +62,204 @@ static void GL_SelectTextureNoClient( int unit ) {
+@@ -31,6 +31,10 @@ If you have questions concerning this license or the applicable additional terms
+ 
+ #include "renderer/tr_local.h"
+ 
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++#endif
++
+ // DG: if this is defined, the soft particle shaders will be compiled into the executable
+ //  otherwise soft_particle.vfp will be opened as a file just like the other shaders
+ //  (useful when tweaking that shader - when loaded from disk, you can use `reloadARBprograms`
+@@ -62,7 +66,204 @@ static void GL_SelectTextureNoClient( int unit ) {
  RB_ARB2_DrawInteraction
  ==================
  */
@@ -6177,7 +6352,7 @@ index c1d0d3e..24a3af8 100644
  	// load all the vertex program parameters
  	qglProgramEnvParameter4fvARB( GL_VERTEX_PROGRAM_ARB, PP_LIGHT_ORIGIN, din->localLightOrigin.ToFloatPtr() );
  	qglProgramEnvParameter4fvARB( GL_VERTEX_PROGRAM_ARB, PP_VIEW_ORIGIN, din->localViewOrigin.ToFloatPtr() );
-@@ -190,6 +387,7 @@ void RB_ARB2_CreateDrawInteractions( const drawSurf_t *surf ) {
+@@ -190,6 +391,7 @@ void RB_ARB2_CreateDrawInteractions( const drawSurf_t *surf ) {
  	} else {
  		globalImages->specularTableImage->Bind();
  	}
@@ -6185,15 +6360,53 @@ index c1d0d3e..24a3af8 100644
  
  
  	for ( ; surf ; surf=surf->nextOnLight ) {
-@@ -258,6 +456,7 @@ void RB_ARB2_DrawInteractions( void ) {
+@@ -258,6 +460,45 @@ void RB_ARB2_DrawInteractions( void ) {
  	//
  	for ( vLight = backEnd.viewDef->viewLights ; vLight ; vLight = vLight->next ) {
  		backEnd.vLight = vLight;
 +		g_capLightId++;   // iter 9: shadow/interaction grouping for the WebGPU echo
++
++#ifdef __EMSCRIPTEN__
++		// Iter 33 (warm-wash hunt): one-shot light inventory — names each
++		// frame-relative light index so r_wgpuSingleLight N findings map to
++		// an actual light shader + origin. Fires once, ~10s into the map.
++		{
++			extern uint32_t g_capFrameId;
++			extern int g_capWgpuSingleLight;
++			static uint32_t dumpedAtFrame = 0;
++			static int dumpCount = 0;
++			static uint32_t frameMinId = 0;
++			// on-demand re-arm: d3cmd("r_wgpuSingleLight 999") re-dumps the
++			// current frame's light list (then set it back to -1)
++			if ( g_capWgpuSingleLight == 999 && dumpedAtFrame != 0 && g_capFrameId - dumpedAtFrame >= 200 ) {
++				dumpCount = 0;
++				dumpedAtFrame = 0;
++			}
++			if ( g_capWgpuSingleLight == 999 && dumpCount < 48 ) {
++				if ( dumpedAtFrame == 0 ) { dumpedAtFrame = g_capFrameId; frameMinId = g_capLightId; }
++				if ( g_capFrameId - dumpedAtFrame < 200 ) {
++					const idVec3& o = vLight->lightDef->parms.origin;
++					const idVec3& vo = backEnd.viewDef->renderView.vieworg;
++					static char lightDesc[256];
++					idStr::snPrintf( lightDesc, sizeof( lightDesc ),
++						"shader=%s origin=(%.0f,%.0f,%.0f) view=(%.0f,%.0f,%.0f) parms=(%.2f,%.2f,%.2f)",
++						vLight->lightShader->GetName(),
++						o.x, o.y, o.z, vo.x, vo.y, vo.z,
++						vLight->lightDef->parms.shaderParms[0],
++						vLight->lightDef->parms.shaderParms[1],
++						vLight->lightDef->parms.shaderParms[2] );
++					EM_ASM_({
++						console.info("[d3] light[" + $0 + "] " + UTF8ToString($1));
++					}, (int)(g_capLightId - frameMinId), lightDesc);
++					dumpCount++;
++				}
++			}
++		}
++#endif
  
  		// do fogging later
  		if ( vLight->lightShader->IsFogLight() ) {
-@@ -314,7 +513,9 @@ void RB_ARB2_DrawInteractions( void ) {
+@@ -314,7 +555,9 @@ void RB_ARB2_DrawInteractions( void ) {
  		qglStencilFunc( GL_ALWAYS, 128, 255 );
  
  		backEnd.depthFunc = GLS_DEPTHFUNC_LESS;
@@ -6203,7 +6416,7 @@ index c1d0d3e..24a3af8 100644
  
  		backEnd.depthFunc = GLS_DEPTHFUNC_EQUAL;
  	}
-@@ -757,6 +958,26 @@ int R_FindARBProgram( GLenum target, const char *program ) {
+@@ -757,6 +1000,26 @@ int R_FindARBProgram( GLenum target, const char *program ) {
  	return progs[i].ident;
  }
  
@@ -7489,10 +7702,10 @@ index c83ebb5..82b5bdd 100644
  	// ensures that depth writes are enabled for the depth clear
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..43bc27f
+index 0000000..efe634a
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,840 @@
+@@ -0,0 +1,853 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -7976,6 +8189,11 @@ index 0000000..43bc27f
 +"    //   params.w = r_brightness\n"
 +"    //   params2.x = 1 / r_gamma\n"
 +"    //   params2.y = BFG specular (0 = classic LUT ramp, 1 = pow(N·H,10))\n"
++"    //   params2.z = zeroClamp projection (1 = cookie is TR_CLAMP_TO_ZERO:\n"
++"    //               zero light outside the projection's [0,1] uv box —\n"
++"    //               WebGPU has no border-clamp sampler, and without this\n"
++"    //               the cookie's edge texels smear across the whole light\n"
++"    //               volume; see the enpro warm-wash bug)\n"
 +"    params:               vec4<f32>,\n"
 +"    params2:              vec4<f32>,\n"
 +"};\n"
@@ -8074,7 +8292,15 @@ index 0000000..43bc27f
 +"\n"
 +"    // Light projection cookie (perspective-corrected projection)\n"
 +"    let proj_uv = in.light_proj_uvw.xy / max(in.light_proj_uvw.z, 0.001);\n"
-+"    let light_proj_color = textureSample(t_lightProj, s_lighting, proj_uv).rgb;\n"
++"    var light_proj_color = textureSample(t_lightProj, s_lighting, proj_uv).rgb;\n"
++"    // zeroClamp emulation (params2.z): vanilla GL gives these cookies a\n"
++"    // black border + border-clamp sampler, so the light is ZERO outside its\n"
++"    // projection frustum (and behind the light, w<=0). Mask explicitly —\n"
++"    // edge-clamp alone smears the cookie's edge texels everywhere.\n"
++"    let zc_in = step(0.0, proj_uv.x) * step(proj_uv.x, 1.0)\n"
++"              * step(0.0, proj_uv.y) * step(proj_uv.y, 1.0)\n"
++"              * step(0.0001, in.light_proj_uvw.z);\n"
++"    light_proj_color = light_proj_color * mix(1.0, zc_in, u.params2.z);\n"
 +"    // Falloff ramp: vanilla interaction.vfp does `MUL light, light, falloff`\n"
 +"    // with the full RGBA sample — the ramp lives in RGB (TGA / makeintensity\n"
 +"    // images replicate intensity across channels). Sampling .a here was a\n"
