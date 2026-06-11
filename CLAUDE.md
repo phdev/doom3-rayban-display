@@ -1095,3 +1095,26 @@ iPhone should gain the spin elimination + SIMD/O3 — re-test shadows
 on-device (?shadows) after this lands; classic dhewm3 has NO
 com_engineHz (that's RBDOOM), so tic-rate reduction isn't a lever
 without deeper surgery.
+
+**Iter 25 — PLAYER SHADOW validated + union-darken artifact fixed
+(2026-06-11).** The user demanded on-Chrome validation of the player
+shadow before any more on-device asks. FINDINGS: (1) the union-of-all-
+volumes darken pass (iter 23) blanket-darkened regions whose occluded
+light contributed nothing — giant moving blobs = the "improper
+lighting" reports. NOW PLAYER-VOLUMES-ONLY (capture tags records
+sPad3=1 when surf->space->entityDef suppresses surfaces in a view —
+only the first-person body does); world/NPC shadows remain vanilla
+per-light. (2) Player volumes verified captured (probe: ~16/600
+volumes) and VISUALLY validated: feet-down view in a bright pool
+shows a coherent dark player shadow that toggles with r_shadowDarken
+(10.7% px, connected region). (3) VALIDATION METHODOLOGY hard-won:
+screenshot A/B diffs in this game are POLLUTED by — scrolling light
+textures (translate time), light flicker tables, viewmodel sway, AND
+a slowly-settling camera after setviewpos (teleport, wait ~6s).
+Freeze with `timescale 0.001` (g_stopTime STOPS THINK → cvar toggles
+don't propagate!), settle first, and prefer feet-down vantages near
+body-height lights (lights with origin BELOW the floor throw player
+shadows at the CEILING — vantages matter). The X360-style shadow
+spots come from body-height lights like light_5252 by the crates.
+PHONE NOTE: "A problem repeatedly occurred" on iOS = Safari TAB
+CRASH (memory), not slowness — memory diet is the open phone item.

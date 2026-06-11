@@ -1949,10 +1949,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..042a9fa
+index 0000000..0fa0f64
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,3552 @@
+@@ -0,0 +1,3558 @@
 +/*
 +================================================================================
 +
@@ -4489,8 +4489,14 @@ index 0000000..042a9fa
 +                rpd.depthStencilAttachment = &da;
 +                WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
 +                wgpuRenderPassEncoderSetStencilReference(rp, 128);
++                // PLAYER volumes only: darkening the union of every volume
++                // in the scene blanket-darkened regions whose occluded light
++                // contributed nothing there (giant blobs). World/NPC shadows
++                // stay vanilla per-light; this pass exists so YOUR shadow is
++                // always visible.
 +                for (uint32_t sIdx = 0; sIdx < lastShadowCount; ++sIdx) {
 +                    const Rec& sr = lastShadowRecords[sIdx];
++                    if (sr.sPad3 != 1u) continue;
 +                    wgpuRenderPassEncoderSetPipeline(rp, sr.pad1 ? shadowZPassPipeline : shadowZFailPipeline);
 +                    wgpuRenderPassEncoderSetBindGroup(rp, 0, shadowBindGroups[sIdx], 0, nullptr);
 +                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, shadowVertexBuf, sr.vertOffset, (uint64_t)sr.vertCount * 16u);
@@ -6237,7 +6243,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..4cfa923 100644
+index c83ebb5..0f6d74c 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -6248,7 +6254,7 @@ index c83ebb5..4cfa923 100644
  
  /*
  
-@@ -38,6 +39,728 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +39,735 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -6640,6 +6646,12 @@ index c83ebb5..4cfa923 100644
 +// RB_T_Shadow once numIndexes/external are decided.
 +void D3_WebGPU_CaptureShadow( const drawSurf_t* surf, const srfTriangles_t* tri,
 +                              int numIndexes, bool external, const float localLight[4] ) {
++	// Iter 25: tag the first-person player body's volumes (the only entity
++	// that suppresses its surfaces in a view) so the backend's darken pass
++	// can give the PLAYER an always-visible shadow without blanket-darkening
++	// the scene with every volume in the world.
++	const bool playerBody = ( surf && surf->space && surf->space->entityDef &&
++	                          surf->space->entityDef->parms.suppressSurfaceInViewID != 0 );
 +	if ( !backEnd.viewDef || backEnd.viewDef->viewEntitys == NULL ) return;
 +	if ( ( backEnd.viewDef->viewport.x2 - backEnd.viewDef->viewport.x1 ) < 128 ) return;
 +	if ( !surf || !tri || !tri->shadowVertexes || !tri->indexes ) return;
@@ -6674,6 +6686,7 @@ index c83ebb5..4cfa923 100644
 +	r.lightId = g_capLightId;
 +	g_shadowVertBytes += vbytes;
 +	g_capIndexBytes   += iR;
++	g_shadowRecords[g_shadowRecordCount].sPad3 = playerBody ? 1u : 0u;
 +	g_shadowRecordCount++;
 +	g_capFrameId++;
 +}
@@ -6977,7 +6990,7 @@ index c83ebb5..4cfa923 100644
  
  /*
  =================
-@@ -49,6 +772,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +779,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -6993,7 +7006,7 @@ index c83ebb5..4cfa923 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +810,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +817,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -7009,7 +7022,7 @@ index c83ebb5..4cfa923 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +857,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +864,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -7026,7 +7039,7 @@ index c83ebb5..4cfa923 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +917,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +924,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -7034,7 +7047,7 @@ index c83ebb5..4cfa923 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1144,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1151,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -7047,7 +7060,7 @@ index c83ebb5..4cfa923 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1313,51 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1320,51 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
