@@ -1271,3 +1271,35 @@ System-Events ESC injection didn't land (accessibility). A patched-
 tree NATIVE build fails to link (port files aren't native-clean) —
 deleted build-native from the engine checkout BEFORE patch regen
 (git add -A would have shipped it into the patch).
+
+**Iter 30 — the WebKit GPU-process balloon (the REAL iPhone killer)
+(2026-06-11).** Shadows-on (iter 29) re-crashed the iPhone
+("GPUCommandEncoder.beginRenderPass: Unable to begin render pass" +
+WebGL context lost). MEASURED on Mac Safari (same WebKit WebGPU →
+Metal stack as iOS, via `ps` on com.apple.WebKit.GPU while the game
+runs): the GPU helper process BALLOONED past 1.7GB and kept climbing
+with shadows on; even shadows-off plateaued at 1.6-2.3GB with
+±300MB/s churn — iOS jetsam kills the tab long before those numbers.
+The driver is per-frame allocation churn in WebKit, not our resident
+resources (~100MB). Three structural cuts, all validated det-IDENTICAL
+×6 + render-equivalent (mean px diff 2.45 = animation noise floor):
+- **Delta vertex upload**: chunk-diff (256KB) the vert/index/shadow
+  accumulators against CPU mirrors; upload only changed ranges.
+  Static world geometry dominates → ~12MB/frame staging drops to the
+  animated remainder. Mirrors malloc-grow to high-water (~14MB heap).
+- **Redundant-submit skip**: on 120Hz displays rAF outpaces the 60Hz
+  engine — frames with NO fresh captures (cap+pass+shadow all zero)
+  skip acquire/encode/submit entirely; the canvas keeps the last
+  presented frame.
+- **Per-light pass merge**: only lights WITH shadow volumes need a
+  private stencil-reload pass; all unshadowed lights render in ONE
+  merged pass (stencil stays at cleared 128, GEQUAL passes — additive
+  blending is commutative, identical output). ~30 passes/frame → 1 +
+  shadowed-light count; the no-shadows path becomes a single pass.
+  (The per-light loop ran UNCONDITIONALLY before — pass count was
+  never the shadows delta; volume draws + shadow vert uploads were.)
+RESULT (Mac Safari, shadows ON): GPU process settles ~0.8GB trending
+down — BELOW the old shadows-OFF steady state. Shadows stay ON for
+the phone. Measurement recipe for future regressions: open the URL in
+Mac Safari, `ps -axo pid,rss,comm | grep WebKit.GPU` every 3s — a
+climb past ~1GB within a minute = the iPhone will die.

@@ -1981,10 +1981,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..e9ff5c9
+index 0000000..4213026
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,3652 @@
+@@ -0,0 +1,3806 @@
 +/*
 +================================================================================
 +
@@ -2250,6 +2250,20 @@ index 0000000..e9ff5c9
 +            initSkyPipeline();
 +            initReflectPipeline();
 +            initRecordSlots();
++        }
++        // Iter 30: on 120Hz displays rAF outpaces the 60Hz engine, so every
++        // other EndFrame would re-encode and re-submit a byte-identical
++        // frame — pure WebKit GPU-process churn (measured: the GPU helper
++        // ballooned past 1.6GB on Mac Safari; iOS kills the tab far
++        // earlier). No fresh captures of ANY kind → skip the submit; the
++        // canvas keeps showing the last presented frame.
++        if (recordSlotsReady && lastRecordCount > 0) {
++            extern uint32_t g_capRecordCount;
++            extern uint32_t g_passRecordCount;
++            extern uint32_t g_shadowRecordCount;
++            if (g_capRecordCount == 0 && g_passRecordCount == 0 && g_shadowRecordCount == 0) {
++                return;
++            }
 +        }
 +        if (surface && demoPipeline) {
 +            WGPUSurfaceTexture st;
@@ -3727,6 +3741,58 @@ index 0000000..e9ff5c9
 +        EM_ASM_({ console.info("[d3] WebGPU record slots ready: " + $0); }, kMaxRecordSlots);
 +    }
 +
++    // Iter 30: upload only the 256KB chunks that changed since the last
++    // frame. Re-uploading the full accumulators every frame (~12MB) made
++    // WebKit's GPU helper process balloon (measured >1.6GB on Mac Safari —
++    // iOS jetsam-kills the tab far earlier); static world geometry
++    // dominates the accumulator, so chunk-diffing against a CPU mirror
++    // cuts the staging churn ~10x. `fresh` forces a full upload (the GPU
++    // buffer was just recreated).
++    void deltaUpload(WGPUBuffer buf, const uint8_t* data, uint32_t bytes,
++                     uint8_t*& mirror, uint32_t& mirrorBytes, uint32_t& mirrorCap,
++                     bool fresh) {
++        const uint32_t kChunk = 256 * 1024;
++        if (!buf || bytes == 0) return;
++        if (mirrorCap < bytes) {
++            uint8_t* nm = (uint8_t*)realloc(mirror, bytes);
++            if (!nm) {   // mirror OOM: plain full upload, drop the mirror
++                free(mirror); mirror = nullptr; mirrorBytes = mirrorCap = 0;
++                wgpuQueueWriteBuffer(queue, buf, 0, data, bytes);
++                return;
++            }
++            mirror = nm; mirrorCap = bytes;
++        }
++        if (fresh || mirrorBytes == 0) {
++            memcpy(mirror, data, bytes);
++            mirrorBytes = bytes;
++            wgpuQueueWriteBuffer(queue, buf, 0, data, bytes);
++            return;
++        }
++        const uint32_t cmpEnd = bytes < mirrorBytes ? bytes : mirrorBytes;
++        uint32_t off = 0;
++        while (off < cmpEnd) {
++            const uint32_t len = (cmpEnd - off > kChunk) ? kChunk : cmpEnd - off;
++            if (memcmp(mirror + off, data + off, len) != 0) {
++                const uint32_t start = off;
++                off += len;
++                while (off < cmpEnd) {
++                    const uint32_t l2 = (cmpEnd - off > kChunk) ? kChunk : cmpEnd - off;
++                    if (memcmp(mirror + off, data + off, l2) == 0) break;
++                    off += l2;
++                }
++                memcpy(mirror + start, data + start, off - start);
++                wgpuQueueWriteBuffer(queue, buf, start, data + start, off - start);
++            } else {
++                off += len;
++            }
++        }
++        if (bytes > mirrorBytes) {   // grown tail is always new content
++            memcpy(mirror + mirrorBytes, data + mirrorBytes, bytes - mirrorBytes);
++            wgpuQueueWriteBuffer(queue, buf, mirrorBytes, data + mirrorBytes, bytes - mirrorBytes);
++        }
++        mirrorBytes = bytes;
++    }
++
 +    // Iter 6.6: copy CPU-side records → GPU buffers and CONSUME the
 +    // accumulator (the engine appends across all of a frame's views; we
 +    // drain here so a later RB_BeginDrawingView can't wipe records before
@@ -3757,6 +3823,7 @@ index 0000000..e9ff5c9
 +
 +        const uint32_t vNeed = (g_capVertBytes + 3u) & ~3u;
 +        const uint32_t iNeed = (g_capIndexBytes + 3u) & ~3u;
++        bool vertBufFresh = false, idxBufFresh = false;
 +        if (vNeed > recordVertexCap) {
 +            if (recordVertexBuf) wgpuBufferRelease(recordVertexBuf);
 +            uint32_t cap = vNeed; if (cap < 256*1024) cap = 256*1024;
@@ -3765,6 +3832,7 @@ index 0000000..e9ff5c9
 +            d.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
 +            recordVertexBuf = wgpuDeviceCreateBuffer(device, &d);
 +            recordVertexCap = cap;
++            vertBufFresh = true;
 +        }
 +        if (iNeed > recordIndexCap) {
 +            if (recordIndexBuf) wgpuBufferRelease(recordIndexBuf);
@@ -3774,10 +3842,13 @@ index 0000000..e9ff5c9
 +            d.usage = WGPUBufferUsage_Index | WGPUBufferUsage_CopyDst;
 +            recordIndexBuf = wgpuDeviceCreateBuffer(device, &d);
 +            recordIndexCap = cap;
++            idxBufFresh = true;
 +        }
 +        if (!recordVertexBuf || !recordIndexBuf) return false;
-+        wgpuQueueWriteBuffer(queue, recordVertexBuf, 0, g_capVertsAccum,    vNeed);
-+        wgpuQueueWriteBuffer(queue, recordIndexBuf,  0, g_capIndexesAccum,  iNeed);
++        deltaUpload(recordVertexBuf, g_capVertsAccum, vNeed,
++                    vertMirror, vertMirrorBytes, vertMirrorCap, vertBufFresh);
++        deltaUpload(recordIndexBuf, (const uint8_t*)g_capIndexesAccum, iNeed,
++                    idxMirror, idxMirrorBytes, idxMirrorCap, idxBufFresh);
 +
 +        uint32_t total = (g_capRecordCount < kMaxRecordSlots) ? g_capRecordCount : kMaxRecordSlots;
 +        // Keep only the MAIN view's records. Subviews (mirrors, security
@@ -4094,6 +4165,7 @@ index 0000000..e9ff5c9
 +            uint32_t sn = 0;
 +            if (g_shadowRecordCount > 0 && lastRecordCount > 0 && shadowBGL) {
 +                const uint32_t vNeedS = (g_shadowVertBytes + 3u) & ~3u;
++                bool shadowBufFresh = false;
 +                if (vNeedS > shadowVertexCap) {
 +                    if (shadowVertexBuf) wgpuBufferRelease(shadowVertexBuf);
 +                    uint32_t cap = vNeedS; if (cap < 256*1024) cap = 256*1024;
@@ -4102,9 +4174,11 @@ index 0000000..e9ff5c9
 +                    d.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
 +                    shadowVertexBuf = wgpuDeviceCreateBuffer(device, &d);
 +                    shadowVertexCap = cap;
++                    shadowBufFresh = true;
 +                }
 +                if (shadowVertexBuf && vNeedS > 0) {
-+                    wgpuQueueWriteBuffer(queue, shadowVertexBuf, 0, g_shadowVertsAccum, vNeedS);
++                    deltaUpload(shadowVertexBuf, g_shadowVertsAccum, vNeedS,
++                                shadowMirror, shadowMirrorBytes, shadowMirrorCap, shadowBufFresh);
 +                }
 +                const uint32_t mainView = lastRecords[lastRecordCount - 1].pad0;
 +                const uint32_t sTotal = (g_shadowRecordCount < kMaxRecordSlots) ? g_shadowRecordCount : kMaxRecordSlots;
@@ -4502,14 +4576,86 @@ index 0000000..e9ff5c9
 +        // the stencil buffer can reload to 128 between lights (loadOp Clear):
 +        // shadow volumes bump the stencil, then the light's interactions
 +        // render additively with stencil GEQUAL 128 — shadowed fragments
-+        // fail. Lights without shadow records leave the stencil at 128 so
-+        // their interactions pass everywhere. Records arrive grouped by
-+        // lightId in engine light order.
++        // fail. Records arrive grouped by lightId in engine light order.
++        //
++        // Iter 30: only lights WITH shadow volumes need that private pass.
++        // All unshadowed lights merge into ONE pass (their stencil stays at
++        // the cleared 128, so GEQUAL passes everywhere — identical output,
++        // additive blending is commutative). WebKit allocates per encoder,
++        // and ~30 render passes/frame was a big slice of the GPU-process
++        // balloon; this cuts passes to 1 + lights-with-shadows (and the
++        // no-shadows path becomes a single pass).
 +        bool colorCleared = false;
 +        {
++            uint32_t shadowedLights[64];
++            uint32_t shadowedLightCount = 0;
++            bool mergeOK = true;
++            for (uint32_t s = 0; s < lastShadowCount && mergeOK; ++s) {
++                const uint32_t id = lastShadowRecords[s].lightId;
++                bool seen = false;
++                for (uint32_t k = 0; k < shadowedLightCount; ++k) {
++                    if (shadowedLights[k] == id) { seen = true; break; }
++                }
++                if (!seen) {
++                    if (shadowedLightCount >= 64) { mergeOK = false; break; }
++                    shadowedLights[shadowedLightCount++] = id;
++                }
++            }
++            auto lightIsShadowed = [&](uint32_t id) -> bool {
++                if (!mergeOK) return true;   // fallback: every light gets its own pass
++                for (uint32_t k = 0; k < shadowedLightCount; ++k) {
++                    if (shadowedLights[k] == id) return true;
++                }
++                return false;
++            };
++            // Merged pass: all interactions of unshadowed lights.
++            bool anyUnshadowed = false;
++            for (uint32_t k = 0; k < lastRecordCount; ++k) {
++                if (!lightIsShadowed(lastRecords[k].lightId)) { anyUnshadowed = true; break; }
++            }
++            if (anyUnshadowed) {
++                WGPURenderPassColorAttachment ca = {};
++                ca.view = color;
++                ca.loadOp = colorCleared ? WGPULoadOp_Load : WGPULoadOp_Clear;
++                ca.storeOp = WGPUStoreOp_Store;
++                ca.clearValue = { 0.0, 0.0, 0.0, 1.0 };
++                ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
++                colorCleared = true;
++                WGPURenderPassDepthStencilAttachment da = {};
++                da.view = depth;
++                da.depthLoadOp = kUsePrePass ? WGPULoadOp_Load : WGPULoadOp_Clear;
++                da.depthStoreOp = WGPUStoreOp_Store;
++                da.depthClearValue = 1.0f;
++                da.stencilLoadOp = WGPULoadOp_Clear;
++                da.stencilStoreOp = WGPUStoreOp_Store;
++                da.stencilClearValue = 128;
++                WGPURenderPassDescriptor rpd = {};
++                rpd.colorAttachmentCount = 1;
++                rpd.colorAttachments = &ca;
++                rpd.depthStencilAttachment = &da;
++                WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
++                wgpuRenderPassEncoderSetStencilReference(rp, 128);
++                wgpuRenderPassEncoderSetPipeline(rp, interactionPipeline);
++                for (uint32_t k = 0; k < lastRecordCount; ++k) {
++                    if (lightIsShadowed(lastRecords[k].lightId)) continue;
++                    const Rec& r = lastRecords[k];
++                    wgpuRenderPassEncoderSetBindGroup(rp, 0, recordBindGroups[k], 0, nullptr);
++                    wgpuRenderPassEncoderSetBindGroup(rp, 1, lastMatGroups[k] ? lastMatGroups[k] : fallbackMatGroup(), 0, nullptr);
++                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
++                    wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
++                    wgpuRenderPassEncoderDrawIndexed(rp, r.indexCount, 1, 0, 0, 0);
++                }
++                wgpuRenderPassEncoderEnd(rp);
++                wgpuRenderPassEncoderRelease(rp);
++            }
 +            uint32_t i = 0;
 +            while (i < lastRecordCount) {
 +                const uint32_t light = lastRecords[i].lightId;
++                if (!lightIsShadowed(light)) {
++                    // already drawn in the merged pass
++                    while (i < lastRecordCount && lastRecords[i].lightId == light) i++;
++                    continue;
++                }
 +                WGPURenderPassColorAttachment ca = {};
 +                ca.view = color;
 +                ca.loadOp = colorCleared ? WGPULoadOp_Load : WGPULoadOp_Clear;
@@ -5486,6 +5632,14 @@ index 0000000..e9ff5c9
 +    int                     matCacheCount = 0;
 +    size_t                  gpuTexBytes = 0;     // iter 28: bytes resident in texCache (incl. mips)
 +    int                     gpuTexDropped = 0;   // iter 28: images denied by r_wgpuTexBudgetMB
++    // Iter 30: delta-upload mirrors (CPU copy of last-uploaded accumulator
++    // contents; uploads send only changed 256KB chunks).
++    uint8_t*                vertMirror = nullptr;
++    uint32_t                vertMirrorBytes = 0, vertMirrorCap = 0;
++    uint8_t*                idxMirror = nullptr;
++    uint32_t                idxMirrorBytes = 0, idxMirrorCap = 0;
++    uint8_t*                shadowMirror = nullptr;
++    uint32_t                shadowMirrorBytes = 0, shadowMirrorCap = 0;
 +    bool                    matCacheOverflowWarned = false;
 +    WGPUTextureView         fbFlatNormalView = nullptr;
 +    WGPUTextureView         fbWhiteView      = nullptr;
