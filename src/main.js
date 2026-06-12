@@ -1576,10 +1576,10 @@ async function start() {
         // the pistol/fists depending on what was held when the light was
         // first raised), then tops off the clip — the reload impulse is a
         // no-op on a full clip, so it only acts when ammo was spent.
-        if (!enabled && typeof window.d3cmd === "function") {
+        if (!enabled) {
           window.setTimeout(() => {
-            window.d3cmd("_impulse3");   // machinegun
-            window.setTimeout(() => window.d3cmd("_impulse13"), 700);  // reload if needed
+            tapKey(WEAPON_MACHINEGUN_KEY);
+            window.setTimeout(() => tapKey(RELOAD_KEY), 800);  // no-op on a full clip
           }, 250);
         }
       }
@@ -1701,6 +1701,25 @@ function armAutoFlashlight() {
   window.setTimeout(() => tryEnable(0), 2600);
 }
 
+// Iter 43b: weapon select and reload ride the engine's default key binds
+// (default.cfg: `bind 4 "_impulse3"` machinegun, `bind r "_impulse13"`
+// reload) through the same synthetic key-event path the move pad uses —
+// impulses are bind-layer only, the console rejects "_impulseN" and "use".
+const WEAPON_MACHINEGUN_KEY = { key: "4", code: "Digit4", keyCode: 52 };
+const RELOAD_KEY = { key: "r", code: "KeyR", keyCode: 82 };
+function tapKey(k, holdMs = 90) {
+  const fire = (type) => {
+    for (const target of [window, document, refs.canvas]) {
+      target.dispatchEvent(new KeyboardEvent(type, {
+        key: k.key, code: k.code, keyCode: k.keyCode, which: k.keyCode,
+        bubbles: true, cancelable: true
+      }));
+    }
+  };
+  fire("keydown");
+  window.setTimeout(() => fire("keyup"), holdMs);
+}
+
 // Iter 43: spawn loadout — start with the assault rifle (machinegun)
 // instead of the bare pistol. `give` is a direct console command (not an
 // impulse), but the weapon auto-switch lands cleaner after the intro
@@ -1720,7 +1739,9 @@ function armSpawnLoadout() {
       window.setTimeout(() => tryGive(attempt + 1), 1000);
       return;
     }
-    window.d3cmd("give machinegun");
+    // Full classname required — `give machinegun` is "unknown item".
+    window.d3cmd("give weapon_machinegun");
+    window.setTimeout(() => tapKey(WEAPON_MACHINEGUN_KEY), 600);
     diag("loadout: assault rifle equipped");
   };
   window.setTimeout(() => tryGive(0), 3000);
