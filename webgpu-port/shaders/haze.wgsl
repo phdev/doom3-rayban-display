@@ -88,7 +88,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     }
 
     var n = nrm.xyz * 2.0 - 1.0;           // RGB normal (pre-rxgb cache)
-    let offset = n.xy * m * in.deflect;
+    // params2.y > 0.5: debug — zero deflection (pane should be invisible)
+    let offset = select(n.xy * m * in.deflect, vec2<f32>(0.0), u.params2.y > 0.5);
 
     var suv = in.clip_pos.xy / vec2<f32>(u.params.z, u.params.w);
     // half-texel inset: the shared sampler is REPEAT (the normal map

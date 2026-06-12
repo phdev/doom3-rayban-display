@@ -2073,10 +2073,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..507a9b7
+index 0000000..09daa27
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,4102 @@
+@@ -0,0 +1,4225 @@
 +/*
 +================================================================================
 +
@@ -2447,6 +2447,24 @@ index 0000000..507a9b7
 +        }
 +
 +        if (!cmdEncoder) return;
++        // iter 46 debug (-898): read back GPU-side uniform slot 2 + record-2
++        // verts and print them — splits CPU-staging truth from GPU truth.
++        {
++            extern int g_capWgpuSingleLight;
++            if (g_capWgpuSingleLight == -898 && passUBuf && recordVertexBuf && lastPassCount > 2 && !dbgReadDone) {
++                dbgReadDone = true;
++                if (!dbgReadBuf) {
++                    WGPUBufferDescriptor d = {};
++                    d.size = 512;
++                    d.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
++                    dbgReadBuf = wgpuDeviceCreateBuffer(device, &d);
++                }
++                const Rec& r2 = lastPassRecords[2];
++                wgpuCommandEncoderCopyBufferToBuffer(cmdEncoder, passUBuf, 2 * kUBStride, dbgReadBuf, 0, 128);
++                wgpuCommandEncoderCopyBufferToBuffer(cmdEncoder, recordVertexBuf, r2.vertOffset, dbgReadBuf, 256, 240);
++                dbgReadPending = true;
++            }
++        }
 +        WGPUCommandBufferDescriptor cbd = {};
 +        cbd.label = { "frame", WGPU_STRLEN };
 +        WGPUCommandBuffer cb = wgpuCommandEncoderFinish(cmdEncoder, &cbd);
@@ -2454,6 +2472,31 @@ index 0000000..507a9b7
 +        cmdEncoder = nullptr;
 +        wgpuQueueSubmit(queue, 1, &cb);
 +        wgpuCommandBufferRelease(cb);
++        if (dbgReadPending) {
++            dbgReadPending = false;
++            WGPUBufferMapCallbackInfo cbi = {};
++            cbi.mode = WGPUCallbackMode_AllowSpontaneous;
++            cbi.userdata1 = this;
++            cbi.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void* ud, void*) {
++                    idRenderBackend_WebGPU* self = (idRenderBackend_WebGPU*)ud;
++                    if (status != WGPUMapAsyncStatus_Success) {
++                        EM_ASM_({ console.info("[d3] GPU readback map FAILED status=" + $0); }, (int)status);
++                        return;
++                    }
++                    const float* f = (const float*)wgpuBufferGetConstMappedRange(self->dbgReadBuf, 0, 512);
++                    if (f) {
++                        char l1[256], l2[256];
++                        snprintf(l1, sizeof(l1), "GPU ub2 m0=%.4f m5=%.4f m12=%.2f m13=%.2f m14=%.2f tint=(%.2f,%.2f,%.2f,%.2f)",
++                                 f[0], f[5], f[12], f[13], f[14], f[16], f[17], f[18], f[19]);
++                        const float* v = f + 64;   // verts at byte 256
++                        snprintf(l2, sizeof(l2), "GPU v0=(%.0f,%.0f,%.0f) v1=(%.0f,%.0f,%.0f) v2=(%.0f,%.0f,%.0f) v3=(%.0f,%.0f,%.0f)",
++                                 v[0], v[1], v[2], v[15], v[16], v[17], v[30], v[31], v[32], v[45], v[46], v[47]);
++                        EM_ASM_({ console.info("[d3] " + UTF8ToString($0)); console.info("[d3] " + UTF8ToString($1)); }, l1, l2);
++                    }
++                    wgpuBufferUnmap(self->dbgReadBuf);
++                };
++            wgpuBufferMapAsync(dbgReadBuf, WGPUMapMode_Read, 0, 512, cbi);
++        }
 +#endif
 +    }
 +
@@ -3939,7 +3982,7 @@ index 0000000..507a9b7
 +        {
 +            WGPUBufferDescriptor bd = {};
 +            bd.size = (uint64_t)kMaxRecordSlots * kUBStride;
-+            bd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
++            bd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc;   // CopySrc: -898 readback probe
 +            bd.label = { "passUBuf", WGPU_STRLEN };
 +            passUBuf = wgpuDeviceCreateBuffer(device, &bd);
 +            bd.label = { "recordUBuf", WGPU_STRLEN };
@@ -4025,6 +4068,7 @@ index 0000000..507a9b7
 +            return;
 +        }
 +        const uint32_t cmpEnd = bytes < mirrorBytes ? bytes : mirrorBytes;
++        uint32_t dbgUploaded = 0;
 +        uint32_t off = 0;
 +        while (off < cmpEnd) {
 +            const uint32_t len = (cmpEnd - off > kChunk) ? kChunk : cmpEnd - off;
@@ -4038,6 +4082,7 @@ index 0000000..507a9b7
 +                }
 +                memcpy(mirror + start, data + start, off - start);
 +                wgpuQueueWriteBuffer(queue, buf, start, data + start, off - start);
++                dbgUploaded += off - start;
 +            } else {
 +                off += len;
 +            }
@@ -4045,6 +4090,16 @@ index 0000000..507a9b7
 +        if (bytes > mirrorBytes) {   // grown tail is always new content
 +            memcpy(mirror + mirrorBytes, data + mirrorBytes, bytes - mirrorBytes);
 +            wgpuQueueWriteBuffer(queue, buf, mirrorBytes, data + mirrorBytes, bytes - mirrorBytes);
++            dbgUploaded += bytes - mirrorBytes;
++        }
++        {
++            extern int g_capWgpuSingleLight;
++            if (g_capWgpuSingleLight == -895 && buf == recordVertexBuf) {
++                char dl[160];
++                snprintf(dl, sizeof(dl), "dU bytes=%u mirrorBytes=%u uploaded=%u cap=%u",
++                         bytes, mirrorBytes, dbgUploaded, recordVertexCap);
++                EM_ASM_({ console.info("[d3] " + UTF8ToString($0)); }, dl);
++            }
 +        }
 +        mirrorBytes = bytes;
 +    }
@@ -4097,7 +4152,7 @@ index 0000000..507a9b7
 +            uint32_t cap = vNeed; if (cap < 256*1024) cap = 256*1024;
 +            WGPUBufferDescriptor d = {};
 +            d.size = cap;
-+            d.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
++            d.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc;
 +            recordVertexBuf = wgpuDeviceCreateBuffer(device, &d);
 +            recordVertexCap = cap;
 +            vertBufFresh = true;
@@ -4113,6 +4168,10 @@ index 0000000..507a9b7
 +            idxBufFresh = true;
 +        }
 +        if (!recordVertexBuf || !recordIndexBuf) return false;
++        {
++            extern int g_capWgpuSingleLight;
++            if (g_capWgpuSingleLight == -896) vertBufFresh = true;   // debug: force full upload
++        }
 +        deltaUpload(recordVertexBuf, g_capVertsAccum, vNeed,
 +                    vertMirror, vertMirrorBytes, vertMirrorCap, vertBufFresh);
 +        deltaUpload(recordIndexBuf, (const uint8_t*)g_capIndexesAccum, iNeed,
@@ -4458,6 +4517,16 @@ index 0000000..507a9b7
 +                    ub[20] = svcMod; ub[21] = svcAdd; ub[22] = 0.0f; ub[23] = 0.0f;
 +                    memcpy(ub + 24, r.lightProjS, 16);   // stage texture matrix S
 +                    memcpy(ub + 28, r.lightProjT, 16);   // stage texture matrix T
++                    {
++                        extern int g_capWgpuSingleLight;
++                        if (g_capWgpuSingleLight == -895 && pn == 2) {
++                            extern uint8_t g_capVertsAccum[];
++                            const float* v = (const float*)(g_capVertsAccum + r.vertOffset);
++                            char dl[120];
++                            snprintf(dl, sizeof(dl), "rec2 vOff=%u v0x=%.1f v0y=%.1f", r.vertOffset, v[0], v[1]);
++                            EM_ASM_({ console.info("[d3] " + UTF8ToString($0)); }, dl);
++                        }
++                    }
 +                    // pass-record probe (d3cmd r_wgpuSingleLight 998): name +
 +                    // stage color + blend kind for every drawn pass record.
 +                    if (g_capWgpuSingleLight == 998 && pn < 24) {
@@ -4474,14 +4543,38 @@ index 0000000..507a9b7
 +                        }
 +                        char line[384];
 +                        snprintf(line, sizeof(line),
-+                                 "pass[%u] img=%s color=(%.2f,%.2f,%.2f,%.2f) blend=%u svc=%u kind=%u nv=%u ni=%u bb=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) m=(%.3f,%.3f,%.3f|%.1f,%.1f,%.1f)",
++                                 "pass[%u] img=%s color=(%.2f,%.2f,%.2f,%.2f) blend=%u svc=%u kind=%u nv=%u ni=%u bb=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) sc=(%.0f,%.0f %.0fx%.0f)",
 +                                 pn, D3_WebGPU_ImageName(g_passImagePtrs[i]),
 +                                 r.diffuseColor[0], r.diffuseColor[1], r.diffuseColor[2], r.diffuseColor[3],
 +                                 r.pad1, r.pad2, r.pad3, r.vertCount, r.indexCount,
 +                                 mn[0], mn[1], mn[2], mxb[0], mxb[1], mxb[2],
-+                                 r.modelMatrix[0], r.modelMatrix[5], r.modelMatrix[10],
-+                                 r.modelMatrix[12], r.modelMatrix[13], r.modelMatrix[14]);
++                                 r.lightFalloffS[0], r.lightFalloffS[1],
++                                 r.lightFalloffS[2], r.lightFalloffS[3]);
 +                        EM_ASM_({ console.info("[d3] " + UTF8ToString($0)); }, line);
++                        // corner projection: where do gui-space (0,0) and (640,480) land?
++                        {
++                            const float* M = r.modelMatrix;
++                            float cx[2], cy[2];
++                            const float cs[2][2] = { {0,0}, {640,480} };
++                            for (int k = 0; k < 2; ++k) {
++                                float x = cs[k][0], y = cs[k][1];
++                                float clipX = M[0]*x + M[4]*y + M[12];
++                                float clipY = M[1]*x + M[5]*y + M[13];
++                                float clipW = M[3]*x + M[7]*y + M[15];
++                                cx[k] = (clipX/clipW*0.5f+0.5f) * (float)depthW;
++                                cy[k] = (1.0f-(clipY/clipW*0.5f+0.5f)) * (float)depthH;
++                            }
++                            extern uint16_t g_capIndexesAccum[];
++                            const uint16_t* ix = g_capIndexesAccum + r.indexOffset / 2;
++                            char cl[200];
++                            snprintf(cl, sizeof(cl), "   corners px (0,0)->(%.0f,%.0f) (640,480)->(%.0f,%.0f) idx=[%u,%u,%u,%u,%u,%u]",
++                                     cx[0], cy[0], cx[1], cy[1],
++                                     ix[0], ix[1], ix[2],
++                                     r.indexCount > 3 ? ix[3] : 0,
++                                     r.indexCount > 4 ? ix[4] : 0,
++                                     r.indexCount > 5 ? ix[5] : 0);
++                            EM_ASM_({ console.info("[d3] " + UTF8ToString($0)); }, cl);
++                        }
 +                    }
 +                    memcpy(passUBStage + (size_t)pn * kUBStride, ub, 128);
 +                    if (pn + 1 > passUBHigh) passUBHigh = pn + 1;
@@ -4768,12 +4861,31 @@ index 0000000..507a9b7
 +                    memcpy(ub +  0, r.modelMatrix,     64);
 +                    memcpy(ub + 16, r.localLightOrigin, 16);   // vertexParm 0: scroll
 +                    memcpy(ub + 20, r.localViewOrigin,  16);   // vertexParm 1: magnitude
++                    {
++                        extern int g_capWgpuSingleLight;
++                        if (g_capWgpuSingleLight == -895) {
++                            extern uint8_t g_hazeVertsAccum[];
++                            const float* v = (const float*)(g_hazeVertsAccum + r.vertOffset);
++                            char hl[240];
++                            snprintf(hl, sizeof(hl),
++                                     "haze[%u] img=%s scroll=(%.2f,%.2f) mag=(%.2f,%.2f) m00=%.3f mask=%u nv=%u v0=(%.0f,%.0f,%.0f)",
++                                     hn, D3_WebGPU_ImageName(g_hazeImagePtrs[i][0]),
++                                     r.localLightOrigin[0], r.localLightOrigin[1],
++                                     r.localViewOrigin[0], r.localViewOrigin[1],
++                                     r.specularColor[0], r.pad1, r.vertCount, v[0], v[1], v[2]);
++                            EM_ASM_({ console.info("[d3] " + UTF8ToString($0)); }, hl);
++                        }
++                    }
 +                    ub[24] = r.specularColor[0];               // projection m00
 +                    ub[25] = (r.pad1 & 1u) ? 1.0f : 0.0f;      // hasMask
 +                    ub[26] = (float)depthW;
 +                    ub[27] = (float)depthH;
 +                    ub[28] = (r.pad1 & 2u) ? 1.0f : 0.0f;      // mask *= vertex color
-+                    ub[29] = ub[30] = ub[31] = 0.0f;
++                    {
++                        extern int g_capWgpuSingleLight;
++                        ub[29] = (g_capWgpuSingleLight == -894) ? 1.0f : 0.0f;   // debug: zero deflection
++                    }
++                    ub[30] = ub[31] = 0.0f;
 +                    wgpuQueueWriteBuffer(queue, hazeUniformBufs[hn], 0, ub, 128);
 +                    lastHazeRecords[hn] = r;
 +                    hn++;
@@ -5217,6 +5329,14 @@ index 0000000..507a9b7
 +            }
 +            for (uint32_t i = 0; i < lastPassCount; ++i) {
 +                const Rec& r = lastPassRecords[i];
++                // iter 46 debug: -900-N isolates pass record N (find which
++                // record paints what); -899 disables ALL pass records.
++                {
++                    extern int g_capWgpuSingleLight;
++                    if (g_capWgpuSingleLight <= -900 && g_capWgpuSingleLight >= -990 &&
++                        (int)i != (-900 - g_capWgpuSingleLight)) continue;
++                    if (g_capWgpuSingleLight == -899) continue;
++                }
 +                if (splitGUI && r.pad3 == 1u) continue;   // GUI draws after post-FX
 +                WGPURenderPipeline p;
 +                if (r.pad3 == 1u) {
@@ -6055,6 +6175,9 @@ index 0000000..507a9b7
 +    WGPURenderPipeline      shadowZPassPipeline = nullptr;
 +    WGPURenderPipeline      shadowZFailUndoPipeline = nullptr;    // iter 39: inverted ops — stencil restore
 +    WGPURenderPipeline      shadowZPassUndoPipeline = nullptr;
++    WGPUBuffer              dbgReadBuf = nullptr;                 // iter 46: -898 GPU readback probe
++    bool                    dbgReadPending = false;
++    bool                    dbgReadDone = false;
 +    WGPURenderPipeline      shadowDebugPipeline = nullptr;        // iter 38: -994 magenta volumes
 +    WGPURenderPipeline      shadowDebugDepthPipeline = nullptr;   // iter 38: -993 magenta + Less depth
 +    WGPUBindGroupLayout     shadowBGL = nullptr;
@@ -8142,10 +8265,10 @@ index c83ebb5..7b06143 100644
  	// ensures that depth writes are enabled for the depth clear
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..667447e
+index 0000000..026c862
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,860 @@
+@@ -0,0 +1,861 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -8564,7 +8687,8 @@ index 0000000..667447e
 +"    }\n"
 +"\n"
 +"    var n = nrm.xyz * 2.0 - 1.0;           // RGB normal (pre-rxgb cache)\n"
-+"    let offset = n.xy * m * in.deflect;\n"
++"    // params2.y > 0.5: debug — zero deflection (pane should be invisible)\n"
++"    let offset = select(n.xy * m * in.deflect, vec2<f32>(0.0), u.params2.y > 0.5);\n"
 +"\n"
 +"    var suv = in.clip_pos.xy / vec2<f32>(u.params.z, u.params.w);\n"
 +"    // half-texel inset: the shared sampler is REPEAT (the normal map\n"
@@ -9214,16 +9338,28 @@ index 7efe196..afa6fe1 100644
  
  void GLimp_GrabInput(int flags) {
 diff --git a/neo/sys/linux/main.cpp b/neo/sys/linux/main.cpp
-index 3468d39..2cefde6 100644
+index 3468d39..a789d1f 100644
 --- a/neo/sys/linux/main.cpp
 +++ b/neo/sys/linux/main.cpp
-@@ -407,9 +407,18 @@ void idSysLocal::OpenURL( const char *url, bool quit ) {
+@@ -407,9 +407,30 @@ void idSysLocal::OpenURL( const char *url, bool quit ) {
  main
  ===============
  */
 +#ifdef __EMSCRIPTEN__
 +#include <emscripten.h>
 +static void D3_EmscriptenFrame(void) {
++	// Iter 46b: ProMotion iPhones run rAF at 120Hz — with com_fixedTic 1
++	// (one sim tic per engine frame, the 62.5Hz-vs-60Hz stutter fix) an
++	// ungated loop ran the game at DOUBLE speed. Phase-locked 60Hz gate:
++	// at 120Hz every other callback skips (the WebGPU backend re-presents
++	// the last frame), at 60Hz every callback runs; a stall (>50ms behind)
++	// resyncs instead of bursting catch-up frames.
++	static double nextDue = 0.0;
++	const double now = emscripten_get_now();
++	if ( now + 0.5 < nextDue ) {
++		return;
++	}
++	nextDue = ( nextDue < now - 50.0 ) ? now + 16.6667 : nextDue + 16.6667;
 +	common->Frame();
 +}
 +#endif
@@ -9236,7 +9372,7 @@ index 3468d39..2cefde6 100644
  	if (getuid() == 0) {
  		printf("Doom 3 shouldn't be run as root! Backing out to save your ass. If\n");
  		printf("you really know what you're doing, edit neo/sys/linux/main.cpp and remove\n");
-@@ -417,6 +426,7 @@ int main(int argc, char **argv) {
+@@ -417,6 +438,7 @@ int main(int argc, char **argv) {
  
  		return 1;
  	}
@@ -9244,7 +9380,7 @@ index 3468d39..2cefde6 100644
  	// fallback path to the binary for systems without /proc
  	// while not 100% reliable, its good enough
  	if (argc > 0) {
-@@ -448,8 +458,16 @@ int main(int argc, char **argv) {
+@@ -448,8 +470,16 @@ int main(int argc, char **argv) {
  		common->Init( 0, NULL );
  	}
  
