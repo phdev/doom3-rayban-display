@@ -11,7 +11,12 @@ const ENGINE_BASE = `${import.meta.env.BASE_URL}wasm/`;
 // Injected by Vite (define); falls back to a constant in dev.
 const ENGINE_VER = (typeof __ENGINE_VER__ !== "undefined") ? __ENGINE_VER__ : "dev";
 const bustCache = (url) => `${url}${url.includes("?") ? "&" : "?"}v=${ENGINE_VER}`;
-const BUNDLED_PK4_PATH = "base/pak-display.pk4";
+// Iter 36: texture tiers. The bundled default is the 128px bake (phone-
+// friendly, ~57MB); ?hd switches to the 256px bake (~98MB, visibly sharper
+// on desktop). Both ship as same-origin 4MB chunk sets (GitHub release
+// assets send no CORS headers, so cross-origin hosting is a dead end).
+const HD_TIER = (typeof window !== "undefined") && /[?&]hd\b/.test(window.location.search);
+const BUNDLED_PK4_PATH = HD_TIER ? "base256/pak-display.pk4" : "base/pak-display.pk4";
 const BUNDLED_PK4_URL = `${ENGINE_BASE}${BUNDLED_PK4_PATH}`;
 const BUNDLED_PK4_GZIP_URL = `${BUNDLED_PK4_URL}.gz`;
 const URL_PK4_PARAM = "pk4";

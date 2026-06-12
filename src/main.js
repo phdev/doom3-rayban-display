@@ -526,6 +526,10 @@ try {
       // drain) — "shdw 0" with shadows expected = r_shadows got overridden.
       const shdw = (typeof window.__d3ShadowVols === "number") ? ` | shdw ${window.__d3ShadowVols}` : "";
       fpsLine = `build ${BUILD_STAMP} UTC | fps ${(frames * 1000 / (now - last)).toFixed(1)}${mem}${wtex}${shdw}`;
+      // ?fpstitle: mirror the stats line into the tab title — lets tooling
+      // read live fps via plain AppleScript (no focus steal / clipboard /
+      // accessibility); used for the Safari perf bisect.
+      if (/[?&]fpstitle\b/.test(location.search)) { try { document.title = fpsLine; } catch {} }
       try { localStorage.setItem("d3_prev_session", JSON.stringify({ t: Date.now(), line: fpsLine })); } catch {}
       frames = 0;
       last = now;
