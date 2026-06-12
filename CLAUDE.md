@@ -1537,6 +1537,26 @@ the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
 MEASURE before declaring iPhone-safe) and before the new native
 side-by-side.
 
+**Iter 49 — blend census + teleportable screenshots (2026-06-12).**
+After iter 48 proved unhandled blends were a CLASS of bug, a census of
+every `blend` line in the game's .mtr files found five more modes the
+additive catch-all was mangling: gl_zero/one_minus_src_color (x67,
+blood + burn decals — drawn additively they GLOW: the user's emissive
+floor blood), gl_dst_alpha/one (x106), gl_zero/one_minus_src_alpha,
+gl_dst_color/one, and gl_zero/gl_one ("don't draw anything", x126 —
+we'd been DRAWING those). Pass kinds 8-11 + a capture reject. RULE:
+never let a renderer catch-all silently substitute additive — census
+the data and enumerate. ALSO (user's idea): the diag stats line now
+shows live "pos X Y Z | yaw P pitch Q" (engine publishes
+window.__d3ViewPos every 32 views from RB_BeginDrawingView) — any
+user screenshot is now a teleportable repro via `setviewpos X Y Z yaw`
+(pitch needs a look-drag; setviewpos only takes yaw). OPEN from user
+reports (need their pos-stamped screenshots to repro): ceiling
+geometry vanishing when looking up in the first hallway ("WALKWAY TO
+CPRO" HUD tag) — suspects: record-slot overflow (kMaxRecordSlots 896,
+big vista through ceiling) vs portal/area culling vs unlit-is-black
+legit behavior; check g_capDropped first when reproducing.
+
 **Iter 48 — THE weapon-display grid: maskcolor + dst-alpha gating
 (2026-06-12).** The user's actual complaint all along (bright grid
 overlaid on the ammo display, ALL browsers): the gridscroll material
