@@ -108,7 +108,7 @@ export function createRuntimeConfig() {
         rLightScale: bfgLookEnabled() ? 3 : 2,
         rGamma: 1.0,
         rBrightness: 1.0,
-        skill: 1,
+        skill: 0,
         yawSensitivity: 2.4,
         turnBurstDegrees: 42,
         headTickMs: 50
@@ -132,7 +132,7 @@ export function createRuntimeConfig() {
         rLightScale: bfgLookEnabled() ? 3 : 2,
         rGamma: 1.0,
         rBrightness: 1,
-        skill: 1,
+        skill: 0,
         yawSensitivity: 1.8,
         turnBurstDegrees: 36,
         headTickMs: 50
@@ -628,7 +628,7 @@ function buildArguments(config) {
     // extra args are safe; keeping these conditional is just tidiness.
     ...(config.audioEnabled ? ["+set", "com_asyncSound", "0", "+set", "s_useEAXReverb", "0"] : []),
 
-    "+set", "g_skill", String(getNumericConfig(config.skill, 1)),
+    "+set", "g_skill", String(getNumericConfig(config.skill, 0)),
     // The wearable drives the camera through _D3_AddViewAngles, so disable the
     // engine's own pointer-lock mouse path.
     "+set", "in_mouse", "0",
@@ -836,7 +836,7 @@ function buildAutoexecConfig(config) {
     "seta r_skipBump \"0\"",
     "seta image_downSize \"1\"",
     "seta image_useCompression \"1\"",
-    `seta g_skill "${getNumericConfig(config.skill, 1)}"`,
+    `seta g_skill "${getNumericConfig(config.skill, 0)}"`,
     "seta in_mouse \"0\"",
     "seta in_alwaysRun \"0\"",
     // r_gammaInShader is set in buildArguments (default 1), intentionally NOT pinned
@@ -906,6 +906,18 @@ async function installPk4Data(FS, onStatus, options = {}) {
   }
 
   settings.progress?.(50, "Reading data");
+  // Iter 42: ask the browser to mark our storage persistent — iOS Safari
+  // otherwise treats the 55MB cached pak as best-effort and evicts it under
+  // pressure, forcing a full re-download on the next launch.
+  try {
+    if (navigator.storage?.persist) {
+      navigator.storage.persist().then((granted) => {
+        settings.log?.(`Storage persistence ${granted ? "granted" : "not granted"}`);
+      }).catch(() => {});
+    }
+  } catch {
+    // no Storage API — cache stays best-effort
+  }
   settings.log?.("Reading imported PK4 storage...");
   const storedBytes = await readPk4Bytes();
 

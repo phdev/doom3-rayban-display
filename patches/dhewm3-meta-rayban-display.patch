@@ -2073,10 +2073,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..01fa17b
+index 0000000..9cc0422
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,4024 @@
+@@ -0,0 +1,4053 @@
 +/*
 +================================================================================
 +
@@ -2502,8 +2502,8 @@ index 0000000..01fa17b
 +        // Iter 5: depth-stencil state so the pipeline is compatible with the
 +        // depth attachment added in Init. LessEqual is the OpenGL convention.
 +        WGPUDepthStencilState dss = {};
-+            dss.stencilReadMask = 0xFFFFFFFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim)
-+            dss.stencilWriteMask = 0xFFFFFFFFu;
++            dss.stencilReadMask = 0xFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim); 0xFF not 0xFFFFFFFF — iOS WebKit rejects out-of-format mask bits
++            dss.stencilWriteMask = 0xFFu;
 +        dss.format = WGPUTextureFormat_Depth24PlusStencil8;
 +        dss.depthWriteEnabled = WGPUOptionalBool_True;
 +        dss.depthCompare = WGPUCompareFunction_LessEqual;
@@ -2657,8 +2657,8 @@ index 0000000..01fa17b
 +        frag.targetCount = 1;
 +        frag.targets = &target;
 +        WGPUDepthStencilState dss = {};
-+            dss.stencilReadMask = 0xFFFFFFFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim)
-+            dss.stencilWriteMask = 0xFFFFFFFFu;
++            dss.stencilReadMask = 0xFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim); 0xFF not 0xFFFFFFFF — iOS WebKit rejects out-of-format mask bits
++            dss.stencilWriteMask = 0xFFu;
 +        dss.format = WGPUTextureFormat_Depth24PlusStencil8;
 +        dss.depthWriteEnabled = WGPUOptionalBool_False;   // z comes from the pre-pass
 +        dss.depthCompare = WGPUCompareFunction_LessEqual;
@@ -2755,8 +2755,8 @@ index 0000000..01fa17b
 +                               bool depthWrite, WGPUCompareFunction depthCmp,
 +                               const char* label) -> WGPURenderPipeline {
 +            WGPUDepthStencilState dss = {};
-+            dss.stencilReadMask = 0xFFFFFFFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim)
-+            dss.stencilWriteMask = 0xFFFFFFFFu;
++            dss.stencilReadMask = 0xFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim); 0xFF not 0xFFFFFFFF — iOS WebKit rejects out-of-format mask bits
++            dss.stencilWriteMask = 0xFFu;
 +            dss.format = WGPUTextureFormat_Depth24PlusStencil8;
 +            dss.depthWriteEnabled = depthWrite ? WGPUOptionalBool_True : WGPUOptionalBool_False;
 +            dss.depthCompare = depthCmp;
@@ -2845,8 +2845,8 @@ index 0000000..01fa17b
 +        // included — which lets every light share ONE render pass.
 +        auto makeShadow = [&](bool zfail, bool undo, const char* label) -> WGPURenderPipeline {
 +            WGPUDepthStencilState dss = {};
-+            dss.stencilReadMask = 0xFFFFFFFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim)
-+            dss.stencilWriteMask = 0xFFFFFFFFu;
++            dss.stencilReadMask = 0xFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim); 0xFF not 0xFFFFFFFF — iOS WebKit rejects out-of-format mask bits
++            dss.stencilWriteMask = 0xFFu;
 +            dss.format = WGPUTextureFormat_Depth24PlusStencil8;
 +            dss.depthWriteEnabled = WGPUOptionalBool_False;
 +            dss.depthCompare = WGPUCompareFunction_Less;
@@ -2903,8 +2903,8 @@ index 0000000..01fa17b
 +        // volume fragment depths sit against the prepass depth.
 +        for (int dbgMode = 0; dbgMode < 2; ++dbgMode) {
 +            WGPUDepthStencilState dss = {};
-+            dss.stencilReadMask = 0xFFFFFFFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim)
-+            dss.stencilWriteMask = 0xFFFFFFFFu;
++            dss.stencilReadMask = 0xFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim); 0xFF not 0xFFFFFFFF — iOS WebKit rejects out-of-format mask bits
++            dss.stencilWriteMask = 0xFFu;
 +            dss.format = WGPUTextureFormat_Depth24PlusStencil8;
 +            dss.depthWriteEnabled = WGPUOptionalBool_False;
 +            dss.depthCompare = dbgMode ? WGPUCompareFunction_Less : WGPUCompareFunction_Always;
@@ -2976,8 +2976,8 @@ index 0000000..01fa17b
 +        WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(device, &pld);
 +
 +        WGPUDepthStencilState dss = {};
-+            dss.stencilReadMask = 0xFFFFFFFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim)
-+            dss.stencilWriteMask = 0xFFFFFFFFu;
++            dss.stencilReadMask = 0xFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim); 0xFF not 0xFFFFFFFF — iOS WebKit rejects out-of-format mask bits
++            dss.stencilWriteMask = 0xFFu;
 +        dss.format = WGPUTextureFormat_Depth24PlusStencil8;
 +        dss.depthWriteEnabled = WGPUOptionalBool_False;
 +        dss.depthCompare = WGPUCompareFunction_LessEqual;
@@ -3055,8 +3055,8 @@ index 0000000..01fa17b
 +        WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(device, &pld);
 +
 +        WGPUDepthStencilState dss = {};
-+            dss.stencilReadMask = 0xFFFFFFFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim)
-+            dss.stencilWriteMask = 0xFFFFFFFFu;
++            dss.stencilReadMask = 0xFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim); 0xFF not 0xFFFFFFFF — iOS WebKit rejects out-of-format mask bits
++            dss.stencilWriteMask = 0xFFu;
 +        dss.format = WGPUTextureFormat_Depth24PlusStencil8;
 +        dss.depthWriteEnabled = WGPUOptionalBool_False;
 +        dss.depthCompare = WGPUCompareFunction_LessEqual;
@@ -3185,8 +3185,8 @@ index 0000000..01fa17b
 +        // dst*src, drawn inside a pass that has the depth-stencil attached.
 +        {
 +            WGPUDepthStencilState dss = {};
-+            dss.stencilReadMask = 0xFFFFFFFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim)
-+            dss.stencilWriteMask = 0xFFFFFFFFu;
++            dss.stencilReadMask = 0xFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim); 0xFF not 0xFFFFFFFF — iOS WebKit rejects out-of-format mask bits
++            dss.stencilWriteMask = 0xFFu;
 +            dss.format = WGPUTextureFormat_Depth24PlusStencil8;
 +            dss.depthWriteEnabled = WGPUOptionalBool_False;
 +            dss.depthCompare = WGPUCompareFunction_Always;
@@ -3306,8 +3306,8 @@ index 0000000..01fa17b
 +
 +        auto makeBlend = [&](WGPUBlendFactor src, WGPUBlendFactor dst, const char* label) -> WGPURenderPipeline {
 +            WGPUDepthStencilState dss = {};
-+            dss.stencilReadMask = 0xFFFFFFFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim)
-+            dss.stencilWriteMask = 0xFFFFFFFFu;
++            dss.stencilReadMask = 0xFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim); 0xFF not 0xFFFFFFFF — iOS WebKit rejects out-of-format mask bits
++            dss.stencilWriteMask = 0xFFu;
 +            dss.format = WGPUTextureFormat_Depth24PlusStencil8;
 +            dss.depthWriteEnabled = WGPUOptionalBool_False;
 +            dss.depthCompare = WGPUCompareFunction_LessEqual;
@@ -3430,8 +3430,8 @@ index 0000000..01fa17b
 +        layouts[1].attributes = &dirAttr;
 +
 +        WGPUDepthStencilState dss = {};
-+            dss.stencilReadMask = 0xFFFFFFFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim)
-+            dss.stencilWriteMask = 0xFFFFFFFFu;
++            dss.stencilReadMask = 0xFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim); 0xFF not 0xFFFFFFFF — iOS WebKit rejects out-of-format mask bits
++            dss.stencilWriteMask = 0xFFu;
 +        dss.format = WGPUTextureFormat_Depth24PlusStencil8;
 +        dss.depthWriteEnabled = WGPUOptionalBool_True;
 +        dss.depthCompare = WGPUCompareFunction_LessEqual;
@@ -3500,8 +3500,8 @@ index 0000000..01fa17b
 +        WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(device, &pld);
 +
 +        WGPUDepthStencilState dss = {};
-+            dss.stencilReadMask = 0xFFFFFFFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim)
-+            dss.stencilWriteMask = 0xFFFFFFFFu;
++            dss.stencilReadMask = 0xFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim); 0xFF not 0xFFFFFFFF — iOS WebKit rejects out-of-format mask bits
++            dss.stencilWriteMask = 0xFFu;
 +        dss.format = WGPUTextureFormat_Depth24PlusStencil8;
 +        dss.depthWriteEnabled = WGPUOptionalBool_True;
 +        dss.depthCompare = WGPUCompareFunction_LessEqual;
@@ -3557,15 +3557,27 @@ index 0000000..01fa17b
 +        bgd.entryCount = 3;
 +        bgd.entries = e;
 +        WGPUBindGroup g = wgpuDeviceCreateBindGroup(device, &bgd);
++        // Iter 42: EVICT, never leak. The cache key includes the record
++        // slot, so scene churn (the boot cinematic especially) permanently
++        // strands stale (slot,img) pairs; once full, the old code returned
++        // an unreleased transient per draw per frame — the iOS GPU process
++        // died of it in minutes ("device lost: destroyed" on iPhone).
++        // Round-robin replacement: the encoder holds its own reference to
++        // any in-flight group, so releasing ours here is safe.
++        uint32_t idx;
 +        if (passBGCacheCount < kPassBGCacheSize) {
-+            passBGCache[passBGCacheCount].slot = slot;
-+            passBGCache[passBGCacheCount].img = imgPtr;
-+            passBGCache[passBGCacheCount].group = g;
-+            passBGCacheCount++;
-+        } else if (!passBGOverflowWarned) {
-+            passBGOverflowWarned = true;
-+            EM_ASM({ console.warn("[d3] WebGPU pass bind-group cache full; transient groups will leak"); });
++            idx = passBGCacheCount++;
++        } else {
++            idx = passBGEvictCursor++ % kPassBGCacheSize;
++            if (passBGCache[idx].group) wgpuBindGroupRelease(passBGCache[idx].group);
++            if (!passBGOverflowWarned) {
++                passBGOverflowWarned = true;
++                EM_ASM({ console.info("[d3] WebGPU pass bind-group cache evicting (round-robin)"); });
++            }
 +        }
++        passBGCache[idx].slot = slot;
++        passBGCache[idx].img = imgPtr;
++        passBGCache[idx].group = g;
 +        return g;
 +    }
 +
@@ -3611,8 +3623,8 @@ index 0000000..01fa17b
 +        if (!mod) { fprintf(stderr, "[WebGPU] prepass shader create FAILED\n"); return; }
 +
 +        WGPUDepthStencilState dss = {};
-+            dss.stencilReadMask = 0xFFFFFFFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim)
-+            dss.stencilWriteMask = 0xFFFFFFFFu;
++            dss.stencilReadMask = 0xFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim); 0xFF not 0xFFFFFFFF — iOS WebKit rejects out-of-format mask bits
++            dss.stencilWriteMask = 0xFFu;
 +        dss.format = WGPUTextureFormat_Depth24PlusStencil8;
 +        dss.depthWriteEnabled = WGPUOptionalBool_True;
 +        dss.depthCompare = WGPUCompareFunction_LessEqual;
@@ -3882,14 +3894,20 @@ index 0000000..01fa17b
 +        bgd.entries = e;
 +        WGPUBindGroup group = wgpuDeviceCreateBindGroup(device, &bgd);
 +        wgpuBindGroupLayoutRelease(bgl);
++        // Iter 42: evict round-robin instead of leaking (see getPassBindGroup).
++        int midx;
 +        if (matCacheCount < (int)kMatCacheSize) {
-+            memcpy(matCache[matCacheCount].key, imgs, sizeof(void*) * 5);
-+            matCache[matCacheCount].group = group;
-+            matCacheCount++;
-+        } else if (!matCacheOverflowWarned) {
-+            matCacheOverflowWarned = true;
-+            EM_ASM({ console.warn("[d3] WebGPU material bind-group cache full; transient groups will leak"); });
++            midx = matCacheCount++;
++        } else {
++            midx = (int)(matEvictCursor++ % kMatCacheSize);
++            if (matCache[midx].group) wgpuBindGroupRelease(matCache[midx].group);
++            if (!matCacheOverflowWarned) {
++                matCacheOverflowWarned = true;
++                EM_ASM({ console.info("[d3] WebGPU material bind-group cache evicting (round-robin)"); });
++            }
 +        }
++        memcpy(matCache[midx].key, imgs, sizeof(void*) * 5);
++        matCache[midx].group = group;
 +        return group;
 +    }
 +
@@ -4200,7 +4218,13 @@ index 0000000..01fa17b
 +            if (i + 1 > recordUBHigh) recordUBHigh = i + 1;
 +            // Iter 7b: resolve the material bind group (creates GPU textures
 +            // from the CPU image cache on first sight of each image).
++            // Iter 42: lastMatGroups holds its own reference — the cache may
++            // evict (and release) the entry while redraw-last frames still
++            // encode from this array; without the ref iOS threw
++            // "setBindGroup must be an instance of GPUBindGroup".
++            if (lastMatGroups[i]) wgpuBindGroupRelease(lastMatGroups[i]);
 +            lastMatGroups[i] = getMaterialBindGroup(g_capImagePtrs[i]);
++            if (lastMatGroups[i]) wgpuBindGroupAddRef(lastMatGroups[i]);
 +        }
 +        // Keep a backend-local copy of the consumed records (the draw loop
 +        // reads offsets/counts from here, and no-capture frames redraw it).
@@ -4425,9 +4449,12 @@ index 0000000..01fa17b
 +                    // Iter 17: cinematic records bind this frame's decoded
 +                    // video frame (per-slot dynamic texture) instead of a
 +                    // cached engine image.
++                    // Iter 42: own a reference (see lastMatGroups note).
++                    if (lastPassGroups[pn]) wgpuBindGroupRelease(lastPassGroups[pn]);
 +                    lastPassGroups[pn] = (r.sPad3 > 0)
 +                        ? getCinPassBindGroup(pn, r.sPad3 - 1u)
 +                        : getPassBindGroup(pn, g_passImagePtrs[i]);
++                    if (lastPassGroups[pn]) wgpuBindGroupAddRef(lastPassGroups[pn]);
 +                    if (r.sPad3 > 0) {
 +                        static bool cinAnnounced = false;
 +                        if (!cinAnnounced && lastPassGroups[pn]) {
@@ -5946,6 +5973,7 @@ index 0000000..01fa17b
 +    uint8_t*                shadowMirror = nullptr;
 +    uint32_t                shadowMirrorBytes = 0, shadowMirrorCap = 0;
 +    bool                    matCacheOverflowWarned = false;
++    uint32_t                matEvictCursor = 0;      // iter 42: round-robin eviction
 +    WGPUTextureView         fbFlatNormalView = nullptr;
 +    WGPUTextureView         fbWhiteView      = nullptr;
 +    WGPUTextureView         fbCheckerView    = nullptr;
@@ -5969,6 +5997,7 @@ index 0000000..01fa17b
 +    static constexpr uint32_t kPassBGCacheSize = 1024;
 +    PassBGEntry             passBGCache[kPassBGCacheSize] = {};
 +    uint32_t                passBGCacheCount = 0;
++    uint32_t                passBGEvictCursor = 0;   // iter 42: round-robin eviction
 +    bool                    passBGOverflowWarned = false;
 +    // Iter 9: stencil shadow volumes — two pipelines (z-fail for volumes
 +    // the view is inside, depth-pass for external ones), vec4 vertex

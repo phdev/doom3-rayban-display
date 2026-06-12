@@ -1537,6 +1537,41 @@ the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
 MEASURE before declaring iPhone-safe) and before the new native
 side-by-side.
 
+**Iter 42 — THE REAL iPHONE KILLER: bind-group cache overflow leak
+(2026-06-12, found via live phone console).** After iters 38-41 the
+phone STILL died at boot. Breakthrough instrument: a console-mirror
+script injected into the served page beaconing every console line to a
+local collector — served over a cloudflared HTTPS tunnel because
+**WebGPU needs a secure context; plain http LAN URLs have no
+navigator.gpu on iOS** (which also invalidated the iOS-Simulator
+"repro" — the sim has NO WebGPU at all and was silently testing the GL
+fallback). The phone's own console then named the bug in order:
+"pass bind-group cache full; transient groups will leak" →
+"device lost: destroyed". getPassBindGroup/getMaterialBindGroup cached
+to fixed arrays keyed (slot,img)/(5 images) with NO eviction; scene
+churn (boot cinematic especially) stranded stale pairs until full,
+then every draw created an unreleased transient group — Chrome
+shrugged, the iOS GPU process died in minutes (or seconds in the
+cinematic). FIX 1: round-robin EVICTION in both caches. That exposed
+FIX 2: lastPassGroups/lastMatGroups keep raw handles across frames
+(redraw-last path) — eviction's release invalidated them ("setBindGroup
+must be an instance of GPUBindGroup" on iOS); the replay arrays now
+hold their own reference (wgpuBindGroupAddRef on store, release on
+replace). ALSO: stencil masks set to 0xFF (not 0xFFFFFFFF) — possible
+independent iOS rejection, kept conservative; full-width masks were
+never validated on-device separately. CONFIRMED ON THE IPHONE: WebGPU
+init OK, 90 shadow volumes active, user PLAYED the game (first
+successful iOS WebGPU session ever for this project). Also per user:
+g_skill default 0 (lowest difficulty), navigator.storage.persist() at
+boot (iOS evicts the 55MB IndexedDB pak cache without it; the cache
+itself was already working — "Using cached bundled PK4" on 5/7
+reloads). DEBUG HARNESS (reusable): /tmp/servelog.py (serves dist/ +
+POST /__log), cloudflared quick tunnel, console-mirror snippet in
+dist/index.html (re-inject after every vite build), Monitor tailing
+/tmp/sim-console.log, QR code for the phone. LAW: anything
+cached-by-pointer with a fixed cap MUST evict, never leak — and
+anything HOLDING a cached handle across frames must own a reference.
+
 **Iters 40-41 — catch-up-tick capture spike + square-canvas aspect
 (2026-06-12).** Iter 39 held 60fps on iPhone but still died at the 82%
 boot cinematic with shdw 221 — impossible for one frame of a ~97-volume
