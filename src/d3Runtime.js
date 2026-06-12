@@ -629,6 +629,13 @@ function buildArguments(config) {
     ...(config.audioEnabled ? ["+set", "com_asyncSound", "0", "+set", "s_useEAXReverb", "0"] : []),
 
     "+set", "g_skill", String(getNumericConfig(config.skill, 0)),
+    // Iter 46: one game tic per rendered frame on the wearable profile.
+    // idTech4's sim tick is 1000/60 truncated to 16ms (62.5Hz) — against a
+    // 60Hz display every ~400ms a frame runs two tics and the view visibly
+    // skips (iPhone pace probe: rAF clean 16.7ms, so presentation was
+    // exonerated). fixedTic ties sim to the render loop; the 4% slowdown is
+    // imperceptible. CVAR_ARCHIVE — pinned in autoexec too.
+    "+set", "com_fixedTic", config.inputMode === "wearable" ? "1" : "0",
     // The wearable drives the camera through _D3_AddViewAngles, so disable the
     // engine's own pointer-lock mouse path.
     "+set", "in_mouse", "0",
@@ -837,6 +844,7 @@ function buildAutoexecConfig(config) {
     "seta image_downSize \"1\"",
     "seta image_useCompression \"1\"",
     `seta g_skill "${getNumericConfig(config.skill, 0)}"`,
+    `seta com_fixedTic "${config.inputMode === "wearable" ? "1" : "0"}"`,
     "seta in_mouse \"0\"",
     "seta in_alwaysRun \"0\"",
     // r_gammaInShader is set in buildArguments (default 1), intentionally NOT pinned
