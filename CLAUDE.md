@@ -1537,6 +1537,31 @@ the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
 MEASURE before declaring iPhone-safe) and before the new native
 side-by-side.
 
+**Iters 44-45 — the garbled weapon ammo display: TWO stacked parity
+gaps (2026-06-12, user-reported from iPhone).** The machinegun's on-gun
+ammo GUI looked like blocky cyan garbage. (44) BLEND: its grid/glow
+stages are authored `gl_src_alpha, gl_one` with stage alpha 0.10; the
+capture's blend classifier bucketed unknown blends as plain ONE,ONE
+additive → 10x too bright. New blend kind 5 (srcAlpha-additive) +
+passAddAlpha/guiAddAlpha pipelines. Found via GL-echo A/B + the 998
+pass dump (img/color/blend per record). (45) SCISSOR: the gui's
+640x480 backdrop/grid quads draw on the gui PLANE which extends past
+the physical display face — GL crops via the per-drawSurf scissorRect
+(r_useScissor path) which the backend never honored; the grid painted
+across the gun body ("expands past the bounds" — the user spotted the
+geometry overflow). Pass records now carry the GL scissor in
+lightFalloffS (non-reflect records; reflect pad3=3 reuses that field)
+and the replay applies it per draw — Y-FLIPPED (GL scissor origin
+bottom-left, WebGPU framebuffer top-left: y' = H - (y+h)), clamped
+(WebGPU validation-errors on OOB rects), reset to full canvas after
+the loop. Verified at 4x exposure: contained exactly like GL.
+METHOD NOTES: 998 dump now prints nv/ni + vert BOUNDS + matrix — the
+bounds instantly separated "wrong geometry association" from "wrong
+transform" (all 7 records shared one matrix; the 0-640x0-480 bounds
+named the gui-desktop quads). EM_ASM_ with 17 args silently broke the
+drain — pack dump lines via snprintf (the >5-arg trap, again).
+?pace probe Chrome baseline: 16.7ms avg / 19ms max / zero spikes.
+
 **Iter 43 — spawn loadout + flashlight-return (2026-06-12, user
 requests).** (1) Player spawns with the assault rifle:
 armSpawnLoadout() in main.js (entities-spawned hook, waits out the
