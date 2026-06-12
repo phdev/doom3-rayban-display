@@ -1537,6 +1537,28 @@ the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
 MEASURE before declaring iPhone-safe) and before the new native
 side-by-side.
 
+**Iter 50 — the gray ceiling: DDS-only textures + .tga-named materials
+(2026-06-12).** The 49d "authored darkness" verdict was HALF the story
+— the user's flashlight screenshot (pos chip!) showed the lit surface
+rendering FLAT GRAY = _default fallback. Boot had warned all along:
+~40 "Couldn't load image" lines. TWO reducer gaps compounded:
+(1) id authored some material NAMES with an image extension
+("textures/base_trim/a_reactorpipe_01_fin.tga") while maps reference
+them bare — the reducer's exact-string materials index never expanded
+their stage images; (2) the 1.3.1 patch paks REMOVED many hi-res TGAs
+and ship them ONLY as precompressed dds/<path>.dds — the engine falls
+back to that tree at load (image_usePrecompressedTextures) but the
+keep-test never matched the dds/ prefix AND the browser cannot decode
+DXT anyway (no S3TC on WebKit). FIX (reduce-d3-map-pk4.py): alias bare
+material names in the index + decode referenced DDS-only images to
+TGA at canonical paths via Pillow's DDS plugin, tier-downsized
+(+18 files, +0.4MB). RESULT: boot missing-image warnings ~40 → ZERO;
+gray surfaces (shaft ceiling, reactor pipes, props, env cubemaps) get
+real textures. LAW: every "Couldn't load image" boot warning is a
+future gray-surface report — keep that count at zero; the dds/ tree
+is part of the game data contract. Pak freshness invalidates by
+manifest totalSize, so clients refetch automatically.
+
 **Iter 49d — the "disappearing ceiling" verdict: authored darkness
 (2026-06-12).** First pos-chip-driven repro (user screenshot carried
 `pos -667 3962 -156 | yaw -177 pitch -31`; setviewpos + touch-drag
