@@ -1405,6 +1405,54 @@ capture time relative to map start (machinery transits run ~80s);
 asset (cookies, materials, tables, scripts, default.cfg) — pak
 paranoia wasted three rounds; check engine-state divergence first.
 
+**Iters 35-36 — parity program: presets, audit fixes, HD tier
+(2026-06-11/12).** Executed as a four-step plan:
+(1) PRESETS: default look = native dhewm3 parity (lightScale 2,
+classic specular LUT, no shadow-darken; engine cvar defaults flipped
+to vanilla); `?bfg` = the verified BFG recipe (lightScale 3,
+pow(N·H,10) spec, darken 0.6). bfgLookEnabled() is the single source;
+fx sliders show the active preset.
+(2) ECHO AUDIT (GL vs WebGPU, same engine inputs, 8x8 luma grid per
+station) found three real bugs: (a) zero-lit-record frames froze the
+whole canvas on stale content (dark scenes/r_singleLight) — drain now
+falls through with an empty interaction set; the pass sweep derives
+its main-view tag from the last 3D-kind pass record when no
+interactions exist; (b) flare halos (textures/sfx/flare — every light
+fixture's glow aura) never captured: flare-deform verts live ONLY in
+the frame-temp vertex cache → switched to r_useVertexBuffers 0 under
+WebGPU + vertex-cache fallback read in the capture, AND found that in
+virtual-memory mode vertCache_t->vbo was UNINITIALIZED allocator
+garbage (Position() took the VBO branch and returned junk; vanilla
+never ran this path) — vbo now zeroed on header expansion; (c) audit
+methodology: equalize canvas CSS sizes before comparing (browser
+downscale eats thin bright features), and the echo WebGPU canvas can
+be restyled via JS for fair captures. Post-fix spawn grid: the -89
+tube cells GONE, meanCell 11.7→9.0; residual = ~25% flat
+overbrightness in dim cells (open, low priority). Det rounds
+IDENTICAL throughout.
+(3) SAFARI FPS: blocked on the locked Mac (Safari fully throttles
+locked/unfocused sessions — three ladder attempts read frozen
+titles). Harness READY: ?fpstitle mirrors the diag stats line into
+document.title (readable via plain AppleScript, no focus/clipboard/AX
+needed — but the tab must be VISIBLE+focused for valid numbers);
+/tmp/safari-ladder2.sh runs baseline/noshadows/skipInteractions in
+~5 min at next unlock. Also learned: Safari caches Vite dev ES
+modules aggressively — use `vite build` + `vite preview` for Safari
+testing, never the dev server.
+(4) HD TIER: 256px enpro bake (97.8MB) ships as same-origin 4MB
+chunks under public/wasm/base256/ (force-added like base/);
+`?hd&dsl=256` selects it. GitHub RELEASE assets send NO CORS headers
+(verified — release-assets.githubusercontent.com, no ACAO even with
+Origin) so cross-origin pak hosting is a dead end; the release
+pak256-enpro-v1 exists but is unused by the app. Measured: GPU
+textures 22.8→64MB, wasm heap 296→408MB — desktop only; phone keeps
+128. Tier switch keys the chunk path + manifest freshness handles
+cross-tier cache correctness.
+SHELL GOTCHA (again): the engine-checkout commit trap fired once more
+(cwd in build dir; commit landed on detached HEAD + tried pushing to
+dhewm/dhewm3 upstream — failed harmlessly). Recovered with reset +
+re-stage. ALWAYS cd to the app repo in the same command as git ops.
+
 **Iter 32 — bloom default OFF (2026-06-11, vanilla parity).** User
 call: the game doesn't have bloom (confirmed by the iter-29 research:
 bloom is RBDOOM-fork-only — neither classic dhewm3 nor stock BFG has
