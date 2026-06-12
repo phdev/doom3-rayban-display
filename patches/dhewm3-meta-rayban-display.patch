@@ -2073,10 +2073,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..c759559
+index 0000000..507a9b7
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,4101 @@
+@@ -0,0 +1,4102 @@
 +/*
 +================================================================================
 +
@@ -2584,7 +2584,7 @@ index 0000000..c759559
 +        sd.addressModeU = WGPUAddressMode_Repeat;
 +        sd.addressModeV = WGPUAddressMode_Repeat;
 +        sd.addressModeW = WGPUAddressMode_Repeat;
-+        sd.maxAnisotropy = 1;
++        sd.maxAnisotropy = 16;   // iter 45b: GL parity (image_anisotropy 16; aniso-1 fattened oblique detail)
 +        demoSampler = wgpuDeviceCreateSampler(device, &sd);
 +
 +        // Bind group — texture.wgsl expects uniform@0 sampler@1 texture@2
@@ -2692,7 +2692,7 @@ index 0000000..c759559
 +        msd.addressModeU = WGPUAddressMode_Repeat;
 +        msd.addressModeV = WGPUAddressMode_Repeat;
 +        msd.addressModeW = WGPUAddressMode_Repeat;
-+        msd.maxAnisotropy = 1;
++        msd.maxAnisotropy = 16;   // iter 45b: GL parity
 +        interactionMaterialSampler = wgpuDeviceCreateSampler(device, &msd);
 +        // Iter 33: LIGHT samplers are LOD-0 ONLY. Vanilla samples light
 +        // cookies/falloffs with GL_LINEAR (no mip filter); our full mip
@@ -2704,6 +2704,7 @@ index 0000000..c759559
 +        lsd.addressModeU = WGPUAddressMode_ClampToEdge;
 +        lsd.addressModeV = WGPUAddressMode_ClampToEdge;
 +        lsd.mipmapFilter = WGPUMipmapFilterMode_Nearest;
++        lsd.maxAnisotropy = 1;   // iter 45b: aniso requires all-Linear filters — inherited 16 + Nearest mip = invalid sampler (black scene)
 +        lsd.lodMinClamp = 0.0f;
 +        lsd.lodMaxClamp = 0.0f;
 +        interactionLightSampler = wgpuDeviceCreateSampler(device, &lsd);
