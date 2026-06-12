@@ -59,6 +59,7 @@ app.innerHTML = `
     <pre id="diag" style="position:fixed;left:4px;top:4px;right:4px;margin:0;z-index:9999;font:11px/1.35 ui-monospace,Menlo,monospace;color:#7fff7f;background:rgba(0,0,0,.72);padding:5px 6px;white-space:pre-wrap;word-break:break-word;pointer-events:auto;max-height:60vh;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;touch-action:pan-y"></pre>
     <button id="diagToggle" type="button" aria-label="Toggle debug console" style="position:fixed;right:8px;top:8px;z-index:10000;min-width:44px;min-height:30px;padding:4px 10px;font:600 13px/1 ui-monospace,Menlo,monospace;color:#9effa0;background:rgba(0,0,0,.8);border:1px solid #2f6f30;border-radius:7px;-webkit-appearance:none;cursor:pointer">hide log</button>
     <button id="diagCopy" type="button" aria-label="Copy debug log to clipboard" style="position:fixed;right:100px;top:8px;z-index:10000;min-width:44px;min-height:30px;padding:4px 10px;font:600 13px/1 ui-monospace,Menlo,monospace;color:#9effa0;background:rgba(0,0,0,.8);border:1px solid #2f6f30;border-radius:7px;-webkit-appearance:none;cursor:pointer">copy log</button>
+    <div id="posLine" hidden style="position:fixed;left:8px;top:30px;z-index:10000;font:600 11px/1.3 ui-monospace,Menlo,monospace;color:#7fe27f;background:rgba(0,0,0,.75);border:1px solid #2c5a2c;border-radius:6px;padding:2px 7px;pointer-events:none"></div>
     <div id="glDiag" hidden style="position:fixed;left:8px;top:46px;z-index:10000;max-width:78vw;font:600 11px/1.45 ui-monospace,Menlo,monospace;color:#ffd24a;background:rgba(0,0,0,.85);border:1px solid #8a6a20;border-radius:7px;padding:5px 8px;white-space:pre-wrap;word-break:break-word;pointer-events:none"></div>
   </main>
 `;
@@ -77,6 +78,7 @@ const refs = {
   imuStatus: document.querySelector("#imuStatus"),
   moveControls: document.querySelector("#moveControls"),
   glDiag: document.querySelector("#glDiag"),
+  posLine: document.querySelector("#posLine"),
   webgpuCanvas: document.querySelector("#webgpuCanvas")
 };
 
@@ -528,6 +530,12 @@ try {
       // Iter 49: live view position (published by the engine) — screenshots
       // carry teleportable coordinates (setviewpos x y z yaw).
       const pos = (typeof window.__d3ViewPos === "string") ? ` | pos ${window.__d3ViewPos}` : "";
+      // Iter 49c: always-visible position chip (the full stats line lives
+      // behind "show log"; screenshots must carry coordinates by default).
+      if (refs.posLine && !/[?&]nodiag\b/.test(location.search) && pos) {
+        refs.posLine.textContent = `pos ${window.__d3ViewPos}`;
+        refs.posLine.hidden = false;
+      }
       fpsLine = `build ${BUILD_STAMP} UTC | fps ${(frames * 1000 / (now - last)).toFixed(1)}${mem}${wtex}${shdw}${pos}`;
       // ?fpstitle: mirror the stats line into the tab title — lets tooling
       // read live fps via plain AppleScript (no focus steal / clipboard /
