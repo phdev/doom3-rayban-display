@@ -1537,6 +1537,24 @@ the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
 MEASURE before declaring iPhone-safe) and before the new native
 side-by-side.
 
+**Iters 45b-46 — anisotropy + the 62.5Hz micro-stutter (2026-06-12).**
+(45b) GL runs image_anisotropy 16; our samplers were aniso-1 trilinear,
+over-blurring oblique texture detail (the ammo grid's fat bright
+lines). maxAnisotropy 16 on demoSampler + interactionMaterialSampler.
+TRAP: the LOD-0 light samplers COPY msd — they inherited aniso 16 with
+Nearest mip = INVALID sampler = every interaction bind group dead =
+black scene; Dawn's validation text named it. Light samplers must stay
+aniso-1/LOD-0 (iter-33 law) — reset maxAnisotropy after the copy.
+(46) "Frame skipping" on iPhone: the ?pace probe streamed CLEAN 16.7ms
+rAF (presentation exonerated) → the skip is idTech4's USERCMD_MSEC =
+1000/60 TRUNCATED to 16ms = 62.5Hz sim vs 60Hz display — one
+double-tic render frame every ~400ms (vanilla D3 stutters identically
+on 60Hz monitors). Wearable profile now runs com_fixedTic 1 (one sim
+tic per rendered frame; ~4% slowdown imperceptible at a held 60fps) —
+CVAR_ARCHIVE, pinned in +set args AND autoexec. Phone-console law:
+the cloudflared tunnel + console mirror turns any user report into
+telemetry in minutes — keep /tmp/servelog.py + the ?pace probe.
+
 **Iters 44-45 — the garbled weapon ammo display: TWO stacked parity
 gaps (2026-06-12, user-reported from iPhone).** The machinegun's on-gun
 ammo GUI looked like blocky cyan garbage. (44) BLEND: its grid/glow
