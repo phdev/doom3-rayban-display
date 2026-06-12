@@ -1472,6 +1472,71 @@ flashlight chip is always visible (dimmed) and is a tap target
 scripts must NOT press 'f' anymore (an old script press turned it ON
 and faked a regression).
 
+**Iter 38 — STENCIL SHADOWS ACTUALLY WORK NOW (2026-06-12): the
+"red hallway without shadows" bug.** User called bullshit on the
+iter-37b side-by-side — and was right: at the spawn viewpos
+(-320 3968 -155.75 yaw 180, via getviewpos/setviewpos — native
+teleported through its console via System Events + engine
+`screenshot` cmd) native's r_shadows ON/OFF changes 16.4% of pixels
+(9.86% animation-stable) vs our 1.89%. The world had NO static-light
+shadows; only the player's volume showed. THREE stacked defects, in
+discovery order:
+(1) CAPTURE: D3_WebGPU_CaptureShadow required tri->shadowVertexes —
+NULL for 39 of 43 volumes/frame (static interaction shadows + VP-turbo
+world volumes free/never-have the CPU array; GL draws them from
+vertexCache.Position(tri->shadowCache), exactly like the iter-35 flare
+verts). Fix: cache-read fallback with numVerts = maxIdx+1 derived from
+the index set (source-agnostic). Workflow-audit law: tri->numVerts is
+the FULL already-doubled shadow-vert count for EVERY producer
+(ParseShadowModel, R_CreateShadowVolume, CPU-turbo; VP-turbo's
+newTri->numVerts = ambient*2 likewise total) — the old `numVerts*2`
+was a harmless-looking OOB overread that halved the accumulator.
+Also learned: UpdateLightDef permanently NULLs parms.prelightModel on
+any light parm change (lightHasMoved never resets) — enpro's scripted
+corridor lights lose their dmap prelights at the power-up sequence and
+regenerate world shadows as VP-turbo via the interaction path; the pak
+ships all 332 shadowModel sections intact (md5 = GOG).
+(2) ROOT CAUSE — STENCIL MASKS: every WGPUDepthStencilState in the
+backend was zero-initialized; emdawnwebgpu's library_webgpu.js passes
+stencilReadMask/stencilWriteMask VERBATIM (no 0→default mapping;
+Dawn's WGPU_DEPTH_STENCIL_STATE_INIT macro is what carries the
+0xFFFFFFFF defaults and we never used it). Masks were 0 → every
+stencil WRITE was a no-op and every compare degenerated
+((ref&0) op (stencil&0)): GEQUAL always passed (never shadowed),
+NotEqual never passed (darken pass inert since iter 23!). The visible
+"player shadow" that masked all this came through structural
+side-effects, not stencil. Fix: masks = 0xFFFFFFFF at all 12 sites.
+LAW: zero-init WebGPU structs lose Dawn's _INIT defaults — audit any
+struct with nonzero defaults (masks, depthBias, sample masks).
+(3) NOT the bug: frontFace. GL computes facing in y-up window coords,
+WebGPU in y-down framebuffer coords, so a CW flip was theorized — but
+empirically the WebGPU default (CCW) + GL's op assignment is correct
+(the flip inverted the working player shadow; reverted).
+INSTRUMENTS BUILT (all gated on r_wgpuSingleLight, NEGATIVE values —
+positives trip the single-light filter and zero lastRecordCount):
+996/engine-side per-draw probe stages 0-7 + shadow vert-content dump;
+-996 backend lightId correlation line (int vs shdw ids — they match;
+records ARE contiguous per light); -994 volumes as magenta
+(geometry probe: 71% coverage = capture/extrusion/matrices all good);
+-993 magenta + Less depth; -992/-991 Equal-stencil readout (TRAP:
+with masks 0 it darkened everywhere and the bright-region threshold
+faked a "shadow-like pattern" — instrument bugs can mimic the
+hypothesis). Also: engine `screenshot` console cmd + System Events
+keystrokes = the native ground-truth harness (condump to
+~/Library/Application Support/dhewm3/base/).
+VALIDATED: det rounds 1-6 byte-IDENTICAL; stable shadow signal
+1.34% → 13.32% (native 9.86 — we slightly over-shadow: our private
+pass applies global+local volumes to ALL the light's interactions
+vs vanilla's interleaved order; acceptable); spawn corridor now
+visually matches native (dark distant hall, no red flood); 43
+volumes/frame at spawn, 88 in det scene; zero WebGPU validation
+errors; wasm 296MB / tex 22MB unchanged. Shadow-darken (?bfg 0.6)
+now ACTUALLY darkens for the first time. OPEN: Mac re-locked before
+the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
+— delta-upload covers the static shadow verts, expected fine, but
+MEASURE before declaring iPhone-safe) and before the new native
+side-by-side.
+
 **Iter 37b — Safari fps gap CLOSED + live native side-by-side
 (2026-06-11/12).** With the Mac unlocked, /tmp/safari-ladder2.sh ran
 against vite preview (4174) with ?fpstitle: baseline 60.1 fps /

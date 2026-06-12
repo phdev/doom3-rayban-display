@@ -43,3 +43,10 @@ fn vs_main(in: VSIn) -> VSOut {
 @fragment
 fn fs_main() {
 }
+
+// Iter 38 debug (r_wgpuSingleLight 994): volumes drawn as visible color so
+// geometry/matrix problems separate from stencil-mechanics problems.
+@fragment
+fn fs_debug() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0, 0.0, 1.0, 1.0);
+}

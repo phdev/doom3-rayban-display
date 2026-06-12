@@ -2073,10 +2073,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..912c3fd
+index 0000000..3e6a1a4
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,3933 @@
+@@ -0,0 +1,4052 @@
 +/*
 +================================================================================
 +
@@ -2502,6 +2502,8 @@ index 0000000..912c3fd
 +        // Iter 5: depth-stencil state so the pipeline is compatible with the
 +        // depth attachment added in Init. LessEqual is the OpenGL convention.
 +        WGPUDepthStencilState dss = {};
++            dss.stencilReadMask = 0xFFFFFFFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim)
++            dss.stencilWriteMask = 0xFFFFFFFFu;
 +        dss.format = WGPUTextureFormat_Depth24PlusStencil8;
 +        dss.depthWriteEnabled = WGPUOptionalBool_True;
 +        dss.depthCompare = WGPUCompareFunction_LessEqual;
@@ -2655,6 +2657,8 @@ index 0000000..912c3fd
 +        frag.targetCount = 1;
 +        frag.targets = &target;
 +        WGPUDepthStencilState dss = {};
++            dss.stencilReadMask = 0xFFFFFFFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim)
++            dss.stencilWriteMask = 0xFFFFFFFFu;
 +        dss.format = WGPUTextureFormat_Depth24PlusStencil8;
 +        dss.depthWriteEnabled = WGPUOptionalBool_False;   // z comes from the pre-pass
 +        dss.depthCompare = WGPUCompareFunction_LessEqual;
@@ -2751,6 +2755,8 @@ index 0000000..912c3fd
 +                               bool depthWrite, WGPUCompareFunction depthCmp,
 +                               const char* label) -> WGPURenderPipeline {
 +            WGPUDepthStencilState dss = {};
++            dss.stencilReadMask = 0xFFFFFFFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim)
++            dss.stencilWriteMask = 0xFFFFFFFFu;
 +            dss.format = WGPUTextureFormat_Depth24PlusStencil8;
 +            dss.depthWriteEnabled = depthWrite ? WGPUOptionalBool_True : WGPUOptionalBool_False;
 +            dss.depthCompare = depthCmp;
@@ -2836,6 +2842,8 @@ index 0000000..912c3fd
 +
 +        auto makeShadow = [&](bool zfail, const char* label) -> WGPURenderPipeline {
 +            WGPUDepthStencilState dss = {};
++            dss.stencilReadMask = 0xFFFFFFFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim)
++            dss.stencilWriteMask = 0xFFFFFFFFu;
 +            dss.format = WGPUTextureFormat_Depth24PlusStencil8;
 +            dss.depthWriteEnabled = WGPUOptionalBool_False;
 +            dss.depthCompare = WGPUCompareFunction_Less;
@@ -2870,6 +2878,9 @@ index 0000000..912c3fd
 +            pd.vertex.buffers = &svbl;
 +            pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
 +            pd.primitive.cullMode = WGPUCullMode_None;
++            // Facing stays at the WebGPU default (CCW): the player shadow
++            // renders correctly through the GEQUAL path under it (proven
++            // on-device); a CW-flip experiment inverted and killed it.
 +            pd.multisample.count = 1;
 +            pd.multisample.mask = 0xFFFFFFFF;
 +            pd.fragment = &frag;
@@ -2878,6 +2889,46 @@ index 0000000..912c3fd
 +        };
 +        shadowZFailPipeline = makeShadow(true,  "shadowZFail");
 +        shadowZPassPipeline = makeShadow(false, "shadowZPass");
++
++        // Iter 38 debug pipelines (r_wgpuSingleLight -994 / -993): volumes as
++        // opaque magenta — geometry visibility probe. -994 ignores depth;
++        // -993 uses the real Less test so the magenta fraction reveals how
++        // volume fragment depths sit against the prepass depth.
++        for (int dbgMode = 0; dbgMode < 2; ++dbgMode) {
++            WGPUDepthStencilState dss = {};
++            dss.stencilReadMask = 0xFFFFFFFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim)
++            dss.stencilWriteMask = 0xFFFFFFFFu;
++            dss.format = WGPUTextureFormat_Depth24PlusStencil8;
++            dss.depthWriteEnabled = WGPUOptionalBool_False;
++            dss.depthCompare = dbgMode ? WGPUCompareFunction_Less : WGPUCompareFunction_Always;
++            dss.stencilFront.compare = WGPUCompareFunction_Always;
++            dss.stencilBack.compare  = WGPUCompareFunction_Always;
++            dss.stencilFront.failOp = dss.stencilFront.depthFailOp = dss.stencilFront.passOp = WGPUStencilOperation_Keep;
++            dss.stencilBack.failOp  = dss.stencilBack.depthFailOp  = dss.stencilBack.passOp  = WGPUStencilOperation_Keep;
++            WGPUColorTargetState target = {};
++            target.format = surfaceFormat;
++            target.writeMask = WGPUColorWriteMask_All;
++            WGPUFragmentState frag = {};
++            frag.module = mod;
++            frag.entryPoint = { "fs_debug", WGPU_STRLEN };
++            frag.targetCount = 1;
++            frag.targets = &target;
++            WGPURenderPipelineDescriptor pd = {};
++            pd.label = { "shadowDebug", WGPU_STRLEN };
++            pd.layout = pl;
++            pd.vertex.module = mod;
++            pd.vertex.entryPoint = { "vs_main", WGPU_STRLEN };
++            pd.vertex.bufferCount = 1;
++            pd.vertex.buffers = &svbl;
++            pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
++            pd.primitive.cullMode = WGPUCullMode_None;
++            pd.multisample.count = 1;
++            pd.multisample.mask = 0xFFFFFFFF;
++            pd.fragment = &frag;
++            pd.depthStencil = &dss;
++            if (dbgMode) shadowDebugDepthPipeline = wgpuDeviceCreateRenderPipeline(device, &pd);
++            else         shadowDebugPipeline      = wgpuDeviceCreateRenderPipeline(device, &pd);
++        }
 +        wgpuPipelineLayoutRelease(pl);
 +        wgpuShaderModuleRelease(mod);
 +    }
@@ -2918,6 +2969,8 @@ index 0000000..912c3fd
 +        WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(device, &pld);
 +
 +        WGPUDepthStencilState dss = {};
++            dss.stencilReadMask = 0xFFFFFFFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim)
++            dss.stencilWriteMask = 0xFFFFFFFFu;
 +        dss.format = WGPUTextureFormat_Depth24PlusStencil8;
 +        dss.depthWriteEnabled = WGPUOptionalBool_False;
 +        dss.depthCompare = WGPUCompareFunction_LessEqual;
@@ -2995,6 +3048,8 @@ index 0000000..912c3fd
 +        WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(device, &pld);
 +
 +        WGPUDepthStencilState dss = {};
++            dss.stencilReadMask = 0xFFFFFFFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim)
++            dss.stencilWriteMask = 0xFFFFFFFFu;
 +        dss.format = WGPUTextureFormat_Depth24PlusStencil8;
 +        dss.depthWriteEnabled = WGPUOptionalBool_False;
 +        dss.depthCompare = WGPUCompareFunction_LessEqual;
@@ -3123,6 +3178,8 @@ index 0000000..912c3fd
 +        // dst*src, drawn inside a pass that has the depth-stencil attached.
 +        {
 +            WGPUDepthStencilState dss = {};
++            dss.stencilReadMask = 0xFFFFFFFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim)
++            dss.stencilWriteMask = 0xFFFFFFFFu;
 +            dss.format = WGPUTextureFormat_Depth24PlusStencil8;
 +            dss.depthWriteEnabled = WGPUOptionalBool_False;
 +            dss.depthCompare = WGPUCompareFunction_Always;
@@ -3156,6 +3213,14 @@ index 0000000..912c3fd
 +            pd.fragment = &frag;
 +            pd.depthStencil = &dss;
 +            shadowDarkenPipeline = wgpuDeviceCreateRenderPipeline(device, &pd);
++
++            // Iter 38 debug (-992/-991): same fullscreen multiply but with
++            // stencil compare EQUAL — the encode-time stencil reference
++            // (129 / 127) selects which net count to visualize.
++            dss.stencilFront.compare = WGPUCompareFunction_Equal;
++            dss.stencilBack.compare  = WGPUCompareFunction_Equal;
++            pd.label = { "shadowDarkenEq", WGPU_STRLEN };
++            shadowDarkenEqPipeline = wgpuDeviceCreateRenderPipeline(device, &pd);
 +
 +            WGPUBufferDescriptor d = {};
 +            d.size = 32;
@@ -3234,6 +3299,8 @@ index 0000000..912c3fd
 +
 +        auto makeBlend = [&](WGPUBlendFactor src, WGPUBlendFactor dst, const char* label) -> WGPURenderPipeline {
 +            WGPUDepthStencilState dss = {};
++            dss.stencilReadMask = 0xFFFFFFFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim)
++            dss.stencilWriteMask = 0xFFFFFFFFu;
 +            dss.format = WGPUTextureFormat_Depth24PlusStencil8;
 +            dss.depthWriteEnabled = WGPUOptionalBool_False;
 +            dss.depthCompare = WGPUCompareFunction_LessEqual;
@@ -3356,6 +3423,8 @@ index 0000000..912c3fd
 +        layouts[1].attributes = &dirAttr;
 +
 +        WGPUDepthStencilState dss = {};
++            dss.stencilReadMask = 0xFFFFFFFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim)
++            dss.stencilWriteMask = 0xFFFFFFFFu;
 +        dss.format = WGPUTextureFormat_Depth24PlusStencil8;
 +        dss.depthWriteEnabled = WGPUOptionalBool_True;
 +        dss.depthCompare = WGPUCompareFunction_LessEqual;
@@ -3424,6 +3493,8 @@ index 0000000..912c3fd
 +        WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(device, &pld);
 +
 +        WGPUDepthStencilState dss = {};
++            dss.stencilReadMask = 0xFFFFFFFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim)
++            dss.stencilWriteMask = 0xFFFFFFFFu;
 +        dss.format = WGPUTextureFormat_Depth24PlusStencil8;
 +        dss.depthWriteEnabled = WGPUOptionalBool_True;
 +        dss.depthCompare = WGPUCompareFunction_LessEqual;
@@ -3533,6 +3604,8 @@ index 0000000..912c3fd
 +        if (!mod) { fprintf(stderr, "[WebGPU] prepass shader create FAILED\n"); return; }
 +
 +        WGPUDepthStencilState dss = {};
++            dss.stencilReadMask = 0xFFFFFFFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim)
++            dss.stencilWriteMask = 0xFFFFFFFFu;
 +        dss.format = WGPUTextureFormat_Depth24PlusStencil8;
 +        dss.depthWriteEnabled = WGPUOptionalBool_True;
 +        dss.depthCompare = WGPUCompareFunction_LessEqual;
@@ -4405,6 +4478,30 @@ index 0000000..912c3fd
 +                }
 +            }
 +            lastShadowCount = sn;
++            // Iter 38 (r_wgpuSingleLight -996): one-line lightId correlation
++            // dump — interactions vs shadow records must share ids or the
++            // per-light pass volume filter starves.
++            {
++                extern int g_capWgpuSingleLight;
++                if (g_capWgpuSingleLight == -996 && lastRecordCount > 0) {
++                    char buf[512]; int off = 0;
++                    off += snprintf(buf + off, sizeof(buf) - off, "int:");
++                    uint32_t prev = 0xFFFFFFFFu;
++                    for (uint32_t i = 0; i < lastRecordCount && off < 200; ++i) {
++                        if (lastRecords[i].lightId == prev) continue;
++                        prev = lastRecords[i].lightId;
++                        off += snprintf(buf + off, sizeof(buf) - off, " %u", prev);
++                    }
++                    off += snprintf(buf + off, sizeof(buf) - off, " | shdw:");
++                    prev = 0xFFFFFFFFu;
++                    for (uint32_t i = 0; i < sn && off < 480; ++i) {
++                        if (lastShadowRecords[i].lightId == prev) continue;
++                        prev = lastShadowRecords[i].lightId;
++                        off += snprintf(buf + off, sizeof(buf) - off, " %u", prev);
++                    }
++                    EM_ASM_({ console.info("[d3] lightid-corr " + UTF8ToString($0)); }, buf);
++                }
++            }
 +            // Iter 31: live shadow state for the diag stats line — "is
 +            // r_shadows actually on, on THIS device?" answerable from a
 +            // phone screenshot (engine console prints don't reach JS).
@@ -4896,10 +4993,16 @@ index 0000000..912c3fd
 +                wgpuRenderPassEncoderSetStencilReference(rp, 128);
 +                // Shadow volumes for this light (z-fail or depth-pass per record)
 +                if (shadowZFailPipeline && shadowZPassPipeline && shadowVertexBuf) {
++                    extern int g_capWgpuSingleLight;
++                    // negative sentinels: stay clear of the >=0 single-light filter
++                    WGPURenderPipeline dbgPipe =
++                        (g_capWgpuSingleLight == -994) ? shadowDebugPipeline :
++                        (g_capWgpuSingleLight == -993) ? shadowDebugDepthPipeline : nullptr;
 +                    for (uint32_t sIdx = 0; sIdx < lastShadowCount; ++sIdx) {
 +                        const Rec& sr = lastShadowRecords[sIdx];
 +                        if (sr.lightId != light) continue;
-+                        wgpuRenderPassEncoderSetPipeline(rp, sr.pad1 ? shadowZPassPipeline : shadowZFailPipeline);
++                        wgpuRenderPassEncoderSetPipeline(rp, dbgPipe ? dbgPipe
++                                                             : (sr.pad1 ? shadowZPassPipeline : shadowZFailPipeline));
 +                        wgpuRenderPassEncoderSetBindGroup(rp, 0, shadowBindGroups[sIdx], 0, nullptr);
 +                        wgpuRenderPassEncoderSetVertexBuffer(rp, 0, shadowVertexBuf, sr.vertOffset, (uint64_t)sr.vertCount * 16u);
 +                        wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, sr.indexOffset, (uint64_t)sr.indexCount * 2u);
@@ -4926,9 +5029,15 @@ index 0000000..912c3fd
 +        // pixel by r_shadowDarken. Not physically per-light (vanilla only
 +        // masks each light's own contribution) but it makes shadows READ
 +        // the way they do on consoles/Quest, independent of light energy.
++        {
++        extern int g_capWgpuSingleLight;
++        // iter 38: -992 / -991 visualize net stencil 129 / 127 over ALL volumes
++        const int dbgStencilRef =
++            (g_capWgpuSingleLight == -992) ? 129 :
++            (g_capWgpuSingleLight == -991) ? 127 : 0;
 +        if (shadowDarkenPipeline && shadowDarkenUB && bloomBGL && shadowVertexBuf &&
-+            shadowZFailPipeline && shadowZPassPipeline &&
-+            lastShadowCount > 0 && g_capShadowDarken < 0.999f && colorCleared) {
++            shadowZFailPipeline && shadowZPassPipeline && lastShadowCount > 0 &&
++            (dbgStencilRef || g_capShadowDarken < 0.999f) && colorCleared) {
 +            if (!shadowDarkenBG && fbWhiteView) {
 +                WGPUBindGroupEntry e[3] = {};
 +                e[0].binding = 0; e[0].buffer = shadowDarkenUB; e[0].size = 32;
@@ -4942,6 +5051,7 @@ index 0000000..912c3fd
 +            }
 +            if (shadowDarkenBG) {
 +                float k = g_capShadowDarken; if (k < 0.0f) k = 0.0f;
++                if (dbgStencilRef) k = 0.1f;   // hard darken where the probed value matches
 +                float ub[8] = { k, 0, 0, 0, 0, 0, 0, 0 };
 +                wgpuQueueWriteBuffer(queue, shadowDarkenUB, 0, ub, 32);
 +                WGPURenderPassColorAttachment ca = {};
@@ -4969,19 +5079,25 @@ index 0000000..912c3fd
 +                // always visible.
 +                for (uint32_t sIdx = 0; sIdx < lastShadowCount; ++sIdx) {
 +                    const Rec& sr = lastShadowRecords[sIdx];
-+                    if (sr.sPad3 != 1u) continue;
++                    if (!dbgStencilRef && sr.sPad3 != 1u) continue;   // dbg: ALL volumes
 +                    wgpuRenderPassEncoderSetPipeline(rp, sr.pad1 ? shadowZPassPipeline : shadowZFailPipeline);
 +                    wgpuRenderPassEncoderSetBindGroup(rp, 0, shadowBindGroups[sIdx], 0, nullptr);
 +                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, shadowVertexBuf, sr.vertOffset, (uint64_t)sr.vertCount * 16u);
 +                    wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, sr.indexOffset, (uint64_t)sr.indexCount * 2u);
 +                    wgpuRenderPassEncoderDrawIndexed(rp, sr.indexCount, 1, 0, 0, 0);
 +                }
-+                wgpuRenderPassEncoderSetPipeline(rp, shadowDarkenPipeline);
++                if (dbgStencilRef) {
++                    wgpuRenderPassEncoderSetStencilReference(rp, (uint32_t)dbgStencilRef);
++                    wgpuRenderPassEncoderSetPipeline(rp, shadowDarkenEqPipeline);
++                } else {
++                    wgpuRenderPassEncoderSetPipeline(rp, shadowDarkenPipeline);
++                }
 +                wgpuRenderPassEncoderSetBindGroup(rp, 0, shadowDarkenBG, 0, nullptr);
 +                wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
 +                wgpuRenderPassEncoderEnd(rp);
 +                wgpuRenderPassEncoderRelease(rp);
 +            }
++        }
 +        }
 +
 +        // Final pass: emissive shader passes + 2D HUD over the lit result.
@@ -5889,6 +6005,8 @@ index 0000000..912c3fd
 +    // stream, per-slot 80-byte uniforms (mvp + model-space light origin).
 +    WGPURenderPipeline      shadowZFailPipeline = nullptr;
 +    WGPURenderPipeline      shadowZPassPipeline = nullptr;
++    WGPURenderPipeline      shadowDebugPipeline = nullptr;        // iter 38: -994 magenta volumes
++    WGPURenderPipeline      shadowDebugDepthPipeline = nullptr;   // iter 38: -993 magenta + Less depth
 +    WGPUBindGroupLayout     shadowBGL = nullptr;
 +    WGPUBindGroup           shadowBindGroups[kMaxRecordSlots]  = {nullptr};
 +    WGPUBuffer              shadowVertexBuf = nullptr;
@@ -5985,6 +6103,7 @@ index 0000000..912c3fd
 +    uint32_t                bloomBGGen = 0, bloomBGCurGen = 0;
 +    // Iter 23: Quest-style shadow darkening (union-of-volumes multiply).
 +    WGPURenderPipeline      shadowDarkenPipeline = nullptr;
++    WGPURenderPipeline      shadowDarkenEqPipeline = nullptr;   // iter 38: -992/-991 stencil readout
 +    WGPUBuffer              shadowDarkenUB = nullptr;
 +    WGPUBindGroup           shadowDarkenBG = nullptr;
 +    // Iter 6.8: on-device determinism self-test. Renders the identical
@@ -6508,10 +6627,10 @@ index c1d0d3e..99a7f6b 100644
  ==================
  R_ReloadARBPrograms_f
 diff --git a/neo/renderer/draw_common.cpp b/neo/renderer/draw_common.cpp
-index 0cabbfd..52210e6 100644
+index 0cabbfd..5fc5996 100644
 --- a/neo/renderer/draw_common.cpp
 +++ b/neo/renderer/draw_common.cpp
-@@ -30,10 +30,28 @@ If you have questions concerning this license or the applicable additional terms
+@@ -30,10 +30,29 @@ If you have questions concerning this license or the applicable additional terms
  #include "renderer/VertexCache.h"
  
  #include "renderer/tr_local.h"
@@ -6527,6 +6646,7 @@ index 0cabbfd..52210e6 100644
 +                                const shaderStage_t* pStage, const float* regs );
 +void D3_WebGPU_CaptureShadow( const drawSurf_t* surf, const srfTriangles_t* tri,
 +                              int numIndexes, bool external, const float localLight[4] );
++void D3_WebGPU_ShadowProbe( int stage, int a, int b, int c );
 +void D3_WebGPU_CaptureFog( const drawSurf_t* surf, const srfTriangles_t* tri,
 +                           const float planeS0[4], const float planeT1[4],
 +                           const float planeS1[4], const float color[4] );
@@ -6540,7 +6660,7 @@ index 0cabbfd..52210e6 100644
  /*
  =====================
  RB_BakeTextureMatrixIntoTexgen
-@@ -774,12 +792,19 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
+@@ -774,12 +793,19 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
  	}
  
  	// change the scissor if needed
@@ -6564,7 +6684,7 @@ index 0cabbfd..52210e6 100644
  	}
  
  	// some deforms may disable themselves by setting numIndexes = 0
-@@ -898,6 +923,10 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
+@@ -898,6 +924,10 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
  			qglBindProgramARB( GL_FRAGMENT_PROGRAM_ARB, newStage->fragmentProgram );
  			qglEnable( GL_FRAGMENT_PROGRAM_ARB );
  
@@ -6575,7 +6695,7 @@ index 0cabbfd..52210e6 100644
  			// draw it
  			RB_DrawElementsWithCounters( tri );
  
-@@ -1175,6 +1204,12 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
+@@ -1175,6 +1205,12 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
  
  		RB_PrepareStageTexturing( pStage, surf, ac );
  
@@ -6588,7 +6708,17 @@ index 0cabbfd..52210e6 100644
  		// draw it
  		RB_DrawElementsWithCounters( tri );
  
-@@ -1345,6 +1380,16 @@ static void RB_T_Shadow( const drawSurf_t *surf ) {
+@@ -1305,7 +1341,9 @@ static void RB_T_Shadow( const drawSurf_t *surf ) {
+ 
+ 	tri = surf->geo;
+ 
++	D3_WebGPU_ShadowProbe( 0, tri->shadowCache ? 1 : 0, tri->shadowVertexes ? 1 : 0, tri->numVerts );
+ 	if ( !tri->shadowCache ) {
++		D3_WebGPU_ShadowProbe( 1, 0, 0, tri->numVerts );
+ 		return;
+ 	}
+ 
+@@ -1345,6 +1383,16 @@ static void RB_T_Shadow( const drawSurf_t *surf ) {
  		qglDepthBoundsEXT( surf->scissorRect.zmin, surf->scissorRect.zmax );
  	}
  
@@ -6605,7 +6735,7 @@ index 0cabbfd..52210e6 100644
  	// debug visualization
  	if ( r_showShadows.GetInteger() ) {
  		if ( r_showShadows.GetInteger() == 3 ) {
-@@ -1568,6 +1613,18 @@ static void RB_T_BlendLight( const drawSurf_t *surf ) {
+@@ -1568,6 +1616,18 @@ static void RB_T_BlendLight( const drawSurf_t *surf ) {
  		qglTexGenfv( GL_S, GL_OBJECT_PLANE, lightProject[3].ToFloatPtr() );
  	}
  
@@ -6624,7 +6754,7 @@ index 0cabbfd..52210e6 100644
  	// this gets used for both blend lights and shadow draws
  	if ( tri->ambientCache ) {
  		idDrawVert	*ac = (idDrawVert *)vertexCache.Position( tri->ambientCache );
-@@ -1630,6 +1687,11 @@ static void RB_BlendLight( const drawSurf_t *drawSurfs,  const drawSurf_t *drawS
+@@ -1630,6 +1690,11 @@ static void RB_BlendLight( const drawSurf_t *drawSurfs,  const drawSurf_t *drawS
  
  		GL_SelectTexture( 0 );
  		stage->texture.image->Bind();
@@ -6636,7 +6766,7 @@ index 0cabbfd..52210e6 100644
  
  		if ( stage->texture.hasMatrix ) {
  			RB_LoadShaderTextureMatrix( regs, &stage->texture );
-@@ -1700,6 +1762,19 @@ local[0] = local[1] = local[2] = 0; local[3] = 0.5;
+@@ -1700,6 +1765,19 @@ local[0] = local[1] = local[2] = 0; local[3] = 0.5;
  		qglTexGenfv( GL_S, GL_OBJECT_PLANE, local.ToFloatPtr() );
  	}
  
@@ -6656,7 +6786,7 @@ index 0cabbfd..52210e6 100644
  	RB_T_RenderTriangleSurface( surf );
  }
  
-@@ -1758,6 +1833,8 @@ static void RB_FogPass( const drawSurf_t *drawSurfs,  const drawSurf_t *drawSurf
+@@ -1758,6 +1836,8 @@ static void RB_FogPass( const drawSurf_t *drawSurfs,  const drawSurf_t *drawSurf
  	// texture 0 is the falloff image
  	GL_SelectTexture( 0 );
  	globalImages->fogImage->Bind();
@@ -6665,7 +6795,7 @@ index 0cabbfd..52210e6 100644
  	//GL_Bind( tr.whiteImage );
  	qglDisableClientState( GL_TEXTURE_COORD_ARRAY );
  	qglEnable( GL_TEXTURE_GEN_S );
-@@ -1851,10 +1928,15 @@ void RB_STD_FogAllLights( void ) {
+@@ -1851,10 +1931,15 @@ void RB_STD_FogAllLights( void ) {
  			// units from the origin
  			backEnd.currentScissor = vLight->scissorRect;
  			if ( r_useScissor.GetBool() ) {
@@ -6685,7 +6815,7 @@ index 0cabbfd..52210e6 100644
  			}
  			qglClear( GL_STENCIL_BUFFER_BIT );
  
-@@ -1903,10 +1985,15 @@ void RB_STD_LightScale( void ) {
+@@ -1903,10 +1988,15 @@ void RB_STD_LightScale( void ) {
  
  	// the scissor may be smaller than the viewport for subviews
  	if ( r_useScissor.GetBool() ) {
@@ -6848,7 +6978,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..4c2751d 100644
+index c83ebb5..3e520b0 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -6874,7 +7004,7 @@ index c83ebb5..4c2751d 100644
  
  /*
  
-@@ -38,6 +50,840 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,884 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -7290,6 +7420,17 @@ index c83ebb5..4c2751d 100644
 +	}
 +}
 +
++// Iter 38 probe (r_wgpuSingleLight 996): per-draw shadow capture telemetry.
++// stage 0 = RB_T_Shadow entry, 1 = no shadowCache, 2 = capture entry,
++// 3 = null shadowVertexes, 4 = too-big, 5 = record cap, 6 = accum budget,
++// 7 = ACCEPTED.
++void D3_WebGPU_ShadowProbe( int stage, int a, int b, int c ) {
++	if ( g_capWgpuSingleLight != 996 ) return;
++	EM_ASM_({
++		console.info("[d3] shdw-probe s=" + $0 + " a=" + $1 + " b=" + $2 + " c=" + $3);
++	}, stage, a, b, c);
++}
++
 +// Iter 9: capture a stencil shadow volume draw for the WebGPU echo.
 +// Shadow verts are 16-byte vec4s (w=1 near cap, w=0 projected-to-infinity);
 +// the WGSL shadow shader replicates the stencil-shadow vertex program's
@@ -7305,18 +7446,36 @@ index c83ebb5..4c2751d 100644
 +	                          surf->space->entityDef->parms.suppressSurfaceInViewID != 0 );
 +	if ( !backEnd.viewDef || backEnd.viewDef->viewEntitys == NULL ) return;
 +	if ( ( backEnd.viewDef->viewport.x2 - backEnd.viewDef->viewport.x1 ) < 128 ) return;
-+	if ( !surf || !tri || !tri->shadowVertexes || !tri->indexes ) return;
-+	const int numVerts = tri->numVerts * 2;
++	D3_WebGPU_ShadowProbe( 2, tri ? (tri->shadowVertexes ? 1 : 0) : -1,
++	                       tri ? tri->numVerts : -1, numIndexes );
++	if ( !surf || !tri || !tri->indexes ) { D3_WebGPU_ShadowProbe( 3, 0, 0, 0 ); return; }
++	// Iter 38: static interaction/prelight shadow volumes free their CPU
++	// shadowVertexes after uploading to the vertex cache (GL draws from
++	// vertexCache.Position(tri->shadowCache) — see RB_T_Shadow). Read the
++	// cache copy when the CPU array is gone. numVerts semantics differ by
++	// source (dynamic = halved, proc prelight = full), so for cache reads
++	// the max referenced index is the only source-agnostic vert count.
++	const void* srcVerts = tri->shadowVertexes;
++	int numVerts = tri->numVerts * 2;
++	if ( !srcVerts && tri->shadowCache ) {
++		srcVerts = vertexCache.Position( tri->shadowCache );
++		int maxIdx = -1;
++		for ( int i = 0; i < numIndexes; ++i ) {
++			if ( tri->indexes[i] > maxIdx ) maxIdx = tri->indexes[i];
++		}
++		numVerts = maxIdx + 1;
++	}
++	if ( !srcVerts ) { D3_WebGPU_ShadowProbe( 3, 0, 0, 0 ); return; }
 +	if ( numVerts <= 0 || numIndexes <= 0 ) return;
-+	if ( numVerts > 32768 || numIndexes > kWGPUMaxCaptureIndexes ) { g_capDropped++; return; }
-+	if ( g_shadowRecordCount >= (uint32_t)kWGPUMaxRecords ) { g_capDropped++; return; }
++	if ( numVerts > 32768 || numIndexes > kWGPUMaxCaptureIndexes ) { D3_WebGPU_ShadowProbe( 4, numVerts, numIndexes, 0 ); g_capDropped++; return; }
++	if ( g_shadowRecordCount >= (uint32_t)kWGPUMaxRecords ) { D3_WebGPU_ShadowProbe( 5, g_shadowRecordCount, 0, 0 ); g_capDropped++; return; }
 +
 +	const uint32_t vbytes = (uint32_t)numVerts * 16u;
 +	const uint32_t ibytes = (uint32_t)numIndexes * 2u;
 +	const uint32_t iR = (ibytes + 3u) & ~3u;
 +	if ( g_shadowVertBytes + vbytes > (uint32_t)kWGPUShadowVertBytes ||
-+	     g_capIndexBytes + iR > (uint32_t)kWGPUIndexAccumBytes ) { g_capDropped++; return; }
-+	memcpy( g_shadowVertsAccum + g_shadowVertBytes, tri->shadowVertexes, vbytes );
++	     g_capIndexBytes + iR > (uint32_t)kWGPUIndexAccumBytes ) { D3_WebGPU_ShadowProbe( 6, g_shadowVertBytes + vbytes, g_capIndexBytes + iR, 0 ); g_capDropped++; return; }
++	memcpy( g_shadowVertsAccum + g_shadowVertBytes, srcVerts, vbytes );
 +	for ( int i = 0; i < numIndexes; ++i ) {
 +		g_capIndexesAccum[(g_capIndexBytes / 2) + i] = (uint16_t)tri->indexes[i];
 +	}
@@ -7340,6 +7499,21 @@ index c83ebb5..4c2751d 100644
 +	g_shadowRecords[g_shadowRecordCount].sPad3 = playerBody ? 1u : 0u;
 +	g_shadowRecordCount++;
 +	g_capFrameId++;
++	D3_WebGPU_ShadowProbe( 7, g_shadowRecordCount, g_capLightId, numVerts );
++	// stage 9: vert-content dump for cache-path (static) volumes — first two
++	// verts + the highest-indexed vert + the local light, to validate the
++	// cache read end-to-end.
++	if ( g_capWgpuSingleLight == 996 && !tri->shadowVertexes ) {
++		const float* v = (const float*)srcVerts;
++		const float* vl = v + (size_t)(numVerts - 1) * 4;
++		EM_ASM_({
++			console.info("[d3] shdw-data nv=" + $0 +
++			             " v0=(" + $1.toFixed(1) + "," + $2.toFixed(1) + "," + $3.toFixed(1) + ";" + $4 + ")" +
++			             " v1w=" + $5 + " vLast=(" + $6.toFixed(1) + "," + $7.toFixed(1) + ";" + $8 + ")" +
++			             " light=(" + $9.toFixed(0) + "," + $10.toFixed(0) + "," + $11.toFixed(0) + ")");
++		}, numVerts, v[0], v[1], v[2], v[3], v[7],
++		   vl[0], vl[1], vl[3], localLight[0], localLight[1], localLight[2]);
++	}
 +}
 +
 +// Iter 13a: capture one blend-light surface. Local planes computed by caller.
@@ -7715,7 +7889,7 @@ index c83ebb5..4c2751d 100644
  
  /*
  =================
-@@ -49,6 +895,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +939,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -7731,7 +7905,7 @@ index c83ebb5..4c2751d 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +933,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +977,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -7747,7 +7921,7 @@ index c83ebb5..4c2751d 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +980,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1024,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -7764,7 +7938,7 @@ index c83ebb5..4c2751d 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1040,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1084,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -7772,7 +7946,7 @@ index c83ebb5..4c2751d 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1267,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1311,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -7785,7 +7959,7 @@ index c83ebb5..4c2751d 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1436,57 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1480,57 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
@@ -7855,10 +8029,10 @@ index c83ebb5..4c2751d 100644
  	// ensures that depth writes are enabled for the depth clear
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..efe634a
+index 0000000..667447e
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,853 @@
+@@ -0,0 +1,860 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -8599,6 +8773,13 @@ index 0000000..efe634a
 +"// compatible color target (writeMask = none) even though nothing is written.\n"
 +"@fragment\n"
 +"fn fs_main() {\n"
++"}\n"
++"\n"
++"// Iter 38 debug (r_wgpuSingleLight 994): volumes drawn as visible color so\n"
++"// geometry/matrix problems separate from stencil-mechanics problems.\n"
++"@fragment\n"
++"fn fs_debug() -> @location(0) vec4<f32> {\n"
++"    return vec4<f32>(1.0, 0.0, 1.0, 1.0);\n"
 +"}\n"
 +"";
 +
