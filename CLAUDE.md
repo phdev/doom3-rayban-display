@@ -1540,18 +1540,22 @@ side-by-side.
 **Iter 43 — spawn loadout + flashlight-return (2026-06-12, user
 requests).** (1) Player spawns with the assault rifle:
 armSpawnLoadout() in main.js (entities-spawned hook, waits out the
-cinematic like the flashlight) sends `give machinegun` (+3s
-post-spawn; give auto-selects). (2) Tapping the flashlight chip while
-the light is UP now returns to the rifle EXPLICITLY: the
-onFlashlightChange callback sends _impulse3 (machinegun) 250ms after
-flashlight-off, then _impulse13 (reload) 700ms later — reload is a
-no-op on a full clip so it only acts when ammo was spent (the engine's
-own previous-weapon return can land on pistol/fists depending on what
-was held when the light was first raised). Weapon impulse map for
-future loadout work: 0 fists, 1 pistol, 2 shotgun, 3 machinegun,
-4 chaingun, 11 flashlight, 13 reload. Validated in Chrome: spawn shows
-the rifle viewmodel, chip tap raises the light, second tap returns the
-rifle.
+cinematic like the flashlight) sends `give weapon_machinegun` (+3s
+post-spawn; FULL classname required — `give machinegun` = "unknown
+item") then taps the "4" key bind 600ms later. (2) Tapping the
+flashlight chip while the light is UP returns to the rifle explicitly
+(key "4" at +250ms) and reloads (key "r" at +800ms — no-op on a full
+clip). 43b LAW: **impulses are bind-layer only** — the console rejects
+"_impulseN" AND "use"; programmatic weapon select/reload must ride the
+default.cfg binds (bind 4 "_impulse3", bind r "_impulse13") via the
+move-pad's synthetic KeyboardEvent path (tapKey() in main.js). Slot
+map (def/player.def): 0 fists, 1 pistol, 2 shotgun, 3 machinegun,
+4 chaingun, 5 handgrenade, 11 flashlight. GOTCHA that burned an iter:
+the enpro spawn default weapon is the GRENADE and its dark hand
+viewmodel reads exactly like a rifle at 1/3 scale — verify weapons by
+the AMMO HUD COUNT (grenade shows 5), not the silhouette. Validated:
+machinegun viewmodel + clip HUD at spawn, chip tap raises light,
+second tap returns the rifle.
 
 **Iter 42 — THE REAL iPHONE KILLER: bind-group cache overflow leak
 (2026-06-12, found via live phone console).** After iters 38-41 the
