@@ -2073,10 +2073,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..229a1e8
+index 0000000..c759559
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,4064 @@
+@@ -0,0 +1,4101 @@
 +/*
 +================================================================================
 +
@@ -3976,6 +3976,26 @@ index 0000000..229a1e8
 +        EM_ASM_({ console.info("[d3] WebGPU record slots ready: " + $0); }, kMaxRecordSlots);
 +    }
 +
++    // Iter 45: per-record scissor from the GL path (stored in
++    // lightFalloffS for non-reflect pass records). GL scissor origin is
++    // bottom-left; WebGPU framebuffer origin is top-left — flip Y. Records
++    // without a usable rect (or reflect records, pad3==3) get full-canvas.
++    void setRecordScissor(WGPURenderPassEncoder rp, const Rec& r) {
++        const uint32_t W = (uint32_t)depthW, H = (uint32_t)depthH;
++        if (r.pad3 == 3u) { wgpuRenderPassEncoderSetScissorRect(rp, 0, 0, W, H); return; }
++        float fx = r.lightFalloffS[0], fy = r.lightFalloffS[1];
++        float fw = r.lightFalloffS[2], fh = r.lightFalloffS[3];
++        if (fw <= 0.0f || fh <= 0.0f) { wgpuRenderPassEncoderSetScissorRect(rp, 0, 0, W, H); return; }
++        int x = (int)fx, w = (int)fw, h = (int)fh;
++        int yTop = (int)H - ((int)fy + h);
++        if (x < 0) { w += x; x = 0; }
++        if (yTop < 0) { h += yTop; yTop = 0; }
++        if (x + w > (int)W) w = (int)W - x;
++        if (yTop + h > (int)H) h = (int)H - yTop;
++        if (w <= 0 || h <= 0) { wgpuRenderPassEncoderSetScissorRect(rp, 0, 0, W, H); return; }
++        wgpuRenderPassEncoderSetScissorRect(rp, (uint32_t)x, (uint32_t)yTop, (uint32_t)w, (uint32_t)h);
++    }
++
 +    // Iter 30: upload only the 256KB chunks that changed since the last
 +    // frame. Re-uploading the full accumulators every frame (~12MB) made
 +    // WebKit's GPU helper process balloon (measured >1.6GB on Mac Safari —
@@ -4440,13 +4460,27 @@ index 0000000..229a1e8
 +                    // pass-record probe (d3cmd r_wgpuSingleLight 998): name +
 +                    // stage color + blend kind for every drawn pass record.
 +                    if (g_capWgpuSingleLight == 998 && pn < 24) {
-+                        EM_ASM_({
-+                            console.info("[d3] pass[" + $0 + "] img=" + UTF8ToString($1) +
-+                                         " color=(" + $2.toFixed(2) + "," + $3.toFixed(2) + "," + $4.toFixed(2) + "," + $5.toFixed(2) + ")" +
-+                                         " blend=" + $6 + " svc=" + $7 + " kind=" + $8);
-+                        }, pn, D3_WebGPU_ImageName(g_passImagePtrs[i]),
-+                           r.diffuseColor[0], r.diffuseColor[1], r.diffuseColor[2], r.diffuseColor[3],
-+                           r.pad1, r.pad2, r.pad3);
++                        // iter 45: geometry bounds from the staged verts —
++                        // catches wrong-vertex-range associations.
++                        extern uint8_t g_capVertsAccum[];
++                        float mn[3] = {1e9f,1e9f,1e9f}, mxb[3] = {-1e9f,-1e9f,-1e9f};
++                        for (uint32_t v = 0; v < r.vertCount; ++v) {
++                            const float* p = (const float*)(g_capVertsAccum + r.vertOffset + (size_t)v * 60u);
++                            for (int c = 0; c < 3; ++c) {
++                                if (p[c] < mn[c]) mn[c] = p[c];
++                                if (p[c] > mxb[c]) mxb[c] = p[c];
++                            }
++                        }
++                        char line[384];
++                        snprintf(line, sizeof(line),
++                                 "pass[%u] img=%s color=(%.2f,%.2f,%.2f,%.2f) blend=%u svc=%u kind=%u nv=%u ni=%u bb=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) m=(%.3f,%.3f,%.3f|%.1f,%.1f,%.1f)",
++                                 pn, D3_WebGPU_ImageName(g_passImagePtrs[i]),
++                                 r.diffuseColor[0], r.diffuseColor[1], r.diffuseColor[2], r.diffuseColor[3],
++                                 r.pad1, r.pad2, r.pad3, r.vertCount, r.indexCount,
++                                 mn[0], mn[1], mn[2], mxb[0], mxb[1], mxb[2],
++                                 r.modelMatrix[0], r.modelMatrix[5], r.modelMatrix[10],
++                                 r.modelMatrix[12], r.modelMatrix[13], r.modelMatrix[14]);
++                        EM_ASM_({ console.info("[d3] " + UTF8ToString($0)); }, line);
 +                    }
 +                    memcpy(passUBStage + (size_t)pn * kUBStride, ub, 128);
 +                    if (pn + 1 > passUBHigh) passUBHigh = pn + 1;
@@ -5197,11 +5231,13 @@ index 0000000..229a1e8
 +                }
 +                if (!p || !lastPassGroups[i]) continue;
 +                wgpuRenderPassEncoderSetPipeline(rp, p);
++                setRecordScissor(rp, r);   // iter 45: GL per-surf scissor
 +                wgpuRenderPassEncoderSetBindGroup(rp, 0, lastPassGroups[i], 0, nullptr);
 +                wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
 +                wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
 +                wgpuRenderPassEncoderDrawIndexed(rp, r.indexCount, 1, 0, 0, 0);
 +            }
++            wgpuRenderPassEncoderSetScissorRect(rp, 0, 0, (uint32_t)depthW, (uint32_t)depthH);
 +            wgpuRenderPassEncoderEnd(rp);
 +            wgpuRenderPassEncoderRelease(rp);
 +
@@ -5312,6 +5348,7 @@ index 0000000..229a1e8
 +                    WGPURenderPipeline p = (r.pad1 == 2u) ? guiAddPipeline
 +                                          : (r.pad1 == 5u) ? guiAddAlphaPipeline
 +                                          : guiAlphaPipeline;
++                    setRecordScissor(rp, r);   // iter 45
 +                    if (!p || !lastPassGroups[i]) continue;
 +                    wgpuRenderPassEncoderSetPipeline(rp3, p);
 +                    wgpuRenderPassEncoderSetBindGroup(rp3, 0, lastPassGroups[i], 0, nullptr);
@@ -7041,7 +7078,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..ef7dbdb 100644
+index c83ebb5..7b06143 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -7067,7 +7104,7 @@ index c83ebb5..ef7dbdb 100644
  
  /*
  
-@@ -38,6 +50,885 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,896 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -7869,6 +7906,17 @@ index c83ebb5..ef7dbdb 100644
 +		memcpy( r.lightProjQ,    &surf->space->modelViewMatrix[8],  16 );
 +		memcpy( r.lightFalloffS, &surf->space->modelViewMatrix[12], 16 );
 +	}
++	// Iter 45: per-surface SCISSOR (GL window coords, same math as the GL
++	// path above at r_useScissor). This is what crops in-world GUI overlay
++	// quads to their surface's screen rect — the machinegun ammo gui's
++	// 640x480 backdrop/grid quads otherwise paint across the gun body.
++	// Reflect records reuse lightFalloffS for the modelView, so they skip it.
++	if ( r.pad3 != 3u ) {
++		r.lightFalloffS[0] = (float)( backEnd.viewDef->viewport.x1 + surf->scissorRect.x1 );
++		r.lightFalloffS[1] = (float)( backEnd.viewDef->viewport.y1 + surf->scissorRect.y1 );
++		r.lightFalloffS[2] = (float)( surf->scissorRect.x2 + 1 - surf->scissorRect.x1 );
++		r.lightFalloffS[3] = (float)( surf->scissorRect.y2 + 1 - surf->scissorRect.y1 );
++	}
 +	g_passImagePtrs[g_passRecordCount] = (void*)img;
 +	g_capVertBytes  += vR;
 +	g_capIndexBytes += iR;
@@ -7953,7 +8001,7 @@ index c83ebb5..ef7dbdb 100644
  
  /*
  =================
-@@ -49,6 +940,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +951,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -7969,7 +8017,7 @@ index c83ebb5..ef7dbdb 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +978,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +989,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -7985,7 +8033,7 @@ index c83ebb5..ef7dbdb 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1025,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1036,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -8002,7 +8050,7 @@ index c83ebb5..ef7dbdb 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1085,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1096,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -8010,7 +8058,7 @@ index c83ebb5..ef7dbdb 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1312,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1323,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -8023,7 +8071,7 @@ index c83ebb5..ef7dbdb 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1481,57 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1492,57 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
