@@ -2073,10 +2073,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..3e6a1a4
+index 0000000..36f5374
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,4052 @@
+@@ -0,0 +1,4021 @@
 +/*
 +================================================================================
 +
@@ -2840,7 +2840,10 @@ index 0000000..3e6a1a4
 +        svbl.attributeCount = 1;
 +        svbl.attributes = &sAttr;
 +
-+        auto makeShadow = [&](bool zfail, const char* label) -> WGPURenderPipeline {
++        // `undo` swaps Increment/Decrement: drawing the same volume twice
++        // (mark, then undo) restores the stencil exactly — wraparound
++        // included — which lets every light share ONE render pass.
++        auto makeShadow = [&](bool zfail, bool undo, const char* label) -> WGPURenderPipeline {
 +            WGPUDepthStencilState dss = {};
 +            dss.stencilReadMask = 0xFFFFFFFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim)
 +            dss.stencilWriteMask = 0xFFFFFFFFu;
@@ -2850,14 +2853,16 @@ index 0000000..3e6a1a4
 +            dss.stencilFront.compare = WGPUCompareFunction_Always;
 +            dss.stencilBack.compare  = WGPUCompareFunction_Always;
 +            dss.stencilFront.failOp = dss.stencilBack.failOp = WGPUStencilOperation_Keep;
++            const WGPUStencilOperation incr = undo ? WGPUStencilOperation_DecrementWrap : WGPUStencilOperation_IncrementWrap;
++            const WGPUStencilOperation decr = undo ? WGPUStencilOperation_IncrementWrap : WGPUStencilOperation_DecrementWrap;
 +            if (zfail) {
-+                dss.stencilFront.depthFailOp = WGPUStencilOperation_IncrementWrap;
-+                dss.stencilBack.depthFailOp  = WGPUStencilOperation_DecrementWrap;
++                dss.stencilFront.depthFailOp = incr;
++                dss.stencilBack.depthFailOp  = decr;
 +                dss.stencilFront.passOp = dss.stencilBack.passOp = WGPUStencilOperation_Keep;
 +            } else {
 +                dss.stencilFront.depthFailOp = dss.stencilBack.depthFailOp = WGPUStencilOperation_Keep;
-+                dss.stencilFront.passOp = WGPUStencilOperation_DecrementWrap;
-+                dss.stencilBack.passOp  = WGPUStencilOperation_IncrementWrap;
++                dss.stencilFront.passOp = decr;
++                dss.stencilBack.passOp  = incr;
 +            }
 +            // Color target declared (writeMask none) for pass compatibility —
 +            // the per-light pass has a color attachment.
@@ -2887,8 +2892,10 @@ index 0000000..3e6a1a4
 +            pd.depthStencil = &dss;
 +            return wgpuDeviceCreateRenderPipeline(device, &pd);
 +        };
-+        shadowZFailPipeline = makeShadow(true,  "shadowZFail");
-+        shadowZPassPipeline = makeShadow(false, "shadowZPass");
++        shadowZFailPipeline     = makeShadow(true,  false, "shadowZFail");
++        shadowZPassPipeline     = makeShadow(false, false, "shadowZPass");
++        shadowZFailUndoPipeline = makeShadow(true,  true,  "shadowZFailUndo");
++        shadowZPassUndoPipeline = makeShadow(false, true,  "shadowZPassUndo");
 +
 +        // Iter 38 debug pipelines (r_wgpuSingleLight -994 / -993): volumes as
 +        // opaque magenta — geometry visibility probe. -994 ignores depth;
@@ -4886,130 +4893,89 @@ index 0000000..3e6a1a4
 +            wgpuRenderPassEncoderEnd(rp);
 +            wgpuRenderPassEncoderRelease(rp);
 +        }
-+        // Iter 9: per-LIGHT passes. Each light gets its own render pass so
-+        // the stencil buffer can reload to 128 between lights (loadOp Clear):
-+        // shadow volumes bump the stencil, then the light's interactions
-+        // render additively with stencil GEQUAL 128 — shadowed fragments
-+        // fail. Records arrive grouped by lightId in engine light order.
-+        //
-+        // Iter 30: only lights WITH shadow volumes need that private pass.
-+        // All unshadowed lights merge into ONE pass (their stencil stays at
-+        // the cleared 128, so GEQUAL passes everywhere — identical output,
-+        // additive blending is commutative). WebKit allocates per encoder,
-+        // and ~30 render passes/frame was a big slice of the GPU-process
-+        // balloon; this cuts passes to 1 + lights-with-shadows (and the
-+        // no-shadows path becomes a single pass).
++        // Iter 39: ONE lighting pass for everything. Per-light stencil
++        // isolation WITHOUT per-light passes: a shadowed light's volumes
++        // MARK the stencil, its interactions draw with GEQUAL-128, then the
++        // same volumes redraw with inverted ops to UNMARK — IncrementWrap
++        // and DecrementWrap are exact inverses (wraparound included), so the
++        // stencil returns to the cleared 128 for the next light. The iter-38
++        // structure (1 + shadowed-light-count passes) killed the iPhone at
++        // shdw 97: each pass costs a full-tile stencil clear/store on TBDR
++        // plus WebKit per-encoder allocations — the GPU helper process
++        // ballooned and jetsam killed the tab during boot. Volumes rasterize
++        // twice now; that is far cheaper than per-pass tile traffic.
 +        bool colorCleared = false;
-+        {
++        if (lastRecordCount > 0) {
 +            uint32_t shadowedLights[64];
 +            uint32_t shadowedLightCount = 0;
-+            bool mergeOK = true;
-+            for (uint32_t s = 0; s < lastShadowCount && mergeOK; ++s) {
++            bool tableOK = true;
++            for (uint32_t s = 0; s < lastShadowCount && tableOK; ++s) {
 +                const uint32_t id = lastShadowRecords[s].lightId;
 +                bool seen = false;
 +                for (uint32_t k = 0; k < shadowedLightCount; ++k) {
 +                    if (shadowedLights[k] == id) { seen = true; break; }
 +                }
 +                if (!seen) {
-+                    if (shadowedLightCount >= 64) { mergeOK = false; break; }
++                    if (shadowedLightCount >= 64) { tableOK = false; break; }
 +                    shadowedLights[shadowedLightCount++] = id;
 +                }
 +            }
 +            auto lightIsShadowed = [&](uint32_t id) -> bool {
-+                if (!mergeOK) return true;   // fallback: every light gets its own pass
++                if (!tableOK) return true;   // table overflow: mark/unmark every light (correct, just more volume draws)
 +                for (uint32_t k = 0; k < shadowedLightCount; ++k) {
 +                    if (shadowedLights[k] == id) return true;
 +                }
 +                return false;
 +            };
-+            // Merged pass: all interactions of unshadowed lights.
-+            bool anyUnshadowed = false;
-+            for (uint32_t k = 0; k < lastRecordCount; ++k) {
-+                if (!lightIsShadowed(lastRecords[k].lightId)) { anyUnshadowed = true; break; }
-+            }
-+            if (anyUnshadowed) {
-+                WGPURenderPassColorAttachment ca = {};
-+                ca.view = color;
-+                ca.loadOp = colorCleared ? WGPULoadOp_Load : WGPULoadOp_Clear;
-+                ca.storeOp = WGPUStoreOp_Store;
-+                ca.clearValue = { 0.0, 0.0, 0.0, 1.0 };
-+                ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
-+                colorCleared = true;
-+                WGPURenderPassDepthStencilAttachment da = {};
-+                da.view = depth;
-+                da.depthLoadOp = kUsePrePass ? WGPULoadOp_Load : WGPULoadOp_Clear;
-+                da.depthStoreOp = WGPUStoreOp_Store;
-+                da.depthClearValue = 1.0f;
-+                da.stencilLoadOp = WGPULoadOp_Clear;
-+                da.stencilStoreOp = WGPUStoreOp_Store;
-+                da.stencilClearValue = 128;
-+                WGPURenderPassDescriptor rpd = {};
-+                rpd.colorAttachmentCount = 1;
-+                rpd.colorAttachments = &ca;
-+                rpd.depthStencilAttachment = &da;
-+                WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
-+                wgpuRenderPassEncoderSetStencilReference(rp, 128);
-+                wgpuRenderPassEncoderSetPipeline(rp, interactionPipeline);
-+                for (uint32_t k = 0; k < lastRecordCount; ++k) {
-+                    if (lightIsShadowed(lastRecords[k].lightId)) continue;
-+                    const Rec& r = lastRecords[k];
-+                    wgpuRenderPassEncoderSetBindGroup(rp, 0, recordBindGroups[k], 0, nullptr);
-+                    wgpuRenderPassEncoderSetBindGroup(rp, 1, lastMatGroups[k] ? lastMatGroups[k] : fallbackMatGroup(), 0, nullptr);
-+                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
-+                    wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
-+                    wgpuRenderPassEncoderDrawIndexed(rp, r.indexCount, 1, 0, 0, 0);
++            WGPURenderPassColorAttachment ca = {};
++            ca.view = color;
++            ca.loadOp = WGPULoadOp_Clear;
++            ca.storeOp = WGPUStoreOp_Store;
++            ca.clearValue = { 0.0, 0.0, 0.0, 1.0 };
++            ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
++            colorCleared = true;
++            WGPURenderPassDepthStencilAttachment da = {};
++            da.view = depth;
++            da.depthLoadOp = kUsePrePass ? WGPULoadOp_Load : WGPULoadOp_Clear;
++            da.depthStoreOp = WGPUStoreOp_Store;
++            da.depthClearValue = 1.0f;
++            da.stencilLoadOp = WGPULoadOp_Clear;
++            da.stencilStoreOp = WGPUStoreOp_Store;
++            da.stencilClearValue = 128;
++            WGPURenderPassDescriptor rpd = {};
++            rpd.colorAttachmentCount = 1;
++            rpd.colorAttachments = &ca;
++            rpd.depthStencilAttachment = &da;
++            WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
++            wgpuRenderPassEncoderSetStencilReference(rp, 128);
++            extern int g_capWgpuSingleLight;
++            // negative sentinels: stay clear of the >=0 single-light filter
++            WGPURenderPipeline dbgPipe =
++                (g_capWgpuSingleLight == -994) ? shadowDebugPipeline :
++                (g_capWgpuSingleLight == -993) ? shadowDebugDepthPipeline : nullptr;
++            const bool volsOK = shadowZFailPipeline && shadowZPassPipeline &&
++                                shadowZFailUndoPipeline && shadowZPassUndoPipeline &&
++                                shadowVertexBuf;
++            auto drawVolumes = [&](uint32_t light, bool undo) {
++                for (uint32_t sIdx = 0; sIdx < lastShadowCount; ++sIdx) {
++                    const Rec& sr = lastShadowRecords[sIdx];
++                    if (sr.lightId != light) continue;
++                    WGPURenderPipeline p = undo
++                        ? (sr.pad1 ? shadowZPassUndoPipeline : shadowZFailUndoPipeline)
++                        : (sr.pad1 ? shadowZPassPipeline : shadowZFailPipeline);
++                    if (!undo && dbgPipe) p = dbgPipe;
++                    wgpuRenderPassEncoderSetPipeline(rp, p);
++                    wgpuRenderPassEncoderSetBindGroup(rp, 0, shadowBindGroups[sIdx], 0, nullptr);
++                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, shadowVertexBuf, sr.vertOffset, (uint64_t)sr.vertCount * 16u);
++                    wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, sr.indexOffset, (uint64_t)sr.indexCount * 2u);
++                    wgpuRenderPassEncoderDrawIndexed(rp, sr.indexCount, 1, 0, 0, 0);
 +                }
-+                wgpuRenderPassEncoderEnd(rp);
-+                wgpuRenderPassEncoderRelease(rp);
-+            }
++            };
 +            uint32_t i = 0;
 +            while (i < lastRecordCount) {
 +                const uint32_t light = lastRecords[i].lightId;
-+                if (!lightIsShadowed(light)) {
-+                    // already drawn in the merged pass
-+                    while (i < lastRecordCount && lastRecords[i].lightId == light) i++;
-+                    continue;
-+                }
-+                WGPURenderPassColorAttachment ca = {};
-+                ca.view = color;
-+                ca.loadOp = colorCleared ? WGPULoadOp_Load : WGPULoadOp_Clear;
-+                ca.storeOp = WGPUStoreOp_Store;
-+                ca.clearValue = { 0.0, 0.0, 0.0, 1.0 };
-+                ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
-+                colorCleared = true;
-+                WGPURenderPassDepthStencilAttachment da = {};
-+                da.view = depth;
-+                da.depthLoadOp = kUsePrePass ? WGPULoadOp_Load : WGPULoadOp_Clear;
-+                da.depthStoreOp = WGPUStoreOp_Store;
-+                da.depthClearValue = 1.0f;
-+                da.stencilLoadOp = WGPULoadOp_Clear;
-+                da.stencilStoreOp = WGPUStoreOp_Store;
-+                da.stencilClearValue = 128;
-+                WGPURenderPassDescriptor rpd = {};
-+                rpd.colorAttachmentCount = 1;
-+                rpd.colorAttachments = &ca;
-+                rpd.depthStencilAttachment = &da;
-+                WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
-+                wgpuRenderPassEncoderSetStencilReference(rp, 128);
-+                // Shadow volumes for this light (z-fail or depth-pass per record)
-+                if (shadowZFailPipeline && shadowZPassPipeline && shadowVertexBuf) {
-+                    extern int g_capWgpuSingleLight;
-+                    // negative sentinels: stay clear of the >=0 single-light filter
-+                    WGPURenderPipeline dbgPipe =
-+                        (g_capWgpuSingleLight == -994) ? shadowDebugPipeline :
-+                        (g_capWgpuSingleLight == -993) ? shadowDebugDepthPipeline : nullptr;
-+                    for (uint32_t sIdx = 0; sIdx < lastShadowCount; ++sIdx) {
-+                        const Rec& sr = lastShadowRecords[sIdx];
-+                        if (sr.lightId != light) continue;
-+                        wgpuRenderPassEncoderSetPipeline(rp, dbgPipe ? dbgPipe
-+                                                             : (sr.pad1 ? shadowZPassPipeline : shadowZFailPipeline));
-+                        wgpuRenderPassEncoderSetBindGroup(rp, 0, shadowBindGroups[sIdx], 0, nullptr);
-+                        wgpuRenderPassEncoderSetVertexBuffer(rp, 0, shadowVertexBuf, sr.vertOffset, (uint64_t)sr.vertCount * 16u);
-+                        wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, sr.indexOffset, (uint64_t)sr.indexCount * 2u);
-+                        wgpuRenderPassEncoderDrawIndexed(rp, sr.indexCount, 1, 0, 0, 0);
-+                    }
-+                }
-+                // This light's interactions, stencil-gated
++                const bool shadowed = volsOK && lightIsShadowed(light);
++                if (shadowed) drawVolumes(light, false);
 +                wgpuRenderPassEncoderSetPipeline(rp, interactionPipeline);
 +                while (i < lastRecordCount && lastRecords[i].lightId == light) {
 +                    const Rec& r = lastRecords[i];
@@ -5020,9 +4986,10 @@ index 0000000..3e6a1a4
 +                    wgpuRenderPassEncoderDrawIndexed(rp, r.indexCount, 1, 0, 0, 0);
 +                    i++;
 +                }
-+                wgpuRenderPassEncoderEnd(rp);
-+                wgpuRenderPassEncoderRelease(rp);
++                if (shadowed) drawVolumes(light, true);
 +            }
++            wgpuRenderPassEncoderEnd(rp);
++            wgpuRenderPassEncoderRelease(rp);
 +        }
 +        // Iter 23: Quest-style visible shadows — re-mark the union of ALL
 +        // shadow volumes in a fresh stencil, then multiply every shadowed
@@ -6005,6 +5972,8 @@ index 0000000..3e6a1a4
 +    // stream, per-slot 80-byte uniforms (mvp + model-space light origin).
 +    WGPURenderPipeline      shadowZFailPipeline = nullptr;
 +    WGPURenderPipeline      shadowZPassPipeline = nullptr;
++    WGPURenderPipeline      shadowZFailUndoPipeline = nullptr;    // iter 39: inverted ops — stencil restore
++    WGPURenderPipeline      shadowZPassUndoPipeline = nullptr;
 +    WGPURenderPipeline      shadowDebugPipeline = nullptr;        // iter 38: -994 magenta volumes
 +    WGPURenderPipeline      shadowDebugDepthPipeline = nullptr;   // iter 38: -993 magenta + Less depth
 +    WGPUBindGroupLayout     shadowBGL = nullptr;

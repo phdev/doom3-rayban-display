@@ -1537,6 +1537,26 @@ the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
 MEASURE before declaring iPhone-safe) and before the new native
 side-by-side.
 
+**Iter 39 — single-pass stencil shadows: mark → draw → unmark
+(2026-06-12, the iPhone crash regression fix).** Iter 38's working
+shadows promptly killed the iPhone ("WEBGL CONTEXT LOST" + dead
+GPUDevice at 82% boot, fps 11.8, shdw 97): the iter-30 pass structure
+gave every SHADOWED light a private render pass, and with real volumes
+flowing that meant 10-20 passes/frame — each one a full-tile stencil
+clear/store on Apple's TBDR plus WebKit per-encoder allocations. THE
+ARCHITECTURE LAW: per-light stencil isolation must NOT cost a render
+pass. Replacement (better than iter 30 even): ONE lighting pass total —
+for each shadowed light, draw its volumes (mark stencil), draw its
+interactions (GEQUAL 128), then redraw the volumes with
+Increment/DecrementWrap SWAPPED (exact inverses, wraparound included)
+to restore stencil to 128 for the next light. Volumes rasterize twice;
+trivial against per-pass tile traffic. shadowZFail/ZPassUndoPipeline.
+The >64-shadowed-lights table overflow now just mark/unmarks every
+light (no pass explosion). VALIDATED: det rounds 1-6 IDENTICAL; stable
+shadow signal 11.47% (iter-38 13.32, native 9.86); zero validation
+errors. WebKit GPU churn re-measure still pending a Mac unlock —
+do it before the next iPhone request.
+
 **Iter 37b — Safari fps gap CLOSED + live native side-by-side
 (2026-06-11/12).** With the Mac unlocked, /tmp/safari-ladder2.sh ran
 against vite preview (4174) with ?fpstitle: baseline 60.1 fps /
