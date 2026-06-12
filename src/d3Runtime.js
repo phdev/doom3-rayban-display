@@ -85,7 +85,12 @@ export function createRuntimeConfig() {
         // airlock/elevator) and WebGL has no working gamma to lift it, so switch
         // the flashlight on automatically once the player spawns — the level opens
         // lit instead of pitch black. Long-pinch toggles it afterward.
-        autoFlashlight: true,
+        // Iter 37: OFF by default — native dhewm3 parity. The auto-flashlight
+        // dated from the broken-dark GL era; with lighting fixed it was THE
+        // remaining difference vs native (measured: corridor luma 23.5 vs
+        // native 23.0 with it off, 30.8 with it on — read as "missing
+        // shadows"). The on-screen Flashlight chip now tap-toggles it.
+        autoFlashlight: false,
         // With the WebKit lit-pass falloff fix (`main.js` fixFalloffSampling()),
         // the engine now lights the world correctly, so the wearable cvars are
         // reset to ~desktop values (they were cranked way up — lightScale 6, gamma
@@ -115,7 +120,12 @@ export function createRuntimeConfig() {
         inputMode: "desktop",
         lowLatencyControls: false,
         audioEnabled: false,
-        autoFlashlight: true,
+        // Iter 37: OFF by default — native dhewm3 parity. The auto-flashlight
+        // dated from the broken-dark GL era; with lighting fixed it was THE
+        // remaining difference vs native (measured: corridor luma 23.5 vs
+        // native 23.0 with it off, 30.8 with it on — read as "missing
+        // shadows"). The on-screen Flashlight chip now tap-toggles it.
+        autoFlashlight: false,
         displayBrightness: 1,
         displayContrast: 1,
         displaySaturate: 1,

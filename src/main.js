@@ -33,7 +33,7 @@ app.innerHTML = `
     <canvas id="webgpuCanvas" class="webgpu-canvas" width="448" height="448" aria-hidden="true"></canvas>
     <div id="enemyLeftIndicator" class="enemy-indicator enemy-indicator-left" aria-hidden="true"></div>
     <div id="enemyRightIndicator" class="enemy-indicator enemy-indicator-right" aria-hidden="true"></div>
-    <div id="flashlightIndicator" class="flashlight-indicator" aria-hidden="true">Flashlight</div>
+    <div id="flashlightIndicator" class="flashlight-indicator" role="button" tabindex="0">Flashlight</div>
     <section id="loadingPanel" class="loading-panel" role="status" aria-live="polite">
       <div id="loadingLabel" class="loading-label">Loading</div>
       <div
@@ -1703,6 +1703,14 @@ function setEnemyIndicators({ left, right }) {
 function setFlashlightIndicator(on) {
   refs.flashlightIndicator.classList.toggle("is-on", Boolean(on));
 }
+
+// Iter 37: the chip is a tap-toggle (the only flashlight control on touch
+// devices now that auto-enable is off — native-parity boots dark-corridor
+// correct, and the player lights up on demand like in the native game).
+refs.flashlightIndicator.addEventListener("click", (e) => {
+  e.preventDefault();
+  wearableInput?.toggleFlashlight();
+});
 
 function handleAutoFireStarted() {
   wearableInput?.setForward(false);
