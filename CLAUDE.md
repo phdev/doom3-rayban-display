@@ -1537,6 +1537,24 @@ the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
 MEASURE before declaring iPhone-safe) and before the new native
 side-by-side.
 
+**Iter 49d — the "disappearing ceiling" verdict: authored darkness
+(2026-06-12).** First pos-chip-driven repro (user screenshot carried
+`pos -667 3962 -156 | yaw -177 pitch -31`; setviewpos + touch-drag
+pitch landed exactly there). Triple proof it is NOT a bug:
+(1) r_showTris 2 wireframe covers the black region — geometry IS
+submitted and drawn; (2) 8x exposure: the region is mathematically
+ZERO — no light contribution at all (not dim — none); (3) enpro.map
+light census: the only light up that shaft is light_7
+(lights/squareishlight, z+16, radius 256/352/320 — the orange glow we
+DO render); the black faces are outside its reach. idTech4 has no
+ambient — unlit surfaces are pure black BY DESIGN; native renders the
+same. GL echo and WebGPU agreed pixel-for-pixel, which exonerated the
+backend immediately. METHOD: pos chip → setviewpos → r_showTris →
+exposure amp → .map light census = the complete "missing geometry"
+triage ladder, no native app needed. Blood smear confirmed fixed by
+the user (iter 49 census). The .map ships in the pak — light-entity
+queries are always available.
+
 **Iter 49 — blend census + teleportable screenshots (2026-06-12).**
 After iter 48 proved unhandled blends were a CLASS of bug, a census of
 every `blend` line in the game's .mtr files found five more modes the
