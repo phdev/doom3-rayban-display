@@ -1537,6 +1537,43 @@ the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
 MEASURE before declaring iPhone-safe) and before the new native
 side-by-side.
 
+**Iter 50c — NATIVE GROUND TRUTH closes the ceiling report
+(2026-06-12).** User pushed back twice with native Mac screenshots
+("definitely a ceiling there") — both pitched UP with the flashlight
+aimed at it. Scripted native proof at the EXACT spot
+(getviewpos-verified `(-675 3964 -155.65) 178.0`): native upper half
+at LEVEL pitch = mean luma 5.0, MEDIAN 0.0, 85% black — DARKER than
+ours (no-flashlight 8.0/2.3/63%). Pixel analysis of the user's own
+pitched-up native shot: lit beam pool mean 6.8 vs ours 5.8; OFF-beam
+ceiling luma 1.4 (98% black) — even native shows the ceiling ONLY
+where the flashlight beam lands. Verdict stands: authored darkness,
+we render slightly MORE than native. THE NATIVE AUTOMATION RECIPE
+(keystrokes are NOT viable — System Events sees no AX windows for
+SDL apps, and a focus miss types into the user's frontmost app):
+drive everything from a cfg in fs_basepath/base via `+exec`:
+`devmap <map>; timescale 10; wait 5000; timescale 1; setviewpos ...;
+wait 90; screenshot; getviewpos; condump out.txt; quit` with
+isolated `+set fs_configpath/fs_savepath /tmp/<dir>`. GOTCHAS:
+(a) launching unfocused/backgrounded DEADLOCKS in Cocoa_GL_SwapWindow
+(main thread stuck in the launch AppleEvent handler; 0% CPU forever)
+— `+set r_swapInterval 0` fixes it (skips the display-link wait);
+(b) `wait` counts RENDER frames and vsync-off fps is ~125+, so
+fixed waits can't outlast the >160s enpro intro — fast-forward
+game time with timescale 10 instead (vanilla has no
+g_skipCinematics; that's our patch); (c) setviewpos zeroes pitch
+(level) and native takes x y z yaw only; (d) macOS screenshot
+filenames contain U+202F before AM/PM — glob, don't type the path;
+(e) screenshots land in fs_savepath/base/screenshots/*.tga at 2x
+window size (retina). RESIDUAL COSMETIC DELTA worth a future iter:
+native renders the flashlight's beam-glow cone + lens flare quads
+(implicit materials from models/items/flashlight/beam1.tga etc.);
+our zz_flashlight_fix.mtr blanks those four surfaces — a fix from
+when the reduced pak LACKED the textures, but the iter-50-era pak
+now SHIPS them (beam1/bulb/dust/flare/flare2.tga confirmed in the
+pak). Removing the override should restore the native beam look —
+needs the GL-echo A/B (verify no white quads / no black boxes over
+lit surfaces) before shipping.
+
 **Iter 50b — ceiling follow-up at pitch-level vantage: authored
 darkness confirmed, no defect (2026-06-12).** User report from the
 SAME spot (`pos -675 3964 -156 | yaw 178 pitch -3`, flashlight on,
