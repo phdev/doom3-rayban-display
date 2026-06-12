@@ -2073,10 +2073,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..9cc0422
+index 0000000..229a1e8
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,4053 @@
+@@ -0,0 +1,4064 @@
 +/*
 +================================================================================
 +
@@ -2793,12 +2793,16 @@ index 0000000..9cc0422
 +        };
 +        passOpaquePipeline = makeVariant(WGPUBlendFactor_One, WGPUBlendFactor_Zero, true,  WGPUCompareFunction_LessEqual, "passOpaque");
 +        passAddPipeline    = makeVariant(WGPUBlendFactor_One, WGPUBlendFactor_One,  false, WGPUCompareFunction_LessEqual, "passAdditive");
++        // Iter 44: srcAlpha-additive (gl_src_alpha, gl_one) — gui glow stages
++        // whose stage alpha dims the contribution (kind 5).
++        passAddAlphaPipeline = makeVariant(WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_One, false, WGPUCompareFunction_LessEqual, "passAddAlpha");
 +        passAlphaPipeline  = makeVariant(WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_OneMinusSrcAlpha, false, WGPUCompareFunction_LessEqual, "passAlpha");
 +        // Iter 16: 'blend filter' stages (gl_dst_color, gl_zero) — glass tints.
 +        passFilterPipeline = makeVariant(WGPUBlendFactor_Dst, WGPUBlendFactor_Zero, false, WGPUCompareFunction_LessEqual, "passFilter");
 +        // Iter 8d: 2D overlay variants (HUD/menus) — no depth dependence
 +        guiAddPipeline     = makeVariant(WGPUBlendFactor_One, WGPUBlendFactor_One,  false, WGPUCompareFunction_Always, "guiAdditive");
 +        guiAlphaPipeline   = makeVariant(WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_OneMinusSrcAlpha, false, WGPUCompareFunction_Always, "guiAlpha");
++        guiAddAlphaPipeline = makeVariant(WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_One, false, WGPUCompareFunction_Always, "guiAddAlpha");
 +        wgpuPipelineLayoutRelease(passPL);
 +        wgpuShaderModuleRelease(mod);
 +    }
@@ -5181,11 +5185,14 @@ index 0000000..9cc0422
 +                if (splitGUI && r.pad3 == 1u) continue;   // GUI draws after post-FX
 +                WGPURenderPipeline p;
 +                if (r.pad3 == 1u) {
-+                    p = (r.pad1 == 2u) ? guiAddPipeline : guiAlphaPipeline;
++                    p = (r.pad1 == 2u) ? guiAddPipeline
++                      : (r.pad1 == 5u) ? guiAddAlphaPipeline
++                      : guiAlphaPipeline;
 +                } else {
 +                    p = (r.pad1 == 1u) ? passOpaquePipeline
 +                      : (r.pad1 == 3u) ? passAlphaPipeline
 +                      : (r.pad1 == 4u) ? passFilterPipeline
++                      : (r.pad1 == 5u) ? passAddAlphaPipeline
 +                      : passAddPipeline;
 +                }
 +                if (!p || !lastPassGroups[i]) continue;
@@ -5302,7 +5309,9 @@ index 0000000..9cc0422
 +                for (uint32_t i = 0; i < lastPassCount; ++i) {
 +                    const Rec& r = lastPassRecords[i];
 +                    if (r.pad3 != 1u) continue;
-+                    WGPURenderPipeline p = (r.pad1 == 2u) ? guiAddPipeline : guiAlphaPipeline;
++                    WGPURenderPipeline p = (r.pad1 == 2u) ? guiAddPipeline
++                                          : (r.pad1 == 5u) ? guiAddAlphaPipeline
++                                          : guiAlphaPipeline;
 +                    if (!p || !lastPassGroups[i]) continue;
 +                    wgpuRenderPassEncoderSetPipeline(rp3, p);
 +                    wgpuRenderPassEncoderSetBindGroup(rp3, 0, lastPassGroups[i], 0, nullptr);
@@ -5984,6 +5993,8 @@ index 0000000..9cc0422
 +    // additive + alpha get texture.wgsl variants (depth write OFF).
 +    WGPURenderPipeline      passOpaquePipeline = nullptr;
 +    WGPURenderPipeline      passAddPipeline   = nullptr;
++    WGPURenderPipeline      passAddAlphaPipeline = nullptr;   // iter 44: srcAlpha-additive (kind 5)
++    WGPURenderPipeline      guiAddAlphaPipeline  = nullptr;
 +    WGPURenderPipeline      passAlphaPipeline = nullptr;
 +    WGPURenderPipeline      passFilterPipeline = nullptr;
 +    // Iter 8d: 2D GUI/HUD variants — depth test Always (overlay)
@@ -7030,7 +7041,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..3e520b0 100644
+index c83ebb5..ef7dbdb 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -7056,7 +7067,7 @@ index c83ebb5..3e520b0 100644
  
  /*
  
-@@ -38,6 +50,884 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,885 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -7841,6 +7852,7 @@ index c83ebb5..3e520b0 100644
 +	else if ( blend == (GLS_SRCBLEND_SRC_ALPHA | GLS_DSTBLEND_ONE_MINUS_SRC_ALPHA) ) r.pad1 = 3;
 +	else if ( blend == (GLS_SRCBLEND_ONE | GLS_DSTBLEND_ZERO) )                      r.pad1 = 1;
 +	else if ( blend == (GLS_SRCBLEND_DST_COLOR | GLS_DSTBLEND_ZERO) )                r.pad1 = 4;  // filter (blend filter / gl_dst_color gl_zero)
++	else if ( blend == (GLS_SRCBLEND_SRC_ALPHA | GLS_DSTBLEND_ONE) )                 r.pad1 = 5;  // iter 44: srcAlpha-additive — gui glows (machinegun ammo grid alpha 0.1); bucketing as ONE/ONE lost the dim
 +	else                                                                             r.pad1 = 2;
 +	r.pad2 = (uint32_t)pStage->vertexColor;
 +	r.pad3 = is2D ? 1u : 0u;
@@ -7941,7 +7953,7 @@ index c83ebb5..3e520b0 100644
  
  /*
  =================
-@@ -49,6 +939,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +940,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -7957,7 +7969,7 @@ index c83ebb5..3e520b0 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +977,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +978,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -7973,7 +7985,7 @@ index c83ebb5..3e520b0 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1024,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1025,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -7990,7 +8002,7 @@ index c83ebb5..3e520b0 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1084,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1085,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -7998,7 +8010,7 @@ index c83ebb5..3e520b0 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1311,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1312,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -8011,7 +8023,7 @@ index c83ebb5..3e520b0 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1480,57 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1481,57 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
