@@ -1569,7 +1569,20 @@ async function start() {
       getEngine: () => engine,
       onRecenter: () => headTracking.recenter(),
       onTurnBurst: (direction) => headTracking.addTurnBurst(direction),
-      onFlashlightChange: setFlashlightIndicator
+      onFlashlightChange: (enabled) => {
+        setFlashlightIndicator(enabled);
+        // Iter 43: lowering the flashlight returns to the assault rifle
+        // explicitly (the engine's own previous-weapon return can land on
+        // the pistol/fists depending on what was held when the light was
+        // first raised), then tops off the clip — the reload impulse is a
+        // no-op on a full clip, so it only acts when ammo was spent.
+        if (!enabled && typeof window.d3cmd === "function") {
+          window.setTimeout(() => {
+            window.d3cmd("_impulse3");   // machinegun
+            window.setTimeout(() => window.d3cmd("_impulse13"), 700);  // reload if needed
+          }, 250);
+        }
+      }
     });
 
     wearableInput.install();
@@ -1654,6 +1667,7 @@ function handleRuntimeLog(text) {
   if (/entities spawned/i.test(text)) {
     armAutoFlashlight();
     armCinematicShadowGuard();
+    armSpawnLoadout();
   }
 }
 
@@ -1685,6 +1699,31 @@ function armAutoFlashlight() {
     diag("flashlight: auto-enabled for the dark spawn room (long-pinch to toggle)");
   };
   window.setTimeout(() => tryEnable(0), 2600);
+}
+
+// Iter 43: spawn loadout — start with the assault rifle (machinegun)
+// instead of the bare pistol. `give` is a direct console command (not an
+// impulse), but the weapon auto-switch lands cleaner after the intro
+// cinematic releases the camera, so wait it out like the flashlight does.
+let spawnLoadoutArmed = false;
+function armSpawnLoadout() {
+  if (spawnLoadoutArmed) {
+    return;
+  }
+  spawnLoadoutArmed = true;
+  const tryGive = (attempt) => {
+    if (typeof window.d3cmd !== "function" && attempt < 60) {
+      window.setTimeout(() => tryGive(attempt + 1), 1000);
+      return;
+    }
+    if (window.__d3InCinematic === 1 && attempt < 120) {
+      window.setTimeout(() => tryGive(attempt + 1), 1000);
+      return;
+    }
+    window.d3cmd("give machinegun");
+    diag("loadout: assault rifle equipped");
+  };
+  window.setTimeout(() => tryGive(0), 3000);
 }
 
 // Iter 40: phone defense-in-depth. Cinematic flythroughs legitimately push

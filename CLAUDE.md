@@ -1537,6 +1537,22 @@ the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
 MEASURE before declaring iPhone-safe) and before the new native
 side-by-side.
 
+**Iter 43 — spawn loadout + flashlight-return (2026-06-12, user
+requests).** (1) Player spawns with the assault rifle:
+armSpawnLoadout() in main.js (entities-spawned hook, waits out the
+cinematic like the flashlight) sends `give machinegun` (+3s
+post-spawn; give auto-selects). (2) Tapping the flashlight chip while
+the light is UP now returns to the rifle EXPLICITLY: the
+onFlashlightChange callback sends _impulse3 (machinegun) 250ms after
+flashlight-off, then _impulse13 (reload) 700ms later — reload is a
+no-op on a full clip so it only acts when ammo was spent (the engine's
+own previous-weapon return can land on pistol/fists depending on what
+was held when the light was first raised). Weapon impulse map for
+future loadout work: 0 fists, 1 pistol, 2 shotgun, 3 machinegun,
+4 chaingun, 11 flashlight, 13 reload. Validated in Chrome: spawn shows
+the rifle viewmodel, chip tap raises the light, second tap returns the
+rifle.
+
 **Iter 42 — THE REAL iPHONE KILLER: bind-group cache overflow leak
 (2026-06-12, found via live phone console).** After iters 38-41 the
 phone STILL died at boot. Breakthrough instrument: a console-mirror
