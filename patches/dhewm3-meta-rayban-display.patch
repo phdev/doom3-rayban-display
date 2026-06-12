@@ -2073,10 +2073,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..09daa27
+index 0000000..40d4999
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,4225 @@
+@@ -0,0 +1,4238 @@
 +/*
 +================================================================================
 +
@@ -2797,7 +2797,8 @@ index 0000000..09daa27
 +
 +        auto makeVariant = [&](WGPUBlendFactor src, WGPUBlendFactor dst,
 +                               bool depthWrite, WGPUCompareFunction depthCmp,
-+                               const char* label) -> WGPURenderPipeline {
++                               const char* label,
++                               WGPUColorWriteMask writeMask = WGPUColorWriteMask_All) -> WGPURenderPipeline {
 +            WGPUDepthStencilState dss = {};
 +            dss.stencilReadMask = 0xFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim); 0xFF not 0xFFFFFFFF — iOS WebKit rejects out-of-format mask bits
 +            dss.stencilWriteMask = 0xFFu;
@@ -2810,7 +2811,7 @@ index 0000000..09daa27
 +            dss.stencilBack.failOp  = dss.stencilBack.depthFailOp  = dss.stencilBack.passOp  = WGPUStencilOperation_Keep;
 +            WGPUColorTargetState target = {};
 +            target.format = surfaceFormat;
-+            target.writeMask = WGPUColorWriteMask_All;
++            target.writeMask = writeMask;
 +            WGPUBlendState blend = {};
 +            blend.color.srcFactor = src; blend.color.dstFactor = dst;
 +            blend.alpha.srcFactor = src; blend.alpha.dstFactor = dst;
@@ -2840,6 +2841,12 @@ index 0000000..09daa27
 +        // Iter 44: srcAlpha-additive (gl_src_alpha, gl_one) — gui glow stages
 +        // whose stage alpha dims the contribution (kind 5).
 +        passAddAlphaPipeline = makeVariant(WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_One, false, WGPUCompareFunction_LessEqual, "passAddAlpha");
++        // Iter 48: dst-alpha gated stage (gl_dst_alpha, gl_one_minus_dst_alpha)
++        // — weapon gui grids show only where a maskcolor stage primed alpha.
++        passDstAlphaPipeline = makeVariant(WGPUBlendFactor_DstAlpha, WGPUBlendFactor_OneMinusDstAlpha, false, WGPUCompareFunction_LessEqual, "passDstAlpha");
++        // Iter 48: alpha-prime (maskcolor) — writes ONLY the framebuffer
++        // alpha channel: dst.a = tex.a * stage.a (One/Zero replace).
++        passAlphaPrimePipeline = makeVariant(WGPUBlendFactor_One, WGPUBlendFactor_Zero, false, WGPUCompareFunction_LessEqual, "passAlphaPrime", WGPUColorWriteMask_Alpha);
 +        passAlphaPipeline  = makeVariant(WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_OneMinusSrcAlpha, false, WGPUCompareFunction_LessEqual, "passAlpha");
 +        // Iter 16: 'blend filter' stages (gl_dst_color, gl_zero) — glass tints.
 +        passFilterPipeline = makeVariant(WGPUBlendFactor_Dst, WGPUBlendFactor_Zero, false, WGPUCompareFunction_LessEqual, "passFilter");
@@ -5340,6 +5347,7 @@ index 0000000..09daa27
 +                if (splitGUI && r.pad3 == 1u) continue;   // GUI draws after post-FX
 +                WGPURenderPipeline p;
 +                if (r.pad3 == 1u) {
++                    if (r.pad1 == 6u) continue;   // alpha-prime: no 2D consumer yet
 +                    p = (r.pad1 == 2u) ? guiAddPipeline
 +                      : (r.pad1 == 5u) ? guiAddAlphaPipeline
 +                      : guiAlphaPipeline;
@@ -5348,6 +5356,8 @@ index 0000000..09daa27
 +                      : (r.pad1 == 3u) ? passAlphaPipeline
 +                      : (r.pad1 == 4u) ? passFilterPipeline
 +                      : (r.pad1 == 5u) ? passAddAlphaPipeline
++                      : (r.pad1 == 6u) ? passAlphaPrimePipeline
++                      : (r.pad1 == 7u) ? passDstAlphaPipeline
 +                      : passAddPipeline;
 +                }
 +                if (!p || !lastPassGroups[i]) continue;
@@ -5466,6 +5476,7 @@ index 0000000..09daa27
 +                for (uint32_t i = 0; i < lastPassCount; ++i) {
 +                    const Rec& r = lastPassRecords[i];
 +                    if (r.pad3 != 1u) continue;
++                    if (r.pad1 == 6u) continue;   // alpha-prime: no 2D consumer yet
 +                    WGPURenderPipeline p = (r.pad1 == 2u) ? guiAddPipeline
 +                                          : (r.pad1 == 5u) ? guiAddAlphaPipeline
 +                                          : guiAlphaPipeline;
@@ -6152,6 +6163,8 @@ index 0000000..09daa27
 +    WGPURenderPipeline      passOpaquePipeline = nullptr;
 +    WGPURenderPipeline      passAddPipeline   = nullptr;
 +    WGPURenderPipeline      passAddAlphaPipeline = nullptr;   // iter 44: srcAlpha-additive (kind 5)
++    WGPURenderPipeline      passDstAlphaPipeline = nullptr;   // iter 48: dst-alpha gated (kind 7)
++    WGPURenderPipeline      passAlphaPrimePipeline = nullptr; // iter 48: maskcolor alpha-prime (kind 6)
 +    WGPURenderPipeline      guiAddAlphaPipeline  = nullptr;
 +    WGPURenderPipeline      passAlphaPipeline = nullptr;
 +    WGPURenderPipeline      passFilterPipeline = nullptr;
@@ -7202,7 +7215,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..7b06143 100644
+index c83ebb5..97c6d9c 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -7228,7 +7241,7 @@ index c83ebb5..7b06143 100644
  
  /*
  
-@@ -38,6 +50,896 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,904 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -7948,11 +7961,17 @@ index c83ebb5..7b06143 100644
 +			cinFallback = globalImages->blackImage;
 +		}
 +	}
-+	// Stages that mask off ALL color writes (maskcolor / makealpha — they
-+	// only prime the alpha channel for a later gl_dst_alpha stage) must NOT
-+	// be replayed: our pipelines write RGB, so they'd paint opaque blocks
-+	// (found via glass1's alpha-prime stage painting the window white).
-+	if ( ( pStage->drawStateBits & GLS_COLORMASK ) == GLS_COLORMASK ) { WGPU_PASS_REJECT("colormask"); return; }
++	// Iter 48: maskcolor stages (RGB write-masked, alpha writable) PRIME the
++	// framebuffer alpha for a later GL_DST_ALPHA-gated stage — the weapon
++	// gui gridscroll materials depend on this (mask alpha ~0.1 is what makes
++	// the native ammo-display grid faint). Replay them as kind 6 with an
++	// alpha-only writeMask pipeline. Stages masking ALL channels stay
++	// rejected (nothing to draw).
++	bool alphaPrime = false;
++	if ( ( pStage->drawStateBits & GLS_COLORMASK ) == GLS_COLORMASK ) {
++		if ( pStage->drawStateBits & GLS_ALPHAMASK ) { WGPU_PASS_REJECT("colormask"); return; }
++		alphaPrime = true;
++	}
 +	idImage* img = pStage->texture.image;
 +	if ( cinFallback ) img = cinFallback;
 +	if ( !img && !cinSlot ) { WGPU_PASS_REJECT("no-image"); return; }
@@ -8013,8 +8032,10 @@ index c83ebb5..7b06143 100644
 +	else if ( blend == (GLS_SRCBLEND_SRC_ALPHA | GLS_DSTBLEND_ONE_MINUS_SRC_ALPHA) ) r.pad1 = 3;
 +	else if ( blend == (GLS_SRCBLEND_ONE | GLS_DSTBLEND_ZERO) )                      r.pad1 = 1;
 +	else if ( blend == (GLS_SRCBLEND_DST_COLOR | GLS_DSTBLEND_ZERO) )                r.pad1 = 4;  // filter (blend filter / gl_dst_color gl_zero)
-+	else if ( blend == (GLS_SRCBLEND_SRC_ALPHA | GLS_DSTBLEND_ONE) )                 r.pad1 = 5;  // iter 44: srcAlpha-additive — gui glows (machinegun ammo grid alpha 0.1); bucketing as ONE/ONE lost the dim
++	else if ( blend == (GLS_SRCBLEND_SRC_ALPHA | GLS_DSTBLEND_ONE) )                 r.pad1 = 5;  // iter 44: srcAlpha-additive gui glows
++	else if ( blend == (GLS_SRCBLEND_DST_ALPHA | GLS_DSTBLEND_ONE_MINUS_DST_ALPHA) ) r.pad1 = 7;  // iter 48: dst-alpha gated (weapon gui grids)
 +	else                                                                             r.pad1 = 2;
++	if ( alphaPrime ) r.pad1 = 6;   // iter 48: alpha-prime (maskcolor) — overrides blend kind
 +	r.pad2 = (uint32_t)pStage->vertexColor;
 +	r.pad3 = is2D ? 1u : 0u;
 +	r.sPad3 = cinSlot;   // iter 17: 1-based dynamic-frame slot, 0 = static image
@@ -8125,7 +8146,7 @@ index c83ebb5..7b06143 100644
  
  /*
  =================
-@@ -49,6 +951,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +959,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -8141,7 +8162,7 @@ index c83ebb5..7b06143 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +989,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +997,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -8157,7 +8178,7 @@ index c83ebb5..7b06143 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1036,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1044,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -8174,7 +8195,7 @@ index c83ebb5..7b06143 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1096,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1104,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -8182,7 +8203,7 @@ index c83ebb5..7b06143 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1323,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1331,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -8195,7 +8216,7 @@ index c83ebb5..7b06143 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1492,57 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1500,57 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
