@@ -324,6 +324,13 @@ def main(argv=None):
                         t for t in asset_tokens(body) if t.startswith("sound/"))
                     continue
                 if ext == ".mtr":
+                    # Iter 50: some id materials are AUTHORED with an image
+                    # extension in the name ("textures/.../x_fin.tga") while
+                    # maps reference them bare — index both spellings.
+                    _bare = strip_ext(declname)
+                    if _bare != declname:
+                        materials.setdefault(_bare, set()).update(
+                            strip_ext(t) for t in asset_tokens(body))
                     materials.setdefault(declname, set()).update(
                         strip_ext(t) for t in asset_tokens(body))
                 else:
@@ -451,6 +458,41 @@ def main(argv=None):
             if ext in IMAGE_EXTS and strip_ext(name) in extra_stripped:
                 keep.add(name)
 
+        # 3c. DDS-only fallback conversion. The 1.3.1 patch paks removed many
+        # hi-res TGAs and ship them ONLY precompressed under dds/<path>.dds;
+        # the engine falls back to that tree at load time
+        # (image_usePrecompressedTextures), but the browser build can't use
+        # DXT (no S3TC on WebKit) and the keep-test above never matched the
+        # dds/ prefix — those surfaces rendered _default gray (enpro's upper
+        # shaft, reactor pipes, prop details). Decode the referenced DDS-only
+        # images to TGA at their canonical paths.
+        all_ref_stripped = ref_stripped | extra_stripped
+        kept_stripped = {strip_ext(n) for n in keep}
+        dds_convert = {}
+        for name in entries:
+            if not (name.startswith("dds/") and name.endswith(".dds")):
+                continue
+            canon = strip_ext(name)[4:]
+            if canon in all_ref_stripped and canon not in kept_stripped:
+                dds_convert[canon + ".tga"] = name
+        if dds_convert:
+            print(f"  converting {len(dds_convert)} DDS-only textures to TGA", file=sys.stderr)
+
+        def convert_dds(data, out_name, max_dim):
+            import io
+            from PIL import Image
+            img = Image.open(io.BytesIO(data))
+            img = img.convert("RGBA")
+            if max_dim:
+                w, h = img.size
+                longest = max(w, h)
+                if longest > max_dim:
+                    f = (longest + max_dim - 1) // max_dim
+                    img = img.resize((max(1, w // f), max(1, h // f)), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="TGA")
+            return buf.getvalue()
+
         # 4. Write the reduced archive (downsampling audio on the way out).
         output_path.parent.mkdir(parents=True, exist_ok=True)
         kept_bytes = 0
@@ -466,6 +508,17 @@ def main(argv=None):
                 out.writestr(name, data)
                 kept_bytes += len(data)
                 top = name.split("/", 1)[0] if "/" in name else "(root)"
+                by_dir[top] = by_dir.get(top, 0) + len(data)
+            for out_name, src_name in sorted(dds_convert.items()):
+                zpath, original = entries[src_name]
+                try:
+                    data = convert_dds(pool.read(zpath, original), out_name, args.max_texture)
+                except Exception as e:
+                    print(f"  dds convert FAILED for {src_name}: {e}", file=sys.stderr)
+                    continue
+                out.writestr(out_name, data)
+                kept_bytes += len(data)
+                top = out_name.split("/", 1)[0] if "/" in out_name else "(root)"
                 by_dir[top] = by_dir.get(top, 0) + len(data)
         for top, size in sorted(by_dir.items(), key=lambda kv: -kv[1]):
             print(f"  {top:<14} {size/1e6:8.1f} MB (uncompressed)", file=sys.stderr)
