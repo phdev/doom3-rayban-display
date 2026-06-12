@@ -2073,10 +2073,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..40d4999
+index 0000000..14d2654
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,4238 @@
+@@ -0,0 +1,4251 @@
 +/*
 +================================================================================
 +
@@ -2847,6 +2847,11 @@ index 0000000..40d4999
 +        // Iter 48: alpha-prime (maskcolor) — writes ONLY the framebuffer
 +        // alpha channel: dst.a = tex.a * stage.a (One/Zero replace).
 +        passAlphaPrimePipeline = makeVariant(WGPUBlendFactor_One, WGPUBlendFactor_Zero, false, WGPUCompareFunction_LessEqual, "passAlphaPrime", WGPUColorWriteMask_Alpha);
++        // Iter 49: the remaining data blends.
++        passInvMulPipeline      = makeVariant(WGPUBlendFactor_Zero, WGPUBlendFactor_OneMinusSrc,      false, WGPUCompareFunction_LessEqual, "passInvMul");       // kind 8: blood/burn decals
++        passDstAlphaAddPipeline = makeVariant(WGPUBlendFactor_DstAlpha, WGPUBlendFactor_One,          false, WGPUCompareFunction_LessEqual, "passDstAlphaAdd");  // kind 9
++        passInvAlphaPipeline    = makeVariant(WGPUBlendFactor_Zero, WGPUBlendFactor_OneMinusSrcAlpha, false, WGPUCompareFunction_LessEqual, "passInvAlpha");     // kind 10
++        passMulAddPipeline      = makeVariant(WGPUBlendFactor_Dst,  WGPUBlendFactor_One,              false, WGPUCompareFunction_LessEqual, "passMulAdd");       // kind 11
 +        passAlphaPipeline  = makeVariant(WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_OneMinusSrcAlpha, false, WGPUCompareFunction_LessEqual, "passAlpha");
 +        // Iter 16: 'blend filter' stages (gl_dst_color, gl_zero) — glass tints.
 +        passFilterPipeline = makeVariant(WGPUBlendFactor_Dst, WGPUBlendFactor_Zero, false, WGPUCompareFunction_LessEqual, "passFilter");
@@ -5358,6 +5363,10 @@ index 0000000..40d4999
 +                      : (r.pad1 == 5u) ? passAddAlphaPipeline
 +                      : (r.pad1 == 6u) ? passAlphaPrimePipeline
 +                      : (r.pad1 == 7u) ? passDstAlphaPipeline
++                      : (r.pad1 == 8u) ? passInvMulPipeline
++                      : (r.pad1 == 9u) ? passDstAlphaAddPipeline
++                      : (r.pad1 == 10u) ? passInvAlphaPipeline
++                      : (r.pad1 == 11u) ? passMulAddPipeline
 +                      : passAddPipeline;
 +                }
 +                if (!p || !lastPassGroups[i]) continue;
@@ -6165,6 +6174,10 @@ index 0000000..40d4999
 +    WGPURenderPipeline      passAddAlphaPipeline = nullptr;   // iter 44: srcAlpha-additive (kind 5)
 +    WGPURenderPipeline      passDstAlphaPipeline = nullptr;   // iter 48: dst-alpha gated (kind 7)
 +    WGPURenderPipeline      passAlphaPrimePipeline = nullptr; // iter 48: maskcolor alpha-prime (kind 6)
++    WGPURenderPipeline      passInvMulPipeline = nullptr;     // iter 49: kind 8
++    WGPURenderPipeline      passDstAlphaAddPipeline = nullptr;// iter 49: kind 9
++    WGPURenderPipeline      passInvAlphaPipeline = nullptr;   // iter 49: kind 10
++    WGPURenderPipeline      passMulAddPipeline = nullptr;     // iter 49: kind 11
 +    WGPURenderPipeline      guiAddAlphaPipeline  = nullptr;
 +    WGPURenderPipeline      passAlphaPipeline = nullptr;
 +    WGPURenderPipeline      passFilterPipeline = nullptr;
@@ -7215,7 +7228,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..97c6d9c 100644
+index c83ebb5..5e3b975 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -7241,7 +7254,7 @@ index c83ebb5..97c6d9c 100644
  
  /*
  
-@@ -38,6 +50,904 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,911 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -8034,6 +8047,13 @@ index c83ebb5..97c6d9c 100644
 +	else if ( blend == (GLS_SRCBLEND_DST_COLOR | GLS_DSTBLEND_ZERO) )                r.pad1 = 4;  // filter (blend filter / gl_dst_color gl_zero)
 +	else if ( blend == (GLS_SRCBLEND_SRC_ALPHA | GLS_DSTBLEND_ONE) )                 r.pad1 = 5;  // iter 44: srcAlpha-additive gui glows
 +	else if ( blend == (GLS_SRCBLEND_DST_ALPHA | GLS_DSTBLEND_ONE_MINUS_DST_ALPHA) ) r.pad1 = 7;  // iter 48: dst-alpha gated (weapon gui grids)
++	// Iter 49: the rest of the data's blend census — the additive catch-all
++	// was mangling all of these (glowing blood decals etc).
++	else if ( blend == (GLS_SRCBLEND_ZERO | GLS_DSTBLEND_ONE_MINUS_SRC_COLOR) )      r.pad1 = 8;  // inverse multiply — blood/burn decals
++	else if ( blend == (GLS_SRCBLEND_DST_ALPHA | GLS_DSTBLEND_ONE) )                 r.pad1 = 9;  // dst-alpha gated additive
++	else if ( blend == (GLS_SRCBLEND_ZERO | GLS_DSTBLEND_ONE_MINUS_SRC_ALPHA) )      r.pad1 = 10; // inverse alpha multiply
++	else if ( blend == (GLS_SRCBLEND_DST_COLOR | GLS_DSTBLEND_ONE) )                 r.pad1 = 11; // multiply-add
++	else if ( blend == (GLS_SRCBLEND_ZERO | GLS_DSTBLEND_ONE) ) { WGPU_PASS_REJECT("zero-one"); return; }  // "don't draw anything"
 +	else                                                                             r.pad1 = 2;
 +	if ( alphaPrime ) r.pad1 = 6;   // iter 48: alpha-prime (maskcolor) — overrides blend kind
 +	r.pad2 = (uint32_t)pStage->vertexColor;
@@ -8146,7 +8166,7 @@ index c83ebb5..97c6d9c 100644
  
  /*
  =================
-@@ -49,6 +959,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +966,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -8162,7 +8182,7 @@ index c83ebb5..97c6d9c 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +997,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +1004,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -8178,7 +8198,7 @@ index c83ebb5..97c6d9c 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1044,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1051,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -8195,7 +8215,7 @@ index c83ebb5..97c6d9c 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1104,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1111,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -8203,7 +8223,7 @@ index c83ebb5..97c6d9c 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1331,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1338,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -8216,7 +8236,7 @@ index c83ebb5..97c6d9c 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1500,57 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1507,72 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
@@ -8231,6 +8251,21 @@ index c83ebb5..97c6d9c 100644
 +		g_capBloomThresh = r_bloomThreshold.GetFloat();
 +		g_capBloomScale = r_bloomScale.GetFloat();
 +		g_capWgpuSingleLight = r_wgpuSingleLight.GetInteger();
++	// Iter 49: publish the view position/angles for the diag UI — user
++	// screenshots then carry teleportable coordinates (setviewpos x y z yaw).
++	{
++		static uint32_t posTick = 0;
++		if ( ( ++posTick & 31 ) == 0 && backEnd.viewDef && backEnd.viewDef->viewEntitys ) {
++			const idVec3& o = backEnd.viewDef->renderView.vieworg;
++			const idMat3& ax = backEnd.viewDef->renderView.viewaxis;
++			const float yaw = RAD2DEG( atan2f( ax[0].y, ax[0].x ) );
++			const float pitch = RAD2DEG( asinf( -ax[0].z ) );
++			EM_ASM_({
++				window.__d3ViewPos = $0.toFixed(0) + " " + $1.toFixed(0) + " " + $2.toFixed(0) +
++				                     " | yaw " + $3.toFixed(0) + " pitch " + $4.toFixed(0);
++			}, o.x, o.y, o.z, yaw, pitch);
++		}
++	}
 +		extern idCVar r_shadowDarken;
 +		g_capShadowDarken = r_shadowDarken.GetFloat();
 +		extern idCVar r_wgpuTexBudgetMB, r_wgpuTexMaxDim, r_wgpuDetTest;

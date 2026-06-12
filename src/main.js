@@ -525,7 +525,10 @@ try {
       // Live stencil-shadow volume count (published by the backend each
       // drain) — "shdw 0" with shadows expected = r_shadows got overridden.
       const shdw = (typeof window.__d3ShadowVols === "number") ? ` | shdw ${window.__d3ShadowVols}` : "";
-      fpsLine = `build ${BUILD_STAMP} UTC | fps ${(frames * 1000 / (now - last)).toFixed(1)}${mem}${wtex}${shdw}`;
+      // Iter 49: live view position (published by the engine) — screenshots
+      // carry teleportable coordinates (setviewpos x y z yaw).
+      const pos = (typeof window.__d3ViewPos === "string") ? ` | pos ${window.__d3ViewPos}` : "";
+      fpsLine = `build ${BUILD_STAMP} UTC | fps ${(frames * 1000 / (now - last)).toFixed(1)}${mem}${wtex}${shdw}${pos}`;
       // ?fpstitle: mirror the stats line into the tab title — lets tooling
       // read live fps via plain AppleScript (no focus steal / clipboard /
       // accessibility); used for the Safari perf bisect.
