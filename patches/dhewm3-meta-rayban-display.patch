@@ -7228,7 +7228,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..5e3b975 100644
+index c83ebb5..efa602b 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -8260,10 +8260,10 @@ index c83ebb5..5e3b975 100644
 +			const idMat3& ax = backEnd.viewDef->renderView.viewaxis;
 +			const float yaw = RAD2DEG( atan2f( ax[0].y, ax[0].x ) );
 +			const float pitch = RAD2DEG( asinf( -ax[0].z ) );
-+			EM_ASM_({
-+				window.__d3ViewPos = $0.toFixed(0) + " " + $1.toFixed(0) + " " + $2.toFixed(0) +
-+				                     " | yaw " + $3.toFixed(0) + " pitch " + $4.toFixed(0);
-+			}, o.x, o.y, o.z, yaw, pitch);
++			char posLine[96];
++			idStr::snPrintf( posLine, sizeof(posLine), "%.0f %.0f %.0f | yaw %.0f pitch %.0f",
++			                 o.x, o.y, o.z, yaw, pitch );
++			EM_ASM_({ window.__d3ViewPos = UTF8ToString($0); }, posLine);
 +		}
 +	}
 +		extern idCVar r_shadowDarken;
