@@ -88,8 +88,18 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     }
 
     var n = nrm.xyz * 2.0 - 1.0;           // RGB normal (pre-rxgb cache)
+    // Iter 47b: sanitize + hard-clamp. The pane's triangles cross the near
+    // plane, and WebKit's clipper interpolates attributes through w~0
+    // vertices differently than Chrome — the interpolated deflect exploded
+    // to inf/NaN and smeared the scene copy across the pane (iOS + Mac
+    // Safari only). Legit refraction is <= 0.01 UV by construction, so a
+    // +-0.02 clamp is transparent; the NaN select catches what clamp
+    // cannot (NaN passes through min/max on some implementations).
+    var off = n.xy * m * in.deflect;
+    off = clamp(off, vec2<f32>(-0.02, -0.02), vec2<f32>(0.02, 0.02));
+    off = select(vec2<f32>(0.0), off, vec2<bool>(off.x == off.x, off.y == off.y));
     // params2.y > 0.5: debug — zero deflection (pane should be invisible)
-    let offset = select(n.xy * m * in.deflect, vec2<f32>(0.0), u.params2.y > 0.5);
+    let offset = select(off, vec2<f32>(0.0), u.params2.y > 0.5);
 
     var suv = in.clip_pos.xy / vec2<f32>(u.params.z, u.params.w);
     // half-texel inset: the shared sampler is REPEAT (the normal map

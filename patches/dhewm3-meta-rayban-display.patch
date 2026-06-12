@@ -8265,10 +8265,10 @@ index c83ebb5..7b06143 100644
  	// ensures that depth writes are enabled for the depth clear
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..026c862
+index 0000000..bea17d9
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,861 @@
+@@ -0,0 +1,871 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -8687,8 +8687,18 @@ index 0000000..026c862
 +"    }\n"
 +"\n"
 +"    var n = nrm.xyz * 2.0 - 1.0;           // RGB normal (pre-rxgb cache)\n"
++"    // Iter 47b: sanitize + hard-clamp. The pane's triangles cross the near\n"
++"    // plane, and WebKit's clipper interpolates attributes through w~0\n"
++"    // vertices differently than Chrome — the interpolated deflect exploded\n"
++"    // to inf/NaN and smeared the scene copy across the pane (iOS + Mac\n"
++"    // Safari only). Legit refraction is <= 0.01 UV by construction, so a\n"
++"    // +-0.02 clamp is transparent; the NaN select catches what clamp\n"
++"    // cannot (NaN passes through min/max on some implementations).\n"
++"    var off = n.xy * m * in.deflect;\n"
++"    off = clamp(off, vec2<f32>(-0.02, -0.02), vec2<f32>(0.02, 0.02));\n"
++"    off = select(vec2<f32>(0.0), off, vec2<bool>(off.x == off.x, off.y == off.y));\n"
 +"    // params2.y > 0.5: debug — zero deflection (pane should be invisible)\n"
-+"    let offset = select(n.xy * m * in.deflect, vec2<f32>(0.0), u.params2.y > 0.5);\n"
++"    let offset = select(off, vec2<f32>(0.0), u.params2.y > 0.5);\n"
 +"\n"
 +"    var suv = in.clip_pos.xy / vec2<f32>(u.params.z, u.params.w);\n"
 +"    // half-texel inset: the shared sampler is REPEAT (the normal map\n"
