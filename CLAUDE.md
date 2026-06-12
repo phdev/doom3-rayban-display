@@ -1537,6 +1537,28 @@ the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
 MEASURE before declaring iPhone-safe) and before the new native
 side-by-side.
 
+**Iter 48 — THE weapon-display grid: maskcolor + dst-alpha gating
+(2026-06-12).** The user's actual complaint all along (bright grid
+overlaid on the ammo display, ALL browsers): the gridscroll material
+(gui/weapons/machinegun/gridscroll in weapons.mtr) primes FRAMEBUFFER
+ALPHA with a `maskcolor` stage (bg_mask2.tga alpha x parm3=0.1, RGB
+write-masked) and draws grid.tga with `blend GL_DST_ALPHA,
+GL_ONE_MINUS_DST_ALPHA` — gated to ~10% by the primed mask. Our
+capture REJECTED maskcolor stages (iter-16 comment: "they'd paint
+opaque blocks") and the dst-alpha blend fell into the additive
+catch-all → ungated full-brightness grid. FIX: pass kind 6 =
+alpha-prime (makeVariant grew a writeMask param; alpha-only, One/Zero
+replace) and kind 7 = dst-alpha gated (DstAlpha/OneMinusDstAlpha);
+classifier routes GLS_COLORMASK-without-ALPHAMASK to 6 and the
+dst-alpha blend pair to 7. Chaingun/plasma gui displays share the
+pattern; glass alpha-prime stages un-broke too. Iters 44/45/45b/47b
+along the way were REAL adjacent bugs (srcAlpha-add, scissor, aniso,
+WebKit near-plane haze) but THIS was the user's issue. LESSON: when a
+material misrenders, pull its .mtr FIRST — the four-hour geometry
+hunt would have been ten minutes ("blend GL_DST_ALPHA" names the
+missing feature). Reference matching: native look achieved (dark
+panel, faint grid, crisp digits).
+
 **Iter 47b — the REAL haze smear: WebKit near-plane interpolation
 (2026-06-12).** Iter 47's "stale embed" conclusion was WRONG (Chrome
 went clean coincidentally) — the user retested: smear persisted on
