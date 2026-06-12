@@ -78,8 +78,11 @@ so progression isn't broken.
 - **No tap-to-melee** — SDL maps a touch tap to the left mouse button, so the default
   `MOUSE1 -> _attack` bind made every tap swing the fists. The wearable profile now
   `unbind`s `mouse1`/`mouse2` in the autoexec (desktop keeps them).
-- **Flashlight** — auto-enabled ~2.6 s after spawn (`config.autoFlashlight`) and
-  toggled by a long pinch. Its view-model effect surfaces (`beam1`/`flare`/`flare2`/
+- **Flashlight** — default OFF since iter 37 (native parity: vanilla dhewm3 never
+  auto-raises it, and its point-blank glare was the last visible lighting gap vs
+  native — corridor luma 30.8 with it on vs native 23.0). Toggled by a long pinch
+  or by tapping the always-visible flashlight chip; `config.autoFlashlight` remains
+  for profiles that want the old behavior. Its view-model effect surfaces (`beam1`/`flare`/`flare2`/
   `bulb`) have **no material in the game data**, so the engine built implicit OPAQUE
   materials and the light-beam billboard rendered as a **solid white quad** stuck to
   the flashlight. Fix: the app writes a loose `base/materials/zz_flashlight_fix.mtr`
@@ -1352,8 +1355,9 @@ visualization /tmp/ps-shadow-highlight.png method). Verified on the
 LIVE build. Vanilla native behaves identically. Safari/WebKit also
 verified: build current, shdw counter 3-4 at spawn, zero WebGPU
 validation errors in a 539-line log (the "err 69" line is the idle
-GL probe, not WebGPU). Safari fps ~17 vs Chrome ~60 — open perf
-question, not a correctness one.
+GL probe, not WebGPU). Safari fps ~17 vs Chrome ~60 — RESOLVED in
+iter 37b: the 17 was a pre-iter-30 cached bundle; the ladder measured
+the current build at 60 fps (see iter 37b below).
 
 **Iters 33-34 — THE WARM-WASH HUNT (2026-06-11): a forensic chain
 worth rereading before any future "lighting differs from native"
@@ -1452,6 +1456,42 @@ SHELL GOTCHA (again): the engine-checkout commit trap fired once more
 (cwd in build dir; commit landed on detached HEAD + tried pushing to
 dhewm/dhewm3 upstream — failed harmlessly). Recovered with reset +
 re-stage. ALWAYS cd to the app repo in the same command as git ops.
+
+**Iter 37 — auto-flashlight OFF by default (2026-06-11): THE final
+native-look gap.** The user's "this isn't the same as dhewm3 Mac"
+reports survived every shader/sampler/preset fix because the dominant
+remaining difference wasn't a renderer bug at all: the wearable
+profile auto-raised the flashlight 2.6s after spawn, and a white
+point-blank light carried at the player origin floods near surfaces
+and kills every nearby static-light shadow (including the player's
+own — a light at your origin cannot cast your shadow). Measured
+corridor luma: native 23.0 / ours flashlight-OFF 23.5 / ours
+flashlight-ON 30.8. autoFlashlight is now false in all profiles; the
+flashlight chip is always visible (dimmed) and is a tap target
+(role=button → toggleFlashlight) alongside the long-pinch. Test
+scripts must NOT press 'f' anymore (an old script press turned it ON
+and faked a regression).
+
+**Iter 37b — Safari fps gap CLOSED + live native side-by-side
+(2026-06-11/12).** With the Mac unlocked, /tmp/safari-ladder2.sh ran
+against vite preview (4174) with ?fpstitle: baseline 60.1 fps /
+?noshadows 59.5 / ?skipInteractions 60.0, shdw 4, wgpu-tex 22MB/501,
+wasm 296MB. The historic "Safari 17fps" was a STALE PRE-ITER-30
+BUNDLE (before the GPU-churn fixes); there is no Safari perf gap on
+the current build — shadows are free at 60. Ladder gotchas worth
+keeping: Safari fully freezes title updates when the session is
+locked or the tab unfocused (three runs read frozen titles before
+noticing); never measure on the Vite dev server (Safari caches dev ES
+modules — build + preview). Finished with the literal deliverable the
+user asked for: native dhewm3 (windowed, left) and Safari WebGPU
+(right) running the same enpro corridor live on one screen —
+/tmp/mac-final-pair.png; window-crop lumas 29.3 (native, includes
+console-text rows) vs 14.2 (Safari crop includes black diag/letterbox
+bands) — region-matched corridor luma remains 23.x on both, per the
+iter-37 measurement. Remaining known cosmetic deltas tracked: ~25%
+flat dim-cell overbrightness vs GL echo; GUI screens dark after
+cinematic fast-forward; emissive-only flare overshoot in synthetic
+light-suppressed scenes.
 
 **Iter 32 — bloom default OFF (2026-06-11, vanilla parity).** User
 call: the game doesn't have bloom (confirmed by the iter-29 research:
