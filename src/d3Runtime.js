@@ -589,7 +589,10 @@ function buildArguments(config) {
     "+set", "r_mode", "-1",
     "+set", "r_customWidth", String(config.width),
     "+set", "r_customHeight", String(config.height),
-    "+set", "r_aspectRatio", "0",
+    // Iter 41: -1 = derive aspect from the real render size (square pixels).
+    // The old pin of 0 (4:3) horizontally squeezed the square wearable
+    // canvas to 75% — circles rendered as 3:4 ellipses.
+    "+set", "r_aspectRatio", "-1",
     "+set", "r_multiSamples", "0",
     // Phase 5: pick which RenderBackend to instantiate at engine boot.
     // ?backend=webgpu selects the WebGPU backend (requires navigator.gpu).
@@ -816,7 +819,7 @@ function buildAutoexecConfig(config) {
     `seta r_customWidth "${config.width}"`,
     `seta r_customHeight "${config.height}"`,
     "seta r_mode \"-1\"",
-    "seta r_aspectRatio \"0\"",
+    "seta r_aspectRatio \"-1\"",
     "seta r_swapInterval \"0\"",
     `seta r_gamma "${getNumericConfig(config.rGamma, 1.1)}"`,
     `seta r_brightness "${getNumericConfig(config.rBrightness, 1)}"`,

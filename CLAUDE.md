@@ -1537,6 +1537,36 @@ the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
 MEASURE before declaring iPhone-safe) and before the new native
 side-by-side.
 
+**Iters 40-41 — catch-up-tick capture spike + square-canvas aspect
+(2026-06-12).** Iter 39 held 60fps on iPhone but still died at the 82%
+boot cinematic with shdw 221 — impossible for one frame of a ~97-volume
+scene. CAUSE: the emscripten main loop runs CATCH-UP engine ticks
+between rAFs under load (cinematic fast-forward = the worst case); each
+tick APPENDS a full frame of capture records on top of the undrained
+one, multiplying the shadow vert accumulator past its 4MB budget and
+spiking per-frame staging. FIXES: (a) stale-capture guard at
+RB_ExecuteBackEndCommands entry — if the previous frame was never
+drained, zero ALL accumulator counters (only the latest frame matters
+for replay); the counters live in tr_render.cpp with C linkage —
+declare extern "C" at file scope (block-scope extern picks C++ linkage
+and won't link); (b) shadowVertexBuf grows with 1.5x headroom
+(exact-fit sizing reallocated on every new high-water frame during
+camera flights); (c) wearable-profile JS guard parks r_shadows during
+cinematics (polls window.__d3InCinematic, 100ms) — fast cinematic
+cameras give the delta uploader nothing to exploit; desktop keeps
+cutscene shadows. ITER 41 (user: "horizontally squeezed"): the boot
+args pinned r_aspectRatio 0 (4:3) since the beginning — on the square
+600x600 canvas that compresses X to 75% (circles = 3:4 ellipses).
+r_aspectRatio -1 (auto, derives from real render size) in BOTH the
++set args and autoexec; fov_x now equals fov_y on square. Det rounds
+1-6 IDENTICAL after both (in-view surface counts shift with the
+corrected frustum — expected). TOOLCHAIN GOTCHA: /tmp/emsdk got
+PARTIALLY reaped by the macOS tmp cleaner MID-SESSION (files >3 days
+old deleted, dirs left) — emcc/Emscripten.cmake vanished while builds
+were running an hour apart. Reinstall: rm -rf /tmp/emsdk; clone emsdk;
+install+activate 6.0.0 (matches CI pin). Consider relocating to a
+non-/tmp path if it recurs.
+
 **Iter 39 — single-pass stencil shadows: mark → draw → unmark
 (2026-06-12, the iPhone crash regression fix).** Iter 38's working
 shadows promptly killed the iPhone ("WEBGL CONTEXT LOST" + dead

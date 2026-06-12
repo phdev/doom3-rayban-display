@@ -1653,6 +1653,7 @@ function handleRuntimeLog(text) {
   // the player exists and the game is about to tic. Arm the flashlight just after.
   if (/entities spawned/i.test(text)) {
     armAutoFlashlight();
+    armCinematicShadowGuard();
   }
 }
 
@@ -1684,6 +1685,34 @@ function armAutoFlashlight() {
     diag("flashlight: auto-enabled for the dark spawn room (long-pinch to toggle)");
   };
   window.setTimeout(() => tryEnable(0), 2600);
+}
+
+// Iter 40: phone defense-in-depth. Cinematic flythroughs legitimately push
+// 100+ shadow volumes per frame with a fast-moving camera, and the delta
+// uploader has nothing to exploit while every volume changes — that staging
+// spike is what kills the WebKit GPU process on iOS (crash showed shdw 221
+// at the 82% boot cinematic). Park r_shadows while a cinematic plays on the
+// wearable profile and restore it after; desktop keeps cutscene shadows.
+let cinShadowGuardTimer = null;
+function armCinematicShadowGuard() {
+  if (runtimeConfig.inputMode !== "wearable") return;
+  const qs = window.location.search;
+  if (!/[?&]backend=webgpu\b/.test(qs) || /[?&]noshadows\b/.test(qs)) return;
+  let parked = false;
+  window.clearInterval(cinShadowGuardTimer);
+  cinShadowGuardTimer = window.setInterval(() => {
+    if (typeof window.d3cmd !== "function") return;
+    const inCin = window.__d3InCinematic === 1;
+    if (inCin && !parked) {
+      parked = true;
+      window.d3cmd("r_shadows 0");
+      diag("shadows: parked during cinematic (wearable GPU budget)");
+    } else if (!inCin && parked) {
+      parked = false;
+      window.d3cmd("r_shadows 1");
+      diag("shadows: restored after cinematic");
+    }
+  }, 100);
 }
 
 function startEnemyIndicatorPolling() {

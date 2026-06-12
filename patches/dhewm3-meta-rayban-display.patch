@@ -2073,10 +2073,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..36f5374
+index 0000000..01fa17b
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,4021 @@
+@@ -0,0 +1,4024 @@
 +/*
 +================================================================================
 +
@@ -4458,7 +4458,10 @@ index 0000000..36f5374
 +                bool shadowBufFresh = false;
 +                if (vNeedS > shadowVertexCap) {
 +                    if (shadowVertexBuf) wgpuBufferRelease(shadowVertexBuf);
-+                    uint32_t cap = vNeedS; if (cap < 256*1024) cap = 256*1024;
++                    // Iter 40: 1.5x headroom — exact-fit sizing reallocated the
++                    // buffer on every new high-water frame during camera flights
++                    // (WebKit holds released buffers until fences clear).
++                    uint32_t cap = vNeedS + vNeedS / 2; if (cap < 256*1024) cap = 256*1024;
 +                    WGPUBufferDescriptor d = {};
 +                    d.size = cap;
 +                    d.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
@@ -6805,7 +6808,7 @@ index 0cabbfd..5fc5996 100644
  	}
  
 diff --git a/neo/renderer/tr_backend.cpp b/neo/renderer/tr_backend.cpp
-index cf1c571..47c0571 100644
+index cf1c571..bb78d7d 100644
 --- a/neo/renderer/tr_backend.cpp
 +++ b/neo/renderer/tr_backend.cpp
 @@ -29,6 +29,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -6903,6 +6906,57 @@ index cf1c571..47c0571 100644
 +	} else if ( r_finish.GetBool() ) {
  		qglFinish();
  	}
+ 
+@@ -640,6 +673,17 @@ This function will be called syncronously if running without
+ smp extensions, or asyncronously by another thread.
+ ====================
+ */
++#ifdef __EMSCRIPTEN__
++// Iter 40: WebGPU capture accumulator counters (defined in tr_render.cpp,
++// C linkage there) — see the stale-capture guard below.
++extern "C" {
++	extern uint32_t g_capRecordCount, g_passRecordCount, g_shadowRecordCount;
++	extern uint32_t g_fogRecordCount, g_blendRecordCount;
++	extern uint32_t g_capVertBytes, g_capIndexBytes, g_shadowVertBytes;
++	extern uint32_t g_skyDirBytes, g_capVertDedupCount;
++}
++#endif
++
+ int		backEndStartTime, backEndFinishTime;
+ void RB_ExecuteBackEndCommands( const emptyCommand_t *cmds ) {
+ 	// r_debugRenderToTexture
+@@ -651,6 +695,32 @@ void RB_ExecuteBackEndCommands( const emptyCommand_t *cmds ) {
+ 
+ 	backEndStartTime = Sys_Milliseconds();
+ 
++#ifdef __EMSCRIPTEN__
++	// Iter 40: stale-capture guard. The WebGPU backend drains the capture
++	// accumulators once per rAF, but the emscripten main loop can run
++	// CATCH-UP engine ticks between rAFs (heavy frames, cinematic
++	// fast-forward at boot) — each tick then APPENDS a full frame of
++	// records on top of the undrained one. shdw read 221 on a ~97-volume
++	// scene that way, the shadow vert accumulator blew past its budget,
++	// and the per-frame staging spike killed the iPhone GPU process.
++	// Only the latest engine frame matters for the replay, so if the
++	// previous frame was never drained, drop it before capturing anew.
++	{
++		if ( g_capRecordCount || g_passRecordCount || g_shadowRecordCount ) {
++			g_capRecordCount = 0;
++			g_passRecordCount = 0;
++			g_shadowRecordCount = 0;
++			g_fogRecordCount = 0;
++			g_blendRecordCount = 0;
++			g_capVertBytes = 0;
++			g_capIndexBytes = 0;
++			g_shadowVertBytes = 0;
++			g_skyDirBytes = 0;
++			g_capVertDedupCount = 0;
++		}
++	}
++#endif
++
+ 	// needed for editor rendering
+ 	RB_SetDefaultGLState();
  
 diff --git a/neo/renderer/tr_light.cpp b/neo/renderer/tr_light.cpp
 index 6b2db54..4e17b2c 100644
