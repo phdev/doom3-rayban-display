@@ -1537,6 +1537,26 @@ the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
 MEASURE before declaring iPhone-safe) and before the new native
 side-by-side.
 
+**Iter 50b — ceiling follow-up at pitch-level vantage: authored
+darkness confirmed, no defect (2026-06-12).** User report from the
+SAME spot (`pos -675 3964 -156 | yaw 178 pitch -3`, flashlight on,
+upper half of frame black): full triage ladder run — (1) r_showTris
+wireframe covers the black region (geometry submitted); (2) WebGPU-
+primary vs GL echo upper-half luma 10.19 vs 10.78, median 2.7 vs 0.0
+(we render slightly MORE than vanilla GL there); (3) 8x exposure
+shows the ceiling textured and structurally complete, just nearly
+unlit — the flashlight cone aims level at the door and no static
+light reaches the ceiling span (iter-49d light census applies; same
+area). VERDICT: authored darkness, native-equivalent. The user
+"used to see" this ceiling because pre-iter-50 it rendered the
+self-visible FLAT GRAY _default fallback — fixing the texture made
+it correctly dark. Pitch the view up and the flashlight lights it.
+CAPTURE GOTCHA: in &echo mode the WebGPU canvas resists CSS resize
+(rendered 200px wide despite inline 600px) and overlay chrome
+contaminates element screenshots, inflating its luma (25.5) — use
+WebGPU-PRIMARY mode for honest WebGPU captures; only its numbers
+match the shipping iPhone config.
+
 **Iter 50 — the gray ceiling: DDS-only textures + .tga-named materials
 (2026-06-12).** The 49d "authored darkness" verdict was HALF the story
 — the user's flashlight screenshot (pos chip!) showed the lit surface
