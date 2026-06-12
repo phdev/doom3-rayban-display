@@ -1701,6 +1701,32 @@ function armAutoFlashlight() {
   window.setTimeout(() => tryEnable(0), 2600);
 }
 
+// Iter 45: frame-pacing probe (?pace) — streams rAF gap stats so phone
+// frame-skip reports become measurable through the console mirror. A 60Hz
+// engine on a 120Hz display shows max~17ms; GC/upload stalls show as
+// >50ms spikes; a 2:1 cadence wobble shows as a fat 25-35ms bucket.
+if (/[?&]pace\b/.test(window.location.search)) {
+  let paceLast = performance.now();
+  let paceGaps = [];
+  const paceLoop = (t) => {
+    paceGaps.push(t - paceLast);
+    paceLast = t;
+    window.requestAnimationFrame(paceLoop);
+  };
+  window.requestAnimationFrame(paceLoop);
+  window.setInterval(() => {
+    if (!paceGaps.length) return;
+    const arr = paceGaps;
+    paceGaps = [];
+    const mx = Math.max(...arr);
+    const avg = arr.reduce((a, b) => a + b, 0) / arr.length;
+    const o25 = arr.filter((d) => d > 25).length;
+    const o50 = arr.filter((d) => d > 50).length;
+    const o100 = arr.filter((d) => d > 100).length;
+    console.info(`[pace] n=${arr.length} avg=${avg.toFixed(1)}ms max=${mx.toFixed(0)}ms >25=${o25} >50=${o50} >100=${o100}`);
+  }, 5000);
+}
+
 // Iter 43b: weapon select and reload ride the engine's default key binds
 // (default.cfg: `bind 4 "_impulse3"` machinegun, `bind r "_impulse13"`
 // reload) through the same synthetic key-event path the move pad uses —
