@@ -1537,6 +1537,29 @@ the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
 MEASURE before declaring iPhone-safe) and before the new native
 side-by-side.
 
+**Iter 47b — the REAL haze smear: WebKit near-plane interpolation
+(2026-06-12).** Iter 47's "stale embed" conclusion was WRONG (Chrome
+went clean coincidentally) — the user retested: smear persisted on
+iPhone. REPRODUCED ON MAC SAFARI (same build clean in Chrome on the
+same machine = engine-data innocent, WebKit-specific). Bisect via boot
+arg `&args=%2Bset%20r_wgpuSingleLight%20-894` (zero-deflection debug):
+Safari clean ⇒ the offset term. MECHANISM: the glass pane (heatHaze
+material) crosses the NEAR PLANE; WebKit's clipper interpolates vertex
+attributes through w~0 vertices differently than Chrome/Dawn — the
+interpolated per-vertex deflect exploded to inf/NaN → the pane
+resampled the scene copy from kilometers away → displaced copies of
+the ammo display smeared across the gun. FIX (haze.wgsl): clamp the
+fragment offset to +-0.02 UV (legit refraction <= 0.01 by
+construction, transparent) + a NaN select (NaN passes through min/max
+on some implementations; clamp alone is NOT NaN-safe). LAWS:
+(a) WebKit-only artifacts with clean captured data = suspect
+NEAR-PLANE-CROSSING GEOMETRY + attribute interpolation — clamp and
+NaN-guard any screen-space offset derived from interpolated attributes;
+(b) Mac Safari reproduces iOS WebGPU bugs 1:1 and the boot-arg hook
+(?args=+set) drives debug cvars where no console exists; (c) verify
+"fixed" claims on the AFFECTED platform before declaring victory —
+two Chrome-verified "fixes" shipped before this one.
+
 **Iters 46b-47 — 120Hz double-speed + the haze smear forensic
 (2026-06-12).** (46b) User: "game speed too fast" — com_fixedTic 1
 (iter 46) runs one sim tic per rAF callback and ProMotion iPhones rAF
