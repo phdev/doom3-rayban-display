@@ -1537,6 +1537,34 @@ the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
 MEASURE before declaring iPhone-safe) and before the new native
 side-by-side.
 
+**Iters 46b-47 — 120Hz double-speed + the haze smear forensic
+(2026-06-12).** (46b) User: "game speed too fast" — com_fixedTic 1
+(iter 46) runs one sim tic per rAF callback and ProMotion iPhones rAF
+at 120Hz → 2x game speed (the earlier 60Hz pace trace was a throttled
+session — Safari picks per-session rAF rates!). Fix:
+D3_EmscriptenFrame phase-locks engine frames to 60Hz (nextDue
+accumulator +16.6667ms; >50ms behind = resync not burst; 0.5ms slop
+for rAF jitter). (47) THE "ammo texture overflow" — a four-hour
+forensic with a humbling chain: blend kind 5 (real fix), scissor
+(real fix), aniso (real fix), then the spill PERSISTED. Isolation
+modes proved the drawn quad ≠ captured data; per-record corner
+projection + index dumps all clean; deltaUpload fuzzed clean (2000
+frames) and traced live (uploads everything when moving). The actual
+painter: the HEAT-HAZE pass — enpro's GLASS (textures/glass/* uses
+heatHaze*.vfp, mag 0.4-0.5) — a pane over the weapon resampled the
+scene copy WAY beyond its bounded <=13px refraction. Zero-deflection
+debug (-894) blanked it; re-checking with deflection on after the
+embed regen: CLEAN — the live embedded_shaders.h haze was STALE.
+LAWS: (a) regenerate embedded_shaders.h on EVERY engine build sweep
+(scripts/embed_wgsl.py .build/dhewm3/neo/renderer/wgsl
+webgpu-port/shaders) — a stale embed renders OLD WGSL and no source
+read will explain the pixels; (b) r_wgpuSingleLight 99x diagnostic
+values trip the >=0 single-light filter — leaving 998 set BLACKS the
+scene (only emissives draw) and fakes catastrophic regressions;
+(c) debug sentinels live: -899 skip pass records / -900-N isolate
+record N / -898 GPU readback (needs CopySrc usage) / -896 force full
+vertex upload / -895 delta+haze trace / -894 zero haze deflection.
+
 **Iters 45b-46 — anisotropy + the 62.5Hz micro-stutter (2026-06-12).**
 (45b) GL runs image_anisotropy 16; our samplers were aniso-1 trilinear,
 over-blurring oblique texture detail (the ammo grid's fat bright
