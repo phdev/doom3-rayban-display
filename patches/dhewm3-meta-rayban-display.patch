@@ -182,7 +182,7 @@ index 69f1892..35325ea 100644
  endif()
  if (AROS)
 diff --git a/neo/framework/Common.cpp b/neo/framework/Common.cpp
-index dbf6c54..834da42 100644
+index dbf6c54..4a389ac 100644
 --- a/neo/framework/Common.cpp
 +++ b/neo/framework/Common.cpp
 @@ -874,7 +874,7 @@ doom set test blah + map test
@@ -269,6 +269,29 @@ index dbf6c54..834da42 100644
  }
  
  
+@@ -3357,6 +3388,14 @@ void idCommonLocal::InitGame( void ) {
+ 	// have to do this twice.. first one sets the correct r_mode for the renderer init
+ 	// this time around the backend is all setup correct.. a bit fugly but do not want
+ 	// to mess with all the gl init at this point.. an old vid card will never qualify for
++#ifdef __EMSCRIPTEN__
++	// Boot-speed (iter 61): /save is MEMFS so sysDetect is ALWAYS true here, making
++	// this run EVERY boot — and the redundant s_restart re-inits sound HW for nothing
++	// on the muted default boot. Our machine-spec cvars (r_mode/render-size/image_*)
++	// are pinned by +set args + autoexec (StartupVariable runs last, iter 31), so the
++	// engine's auto-detect is inert. Skip the whole second pass.
++	(void)sysDetect;
++#else
+ 	if ( sysDetect ) {
+ 		SetMachineSpec();
+ 		Com_ExecMachineSpec_f( args );
+@@ -3364,6 +3403,7 @@ void idCommonLocal::InitGame( void ) {
+ 		cmdSystem->BufferCommandText( CMD_EXEC_NOW, "s_restart\n" );
+ 		cmdSystem->ExecuteCommandBuffer();
+ 	}
++#endif
+ }
+ 
+ /*
 diff --git a/neo/framework/FileSystem.cpp b/neo/framework/FileSystem.cpp
 index 7edeb4d..adae33e 100644
 --- a/neo/framework/FileSystem.cpp
@@ -978,7 +1001,7 @@ index 0000000..bd37bff
 +
 +#endif // __D3_WEARABLE_GAME_H__
 diff --git a/neo/game/Game_local.cpp b/neo/game/Game_local.cpp
-index 1fca78f..c95f168 100644
+index 1fca78f..d106c90 100644
 --- a/neo/game/Game_local.cpp
 +++ b/neo/game/Game_local.cpp
 @@ -27,6 +27,10 @@ If you have questions concerning this license or the applicable additional terms
@@ -1008,7 +1031,29 @@ index 1fca78f..c95f168 100644
  
  	clip.Init();
  	pvs.Init();
-@@ -2273,6 +2279,19 @@ gameReturn_t idGameLocal::RunFrame( const usercmd_t *clientCmds ) {
+@@ -1769,12 +1775,21 @@ void idGameLocal::CacheDictionaryMedia( const idDict *dict ) {
+ 				|| !idStr::Icmp( kv->GetKey(), "gui_inventory" ) ) {
+ 				// unfortunate flag names, they aren't actually a gui
+ 			} else {
++#ifdef __EMSCRIPTEN__
++				// Boot-speed (iter 61): this precache PARSES the full .gui script
++				// per gui-bearing entity (~wall monitors) and immediately throws
++				// it away — the real GUI is re-created at spawn. With image_preload
++				// 0 (texture streaming) its media loads lazily on first view anyway,
++				// so the parse-then-discard is pure boot churn. Skip it; a wall
++				// screen's media loads when you first look at it.
++#else
+ 				declManager->MediaPrint( "Precaching gui %s\n", kv->GetValue().c_str() );
+ 				idUserInterface *gui = uiManager->Alloc();
+ 				if ( gui ) {
+ 					gui->InitFromFile( kv->GetValue() );
+ 					uiManager->DeAlloc( gui );
+ 				}
++#endif
+ 			}
+ 		}
+ 		kv = dict->MatchPrefix( "gui", kv );
+@@ -2273,6 +2288,19 @@ gameReturn_t idGameLocal::RunFrame( const usercmd_t *clientCmds ) {
  			player->Think();
  		}
  	} else do {
@@ -1028,7 +1073,7 @@ index 1fca78f..c95f168 100644
  		// update the game time
  		framenum++;
  		previousTime = time;
-@@ -3960,9 +3979,30 @@ void idGameLocal::SetCamera( idCamera *cam ) {
+@@ -3960,9 +3988,30 @@ void idGameLocal::SetCamera( idCamera *cam ) {
  	}
  
  	camera = cam;
@@ -2191,10 +2236,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..ade61f2
+index 0000000..82249b3
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,4316 @@
+@@ -0,0 +1,4323 @@
 +/*
 +================================================================================
 +
@@ -4101,7 +4146,14 @@ index 0000000..ade61f2
 +                vDiffuse == fbCheckerView   && imgs[3] != nullptr,
 +                vSpecular == fbWhiteView    && imgs[4] != nullptr,
 +            };
-+            if (miss[0] || miss[1] || miss[2] || miss[3] || miss[4]) {
++            // Boot-speed (iter 61): with texture streaming every gray surface is
++            // a "miss" until its texture lands, so frame 1 floods hundreds of
++            // these — each EM_ASM is a wasm→JS crossing. Cap the diagnostic to
++            // the first 30 (enough to flag a genuine data gap; the streaming
++            // settle is expected to miss).
++            static int s_missLogged = 0;
++            if ((miss[0] || miss[1] || miss[2] || miss[3] || miss[4]) && s_missLogged < 30) {
++                s_missLogged++;
 +                EM_ASM_({
 +                    console.info("[d3] matGroup MISS bump=" + $0 + " falloff=" + $1 +
 +                                 " proj=" + $2 + " diffuse=" + $3 + " specular=" + $4);

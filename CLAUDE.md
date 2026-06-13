@@ -1539,6 +1539,41 @@ the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
 MEASURE before declaring iPhone-safe) and before the new native
 side-by-side.
 
+**Iter 61 — BOOT-SPEED investigation + safe wins (2026-06-13).** User:
+"near-instant boot when assets are downloaded; Starting map lasts too
+long." MEASURED the 8.6s callMain→first-playable-view via EM_ASM
+emscripten_get_now() timing logs (engine Printfs don't reach JS): NOT
+the cinematic (the g_skipCinematics skip never even fires for enpro) —
+it's 4 fixed CPU phases: ENGINE INIT 3.1s (Common::Init incl. ~33
+synchronous WGPURenderPipeline shader compiles tripped by
+PrintLoadingMessage's EndFrame during InitGame; decl eager-index of
+199 files/2.77MB; full GL/ARB bring-up even though WebGPU-primary) +
+LoadMap 1.7s (idLexer ASCII parse: enpro.cm is 16.8MB!, .proc 10.7MB,
+.map 9.2MB — NO binary geometry format exists in idTech4) + Spawn 2.0s
+(~2000 entities; CacheDictionaryMedia does a full .gui parse-then-
+discard per monitor entity) + FIRST FRAME 1.8s (bind-group flood +
+327 shadow volumes — but ?noshadows tested SAME, shadows aren't the
+cost). SHIPPED SAFE WINS (~0.2s, verified no regression): (a) skip the
+GUI parse-then-discard precache under __EMSCRIPTEN__ (CacheDictionaryMedia,
+Game_local.cpp — wall screens load lazily on first view, image_preload 0
+already streams); (b) cap the matGroup-MISS EM_ASM flood at 30/boot
+(RenderBackend_WebGPU.cpp — was hundreds of wasm→JS crossings per frame
+during the gray→real settle); (c) skip the redundant 2nd execMachineSpec
++ s_restart under __EMSCRIPTEN__ (Common.cpp — sysDetect always true on
+MEMFS, our cvars pinned by +set/autoexec). GPU ANSWER (user asked): most
+boot cost is serial CPU (text parse, object construction) GPUs can't
+help; the ONE GPU-side slice is the ~33 SYNCHRONOUS pipeline/shader
+compiles — async (createRenderPipelineAsync, available in emdawnwebgpu)
+started early would OVERLAP them with the ~6s of CPU work, ~0.5-0.8s.
+THE BIG REMAINING LEVERS (each substantial, not yet done): GPU pipeline
+async-overlap ~0.7s; BINARY GEOMETRY CACHE (.bproc/.bcm, reducer emits
+packed binary + engine loads via memcpy) ~1.5s (the single biggest, but
+new format both sides); idLexer fast-number strtod path ~0.4s. HONEST
+FLOOR: near-instant (<2s) is not reachable on single-threaded WASM
+without the binary-geometry + lazy-spawn + engine-init-floor work; the
+realistic target with the big levers is ~5-6s. WASM threads (multi-core)
+could parallelize the CPU phases but the build is single-threaded.
+
 **Iter 60 — md5anim float decimation + machinegun-only loadout: boot
 26.3→19.0MB (2026-06-13).** (1) ANIM DECIMATION: `--decimate-anims`
 truncates every joint float in .md5anim to 3 decimals (strip trailing
