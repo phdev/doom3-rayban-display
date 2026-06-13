@@ -1157,6 +1157,41 @@ index 36a0cbe..58d9a22 100644
  	}
  
  	GetPhysics()->SetContents( CONTENTS_SOLID );
+diff --git a/neo/game/gamesys/SysCmds.cpp b/neo/game/gamesys/SysCmds.cpp
+index 105ff57..5f83fc6 100644
+--- a/neo/game/gamesys/SysCmds.cpp
++++ b/neo/game/gamesys/SysCmds.cpp
+@@ -692,15 +692,29 @@ void Cmd_SetViewpos_f( const idCmdArgs &args ) {
+ 		return;
+ 	}
+ 
++#ifdef __EMSCRIPTEN__
++	// Wearable port: optional 6th arg sets pitch so a pos-chip screenshot
++	// ("pos X Y Z | yaw W pitch P") is a complete one-command repro.
++	if ( ( args.Argc() < 4 ) || ( args.Argc() > 6 ) ) {
++		gameLocal.Printf( "usage: setviewpos <x> <y> <z> [yaw] [pitch]\n" );
++		return;
++	}
++#else
+ 	if ( ( args.Argc() != 4 ) && ( args.Argc() != 5 ) ) {
+ 		gameLocal.Printf( "usage: setviewpos <x> <y> <z> <yaw>\n" );
+ 		return;
+ 	}
++#endif
+ 
+ 	angles.Zero();
+-	if ( args.Argc() == 5 ) {
++	if ( args.Argc() >= 5 ) {
+ 		angles.yaw = atof( args.Argv( 4 ) );
+ 	}
++#ifdef __EMSCRIPTEN__
++	if ( args.Argc() == 6 ) {
++		angles.pitch = atof( args.Argv( 5 ) );
++	}
++#endif
+ 
+ 	for ( i = 0 ; i < 3 ; i++ ) {
+ 		origin[i] = atof( args.Argv( i + 1 ) );
 diff --git a/neo/game/gamesys/SysCvar.cpp b/neo/game/gamesys/SysCvar.cpp
 index 824d9c2..42c0adc 100644
 --- a/neo/game/gamesys/SysCvar.cpp
@@ -7237,7 +7272,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..efa602b 100644
+index c83ebb5..ff2b665 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -8264,7 +8299,7 @@ index c83ebb5..efa602b 100644
 +	// screenshots then carry teleportable coordinates (setviewpos x y z yaw).
 +	{
 +		static uint32_t posTick = 0;
-+		if ( ( ++posTick & 31 ) == 0 && backEnd.viewDef && backEnd.viewDef->viewEntitys ) {
++		if ( ( ++posTick & 7 ) == 0 && backEnd.viewDef && backEnd.viewDef->viewEntitys ) {
 +			const idVec3& o = backEnd.viewDef->renderView.vieworg;
 +			const idMat3& ax = backEnd.viewDef->renderView.viewaxis;
 +			const float yaw = RAD2DEG( atan2f( ax[0].y, ax[0].x ) );

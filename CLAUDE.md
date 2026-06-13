@@ -1537,6 +1537,47 @@ the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
 MEASURE before declaring iPhone-safe) and before the new native
 side-by-side.
 
+**Iter 52 — black zombies + black skybox: the .skin decl gap +
+cubemap side expansion (2026-06-13).** Two user iPhone reports, one
+root family: the pak reducer never shipped SKIN DECLS or ENV
+CUBEMAPS. (1) ZOMBIE BLACK SILHOUETTE: every D3 zombie def applies a
+skin ("skin" "skins/monsters/zombies/zfat.skin" for enpro's fatties)
+remapping the npc base materials to d-variant flesh materials; .skin
+was not in TEXT_KEEP_EXTS so ZERO skin files shipped → the engine
+builds a DEFAULTED skin → solid black model (textures alone don't
+fix it — fatty's tgas were always in the pak). Fix: keep .skin +
+index skin decls (name AND ±".skin" alias — defs reference
+"zmaintb.skin" while the decl is "zmaintb") + closure pulls each
+referenced skin's remap-target materials and their images (+1.7MB:
+djumpsuit/dsoldier d-variant sets). (2) BLACK SKYBOX (outdoor
+walkway): enpro sky = textures/skies/desert = `cameraCubeMap
+env/desert` — the engine expands the base to six side files
+(_forward.._down / _px.._nz) and the reducer never did → zero env/
+images ever shipped (the known iter-2b "env cubemaps" drop class).
+Fix: CUBE_SIDE_SUFFIXES expansion of ref_stripped + extra_stripped.
+VERIFIED (echo + primary): fatty spawns textured+lit in the corridor;
+the Mars sky renders from the walkway (WebGPU; the GL echo's sky
+stays black — GL4ES cameraCubeMap quirk, echo/fallback-only, was
+never working). Engine adds in the same deploy: setviewpos takes an
+optional 6th PITCH arg (emscripten-only) so a pos-chip screenshot is
+a one-command repro; pos publish every 8 views (was 32, flaky).
+HUNT LESSONS: (a) read the ENGINE console from Playwright via
+d3cmd("condump x.txt") + Module.FS walk — "Couldn't load image:
+models/monsters/zombie/zombie01/zlegs01b" named the gap class
+instantly after hours of screenshot guesswork; (b) testmodel on an
+md5mesh prints "NULL joints" and draws nothing without testanim —
+use `spawn <class>` with notarget + ai_freeze 1 SET BEFORE the
+spawn; (c) enpro's map only ever spawns monster_zombie_fat — maint/
+jumpsuit/tshirt defs ship (def files keep wholesale) but are NOT
+seeded, so their zombie01 images stay excluded BY DESIGN (spawning
+them via console shows missing-image warnings — not a player-facing
+gap); (d) the echo-mode WebGPU canvas lags SECONDS behind teleports
+(redundant-submit skip interplay) — settle 5s+ before echo A/B
+captures, and remember only PRIMARY-mode WebGPU captures are honest
+(iter 50b); (e) sky-brush positions are parseable from the .map's
+brushDef3 planes (axis-aligned faces: coord = -d/n) — that located
+the outdoor walkway in one query after five blind teleports.
+
 **Iter 51 — THE GRAY-PLANES ARTIFACT: fog frustum tris vs partial
 depth prepass (2026-06-13). ALSO closes the +25% dim-cell issue.**
 The user's "missing ceiling" iPhone shot (IMG_2522, pitched up at

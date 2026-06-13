@@ -30,7 +30,23 @@ from pathlib import Path
 TEXT_KEEP_EXTS = {
     ".mtr", ".def", ".script", ".sndshd", ".gui", ".guicfg",
     ".pda", ".cfg", ".txt", ".lang", ".decl", ".af", ".mtr2",
+    # Iter 52: .skin decls remap model surfaces to variant materials
+    # (e.g. zombies remap male_npc jumpsuit -> djumpsuit "dead" flesh).
+    # Without them the engine builds a DEFAULTED skin and the model
+    # renders black — and the variant materials' images need the skin
+    # index below to enter the closure at all.
+    ".skin",
 }
+
+# Iter 52: cubeMap/cameraCubeMap stages reference a BASE name
+# ("cameraCubeMap env/desert") that the engine expands to six side
+# files by convention. Both the camera-space and cube-space suffix
+# sets exist in the data. Without this expansion no env/ cubemap ever
+# shipped (black skyboxes, missing reflections).
+CUBE_SIDE_SUFFIXES = (
+    "_forward", "_back", "_left", "_right", "_up", "_down",
+    "_px", "_nx", "_py", "_ny", "_pz", "_nz",
+)
 
 # Binary asset extensions we prune unless referenced.
 IMAGE_EXTS = {".tga", ".jpg", ".jpeg", ".png", ".dds", ".pcx", ".bmp"}
@@ -307,13 +323,28 @@ def main(argv=None):
         materials = {}   # material name -> set(stripped image paths)
         defs = {}        # entityDef/model name -> concatenated body text
         sndshaders = {}  # sound shader name -> set(sample paths)
+        skindecls = {}   # skin decl name -> set(material name tokens)
         for name in decl_text:
             zpath, original = entries[name]
             ext = name[name.rfind("."):] if "." in name else ""
-            if ext not in (".mtr", ".def", ".sndshd"):
+            if ext not in (".mtr", ".def", ".sndshd", ".skin"):
                 continue
             text = pool.text(zpath, original)
             for declname, body in iter_decl_blocks(text):
+                if ext == ".skin":
+                    # Iter 52: skin decls list `from to` material pairs; defs
+                    # reference the decl by name (sometimes with a stray
+                    # ".skin" suffix — index both spellings). The remap
+                    # TARGET materials are otherwise unreachable through the
+                    # def graph (zombie djumpsuit/dsoldier class).
+                    toks = set(asset_tokens(body))
+                    skindecls.setdefault(declname, set()).update(toks)
+                    _bare = strip_ext(declname)
+                    if _bare != declname:
+                        skindecls.setdefault(_bare, set()).update(toks)
+                    else:
+                        skindecls.setdefault(declname + ".skin", set()).update(toks)
+                    continue
                 if ext == ".sndshd":
                     # Sound shaders list their sample files (sound/*.wav|ogg)
                     # in the body. Entities reference the SHADER NAME (a bare
@@ -393,8 +424,21 @@ def main(argv=None):
                 referenced |= materials[nm]
             if nm in sndshaders:
                 referenced |= sndshaders[nm]
+            # Iter 52: a referenced skin decl pulls in its remap-target
+            # materials and THEIR images (zombie skins remap npc materials
+            # to d-variant flesh materials whose images nothing else names).
+            if nm in skindecls:
+                for t in skindecls[nm]:
+                    referenced.add(t)
+                    if t in materials:
+                        referenced |= materials[t]
 
         ref_stripped = {strip_ext(t) for t in referenced}
+        # Iter 52: expand cubemap bases to their six side files (both the
+        # camera-space and cube-space suffix conventions).
+        for r in list(ref_stripped):
+            for s in CUBE_SIDE_SUFFIXES:
+                ref_stripped.add(r + s)
 
         # 4. Keep binary assets referenced (by path or basename without ext),
         #    plus extra user globs. md5mesh skins are resolved one more level.
@@ -449,6 +493,11 @@ def main(argv=None):
                     for suf in IMPLICIT_SUFFIXES:
                         extra_imgs.add(base + suf)
         extra_stripped = {strip_ext(t) for t in extra_imgs}
+        # Iter 52: cubemap side expansion for model-referenced materials too
+        # (glass/visor reflections use cubeMap stages).
+        for r in list(extra_stripped):
+            for s in CUBE_SIDE_SUFFIXES:
+                extra_stripped.add(r + s)
         for name, (zpath, original) in entries.items():
             if name in keep:
                 continue
