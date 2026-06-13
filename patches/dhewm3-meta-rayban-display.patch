@@ -7283,11 +7283,262 @@ index 7914093..6865145 100644
  	// free the context and close the window
  	GLimp_Shutdown();
  
+diff --git a/neo/renderer/RenderWorld.cpp b/neo/renderer/RenderWorld.cpp
+index 2f77916..63f0485 100644
+--- a/neo/renderer/RenderWorld.cpp
++++ b/neo/renderer/RenderWorld.cpp
+@@ -130,6 +130,7 @@ idRenderWorldLocal::idRenderWorldLocal
+ idRenderWorldLocal::idRenderWorldLocal() {
+ 	mapName.Clear();
+ 	mapTimeStamp = FILE_NOT_FOUND_TIMESTAMP;
++	binaryProcOut = NULL;   // boot-speed: .bproc writer (set only while writing during parse)
+ 
+ 	generateAllInteractionsCalled = false;
+ 
 diff --git a/neo/renderer/RenderWorld_load.cpp b/neo/renderer/RenderWorld_load.cpp
-index 33cbbe0..28380d6 100644
+index 33cbbe0..17087b3 100644
 --- a/neo/renderer/RenderWorld_load.cpp
 +++ b/neo/renderer/RenderWorld_load.cpp
-@@ -477,7 +477,12 @@ A NULL or empty name will make a world without a map model, which
+@@ -179,6 +179,13 @@ idRenderModel *idRenderWorldLocal::ParseModel( idLexer *src ) {
+ 
+ 	src->ExpectTokenString( "}" );
+ 
++	// Boot-speed: capture the RAW parsed verts/indexes to the .bproc BEFORE
++	// FinishSurfaces() (which adds back-side surfaces + welds verts, so a
++	// post-Finish snapshot would double-process on reload).
++	if ( binaryProcOut ) {
++		WriteBinaryProcModel( binaryProcOut, model );
++	}
++
+ 	model->FinishSurfaces();
+ 
+ 	return model;
+@@ -370,6 +377,224 @@ void idRenderWorldLocal::ParseNodes( idLexer *src ) {
+ 	src->ExpectTokenString( "}" );
+ }
+ 
++/*
++===============================================================================
++
++	Binary .bproc cache. Models are captured during the ASCII parse (raw verts,
++	before FinishSurfaces mutates them); interAreaPortals + nodes are written
++	from the built structures (which preserve the source data). On load the
++	model/portal/node blocks rebuild via the same Alloc/AddSurface/FinishSurfaces
++	+ portal/winding reconstruction the ASCII path uses. Magic/version guarded;
++	any short read or bad tag returns false → ASCII fallback.
++
++===============================================================================
++*/
++#define BPROC_MAGIC			(('B'<<0)|('P'<<8)|('R'<<16)|('C'<<24))
++#define BPROC_VERSION		1
++#define BPROC_TAG_END		0
++#define BPROC_TAG_MODEL		1
++#define BPROC_TAG_PORTALS	2
++#define BPROC_TAG_NODES		3
++
++void idRenderWorldLocal::WriteBinaryProcModel( idFile *fp, idRenderModel *model ) {
++	fp->WriteInt( BPROC_TAG_MODEL );
++	fp->WriteString( model->Name() );
++	fp->WriteInt( model->NumSurfaces() );
++	for ( int i = 0; i < model->NumSurfaces(); i++ ) {
++		const modelSurface_t *surf = model->Surface( i );
++		const srfTriangles_t *tri = surf->geometry;
++		fp->WriteString( surf->shader->GetName() );
++		fp->WriteInt( tri->numVerts );
++		fp->WriteInt( tri->numIndexes );
++		for ( int j = 0; j < tri->numVerts; j++ ) {
++			fp->WriteVec3( tri->verts[j].xyz );
++			fp->WriteFloat( tri->verts[j].st[0] );
++			fp->WriteFloat( tri->verts[j].st[1] );
++			fp->WriteVec3( tri->verts[j].normal );
++		}
++		for ( int j = 0; j < tri->numIndexes; j++ ) {
++			fp->WriteInt( tri->indexes[j] );
++		}
++	}
++}
++
++idRenderModel *idRenderWorldLocal::ParseBinaryProcModel( idFile *fp ) {
++	idStr name, matName;
++	int numSurfaces = 0;
++
++	idRenderModel *model = renderModelManager->AllocModel();
++	fp->ReadString( name );
++	model->InitEmpty( name );
++	fp->ReadInt( numSurfaces );
++	for ( int i = 0; i < numSurfaces; i++ ) {
++		modelSurface_t surf;
++		fp->ReadString( matName );
++		surf.shader = declManager->FindMaterial( matName );
++		((idMaterial *)surf.shader)->AddReference();
++		srfTriangles_t *tri = R_AllocStaticTriSurf();
++		surf.geometry = tri;
++		fp->ReadInt( tri->numVerts );
++		fp->ReadInt( tri->numIndexes );
++		R_AllocStaticTriSurfVerts( tri, tri->numVerts );
++		for ( int j = 0; j < tri->numVerts; j++ ) {
++			fp->ReadVec3( tri->verts[j].xyz );
++			fp->ReadFloat( tri->verts[j].st[0] );
++			fp->ReadFloat( tri->verts[j].st[1] );
++			fp->ReadVec3( tri->verts[j].normal );
++		}
++		R_AllocStaticTriSurfIndexes( tri, tri->numIndexes );
++		for ( int j = 0; j < tri->numIndexes; j++ ) {
++			int idx = 0;
++			fp->ReadInt( idx );
++			tri->indexes[j] = idx;
++		}
++		model->AddSurface( surf );
++	}
++	model->FinishSurfaces();
++	return model;
++}
++
++void idRenderWorldLocal::WriteBinaryInterAreaPortals( idFile *fp ) {
++	fp->WriteInt( BPROC_TAG_PORTALS );
++	fp->WriteInt( numPortalAreas );
++	fp->WriteInt( numInterAreaPortals );
++	for ( int i = 0; i < numInterAreaPortals; i++ ) {
++		portal_t *p0 = doublePortals[i].portals[0];	// intoArea = a2, original winding
++		portal_t *p1 = doublePortals[i].portals[1];	// intoArea = a1, reversed winding
++		idWinding *w = p0->w;
++		int numPoints = w->GetNumPoints();
++		fp->WriteInt( numPoints );
++		fp->WriteInt( p1->intoArea );	// a1
++		fp->WriteInt( p0->intoArea );	// a2
++		for ( int j = 0; j < numPoints; j++ ) {
++			fp->WriteVec3( (*w)[j].ToVec3() );
++		}
++	}
++}
++
++void idRenderWorldLocal::ParseBinaryInterAreaPortals( idFile *fp ) {
++	int i, j;
++
++	fp->ReadInt( numPortalAreas );
++	portalAreas = (portalArea_t *)R_ClearedStaticAlloc( numPortalAreas * sizeof( portalAreas[0] ) );
++	areaScreenRect = (idScreenRect *) R_ClearedStaticAlloc( numPortalAreas * sizeof( idScreenRect ) );
++	SetupAreaRefs();
++	fp->ReadInt( numInterAreaPortals );
++	doublePortals = (doublePortal_t *)R_ClearedStaticAlloc( numInterAreaPortals * sizeof( doublePortals[0] ) );
++
++	for ( i = 0; i < numInterAreaPortals; i++ ) {
++		int numPoints = 0, a1 = 0, a2 = 0;
++		idWinding *w;
++		portal_t *p;
++
++		fp->ReadInt( numPoints );
++		fp->ReadInt( a1 );
++		fp->ReadInt( a2 );
++
++		w = new idWinding( numPoints );
++		w->SetNumPoints( numPoints );
++		for ( j = 0; j < numPoints; j++ ) {
++			idVec3 pt;
++			fp->ReadVec3( pt );
++			(*w)[j][0] = pt[0];
++			(*w)[j][1] = pt[1];
++			(*w)[j][2] = pt[2];
++			(*w)[j][3] = 0;
++			(*w)[j][4] = 0;
++		}
++
++		p = (portal_t *)R_ClearedStaticAlloc( sizeof( *p ) );
++		p->intoArea = a2;
++		p->doublePortal = &doublePortals[i];
++		p->w = w;
++		p->w->GetPlane( p->plane );
++		p->next = portalAreas[a1].portals;
++		portalAreas[a1].portals = p;
++		doublePortals[i].portals[0] = p;
++
++		p = (portal_t *)R_ClearedStaticAlloc( sizeof( *p ) );
++		p->intoArea = a1;
++		p->doublePortal = &doublePortals[i];
++		p->w = w->Reverse();
++		p->w->GetPlane( p->plane );
++		p->next = portalAreas[a2].portals;
++		portalAreas[a2].portals = p;
++		doublePortals[i].portals[1] = p;
++	}
++}
++
++void idRenderWorldLocal::WriteBinaryNodes( idFile *fp ) {
++	fp->WriteInt( BPROC_TAG_NODES );
++	fp->WriteInt( numAreaNodes );
++	for ( int i = 0; i < numAreaNodes; i++ ) {
++		areaNode_t *node = &areaNodes[i];
++		fp->WriteFloat( node->plane[0] );
++		fp->WriteFloat( node->plane[1] );
++		fp->WriteFloat( node->plane[2] );
++		fp->WriteFloat( node->plane[3] );
++		fp->WriteInt( node->children[0] );
++		fp->WriteInt( node->children[1] );
++	}
++}
++
++void idRenderWorldLocal::ParseBinaryNodes( idFile *fp ) {
++	fp->ReadInt( numAreaNodes );
++	areaNodes = (areaNode_t *)R_ClearedStaticAlloc( numAreaNodes * sizeof( areaNodes[0] ) );
++	for ( int i = 0; i < numAreaNodes; i++ ) {
++		areaNode_t *node = &areaNodes[i];
++		fp->ReadFloat( node->plane[0] );
++		fp->ReadFloat( node->plane[1] );
++		fp->ReadFloat( node->plane[2] );
++		fp->ReadFloat( node->plane[3] );
++		fp->ReadInt( node->children[0] );
++		fp->ReadInt( node->children[1] );
++	}
++}
++
++bool idRenderWorldLocal::LoadBinaryProc( const char *name, ID_TIME_T sourceTimeStamp ) {
++	idStr fileName = name;
++	fileName.SetFileExtension( "bproc" );
++	idFile *fp = fileSystem->OpenFileRead( fileName );
++	if ( !fp ) {
++		return false;
++	}
++	int magic = 0, ver = 0;
++	fp->ReadInt( magic );
++	fp->ReadInt( ver );
++	if ( magic != BPROC_MAGIC || ver != BPROC_VERSION ) {
++		fileSystem->CloseFile( fp );
++		return false;
++	}
++
++	mapName = name;
++	mapTimeStamp = sourceTimeStamp;
++
++	idRenderModel *lastModel;
++	while ( 1 ) {
++		int tag = BPROC_TAG_END;
++		if ( fp->ReadInt( tag ) != (int)sizeof( int ) ) {	// short read = truncated/corrupt
++			fileSystem->CloseFile( fp );
++			return false;
++		}
++		if ( tag == BPROC_TAG_END ) {
++			break;
++		} else if ( tag == BPROC_TAG_MODEL ) {
++			lastModel = ParseBinaryProcModel( fp );
++			renderModelManager->AddModel( lastModel );
++			localModels.Append( lastModel );
++		} else if ( tag == BPROC_TAG_PORTALS ) {
++			ParseBinaryInterAreaPortals( fp );
++		} else if ( tag == BPROC_TAG_NODES ) {
++			ParseBinaryNodes( fp );
++		} else {
++			fileSystem->CloseFile( fp );
++			return false;	// bad tag = corrupt
++		}
++	}
++	fileSystem->CloseFile( fp );
++	return true;
++}
++
+ /*
+ ================
+ idRenderWorldLocal::CommonChildrenArea_r
+@@ -477,7 +702,12 @@ A NULL or empty name will make a world without a map model, which
  is still useful for displaying a bare model
  =================
  */
@@ -7300,6 +7551,127 @@ index 33cbbe0..28380d6 100644
  	idLexer *		src;
  	idToken			token;
  	idStr			filename;
+@@ -518,6 +748,23 @@ bool idRenderWorldLocal::InitFromMap( const char *name ) {
+ 
+ 	FreeWorld();
+ 
++	// Boot-speed: try the binary .bproc cache first (skips the ~730ms ASCII
++	// parse). On success it builds the world; finish the same post-processing
++	// the ASCII path does below and return. On failure, reset and parse ASCII.
++	{
++		extern idCVar cm_binaryCache;
++		if ( cm_binaryCache.GetBool() && LoadBinaryProc( name, currentTimeStamp ) ) {
++			if ( !numPortalAreas ) {
++				ClearWorld();
++			}
++			CommonChildrenArea_r( &areaNodes[0] );
++			AddWorldModelEntities();
++			ClearPortalStates();
++			return true;
++		}
++	}
++	FreeWorld();   // clear any partial state from a failed binary load
++
+ 	src = new idLexer( filename, LEXFL_NOSTRINGCONCAT | LEXFL_NODOLLARPRECOMPILE );
+ 	if ( !src->IsLoaded() ) {
+ 		common->Printf( "idRenderWorldLocal::InitFromMap: %s not found\n", filename.c_str() );
+@@ -529,6 +776,22 @@ bool idRenderWorldLocal::InitFromMap( const char *name ) {
+ 	mapName = name;
+ 	mapTimeStamp = currentTimeStamp;
+ 
++	// Boot-speed: open the .bproc for writing as we parse (ParseModel captures
++	// raw verts before FinishSurfaces; portals/nodes are written post-build).
++	idStr bprocName;
++	{
++		extern idCVar cm_binaryCache;
++		if ( cm_binaryCache.GetBool() ) {
++			bprocName = filename;
++			bprocName.SetFileExtension( "bproc" );
++			binaryProcOut = fileSystem->OpenFileWrite( bprocName, "fs_devpath" );
++			if ( binaryProcOut ) {
++				binaryProcOut->WriteInt( BPROC_MAGIC );
++				binaryProcOut->WriteInt( BPROC_VERSION );
++			}
++		}
++	}
++
+ 	// if we are writing a demo, archive the load command
+ 	if ( session->writeDemo ) {
+ 		WriteLoadMap();
+@@ -565,16 +828,29 @@ bool idRenderWorldLocal::InitFromMap( const char *name ) {
+ 
+ 			// save it in the list to free when clearing this map
+ 			localModels.Append( lastModel );
++			// shadowModels aren't serialized to .bproc (our reduced pak strips
++			// them) — if one appears, abort the binary cache for this map.
++			if ( binaryProcOut ) {
++				fileSystem->CloseFile( binaryProcOut );
++				binaryProcOut = NULL;
++				fileSystem->RemoveFile( bprocName );
++			}
+ 			continue;
+ 		}
+ 
+ 		if ( token == "interAreaPortals" ) {
+ 			ParseInterAreaPortals( src );
++			if ( binaryProcOut ) {
++				WriteBinaryInterAreaPortals( binaryProcOut );
++			}
+ 			continue;
+ 		}
+ 
+ 		if ( token == "nodes" ) {
+ 			ParseNodes( src );
++			if ( binaryProcOut ) {
++				WriteBinaryNodes( binaryProcOut );
++			}
+ 			continue;
+ 		}
+ 
+@@ -583,6 +859,14 @@ bool idRenderWorldLocal::InitFromMap( const char *name ) {
+ 
+ 	delete src;
+ 
++	// Boot-speed: finalize the .bproc (END tag) so the next boot can load it.
++	if ( binaryProcOut ) {
++		binaryProcOut->WriteInt( BPROC_TAG_END );
++		fileSystem->CloseFile( binaryProcOut );
++		binaryProcOut = NULL;
++		common->Printf( "wrote binary proc cache %s\n", bprocName.c_str() );
++	}
++
+ 	// if it was a trivial map without any areas, create a single area
+ 	if ( !numPortalAreas ) {
+ 		ClearWorld();
+@@ -594,6 +878,7 @@ bool idRenderWorldLocal::InitFromMap( const char *name ) {
+ 	AddWorldModelEntities();
+ 	ClearPortalStates();
+ 
++
+ 	// done!
+ 	return true;
+ }
+diff --git a/neo/renderer/RenderWorld_local.h b/neo/renderer/RenderWorld_local.h
+index 0a129c5..9a4f7db 100644
+--- a/neo/renderer/RenderWorld_local.h
++++ b/neo/renderer/RenderWorld_local.h
+@@ -183,6 +183,16 @@ public:
+ 	void					SetupAreaRefs();
+ 	void					ParseInterAreaPortals( idLexer *src );
+ 	void					ParseNodes( idLexer *src );
++	// Boot-speed: binary .bproc cache. Written DURING the ASCII parse (the raw
++	// parsed verts must be captured BEFORE FinishSurfaces, which mutates them).
++	idFile *				binaryProcOut;			// non-NULL while writing the .bproc
++	void					WriteBinaryProcModel( idFile *fp, idRenderModel *model );
++	void					WriteBinaryInterAreaPortals( idFile *fp );
++	void					WriteBinaryNodes( idFile *fp );
++	idRenderModel *			ParseBinaryProcModel( idFile *fp );
++	void					ParseBinaryInterAreaPortals( idFile *fp );
++	void					ParseBinaryNodes( idFile *fp );
++	bool					LoadBinaryProc( const char *name, ID_TIME_T sourceTimeStamp );
+ 	int						CommonChildrenArea_r( areaNode_t *node );
+ 	void					FreeWorld();
+ 	void					ClearWorld();
 diff --git a/neo/renderer/VertexCache.cpp b/neo/renderer/VertexCache.cpp
 index ec0184e..2cfe895 100644
 --- a/neo/renderer/VertexCache.cpp
