@@ -1539,6 +1539,25 @@ the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
 MEASURE before declaring iPhone-safe) and before the new native
 side-by-side.
 
+**Iter 57 — strip precomputed .proc shadowModels: -3.8MB free
+(2026-06-13).** Toward <5MB boot: enpro.proc (28.5MB raw / 6MB gzip)
+is 63%% `shadowModel` blocks (17.9MB raw, 332 of them) — precomputed
+PRELIGHT shadow volumes. But the WebGPU build regenerates ALL stencil
+shadows dynamically (VP-turbo; iter 38: UpdateLightDef NULLs
+prelightModel on light change), so the prelights are DEAD WEIGHT.
+Reducer `--strip-proc-shadows` removes the shadowModel blocks (balanced-
+brace) from the .proc. VERIFIED EMPIRICALLY (swapped into base/, booted
+?nostream): boots clean (no missing-prelight crash/abort), 70 shadow
+volumes still captured (dynamic regen works), spawn visual identical,
+determinism 6/6 IDENTICAL. RESULT: .proc 5.96→2.21MB gzip; all three
+tiers rebuilt — default streaming BOOT 35.4→31.6MB, base/ (?nostream)
+48.7→45MB, base256/ (?hd) 80→76MB. Zero engine change, zero risk
+(prelights were already unused). Same ~3.8MB as the animation-defer
+option would have yielded, but FREE (no anim-system risk). The .proc is
+now mostly world geometry (10MB raw / ~2.2MB gzip) + BSP nodes (0.6MB);
+the next <5MB lever is portal-area streaming of THAT geometry (deep,
+under investigation). Build recipe adds --strip-proc-shadows.
+
 **Iter 56 — streaming is now DEFAULT + stream-blob IndexedDB cache
 (2026-06-13).** iter-55 ?stream verified on iPhone (user-confirmed),
 so productionized: (1) streaming is the DEFAULT boot (STREAM_TIER =

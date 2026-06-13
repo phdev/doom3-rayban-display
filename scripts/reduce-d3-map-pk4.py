@@ -274,6 +274,13 @@ def main(argv=None):
                              "height maps, alpha textures, and HUD/font art stay lossless TGA.")
     parser.add_argument("--jpeg-quality", type=int, default=85,
                         help="JPEG quality for --jpeg-textures (default 85).")
+    parser.add_argument("--strip-proc-shadows", action="store_true",
+                        help="strip the precomputed shadowModel blocks from the .proc "
+                             "(63%% of enpro.proc, 17.9MB raw / 3.8MB compressed). The "
+                             "WebGPU build regenerates stencil shadows dynamically (VP-turbo, "
+                             "iter 38 nulls prelightModel on light change), so the precomputed "
+                             "prelight shadow volumes are dead weight — verified: boots clean, "
+                             "70 shadow volumes still captured, determinism 6/6, visual identical.")
     parser.add_argument("--defer-textures", action="store_true",
                         help="split output: the boot .pk4 gets everything EXCEPT bulk "
                              "world/model textures, which go into a concat <output>.stream "
@@ -679,6 +686,28 @@ def main(argv=None):
                 top = name.split("/", 1)[0] if "/" in name else "(root)"
                 by_dir[top] = by_dir.get(top, 0) + len(data)
 
+        def strip_proc_shadows(data):
+            """Remove every top-level `shadowModel { ... }` block from a .proc
+            (balanced-brace). The map's lights regenerate shadows dynamically in
+            the WebGPU build, so these precomputed prelight volumes are unused."""
+            text = data.decode("latin-1", errors="replace")
+            out = []; i = 0; n = len(text); removed = 0
+            mark = re.compile(r"\nshadowModel \{")
+            while i < n:
+                m = mark.search(text, i)
+                if not m:
+                    out.append(text[i:]); break
+                out.append(text[i:m.start()])
+                depth = 1; j = m.end()
+                while j < n and depth:
+                    c = text[j]
+                    if c == "{": depth += 1
+                    elif c == "}": depth -= 1
+                    j += 1
+                removed += 1; i = j
+            return "".join(out).encode("latin-1"), removed
+
+        proc_shadow_removed = [0]
         nonlocal_kept = [0]
         with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as out:
             for name in sorted(keep):
@@ -688,6 +717,9 @@ def main(argv=None):
                     data = downsample_wav(data, args.audio_rate, args.audio_width)
                 elif args.max_texture:
                     data = downsize_image(data, name, args.max_texture)
+                if args.strip_proc_shadows and name.endswith(".proc"):
+                    data, r = strip_proc_shadows(data)
+                    proc_shadow_removed[0] += r
                 name, data = maybe_jpeg(data, name)
                 emit(name, data)
             for out_name, src_name in sorted(dds_convert.items()):
@@ -714,6 +746,9 @@ def main(argv=None):
         if args.jpeg_textures:
             print(f"  JPEG: recoded {jpeg_stats[0]} color textures, saved "
                   f"{jpeg_stats[1]/1e6:.1f} MB (uncompressed)", file=sys.stderr)
+        if args.strip_proc_shadows:
+            print(f"  PROC: stripped {proc_shadow_removed[0]} shadowModel blocks",
+                  file=sys.stderr)
         for top, size in sorted(by_dir.items(), key=lambda kv: -kv[1]):
             print(f"  {top:<14} {size/1e6:8.1f} MB (uncompressed)", file=sys.stderr)
     finally:
