@@ -1,7 +1,9 @@
 import {
   clearCachedUrlPk4,
+  readCachedBcm,
   readCachedUrlPk4,
   readPk4Bytes,
+  saveCachedBcm,
   saveCachedUrlPk4
 } from "./storage.js";
 
@@ -415,6 +417,12 @@ export async function bootDoom3({
 
       progress(72, "Configuring");
       installRuntimeConfig(module.FS, config, log);
+
+      // Boot-speed: restore the binary collision cache (.bcm) into MEMFS before
+      // the engine runs, so BuildModels takes the ~95ms binary path instead of
+      // the ~946ms ASCII .cm parse. Keyed by pak size; the engine also
+      // CRC-validates each .bcm, so a stale restore just falls back to ASCII.
+      await restoreBcmCache(module, log);
     } else {
       progress(72, "Configuring");
       log("Runtime filesystem is not exposed yet; deferring PK4 install");
@@ -464,6 +472,12 @@ export async function bootDoom3({
         streamDeferredTextures(module, log).catch((e) => console.warn("[stream] threw", e));
       }, 3000);
     }
+
+    // Boot-speed: persist the .bcm collision cache the engine writes during map
+    // load, so the next boot restores it and skips the ASCII parse.
+    setTimeout(() => {
+      persistBcmCache(module, log).catch((e) => console.warn("[bcm] persist threw", e));
+    }, 6000);
 
     return {
       module,
@@ -1852,6 +1866,103 @@ async function streamDeferredTextures(module, log) {
   } catch (error) {
     log?.(`Texture streaming error: ${formatError(error)}`);
   }
+}
+
+// Boot-speed: binary collision cache (.bcm) persistence bridge. The engine
+// writes a compact binary mirror of the parsed .cm under /save after the first
+// boot's ASCII parse; we stash it in IndexedDB and restore it on later boots so
+// BuildModels skips the ~946ms parse (~95ms binary load instead).
+function bcmPakSize(FS) {
+  try {
+    return FS.stat("/base/pak-display.pk4").size;
+  } catch {
+    return null;
+  }
+}
+
+function findBcmFiles(FS, root) {
+  const hits = [];
+  const walk = (dir, depth) => {
+    if (depth > 7) return;
+    let entries;
+    try {
+      entries = FS.readdir(dir);
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e === "." || e === "..") continue;
+      const full = (dir === "/" ? "" : dir) + "/" + e;
+      let st;
+      try {
+        st = FS.stat(full);
+      } catch {
+        continue;
+      }
+      if (FS.isDir(st.mode)) {
+        walk(full, depth + 1);
+      } else if (full.endsWith(".bcm")) {
+        hits.push(full);
+      }
+    }
+  };
+  walk(root, 0);
+  return hits;
+}
+
+async function restoreBcmCache(module, log) {
+  try {
+    const FS = module.FS;
+    const freshness = bcmPakSize(FS);
+    try {
+      window.__d3BcmPakSize = freshness;
+    } catch {}
+    const cached = await readCachedBcm(freshness);
+    if (!cached || !cached.length) {
+      return;
+    }
+    for (const e of cached) {
+      const dir = e.path.slice(0, e.path.lastIndexOf("/"));
+      mkdirTree(FS, dir);
+      FS.writeFile(e.path, e.bytes);
+    }
+    log(`Restored ${cached.length} binary collision cache file(s) from IndexedDB`);
+  } catch (error) {
+    console.warn("[bcm] restore failed", error);
+  }
+}
+
+async function persistBcmCache(module, log) {
+  const FS = module.FS;
+  if (!FS || typeof FS.readdir !== "function") {
+    return;
+  }
+  // The .bcm is written during BuildModels (part of map load), a few seconds
+  // after the engine starts — poll until it appears.
+  let paths = [];
+  for (let tries = 0; tries < 40; tries++) {
+    paths = findBcmFiles(FS, "/save");
+    if (paths.length) break;
+    await delay(1000);
+  }
+  if (!paths.length) {
+    return;
+  }
+  const entries = [];
+  for (const path of paths) {
+    try {
+      entries.push({ path, bytes: FS.readFile(path) });
+    } catch (error) {
+      console.warn("[bcm] read failed", path, error);
+    }
+  }
+  if (!entries.length) {
+    return;
+  }
+  const freshness = (typeof window !== "undefined" && window.__d3BcmPakSize) || bcmPakSize(FS);
+  await saveCachedBcm(entries, freshness);
+  const total = entries.reduce((a, e) => a + (e.bytes ? e.bytes.length : 0), 0);
+  log(`Saved ${entries.length} binary collision cache file(s) to IndexedDB (${(total / 1048576).toFixed(1)} MB)`);
 }
 
 function mkdirTree(FS, path) {

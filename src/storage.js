@@ -140,6 +140,46 @@ export async function clearPk4File() {
   await withStore("readwrite", (store) => store.delete(PK4_KEY));
 }
 
+// Boot-speed: binary collision cache (.bcm). The engine parses the ASCII .cm
+// once (~946ms) then writes a compact binary mirror; we persist it here so
+// repeat boots restore it and skip the parse (~95ms binary load). Keyed by a
+// freshness token (pak size) so a new pak invalidates it; the engine ALSO
+// CRC-validates each .bcm, so a stale restore is harmless (re-parse + rewrite).
+const BCM_KEY = "geocache:bcm:v1";
+
+export async function readCachedBcm(freshness) {
+  const record = await withStore("readonly", (store) => store.get(BCM_KEY));
+  if (!record) {
+    return null;
+  }
+  if (freshness != null && record.freshness !== freshness) {
+    return null;
+  }
+  const entries = Array.isArray(record.entries) ? record.entries : [];
+  return entries
+    .map((e) => ({ path: e.path, bytes: toUint8Array(e.bytes) }))
+    .filter((e) => e.path && e.bytes);
+}
+
+export async function saveCachedBcm(entries, freshness) {
+  const record = {
+    key: BCM_KEY,
+    freshness: freshness ?? null,
+    updatedAt: new Date().toISOString(),
+    entries: (entries || [])
+      .map((e) => {
+        const bytes = toUint8Array(e.bytes);
+        return bytes ? { path: e.path, bytes: copyToArrayBuffer(bytes) } : null;
+      })
+      .filter(Boolean)
+  };
+  await withStore("readwrite", (store) => store.put(record));
+}
+
+export async function clearCachedBcm() {
+  await withStore("readwrite", (store) => store.delete(BCM_KEY));
+}
+
 export function formatBytes(value) {
   if (!value) {
     return "0 B";

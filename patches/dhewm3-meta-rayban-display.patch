@@ -181,6 +181,426 @@ index 69f1892..35325ea 100644
  	target_link_libraries(idlib SDL3::Headers) # so it can use SDL_Endian.h
  endif()
  if (AROS)
+diff --git a/neo/cm/CollisionModel_files.cpp b/neo/cm/CollisionModel_files.cpp
+index 9240b06..f14a122 100644
+--- a/neo/cm/CollisionModel_files.cpp
++++ b/neo/cm/CollisionModel_files.cpp
+@@ -45,6 +45,16 @@ If you have questions concerning this license or the applicable additional terms
+ #define CM_FILEID			"CM"
+ #define CM_FILEVERSION		"1.00"
+ 
++// Boot-speed: binary collision cache. A byte-for-byte mirror of the ASCII
++// .cm parse that skips the idLexer tokenize + number-conversion entirely
++// (~946ms ASCII -> tens of ms on repeat boots). Falls back to the ASCII path
++// on any mismatch (bad magic, version bump, CRC mismatch, short read), so a
++// stale/corrupt cache is always safe. Toggle off with cm_binaryCache 0.
++#define BCM_FILE_EXT		"bcm"
++#define BCM_MAGIC			(('B'<<0)|('C'<<8)|('M'<<16)|('1'<<24))
++#define BCM_VERSION			1
++idCVar cm_binaryCache( "cm_binaryCache", "1", CVAR_SYSTEM | CVAR_BOOL, "use the binary .bcm collision cache (0 = ASCII .cm only)" );
++
+ /*
+ ===============================================================================
+ 
+@@ -615,3 +625,329 @@ bool idCollisionModelManagerLocal::LoadCollisionModelFile( const char *name, uns
+ 
+ 	return true;
+ }
++
++/*
++===============================================================================
++
++	Binary collision model cache (.bcm) — byte-for-byte mirror of the ASCII
++	Write and Parse path above, via idFile binary ops. Skips the idLexer
++	tokenize + number-conversion (the measured ~946ms .cm cost on this map).
++	Any failure (bad magic/version, CRC mismatch, truncated read) returns
++	false so BuildModels falls through to the ASCII path.
++
++===============================================================================
++*/
++
++void idCollisionModelManagerLocal::WriteBinaryNodes( idFile *fp, cm_node_t *node ) {
++	fp->WriteInt( node->planeType );
++	fp->WriteFloat( node->planeDist );
++	if ( node->planeType != -1 ) {
++		WriteBinaryNodes( fp, node->children[0] );
++		WriteBinaryNodes( fp, node->children[1] );
++	}
++}
++
++void idCollisionModelManagerLocal::WriteBinaryPolygons( idFile *fp, cm_node_t *node ) {
++	cm_polygonRef_t *pref;
++	cm_polygon_t *p;
++	int i;
++
++	for ( pref = node->polygons; pref; pref = pref->next ) {
++		p = pref->p;
++		if ( p->checkcount == checkCount ) {
++			continue;
++		}
++		p->checkcount = checkCount;
++		fp->WriteInt( p->numEdges );
++		for ( i = 0; i < p->numEdges; i++ ) {
++			fp->WriteInt( p->edges[i] );
++		}
++		fp->WriteVec3( p->plane.Normal() );
++		fp->WriteFloat( p->plane.Dist() );
++		fp->WriteVec3( p->bounds[0] );
++		fp->WriteVec3( p->bounds[1] );
++		fp->WriteString( p->material->GetName() );
++	}
++	if ( node->planeType != -1 ) {
++		WriteBinaryPolygons( fp, node->children[0] );
++		WriteBinaryPolygons( fp, node->children[1] );
++	}
++}
++
++void idCollisionModelManagerLocal::WriteBinaryBrushes( idFile *fp, cm_node_t *node ) {
++	cm_brushRef_t *bref;
++	cm_brush_t *b;
++	int i;
++
++	for ( bref = node->brushes; bref; bref = bref->next ) {
++		b = bref->b;
++		if ( b->checkcount == checkCount ) {
++			continue;
++		}
++		b->checkcount = checkCount;
++		fp->WriteInt( b->numPlanes );
++		for ( i = 0; i < b->numPlanes; i++ ) {
++			fp->WriteVec3( b->planes[i].Normal() );
++			fp->WriteFloat( b->planes[i].Dist() );
++		}
++		fp->WriteVec3( b->bounds[0] );
++		fp->WriteVec3( b->bounds[1] );
++		fp->WriteInt( b->contents );
++	}
++	if ( node->planeType != -1 ) {
++		WriteBinaryBrushes( fp, node->children[0] );
++		WriteBinaryBrushes( fp, node->children[1] );
++	}
++}
++
++void idCollisionModelManagerLocal::WriteBinaryCollisionModel( idFile *fp, cm_model_t *model ) {
++	int i, polygonMemory, brushMemory;
++
++	fp->WriteString( model->name.c_str() );
++	// vertices
++	fp->WriteInt( model->numVertices );
++	for ( i = 0; i < model->numVertices; i++ ) {
++		fp->WriteVec3( model->vertices[i].p );
++	}
++	// edges
++	fp->WriteInt( model->numEdges );
++	for ( i = 0; i < model->numEdges; i++ ) {
++		fp->WriteInt( model->edges[i].vertexNum[0] );
++		fp->WriteInt( model->edges[i].vertexNum[1] );
++		fp->WriteInt( model->edges[i].internal );
++		fp->WriteInt( model->edges[i].numUsers );
++	}
++	// nodes
++	WriteBinaryNodes( fp, model->node );
++	// polygons (checkCount++ once for CountPolygonMemory, once for the write — each dedups)
++	checkCount++;
++	polygonMemory = CountPolygonMemory( model->node );
++	fp->WriteInt( polygonMemory );
++	fp->WriteInt( model->numPolygons );
++	checkCount++;
++	WriteBinaryPolygons( fp, model->node );
++	// brushes
++	checkCount++;
++	brushMemory = CountBrushMemory( model->node );
++	fp->WriteInt( brushMemory );
++	fp->WriteInt( model->numBrushes );
++	checkCount++;
++	WriteBinaryBrushes( fp, model->node );
++}
++
++void idCollisionModelManagerLocal::WriteBinaryCollisionModelsToFile( const char *filename, int firstModel, int lastModel, unsigned int mapFileCRC ) {
++	int i;
++	idFile *fp;
++	idStr name;
++
++	name = filename;
++	name.SetFileExtension( BCM_FILE_EXT );
++
++	fp = fileSystem->OpenFileWrite( name, "fs_devpath" );
++	if ( !fp ) {
++		common->Warning( "WriteBinaryCollisionModelsToFile: Error opening file %s\n", name.c_str() );
++		return;
++	}
++	fp->WriteInt( BCM_MAGIC );
++	fp->WriteInt( BCM_VERSION );
++	fp->WriteInt( (int)mapFileCRC );
++	fp->WriteInt( lastModel - firstModel );
++	for ( i = firstModel; i < lastModel; i++ ) {
++		WriteBinaryCollisionModel( fp, models[ i ] );
++	}
++	fileSystem->CloseFile( fp );
++	common->Printf( "wrote binary collision cache %s\n", name.c_str() );
++}
++
++cm_node_t *idCollisionModelManagerLocal::ParseBinaryNodes( idFile *fp, cm_model_t *model, cm_node_t *parent ) {
++	cm_node_t *node;
++
++	model->numNodes++;
++	node = AllocNode( model, model->numNodes < NODE_BLOCK_SIZE_SMALL ? NODE_BLOCK_SIZE_SMALL : NODE_BLOCK_SIZE_LARGE );
++	node->brushes = NULL;
++	node->polygons = NULL;
++	node->parent = parent;
++	fp->ReadInt( node->planeType );
++	fp->ReadFloat( node->planeDist );
++	if ( node->planeType != -1 ) {
++		node->children[0] = ParseBinaryNodes( fp, model, node );
++		node->children[1] = ParseBinaryNodes( fp, model, node );
++	}
++	return node;
++}
++
++void idCollisionModelManagerLocal::ParseBinaryVertices( idFile *fp, cm_model_t *model ) {
++	int i;
++
++	fp->ReadInt( model->numVertices );
++	model->maxVertices = model->numVertices;
++	model->vertices = (cm_vertex_t *) Mem_Alloc( model->maxVertices * sizeof( cm_vertex_t ) );
++	for ( i = 0; i < model->numVertices; i++ ) {
++		fp->ReadVec3( model->vertices[i].p );
++		model->vertices[i].side = 0;
++		model->vertices[i].sideSet = 0;
++		model->vertices[i].checkcount = 0;
++	}
++}
++
++void idCollisionModelManagerLocal::ParseBinaryEdges( idFile *fp, cm_model_t *model ) {
++	int i, tmp;
++
++	fp->ReadInt( model->numEdges );
++	model->maxEdges = model->numEdges;
++	model->edges = (cm_edge_t *) Mem_Alloc( model->maxEdges * sizeof( cm_edge_t ) );
++	for ( i = 0; i < model->numEdges; i++ ) {
++		fp->ReadInt( model->edges[i].vertexNum[0] );
++		fp->ReadInt( model->edges[i].vertexNum[1] );
++		model->edges[i].side = 0;
++		model->edges[i].sideSet = 0;
++		fp->ReadInt( tmp ); model->edges[i].internal = (unsigned short)tmp;
++		fp->ReadInt( tmp ); model->edges[i].numUsers = (unsigned short)tmp;
++		model->edges[i].normal = vec3_origin;
++		model->edges[i].checkcount = 0;
++		model->numInternalEdges += model->edges[i].internal;
++	}
++}
++
++void idCollisionModelManagerLocal::ParseBinaryPolygons( idFile *fp, cm_model_t *model ) {
++	cm_polygon_t *p;
++	int i, n, numEdges, numPolys, polygonMemory;
++	idVec3 normal;
++	float dist;
++	idStr matName;
++
++	fp->ReadInt( polygonMemory );
++	if ( polygonMemory > 0 ) {
++		model->polygonBlock = (cm_polygonBlock_t *) Mem_Alloc( sizeof( cm_polygonBlock_t ) + polygonMemory );
++		model->polygonBlock->bytesRemaining = polygonMemory;
++		model->polygonBlock->next = ( (byte *) model->polygonBlock ) + sizeof( cm_polygonBlock_t );
++	}
++	fp->ReadInt( numPolys );
++	for ( n = 0; n < numPolys; n++ ) {
++		fp->ReadInt( numEdges );
++		p = AllocPolygon( model, numEdges );
++		p->numEdges = numEdges;
++		for ( i = 0; i < numEdges; i++ ) {
++			fp->ReadInt( p->edges[i] );
++		}
++		fp->ReadVec3( normal );
++		p->plane.SetNormal( normal );
++		fp->ReadFloat( dist );
++		p->plane.SetDist( dist );
++		fp->ReadVec3( p->bounds[0] );
++		fp->ReadVec3( p->bounds[1] );
++		fp->ReadString( matName );
++		p->material = declManager->FindMaterial( matName );
++		p->contents = p->material->GetContentFlags();
++		p->checkcount = 0;
++		R_FilterPolygonIntoTree( model, model->node, NULL, p );
++	}
++}
++
++void idCollisionModelManagerLocal::ParseBinaryBrushes( idFile *fp, cm_model_t *model ) {
++	cm_brush_t *b;
++	int i, n, numPlanes, numBrushes, brushMemory;
++	idVec3 normal;
++	float dist;
++
++	fp->ReadInt( brushMemory );
++	if ( brushMemory > 0 ) {
++		model->brushBlock = (cm_brushBlock_t *) Mem_Alloc( sizeof( cm_brushBlock_t ) + brushMemory );
++		model->brushBlock->bytesRemaining = brushMemory;
++		model->brushBlock->next = ( (byte *) model->brushBlock ) + sizeof( cm_brushBlock_t );
++	}
++	fp->ReadInt( numBrushes );
++	for ( n = 0; n < numBrushes; n++ ) {
++		fp->ReadInt( numPlanes );
++		b = AllocBrush( model, numPlanes );
++		b->numPlanes = numPlanes;
++		for ( i = 0; i < numPlanes; i++ ) {
++			fp->ReadVec3( normal );
++			b->planes[i].SetNormal( normal );
++			fp->ReadFloat( dist );
++			b->planes[i].SetDist( dist );
++		}
++		fp->ReadVec3( b->bounds[0] );
++		fp->ReadVec3( b->bounds[1] );
++		fp->ReadInt( b->contents );
++		b->checkcount = 0;
++		b->primitiveNum = 0;
++		R_FilterBrushIntoTree( model, model->node, NULL, b );
++	}
++}
++
++bool idCollisionModelManagerLocal::ParseBinaryCollisionModel( idFile *fp ) {
++	cm_model_t *model;
++	idStr name;
++
++	if ( numModels >= MAX_SUBMODELS ) {
++		common->Error( "LoadBinaryCollisionModelFile: no free slots" );
++		return false;
++	}
++	model = AllocModel();
++	models[numModels] = model;
++	numModels++;
++
++	fp->ReadString( name );
++	model->name = name;
++	ParseBinaryVertices( fp, model );
++	ParseBinaryEdges( fp, model );
++	model->node = ParseBinaryNodes( fp, model, NULL );
++	ParseBinaryPolygons( fp, model );
++	ParseBinaryBrushes( fp, model );
++
++	// calculate edge normals
++	checkCount++;
++	CalculateEdgeNormals( model, model->node );
++	// get model bounds from brush and polygon bounds
++	CM_GetNodeBounds( &model->bounds, model->node );
++	// get model contents
++	model->contents = CM_GetNodeContents( model->node );
++	// total memory used by this model
++	model->usedMemory = model->numVertices * sizeof(cm_vertex_t) +
++						model->numEdges * sizeof(cm_edge_t) +
++						model->polygonMemory +
++						model->brushMemory +
++						model->numNodes * sizeof(cm_node_t) +
++						model->numPolygonRefs * sizeof(cm_polygonRef_t) +
++						model->numBrushRefs * sizeof(cm_brushRef_t);
++	return true;
++}
++
++bool idCollisionModelManagerLocal::LoadBinaryCollisionModelFile( const char *name, unsigned int mapFileCRC ) {
++	idStr fileName;
++	idFile *fp;
++	int magic, version, numModelsInFile, crcInt, i;
++
++	fileName = name;
++	fileName.SetFileExtension( BCM_FILE_EXT );
++	fp = fileSystem->OpenFileRead( fileName );
++	if ( !fp ) {
++		return false;
++	}
++	magic = version = 0;
++	fp->ReadInt( magic );
++	fp->ReadInt( version );
++	if ( magic != BCM_MAGIC || version != BCM_VERSION ) {
++		fileSystem->CloseFile( fp );
++		return false;
++	}
++	crcInt = 0;
++	fp->ReadInt( crcInt );
++	if ( mapFileCRC && (unsigned int)crcInt != mapFileCRC ) {
++		common->Printf( "%s is out of date\n", fileName.c_str() );
++		fileSystem->CloseFile( fp );
++		return false;
++	}
++	numModelsInFile = 0;
++	fp->ReadInt( numModelsInFile );
++	for ( i = 0; i < numModelsInFile; i++ ) {
++		if ( !ParseBinaryCollisionModel( fp ) ) {
++			fileSystem->CloseFile( fp );
++			return false;
++		}
++	}
++	fileSystem->CloseFile( fp );
++	common->Printf( "loaded binary collision cache %s\n", fileName.c_str() );
++	return true;
++}
+diff --git a/neo/cm/CollisionModel_load.cpp b/neo/cm/CollisionModel_load.cpp
+index 199484c..29db6e6 100644
+--- a/neo/cm/CollisionModel_load.cpp
++++ b/neo/cm/CollisionModel_load.cpp
+@@ -3391,14 +3391,25 @@ void idCollisionModelManagerLocal::ListModels( void ) {
+ idCollisionModelManagerLocal::BuildModels
+ ================
+ */
++// Boot-speed: parse-phase timer (logs [parse-time] via D3_ParseTimeLog)
++extern "C" void D3_ParseTimeLog(const char*, int);
++namespace { struct D3ParseTimer { const char* n; unsigned int t0; D3ParseTimer(const char* nm):n(nm),t0(Sys_Milliseconds()){} ~D3ParseTimer(){ D3_ParseTimeLog(n,(int)(Sys_Milliseconds()-t0)); } }; }
++
+ void idCollisionModelManagerLocal::BuildModels( const idMapFile *mapFile ) {
++	D3ParseTimer _pt("BuildModels(.cm)");
+ 	int i;
+ 	const idMapEntity *mapEnt;
+ 
+ 	idTimer timer;
+ 	timer.Start();
+ 
+-	if ( !LoadCollisionModelFile( mapFile->GetName(), mapFile->GetGeometryCRC() ) ) {
++	// Boot-speed: try the binary .bcm cache first (skips the ~946ms ASCII
++	// .cm lex). Any failure (no file, bad magic/version, CRC mismatch)
++	// falls through to the ASCII path below, which then writes a fresh .bcm.
++	extern idCVar cm_binaryCache;
++	bool binLoaded = cm_binaryCache.GetBool() && LoadBinaryCollisionModelFile( mapFile->GetName(), mapFile->GetGeometryCRC() );
++
++	if ( !binLoaded && !LoadCollisionModelFile( mapFile->GetName(), mapFile->GetGeometryCRC() ) ) {
+ 
+ 		if ( !mapFile->GetNumEntities() ) {
+ 			return;
+@@ -3429,6 +3440,12 @@ void idCollisionModelManagerLocal::BuildModels( const idMapFile *mapFile ) {
+ 		WriteCollisionModelsToFile( mapFile->GetName(), 0, numModels, mapFile->GetGeometryCRC() );
+ 	}
+ 
++	// Boot-speed: if the models came from the ASCII path (or a fresh build),
++	// write the binary cache so the next boot takes the fast path.
++	if ( !binLoaded && cm_binaryCache.GetBool() && numModels > 0 ) {
++		WriteBinaryCollisionModelsToFile( mapFile->GetName(), 0, numModels, mapFile->GetGeometryCRC() );
++	}
++
+ 	timer.Stop();
+ 
+ 	// print statistics on collision data
+diff --git a/neo/cm/CollisionModel_local.h b/neo/cm/CollisionModel_local.h
+index 562344f..deb79e9 100644
+--- a/neo/cm/CollisionModel_local.h
++++ b/neo/cm/CollisionModel_local.h
+@@ -490,6 +490,20 @@ private:			// CollisionMap_files.cpp
+ 	void			ParseBrushes( idLexer *src, cm_model_t *model );
+ 	bool			ParseCollisionModel( idLexer *src );
+ 	bool			LoadCollisionModelFile( const char *name, unsigned int mapFileCRC );
++					// Boot-speed: binary .bcm cache (byte-for-byte mirror of the ASCII
++					// Write*/Parse* above; skips tokenize+number-conversion on repeat boots)
++	void			WriteBinaryNodes( idFile *fp, cm_node_t *node );
++	void			WriteBinaryPolygons( idFile *fp, cm_node_t *node );
++	void			WriteBinaryBrushes( idFile *fp, cm_node_t *node );
++	void			WriteBinaryCollisionModel( idFile *fp, cm_model_t *model );
++	void			WriteBinaryCollisionModelsToFile( const char *filename, int firstModel, int lastModel, unsigned int mapFileCRC );
++	cm_node_t *		ParseBinaryNodes( idFile *fp, cm_model_t *model, cm_node_t *parent );
++	void			ParseBinaryVertices( idFile *fp, cm_model_t *model );
++	void			ParseBinaryEdges( idFile *fp, cm_model_t *model );
++	void			ParseBinaryPolygons( idFile *fp, cm_model_t *model );
++	void			ParseBinaryBrushes( idFile *fp, cm_model_t *model );
++	bool			ParseBinaryCollisionModel( idFile *fp );
++	bool			LoadBinaryCollisionModelFile( const char *name, unsigned int mapFileCRC );
+ 
+ private:			// CollisionMap_debug
+ 	int				ContentsFromString( const char *string ) const;
 diff --git a/neo/framework/Common.cpp b/neo/framework/Common.cpp
 index dbf6c54..4a389ac 100644
 --- a/neo/framework/Common.cpp
@@ -1276,6 +1696,23 @@ index a4883b5..095506b 100644
  
  extern idCVar	r_aspectRatio;
  
+diff --git a/neo/idlib/MapFile.cpp b/neo/idlib/MapFile.cpp
+index afbfa1d..8240a1d 100644
+--- a/neo/idlib/MapFile.cpp
++++ b/neo/idlib/MapFile.cpp
+@@ -716,7 +716,12 @@ unsigned int idMapEntity::GetGeometryCRC( void ) const {
+ idMapFile::Parse
+ ===============
+ */
++// Boot-speed: parse-phase timer (logs [parse-time] via D3_ParseTimeLog)
++extern "C" void D3_ParseTimeLog(const char*, int);
++namespace { struct D3ParseTimer { const char* n; unsigned int t0; D3ParseTimer(const char* nm):n(nm),t0(Sys_Milliseconds()){} ~D3ParseTimer(){ D3_ParseTimeLog(n,(int)(Sys_Milliseconds()-t0)); } }; }
++
+ bool idMapFile::Parse( const char *filename, bool ignoreRegion, bool osPath ) {
++	D3ParseTimer _pt("MapFile::Parse(.map)");
+ 	// no string concatenation for epairs and allow path names for materials
+ 	idLexer src( LEXFL_NOSTRINGCONCAT | LEXFL_NOSTRINGESCAPECHARS | LEXFL_ALLOWPATHNAMES );
+ 	idToken token;
 diff --git a/neo/renderer/Cinematic.cpp b/neo/renderer/Cinematic.cpp
 index e6bb4aa..e173c9f 100644
 --- a/neo/renderer/Cinematic.cpp
@@ -6732,6 +7169,23 @@ index 7914093..6865145 100644
  	// free the context and close the window
  	GLimp_Shutdown();
  
+diff --git a/neo/renderer/RenderWorld_load.cpp b/neo/renderer/RenderWorld_load.cpp
+index 33cbbe0..28380d6 100644
+--- a/neo/renderer/RenderWorld_load.cpp
++++ b/neo/renderer/RenderWorld_load.cpp
+@@ -477,7 +477,12 @@ A NULL or empty name will make a world without a map model, which
+ is still useful for displaying a bare model
+ =================
+ */
++// Boot-speed: parse-phase timer (logs [parse-time] via D3_ParseTimeLog)
++extern "C" void D3_ParseTimeLog(const char*, int);
++namespace { struct D3ParseTimer { const char* n; unsigned int t0; D3ParseTimer(const char* nm):n(nm),t0(Sys_Milliseconds()){} ~D3ParseTimer(){ D3_ParseTimeLog(n,(int)(Sys_Milliseconds()-t0)); } }; }
++
+ bool idRenderWorldLocal::InitFromMap( const char *name ) {
++	D3ParseTimer _pt("InitFromMap(.proc)");
+ 	idLexer *		src;
+ 	idToken			token;
+ 	idStr			filename;
 diff --git a/neo/renderer/VertexCache.cpp b/neo/renderer/VertexCache.cpp
 index ec0184e..2cfe895 100644
 --- a/neo/renderer/VertexCache.cpp
@@ -7472,7 +7926,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..78e8901 100644
+index c83ebb5..3ae3b2a 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -7498,7 +7952,7 @@ index c83ebb5..78e8901 100644
  
  /*
  
-@@ -38,6 +50,943 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,954 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -7677,6 +8131,17 @@ index c83ebb5..78e8901 100644
 +    // classic specular LUT (zero below N·H 0.75) with analytic pow(N·H,10),
 +    // which is most of its visible floor/wall sheen.
 +    float    g_capBfgSpec = 1.0f;
++}
++
++// Boot-speed: route a labelled millisecond timing to the browser console
++// (stdout/Printf do NOT reach it under emscripten; only EM_ASM does). Used by
++// the parse-phase timers in RenderWorld_load / CollisionModel_load / MapFile.
++extern "C" void D3_ParseTimeLog(const char* name, int ms) {
++#ifdef __EMSCRIPTEN__
++    EM_ASM_({ console.info("[parse-time] " + UTF8ToString($0) + " = " + $1 + "ms"); }, name, ms);
++#else
++    (void)name; (void)ms;
++#endif
 +}
 +
 +// Iter 17: stash a decoded cinematic frame (called from
@@ -8442,7 +8907,7 @@ index c83ebb5..78e8901 100644
  
  /*
  =================
-@@ -49,6 +998,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +1009,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -8458,7 +8923,7 @@ index c83ebb5..78e8901 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +1036,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +1047,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -8474,7 +8939,7 @@ index c83ebb5..78e8901 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1083,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1094,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -8491,7 +8956,7 @@ index c83ebb5..78e8901 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1143,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1154,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -8499,7 +8964,7 @@ index c83ebb5..78e8901 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1370,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1381,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -8512,7 +8977,7 @@ index c83ebb5..78e8901 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1539,72 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1550,72 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
