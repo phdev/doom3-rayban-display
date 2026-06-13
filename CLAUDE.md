@@ -1539,6 +1539,27 @@ the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
 MEASURE before declaring iPhone-safe) and before the new native
 side-by-side.
 
+**Iter 60 — md5anim float decimation + machinegun-only loadout: boot
+26.3→19.0MB (2026-06-13).** (1) ANIM DECIMATION: `--decimate-anims`
+truncates every joint float in .md5anim to 3 decimals (strip trailing
+zeros so short floats never grow). CHOSE THIS OVER FRAME-DROPPING after
+measuring: float-trunc 3dec = 44% smaller vs frame-halve 39%, AND it's
+SAFE — frame count unchanged so .def frame-commands (weapon-fire/footstep
+timing) stay aligned, and idMD5Anim clamps the recovered quaternion w
+(w = max(0, 1-x²-y²-z²)) so truncation can't NaN. 0.001 joint precision
+is imperceptible. 399 anims, -12.3MB raw. Verified: imp/player/flashlight
+animate smoothly, no joint breakage, det path unaffected. (2) MACHINEGUN-
+ONLY LOADOUT: cut every weapon except machinegun (assault rifle) +
+flashlight + fists (out-of-ammo fallback) + pda (objectives). --cut-defs
+the rest (pistol/shotgun/chaingun/handgrenade/plasmagun/rocket/bfg/
+soulcube/chainsaw) + --cut-map-entities removes their map PICKUPS (else
+box-on-grab). Verified: player spawns holding the MACHINEGUN (the iter-43
+armSpawnLoadout give + the cut grenade leaves no box), flashlight toggles,
+no crash. BFG cut despite char_campbell_bfg's bfgcase (minor cosmetic risk
+deep in the level; user wanted all weapons gone). RESULT: default boot
+26.3→19.0MB, total 34→26.4MB. Note: cut weapons given via console still
+box (asset gone) but are unreachable in normal play.
+
 **Iter 59 — 96px default + JPEG the GUI panels + cut unused weapons:
 -9.4MB (2026-06-13).** Three size cuts in one pass. (1) DEFAULT TIER
 96px (was 128): shrinks the streamed world textures (stream 12.9→7.7MB)

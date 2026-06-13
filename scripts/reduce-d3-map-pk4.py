@@ -292,6 +292,15 @@ def main(argv=None):
                         help="comma-list of path substrings; drop any kept file whose path "
                              "contains one (e.g. 'md5/cinematics' to drop the fast-forwarded "
                              "intro cutscene's animations). Applied AFTER the closure.")
+    parser.add_argument("--decimate-anims", action="store_true",
+                        help="shrink .md5anim by truncating joint floats to fewer decimals "
+                             "(default 3 → ~44%% smaller). SAFE: frame count is unchanged so "
+                             ".def frame-commands (weapon-fire/footstep timing) stay aligned, and "
+                             "idMD5Anim clamps the recovered quaternion w so no NaN. 0.001 joint "
+                             "precision is imperceptible. Beats frame-dropping (39%%) AND avoids "
+                             "its timing-misalignment risk.")
+    parser.add_argument("--anim-decimals", type=int, default=3,
+                        help="decimal places to keep for --decimate-anims (default 3).")
     parser.add_argument("--strip-proc-shadows", action="store_true",
                         help="strip the precomputed shadowModel blocks from the .proc "
                              "(63%% of enpro.proc, 17.9MB raw / 3.8MB compressed). The "
@@ -772,6 +781,21 @@ def main(argv=None):
                     out.append(text[i]); i += 1
             return "".join(out).encode("latin-1"), removed
 
+        _float_re = re.compile(rb"-?\d+\.\d+")
+        def _trunc(m):
+            v = f"{float(m.group(0)):.{args.anim_decimals}f}"
+            # strip trailing zeros so short floats never GROW ("1.000"->"1",
+            # "-0.120"->"-0.12"); result is always <= the original length.
+            if "." in v:
+                v = v.rstrip("0").rstrip(".")
+            return v.encode("latin-1")
+        def decimate_anim(data):
+            """Truncate every joint float in a .md5anim to anim-decimals places.
+            Integers (numFrames/numJoints/frameRate/hierarchy indices) have no
+            decimal point so the regex leaves them untouched."""
+            return _float_re.sub(_trunc, data)
+
+        anim_decimated = [0, 0]  # [count, bytes_saved]
         map_ents_removed = [0]
         proc_shadow_removed = [0]
         nonlocal_kept = [0]
@@ -789,6 +813,11 @@ def main(argv=None):
                 if name.endswith(".map"):
                     data, r = filter_map_entities(data)
                     map_ents_removed[0] += r
+                if args.decimate_anims and name.endswith(".md5anim"):
+                    d2 = decimate_anim(data)
+                    anim_decimated[0] += 1
+                    anim_decimated[1] += len(data) - len(d2)
+                    data = d2
                 name, data = maybe_jpeg(data, name)
                 emit(name, data)
             for out_name, src_name in sorted(dds_convert.items()):
@@ -821,6 +850,9 @@ def main(argv=None):
         if cut_subs:
             print(f"  CUT-DEFS: skipped {len(cut_hits)} defs ({args.cut_defs}); "
                   f"removed {map_ents_removed[0]} map entities", file=sys.stderr)
+        if args.decimate_anims:
+            print(f"  DECIMATE-ANIMS: {anim_decimated[0]} md5anim, saved "
+                  f"{anim_decimated[1]/1e6:.1f} MB (uncompressed)", file=sys.stderr)
         for top, size in sorted(by_dir.items(), key=lambda kv: -kv[1]):
             print(f"  {top:<14} {size/1e6:8.1f} MB (uncompressed)", file=sys.stderr)
     finally:
