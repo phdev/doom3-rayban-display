@@ -1539,6 +1539,27 @@ the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
 MEASURE before declaring iPhone-safe) and before the new native
 side-by-side.
 
+**Iter 59 — 96px default + JPEG the GUI panels + cut unused weapons:
+-9.4MB (2026-06-13).** Three size cuts in one pass. (1) DEFAULT TIER
+96px (was 128): shrinks the streamed world textures (stream 12.9→7.7MB)
+and the boot world/UI. ?hd stays 256 (the quality option), base/
+(?nostream) also 96. Fonts EXCLUDED from downsizing (glyph crispness).
+(2) JPEG THE GUI PANELS: the boot UI was 6.26MB of guis/ — almost the
+whole kept-texture budget (DOOM 3's in-world wall monitors/screens +
+HUD). maybe_jpeg's guis/ exclusion removed so opaque GUI panels JPEG;
+the used-alpha check keeps HUD icons/overlays (transparency) as TGA, so
+HUD readability holds (verified: health/ammo/location/on-gun ammo all
+legible at 96px+JPEG). (3) CUT UNUSED WEAPONS: enpro has pickups for
+pistol/grenade/chaingun/machinegun/shotgun/plasma (+fists) — so only
+rocketlauncher, chainsaw, soulcube are unreachable + safe to cut
+(--cut-defs). BFG NOT cut: char_campbell_bfg's bfgcase prop may use the
+bfg world model. Weapons load on equip (not precached fatally), so a
+cut weapon given via console boxes but never crashes; unreachable in
+normal play. RESULT: default boot 30.5→26.3MB, stream 12.9→7.7MB, total
+43.4→34.0MB; verified gameplay reached, HUD readable, kept weapons work,
+zero errors. Build recipe: --max-texture 96 (default) / 256 (?hd),
+--jpeg-textures now also JPEGs opaque guis.
+
 **Iter 58 — content cut: wraith + sentry drone (and the progression
 trap that blocked the rest) (2026-06-13).** User wanted enpro enemies
 cut to just imp + zombie + the sentry "drone". Built reducer tooling:

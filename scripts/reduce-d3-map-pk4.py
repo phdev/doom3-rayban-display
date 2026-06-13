@@ -213,6 +213,10 @@ def downsize_image(data, name, max_dim):
     ext = name[name.rfind("."):].lower() if "." in name else ""
     if ext not in _IMG_RESIZE_EXTS:
         return data
+    # Keep font glyph sheets at native resolution (text crispness) even when
+    # --max-texture lowers everything else.
+    if name.lower().startswith("fonts/"):
+        return data
     try:
         from PIL import Image
     except ImportError:
@@ -643,7 +647,11 @@ def main(argv=None):
             if not args.jpeg_textures or not name.endswith(".tga"):
                 return name, data
             b = name.lower()
-            if b.startswith(("guis/", "fonts/")):
+            # Fonts stay lossless (glyph crispness). GUI panels (wall screens,
+            # photos, backplates) are the boot UI's bulk (~6MB) and are mostly
+            # opaque images — JPEG them; the used-alpha check below keeps HUD
+            # icons/overlays (transparency) as TGA.
+            if b.startswith("fonts/"):
                 return name, data
             # normal/height/bump maps — lossless only
             stem = strip_ext(b)
