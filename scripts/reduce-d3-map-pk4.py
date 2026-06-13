@@ -267,6 +267,13 @@ def main(argv=None):
                              "many pixels (power-of-two recommended, e.g. 256; 0=keep full size). "
                              "Shrinks the pak, its in-memory copy, and decode memory for low-end "
                              "targets like a phone or the wearable display.")
+    parser.add_argument("--jpeg-textures", action="store_true",
+                        help="re-encode COLOR textures (diffuse/specular/sky, no alpha) as JPEG, "
+                             "dropping the .tga. idTech4's R_LoadImage falls back from a missing "
+                             ".tga to the same-named .jpg, so material refs need no rewrite. Normal/"
+                             "height maps, alpha textures, and HUD/font art stay lossless TGA.")
+    parser.add_argument("--jpeg-quality", type=int, default=85,
+                        help="JPEG quality for --jpeg-textures (default 85).")
     args = parser.parse_args(argv)
 
     input_paths = resolve_inputs(args.input)
@@ -580,6 +587,56 @@ def main(argv=None):
             img.save(buf, format="TGA")
             return buf.getvalue()
 
+        jpeg_stats = [0, 0]  # [count recoded, bytes saved]
+
+        def maybe_jpeg(data, name):
+            """Re-encode a COLOR texture as JPEG when --jpeg-textures is set.
+            Returns (out_name, out_data). Leaves the input untouched (same name)
+            for anything that must stay lossless: normal/height/bump maps (JPEG
+            ringing corrupts surface normals), images with a USED alpha channel
+            (JPEG has none; dhewm3 reads no PNG), and HUD/font art (crispness).
+            idTech4's R_LoadImage tries <name>.tga then falls back to <name>.jpg,
+            so dropping the .tga and writing .jpg needs no material rewrite."""
+            if not args.jpeg_textures or not name.endswith(".tga"):
+                return name, data
+            b = name.lower()
+            if b.startswith(("guis/", "fonts/")):
+                return name, data
+            # normal/height/bump maps — lossless only
+            stem = strip_ext(b)
+            if stem.endswith(("_local", "_h", "_bump", "_n", "_nm", "_normal", "_bmp")) \
+               or "local" in b:
+                return name, data
+            try:
+                from PIL import Image
+                im = Image.open(io.BytesIO(data)); im.load()
+            except Exception:
+                return name, data
+            # used alpha? keep lossless
+            if im.mode in ("RGBA", "LA", "PA") or (im.mode == "P" and "transparency" in im.info):
+                a = im.convert("RGBA").getchannel("A").getextrema()
+                if a[0] < 255:
+                    return name, data
+            # secondary normal-map guard: bluish, high-B images are normals even
+            # if mis-named (DXT5nm-style); skip JPEG to be safe.
+            rgb = im.convert("RGB")
+            ex = rgb.getextrema()
+            try:
+                from PIL import ImageStat
+                mean = ImageStat.Stat(rgb).mean
+                if mean[2] > 170 and mean[2] > mean[0] + 25 and mean[2] > mean[1] + 25:
+                    return name, data
+            except Exception:
+                pass
+            buf = io.BytesIO()
+            rgb.save(buf, format="JPEG", quality=args.jpeg_quality, optimize=True)
+            jb = buf.getvalue()
+            if len(jb) >= len(data):
+                return name, data
+            jpeg_stats[0] += 1
+            jpeg_stats[1] += len(data) - len(jb)
+            return name[:-4] + ".jpg", jb
+
         # 4. Write the reduced archive (downsampling audio on the way out).
         output_path.parent.mkdir(parents=True, exist_ok=True)
         kept_bytes = 0
@@ -592,6 +649,7 @@ def main(argv=None):
                     data = downsample_wav(data, args.audio_rate, args.audio_width)
                 elif args.max_texture:
                     data = downsize_image(data, name, args.max_texture)
+                name, data = maybe_jpeg(data, name)
                 out.writestr(name, data)
                 kept_bytes += len(data)
                 top = name.split("/", 1)[0] if "/" in name else "(root)"
@@ -603,10 +661,14 @@ def main(argv=None):
                 except Exception as e:
                     print(f"  dds convert FAILED for {src_name}: {e}", file=sys.stderr)
                     continue
+                out_name, data = maybe_jpeg(data, out_name)
                 out.writestr(out_name, data)
                 kept_bytes += len(data)
                 top = out_name.split("/", 1)[0] if "/" in out_name else "(root)"
                 by_dir[top] = by_dir.get(top, 0) + len(data)
+        if args.jpeg_textures:
+            print(f"  JPEG: recoded {jpeg_stats[0]} color textures, saved "
+                  f"{jpeg_stats[1]/1e6:.1f} MB (uncompressed)", file=sys.stderr)
         for top, size in sorted(by_dir.items(), key=lambda kv: -kv[1]):
             print(f"  {top:<14} {size/1e6:8.1f} MB (uncompressed)", file=sys.stderr)
     finally:

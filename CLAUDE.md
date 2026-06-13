@@ -1003,7 +1003,9 @@ Missing 'WEAPON_NETFIRING' field in script object 'weapon_fists'"
 shows the demo-quad checker (zero records). ALWAYS include all 9 paks
 in the reducer input.** Shipping the 256 pak = user product call
 (cellular download cost); rebuild recipe: reduce from /tmp/d3gog/base
-(9 paks) --max-texture 256 --no-audio, then scripts/chunk-pk4.py.
+(9 paks) --max-texture 256 --no-audio **--jpeg-textures** (iter 54:
+-22%/-29% via JPEG color textures), then scripts/chunk-pk4.py, then
+`rm` stale chunks beyond the new count before force-adding.
 
 **Iter 21 — capture-gate fix, repeat-aware light sampler, X360 hunt
 notes (2026-06-10).** (1) REAL BUG FIXED: draw_arb2.cpp's capture-gate
@@ -1536,6 +1538,49 @@ the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
 — delta-upload covers the static shadow verts, expected fine, but
 MEASURE before declaring iPhone-safe) and before the new native
 side-by-side.
+
+**Iter 54 — JPEG texture compression + progressive-load scoping
+(2026-06-13).** User asked: load the level in <5MB with assets
+streaming progressively up to ~20MB. PHASE 2 (texture compression,
+SHIPPED): `--jpeg-textures` in reduce-d3-map-pk4.py re-encodes COLOR
+textures (diffuse/specular/sky, no alpha) as JPEG and drops the .tga
+— idTech4's R_LoadImage (Image_files.cpp:860-866) tries `<name>.tga`
+then falls back to `<name>.jpg`, so NO material rewrite is needed.
+Guards keep lossless: normal/height/bump maps (`_local`/`_h`/etc.;
+JPEG ringing corrupts surface normals), USED-alpha textures (JPEG has
+no alpha + dhewm3 reads no PNG), HUD/font art, and a bluish-mean
+normal-map heuristic for mis-named normals. 1002 textures recoded.
+RESULT: 128-tier pak 60.6→47MB (-22%), 256-tier 109→77MB (-29%);
+zero missing-image warnings, spawn renders clean (q85 visually
+lossless at 128/256px). THE STRUCTURAL FLOOR (the key finding,
+measured): the pak does NOT compress below ~28MB because that much is
+NON-texture and loads at MAP SPAWN — enpro.proc 6.0 (world render
+geometry) + .cm 3.3 (collision) + .map 1.1 + .aas48 0.7 + **11.3MB of
+md5anim (animations)** + 2.8MB md5mesh + decls 2.0. So <5MB boot and
+20MB total are NOT reachable by texture work alone — they need
+animation deferral + portal-area geometry streaming (deep engine
+work). VALIDATED PHASE-1 STREAMING PLAN (designed via a 3-agent
+mechanics workflow, not yet built; image_preload 0 + stream textures
+as loose FS files + reload-on-arrival): (1) the BUG that makes
+streaming hard — with image_preload 0 an image loads lazily on first
+Bind (Image_load.cpp:1818); a missing file → MakeDefault sets a VALID
+texnum + defaulted=true (Image_init.cpp:261,313) → PERMANENTLY stuck
+(Bind/EndLevelLoad only reload when texnum==TEXTURE_NOT_LOADED). (2)
+FIX: `R_ReloadStreamedImages_f` (model R_ReloadImages_f Image_init.cpp:
+1086, register at :2014) iterates globalImages->images, and for each
+`defaulted && generatorFunction==NULL && !isPartialImage`: clears
+defaulted, calls `image->Reload(false,true)` (force=true bypasses the
+flaky WASM-zip timestamp gate; PurgeImage→ActuallyLoadImage→
+GenerateImage→D3_WebGPU_CacheImage re-caches real pixels). (3) MANDATORY
+WebGPU invalidation — texCache (RenderBackend_WebGPU.cpp:1705) + matCache
+(1820) + lastMatGroups (4061) short-circuit by idImage*/tuple and never
+re-read; a `D3_WebGPU_InvalidateImageCaches()` shim must release+clear
+them (they lazily rebuild next frame). (4) export D3_ReloadStreamedImages
+via d3_wearable.cpp (buffer `reloadStreamedImages\n`, don't call renderer
+reentrantly) + CMakeLists:573 + d3Runtime.js:432; JS calls it once per
+arriving texture batch. Boot payoff capped at ~18MB (the deferrable
+textures) by the structural floor; the mechanism is the reusable
+foundation that anim/geometry streaming would later plug into.
 
 **Iter 53 — the imp FIREBALL never showed: particles (.prt) never
 shipped (2026-06-13).** User: "the imp's fireball particle doesn't
