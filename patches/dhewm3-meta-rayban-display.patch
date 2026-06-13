@@ -729,6 +729,36 @@ index 7edeb4d..adae33e 100644
  	if ( !backgroundThread.threadHandle ) {
  		Sys_CreateThread( BackgroundDownloadThread, &backgroundThread_exit, backgroundThread, "backgroundDownload" );
  	} else {
+diff --git a/neo/framework/Session.cpp b/neo/framework/Session.cpp
+index 29745c6..575c044 100644
+--- a/neo/framework/Session.cpp
++++ b/neo/framework/Session.cpp
+@@ -126,6 +126,12 @@ static void Session_Map_f( const idCmdArgs &args ) {
+ 	// handle addon packs through reloadEngine
+ 	sprintf( string, "maps/%s.map", map.c_str() );
+ 	ff = fileSystem->FindFile( string, true );
++	if ( ff == FIND_NO ) {
++		// Boot-speed: a binary entities cache (.bmap) may ship in place of the
++		// ASCII .map (the geometry parse is baked to .bcm/.bmap/.bproc).
++		sprintf( string, "maps/%s.bmap", map.c_str() );
++		ff = fileSystem->FindFile( string, true );
++	}
+ 	switch ( ff ) {
+ 	case FIND_NO:
+ 		common->Printf( "Can't find map %s\n", string.c_str() );
+@@ -167,6 +173,12 @@ static void Session_DevMap_f( const idCmdArgs &args ) {
+ 	// handle addon packs through reloadEngine
+ 	sprintf( string, "maps/%s.map", map.c_str() );
+ 	ff = fileSystem->FindFile( string, true );
++	if ( ff == FIND_NO ) {
++		// Boot-speed: a binary entities cache (.bmap) may ship in place of the
++		// ASCII .map (the geometry parse is baked to .bcm/.bmap/.bproc).
++		sprintf( string, "maps/%s.bmap", map.c_str() );
++		ff = fileSystem->FindFile( string, true );
++	}
+ 	switch ( ff ) {
+ 	case FIND_NO:
+ 		common->Printf( "Can't find map %s\n", string.c_str() );
 diff --git a/neo/framework/UsercmdGen.cpp b/neo/framework/UsercmdGen.cpp
 index 6bba28f..9f732b9 100644
 --- a/neo/framework/UsercmdGen.cpp
@@ -1697,7 +1727,7 @@ index a4883b5..095506b 100644
  extern idCVar	r_aspectRatio;
  
 diff --git a/neo/idlib/MapFile.cpp b/neo/idlib/MapFile.cpp
-index afbfa1d..ce9a344 100644
+index afbfa1d..cf83f9d 100644
 --- a/neo/idlib/MapFile.cpp
 +++ b/neo/idlib/MapFile.cpp
 @@ -716,7 +716,21 @@ unsigned int idMapEntity::GetGeometryCRC( void ) const {
@@ -1722,7 +1752,7 @@ index afbfa1d..ce9a344 100644
  	// no string concatenation for epairs and allow path names for materials
  	idLexer src( LEXFL_NOSTRINGCONCAT | LEXFL_NOSTRINGESCAPECHARS | LEXFL_ALLOWPATHNAMES );
  	idToken token;
-@@ -821,6 +835,86 @@ bool idMapFile::Parse( const char *filename, bool ignoreRegion, bool osPath ) {
+@@ -821,6 +835,93 @@ bool idMapFile::Parse( const char *filename, bool ignoreRegion, bool osPath ) {
  	}
  
  	hasPrimitiveData = true;
@@ -1751,8 +1781,12 @@ index afbfa1d..ce9a344 100644
 +#define BMAP_MAGIC		(('B'<<0)|('M'<<8)|('A'<<16)|('P'<<24))
 +#define BMAP_VERSION	1
 +
-+void idMapFile::WriteBinaryMapFile( const char *filename ) const {
-+	idStr qpath = filename;
++void idMapFile::WriteBinaryMapFile( const char * ) const {
++	// Derive the path from the (already once-stripped) map name so it matches
++	// the .bcm/.bproc convention — e.g. "maps/game/enpro.bmap", not
++	// "...enpro.map.bmap" (this map's name carries a .map suffix and the game
++	// calls Parse(name + ".map"), giving a doubled extension on the raw arg).
++	idStr qpath = name;
 +	qpath.SetFileExtension( "bmap" );
 +	idFile *fp = idLib::fileSystem->OpenFileWrite( qpath, "fs_devpath" );
 +	if ( !fp ) {
@@ -1771,7 +1805,10 @@ index afbfa1d..ce9a344 100644
 +}
 +
 +bool idMapFile::LoadBinaryMapFile( const char *filename ) {
++	// Match WriteBinaryMapFile's path: strip the arg once (= GetName()) then set
++	// the extension, so "maps/game/enpro.map.map" -> "maps/game/enpro.bmap".
 +	idStr qpath = filename;
++	qpath.StripFileExtension();
 +	qpath.SetFileExtension( "bmap" );
 +	idFile *fp = idLib::fileSystem->OpenFileRead( qpath );
 +	if ( !fp ) {
@@ -7296,7 +7333,7 @@ index 2f77916..63f0485 100644
  	generateAllInteractionsCalled = false;
  
 diff --git a/neo/renderer/RenderWorld_load.cpp b/neo/renderer/RenderWorld_load.cpp
-index 33cbbe0..17087b3 100644
+index 33cbbe0..11dc8c7 100644
 --- a/neo/renderer/RenderWorld_load.cpp
 +++ b/neo/renderer/RenderWorld_load.cpp
 @@ -179,6 +179,13 @@ idRenderModel *idRenderWorldLocal::ParseModel( idLexer *src ) {
@@ -7313,7 +7350,7 @@ index 33cbbe0..17087b3 100644
  	model->FinishSurfaces();
  
  	return model;
-@@ -370,6 +377,224 @@ void idRenderWorldLocal::ParseNodes( idLexer *src ) {
+@@ -370,6 +377,225 @@ void idRenderWorldLocal::ParseNodes( idLexer *src ) {
  	src->ExpectTokenString( "}" );
  }
  
@@ -7329,6 +7366,7 @@ index 33cbbe0..17087b3 100644
 +
 +===============================================================================
 +*/
++extern "C" void D3_ParseTimeLog(const char*, int);
 +#define BPROC_MAGIC			(('B'<<0)|('P'<<8)|('R'<<16)|('C'<<24))
 +#define BPROC_VERSION		1
 +#define BPROC_TAG_END		0
@@ -7538,7 +7576,7 @@ index 33cbbe0..17087b3 100644
  /*
  ================
  idRenderWorldLocal::CommonChildrenArea_r
-@@ -477,7 +702,12 @@ A NULL or empty name will make a world without a map model, which
+@@ -477,7 +703,12 @@ A NULL or empty name will make a world without a map model, which
  is still useful for displaying a bare model
  =================
  */
@@ -7551,7 +7589,7 @@ index 33cbbe0..17087b3 100644
  	idLexer *		src;
  	idToken			token;
  	idStr			filename;
-@@ -518,6 +748,23 @@ bool idRenderWorldLocal::InitFromMap( const char *name ) {
+@@ -518,6 +749,23 @@ bool idRenderWorldLocal::InitFromMap( const char *name ) {
  
  	FreeWorld();
  
@@ -7575,7 +7613,7 @@ index 33cbbe0..17087b3 100644
  	src = new idLexer( filename, LEXFL_NOSTRINGCONCAT | LEXFL_NODOLLARPRECOMPILE );
  	if ( !src->IsLoaded() ) {
  		common->Printf( "idRenderWorldLocal::InitFromMap: %s not found\n", filename.c_str() );
-@@ -529,6 +776,22 @@ bool idRenderWorldLocal::InitFromMap( const char *name ) {
+@@ -529,6 +777,22 @@ bool idRenderWorldLocal::InitFromMap( const char *name ) {
  	mapName = name;
  	mapTimeStamp = currentTimeStamp;
  
@@ -7598,7 +7636,7 @@ index 33cbbe0..17087b3 100644
  	// if we are writing a demo, archive the load command
  	if ( session->writeDemo ) {
  		WriteLoadMap();
-@@ -565,16 +828,29 @@ bool idRenderWorldLocal::InitFromMap( const char *name ) {
+@@ -565,16 +829,29 @@ bool idRenderWorldLocal::InitFromMap( const char *name ) {
  
  			// save it in the list to free when clearing this map
  			localModels.Append( lastModel );
@@ -7628,7 +7666,7 @@ index 33cbbe0..17087b3 100644
  			continue;
  		}
  
-@@ -583,6 +859,14 @@ bool idRenderWorldLocal::InitFromMap( const char *name ) {
+@@ -583,6 +860,14 @@ bool idRenderWorldLocal::InitFromMap( const char *name ) {
  
  	delete src;
  
@@ -7643,7 +7681,7 @@ index 33cbbe0..17087b3 100644
  	// if it was a trivial map without any areas, create a single area
  	if ( !numPortalAreas ) {
  		ClearWorld();
-@@ -594,6 +878,7 @@ bool idRenderWorldLocal::InitFromMap( const char *name ) {
+@@ -594,6 +879,7 @@ bool idRenderWorldLocal::InitFromMap( const char *name ) {
  	AddWorldModelEntities();
  	ClearPortalStates();
  
