@@ -1537,6 +1537,45 @@ the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
 MEASURE before declaring iPhone-safe) and before the new native
 side-by-side.
 
+**Iter 51 — THE GRAY-PLANES ARTIFACT: fog frustum tris vs partial
+depth prepass (2026-06-13). ALSO closes the +25% dim-cell issue.**
+The user's "missing ceiling" iPhone shot (IMG_2522, pitched up at
+-697 3974 -156 yaw~150) was REAL after all — but inverted: WebGPU
+painted flat gray-green polygons where GL/native render black.
+HUNT: matched the framing locally (gray planes reproduce with the
+FRESH pak) → GL echo A/B showed GL black = WebGPU-only artifact →
+-899 (planes survive = not pass records) → prefix sweep: planes
+appear with ONLY light[0] drawn = fogs/basicfog (color 0.14,0.18,
+0.15 — matches the planes' tint) → fog textures resolve (no
+FALLBACK lines) + sampler is ClampToEdge → source read found it.
+ROOT CAUSE: vanilla RB_FogPass ends by drawing the fog light's
+FRUSTUM BOUNDING TRIS (back-side culled, GL_LESS) to fog the void —
+correct only against a depth buffer containing EVERY opaque surface
+(GL's full depth-fill). Our prepass writes depth ONLY for captured
+interaction surfaces, so UNLIT pixels keep far-plane depth and the
+fog box's flat faces pass the depth test and paint solid fog color
+there (unlit ceiling = flat gray planes). The same leak washed a
+fog pedestal over the whole scene (near faces / un-gated stacking)
+— measured at the level-pitch vantage: upper-half mean 10.19 →
+7.20, median 2.7 → 0.0, frac<8 59.7% → 83.9% vs NATIVE 5.0/0.0/85%
+— the long-open "+25% flat dim-cell overbrightness vs GL echo" was
+THIS, now closed. FIX (interim, capture-side): RB_T_BasicFog skips
+capturing `surf->geo == backEnd.vLight->frustumTris` — replaying
+frustum tris is wrong-by-construction until the prepass covers all
+opaque surfaces; the only loss is fog against the void (rare
+indoors). Det rounds 6/6 IDENTICAL. THE PROPER FOLLOW-UP (also
+unlocks min-ambient): capture RB_T_FillDepthBuffer surfaces into
+depth-only records so the prepass covers ALL opaque geometry, then
+split fog into vanilla's two modes (chain = depth Equal; frustum =
+Less + back-cull). LAW: any vanilla pass that relies on the FULL
+depth buffer (fog frustum, blend-light frustum?, future
+stencil-against-depth tricks) is unsafe to replay against our
+partial interaction-only prepass — audit depth assumptions when
+porting a pass. Diag UI note from this hunt: the #posLine chip is
+hidden behind the diag box when the diag is open (user screenshots
+carried no pos) — read pos from the diag stats line instead, or fix
+the chip z/position.
+
 **Iter 50c — NATIVE GROUND TRUTH closes the ceiling report
 (2026-06-12).** User pushed back twice with native Mac screenshots
 ("definitely a ceiling there") — both pitched UP with the flashlight

@@ -6826,7 +6826,7 @@ index c1d0d3e..99a7f6b 100644
  ==================
  R_ReloadARBPrograms_f
 diff --git a/neo/renderer/draw_common.cpp b/neo/renderer/draw_common.cpp
-index 0cabbfd..5fc5996 100644
+index 0cabbfd..5c5b417 100644
 --- a/neo/renderer/draw_common.cpp
 +++ b/neo/renderer/draw_common.cpp
 @@ -30,10 +30,29 @@ If you have questions concerning this license or the applicable additional terms
@@ -6965,13 +6965,22 @@ index 0cabbfd..5fc5996 100644
  
  		if ( stage->texture.hasMatrix ) {
  			RB_LoadShaderTextureMatrix( regs, &stage->texture );
-@@ -1700,6 +1765,19 @@ local[0] = local[1] = local[2] = 0; local[3] = 0.5;
+@@ -1700,6 +1765,28 @@ local[0] = local[1] = local[2] = 0; local[3] = 0.5;
  		qglTexGenfv( GL_S, GL_OBJECT_PLANE, local.ToFloatPtr() );
  	}
  
 +	// Iter 12b (WebGPU echo): capture this fog surface with freshly
 +	// localized planes (the GL block above only refreshes on space change).
-+	{
++	// Iter 51: do NOT capture the fog light's frustum bounding triangles.
++	// Vanilla draws them back-side-culled with GL_LESS against a depth
++	// buffer that contains EVERY opaque surface (full depth-fill pass);
++	// our WebGPU prepass only writes depth for captured interaction
++	// surfaces, so unlit pixels keep far-plane depth and the frustum's
++	// flat box faces paint solid fog-color polygons there (the "gray
++	// planes over the unlit ceiling" artifact). Until the prepass covers
++	// all opaque surfaces, replaying the frustum tris is wrong-by-
++	// construction; skipping them only loses fog against the void.
++	if ( surf->geo != backEnd.vLight->frustumTris ) {
 +		idPlane s0, t1, s1;
 +		R_GlobalPlaneToLocal( surf->space->modelMatrix, fogPlanes[0], s0 );
 +		s0[3] += 0.5f;
@@ -6985,7 +6994,7 @@ index 0cabbfd..5fc5996 100644
  	RB_T_RenderTriangleSurface( surf );
  }
  
-@@ -1758,6 +1836,8 @@ static void RB_FogPass( const drawSurf_t *drawSurfs,  const drawSurf_t *drawSurf
+@@ -1758,6 +1845,8 @@ static void RB_FogPass( const drawSurf_t *drawSurfs,  const drawSurf_t *drawSurf
  	// texture 0 is the falloff image
  	GL_SelectTexture( 0 );
  	globalImages->fogImage->Bind();
@@ -6994,7 +7003,7 @@ index 0cabbfd..5fc5996 100644
  	//GL_Bind( tr.whiteImage );
  	qglDisableClientState( GL_TEXTURE_COORD_ARRAY );
  	qglEnable( GL_TEXTURE_GEN_S );
-@@ -1851,10 +1931,15 @@ void RB_STD_FogAllLights( void ) {
+@@ -1851,10 +1940,15 @@ void RB_STD_FogAllLights( void ) {
  			// units from the origin
  			backEnd.currentScissor = vLight->scissorRect;
  			if ( r_useScissor.GetBool() ) {
@@ -7014,7 +7023,7 @@ index 0cabbfd..5fc5996 100644
  			}
  			qglClear( GL_STENCIL_BUFFER_BIT );
  
-@@ -1903,10 +1988,15 @@ void RB_STD_LightScale( void ) {
+@@ -1903,10 +1997,15 @@ void RB_STD_LightScale( void ) {
  
  	// the scissor may be smaller than the viewport for subviews
  	if ( r_useScissor.GetBool() ) {
