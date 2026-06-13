@@ -16,12 +16,15 @@ const bustCache = (url) => `${url}${url.includes("?") ? "&" : "?"}v=${ENGINE_VER
 // on desktop). Both ship as same-origin 4MB chunk sets (GitHub release
 // assets send no CORS headers, so cross-origin hosting is a dead end).
 const HD_TIER = (typeof window !== "undefined") && /[?&]hd\b/.test(window.location.search);
-// Iter 55: progressive texture streaming. ?stream uses the deferred BOOT pak
-// (structural + HUD/light textures only, ~35MB) and streams the bulk world/
-// model textures (~13MB gzip) in after boot — they pop from gray _default to
-// real as each batch lands. Opt-in while it bakes; flip to default once
-// on-device-verified. base-stream/ holds the boot pak chunks + the .stream blob.
-const STREAM_TIER = (typeof window !== "undefined") && /[?&]stream\b/.test(window.location.search);
+// Iter 55/56: progressive texture streaming is now the DEFAULT. The deferred
+// BOOT pak (structural + HUD/light textures, ~35MB) loads first; the bulk world/
+// model textures (~13MB gzip) stream in after boot, popping from gray-lit to
+// real as each batch lands (the stream blob IndexedDB-caches, so repeat/cellular
+// visits don't re-fetch). ?nostream falls back to the monolithic 47MB pak;
+// ?hd uses the 256px monolith (no stream variant baked). base-stream/ holds the
+// boot pak chunks + the .stream blob + manifests.
+const NO_STREAM = (typeof window !== "undefined") && /[?&]nostream\b/.test(window.location.search);
+const STREAM_TIER = !HD_TIER && !NO_STREAM;
 const BUNDLED_PK4_PATH = STREAM_TIER
   ? "base-stream/pak-display.pk4"
   : (HD_TIER ? "base256/pak-display.pk4" : "base/pak-display.pk4");
@@ -1799,17 +1802,28 @@ async function streamDeferredTextures(module, log) {
     if (!files.length) return;
     log?.(`Streaming ${files.length} textures (${((manifest.compressedSize || 0) / 1e6).toFixed(1)} MB)...`);
 
-    // Download the gzip blob — prefer the chunked manifest (resumable + matches
-    // the pak delivery), fall back to a single fetch.
-    let gz;
-    try {
-      gz = await fetchChunkedBytes(
-        { manifestUrl: appendPathSuffix(STREAM_BLOB_URL, ".manifest.json") },
-        () => {}, log);
-    } catch {
-      const r = await fetch(STREAM_BLOB_URL, { cache: "force-cache" });
-      if (!r.ok) throw new Error(`stream blob fetch failed (${r.status})`);
-      gz = new Uint8Array(await r.arrayBuffer());
+    // Download the gzip blob — but reuse the IndexedDB cache first (keyed by
+    // URL, freshness by the manifest's compressedSize, mirroring the boot pak's
+    // totalSize check) so repeat/cellular visits don't re-fetch the 13MB.
+    let gz = null;
+    const cached = await readCachedUrlPk4(STREAM_BLOB_URL).catch(() => null);
+    if (cached && cached.byteLength === manifest.compressedSize) {
+      gz = cached;
+      log?.("Texture stream: using cached blob");
+    } else {
+      // prefer the chunked manifest (resumable + matches the pak delivery),
+      // fall back to a single fetch.
+      try {
+        gz = await fetchChunkedBytes(
+          { manifestUrl: appendPathSuffix(STREAM_BLOB_URL, ".manifest.json") },
+          () => {}, log);
+      } catch {
+        const r = await fetch(STREAM_BLOB_URL, { cache: "force-cache" });
+        if (!r.ok) throw new Error(`stream blob fetch failed (${r.status})`);
+        gz = new Uint8Array(await r.arrayBuffer());
+      }
+      saveCachedUrlPk4(STREAM_BLOB_URL, gz, { name: "texture stream blob" })
+        .catch(() => {}); // best-effort; streaming still works uncached
     }
 
     // Inflate the whole blob (manifest offsets are into the uncompressed bytes).

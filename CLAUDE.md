@@ -1539,6 +1539,24 @@ the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
 MEASURE before declaring iPhone-safe) and before the new native
 side-by-side.
 
+**Iter 56 — streaming is now DEFAULT + stream-blob IndexedDB cache
+(2026-06-13).** iter-55 ?stream verified on iPhone (user-confirmed),
+so productionized: (1) streaming is the DEFAULT boot (STREAM_TIER =
+!hd && !nostream) — `?nostream` falls back to the 47MB monolithic pak,
+`?hd` uses the 256px monolith (no stream variant baked). (2) The 13MB
+gzip stream blob now IndexedDB-caches (reuses storage.js
+saveCachedUrlPk4/readCachedUrlPk4, freshness by the manifest's
+compressedSize) so repeat/cellular visits don't re-fetch it — verified:
+2nd boot logs "Using cached bundled PK4" + "Texture stream: using
+cached blob". VERIFIED: default boots base-stream/ + streams + caches;
+?nostream boots the monolith with NO streaming + det 6/6 IDENTICAL.
+NOTE for tests/diagnostics: boot with `?nostream` for a stable,
+fully-textured frame (default now streams gray→real over the first
+seconds); the det self-test is self-contained per round so it holds
+either way. Monolithic base/ + base256/ stay committed as the
+?nostream / ?hd fallbacks. NEXT toward <5MB (still open): defer the
+11MB md5anim animations, then portal-area .proc geometry streaming.
+
 **Iter 55 — PROGRESSIVE TEXTURE STREAMING (?stream, 2026-06-13).**
 Phase 1 of the progressive-load request, built + verified on Mac Chrome
 (on-device is the open gate). `?stream` boots on a 35MB structural pak
