@@ -373,6 +373,30 @@ def main(argv=None):
                     # attaches to). Concatenate so the closure sees both.
                     defs[declname] = defs.get(declname, "") + "\n" + body
 
+        # 2b. Index particle (.prt) decls. The VISIBLE part of many effects —
+        # the imp fireball, rocket/projectile smoke trails, explosions — is a
+        # PARTICLE SYSTEM, not a model+material: a projectile def carries
+        # `"model" "impfireball2.prt"` / `"smoke_fly" "imp_trail2.prt"` /
+        # `"model_detonate" "imp_explosion.prt"`. Two reducer gaps made the
+        # whole class ship as NOTHING (iter 53):
+        #   (1) .prt is in MODEL_EXTS (a prunable binary), and step 2 only
+        #       PARSES .mtr/.def/.sndshd/.skin — so particle stage textures
+        #       (textures/particles/*) never entered the closure; AND
+        #   (2) the decl is referenced by NAME ("impfireball2.prt") but lives
+        #       in a differently-named FILE (particles/patrick2.prt), so the
+        #       binary-keep path's name match never fired and ZERO .prt shipped.
+        # Index every particle decl -> its stage assets, and -> the .prt FILE
+        # that must ship so the engine can load the decl at all.
+        particles = {}      # particle decl name -> set(stripped asset paths)
+        prt_file_of = {}    # particle decl name -> .prt entry to keep
+        for pname, (pzpath, poriginal) in entries.items():
+            if not pname.endswith(".prt"):
+                continue
+            for declname, body in iter_decl_blocks(pool.text(pzpath, poriginal)):
+                particles.setdefault(declname, set()).update(
+                    strip_ext(t) for t in asset_tokens(body))
+                prt_file_of.setdefault(declname, pname)
+
         # 3. Seed referenced tokens from the map files, then expand one level
         #    through the entityDefs the map instantiates, and resolve material
         #    names to their images.
@@ -432,6 +456,20 @@ def main(argv=None):
                     referenced.add(t)
                     if t in materials:
                         referenced |= materials[t]
+            # Iter 53: a referenced particle decl (nm may carry the ".prt"
+            # suffix from the projectile's "model"/"smoke_fly" keys) pulls in
+            # (a) the .prt FILE so the engine can load the decl, and (b) every
+            # stage's texture/material image — resolving material names through
+            # the materials index (e.g. textures/particles/barrelpoof_sort ->
+            # barrelpoof.tga). Without these the imp fireball is invisible.
+            for pkey in (nm, strip_ext(nm)):
+                if pkey in particles:
+                    if pkey in prt_file_of:
+                        keep.add(prt_file_of[pkey])
+                    for t in particles[pkey]:
+                        referenced.add(t)
+                        if t in materials:
+                            referenced |= materials[t]
 
         ref_stripped = {strip_ext(t) for t in referenced}
         # Iter 52: expand cubemap bases to their six side files (both the

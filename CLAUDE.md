@@ -1537,6 +1537,50 @@ the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
 MEASURE before declaring iPhone-safe) and before the new native
 side-by-side.
 
+**Iter 53 — the imp FIREBALL never showed: particles (.prt) never
+shipped (2026-06-13).** User: "the imp's fireball particle doesn't
+show." The visible fireball, its smoke trail, and the explosion are a
+PARTICLE SYSTEM, not a model+material — and the reducer shipped ZERO
+.prt files. TWO compounding gaps (a 5-agent-equivalent trace nailed
+both with file:line): (1) .prt was in MODEL_EXTS (a prunable binary),
+and step-2's decl indexer only parsed .mtr/.def/.sndshd/.skin — so
+particle stage textures (textures/particles/*) never entered the
+closure; (2) projectiles reference a particle by DECL name +".prt"
+(`"model" "impfireball2.prt"`, `"smoke_fly" "imp_trail2.prt"`,
+`"model_detonate" "imp_explosion.prt"`) but those decls physically
+live in DIFFERENTLY-NAMED files (particles/patrick2.prt,
+particles/monster_weapons.prt) — so even the binary-keep name match
+never fired. Net: no .prt + none of smokepuff/billow3_glow/fbeam/
+barrelpoof/rocketbacklit/boomboom* shipped; the only trace of a
+fireball in-game was the faint moving glow from lights/impflyflash
+(blanket-kept under lights/). FIX (reduce-d3-map-pk4.py): index every
+particle decl -> its stage assets AND -> the .prt FILE that holds it
+(step 2b scans all .prt entries); in the closure, a referenced
+particle token (with or without the .prt suffix — strip_ext handles
+it) keeps that .prt file + pulls each stage's image, resolving
+material names (textures/particles/barrelpoof_sort -> barrelpoof.tga)
+through the materials index. +1.1MB (14 .prt + ~30 particle textures).
+RESULT: boot/combat particle warnings -> ZERO; the fireball renders
+in WebGPU. VERIFICATION (hard-won): AI monsters wander out of frame
+and fast projectiles dodge burst-capture — `spawn projectile_impfireball`
+at timescale 0.02-0.15 spawns a near-stationary, continuously-emitting
+fireball; both #gameCanvas (GL echo) and #webgpuCanvas show the same
+bright additive orb (a compact sprite, not just diffuse wall glow =
+the particle billboard renders, confirming the iter-35 flare/deform
+vertex-cache path also carries particles). LAW: particles are a
+first-class asset class with the decl-name != file-name break — any
+`.prt` / `.fx` / `.skin` style "named decl lives in an arbitrary
+file" reference needs a decl->file index, not a name match.
+SENTRY BOT (same user report, RESOLVED BY iter 52): char_sentry_flashlight
+REQUIRES a skin (skin_flashlight_off/on); pre-iter-52 no .skin shipped
+-> defaulted skin -> black model, the SAME mechanism as the zombie.
+The iter-52 .skin fix already covered it (user confirmed "showing
+now"). Couldn't repro locally because the scripted bot isn't present
+at its map origin (-1540 3836 -351) at boot and console-`spawn
+char_sentry_flashlight` yields no visible model (empty inherited
+model def). Its body data (material block + all 10 TGAs) was always
+complete — the missing piece was the skin decl itself.
+
 **Iter 52 — black zombies + black skybox: the .skin decl gap +
 cubemap side expansion (2026-06-13).** Two user iPhone reports, one
 root family: the pak reducer never shipped SKIN DECLS or ENV
