@@ -274,6 +274,20 @@ def main(argv=None):
                              "height maps, alpha textures, and HUD/font art stay lossless TGA.")
     parser.add_argument("--jpeg-quality", type=int, default=85,
                         help="JPEG quality for --jpeg-textures (default 85).")
+    parser.add_argument("--cut-defs", default="",
+                        help="comma-list of substrings; any entityDef/model def whose name "
+                             "contains one is NOT expanded in the asset closure, so its unique "
+                             "models/anims/textures are dropped (e.g. 'maggot,wraith,lostsoul,"
+                             "sentry' to cut those enemies). The def TEXT still ships, so pair "
+                             "with --cut-map-entities to also remove their map instances (else "
+                             "they spawn as default box models).")
+    parser.add_argument("--cut-map-entities", action="store_true",
+                        help="with --cut-defs, also delete matching entity blocks from the .map "
+                             "so the cut enemies don't spawn at all (no box models).")
+    parser.add_argument("--drop-paths", default="",
+                        help="comma-list of path substrings; drop any kept file whose path "
+                             "contains one (e.g. 'md5/cinematics' to drop the fast-forwarded "
+                             "intro cutscene's animations). Applied AFTER the closure.")
     parser.add_argument("--strip-proc-shadows", action="store_true",
                         help="strip the precomputed shadowModel blocks from the .proc "
                              "(63%% of enpro.proc, 17.9MB raw / 3.8MB compressed). The "
@@ -446,13 +460,20 @@ def main(argv=None):
         # md5mesh + every md5anim. A single pass stops at the first hop and drops
         # character meshes/animations (the empty-defaulted model then fatally
         # fails a joint lookup at spawn), so walk the def graph to a fixpoint.
+        cut_subs = [c.strip().lower() for c in args.cut_defs.split(",") if c.strip()]
         worklist = list(seed_names)
         expanded = set()
+        cut_hits = set()
         while worklist:
             nm = worklist.pop()
             if nm in expanded:
                 continue
             expanded.add(nm)
+            # Cut: do NOT expand a cut def, so its unique model/anim/texture
+            # tokens never enter the closure and its assets are dropped.
+            if cut_subs and any(c in nm for c in cut_subs):
+                cut_hits.add(nm)
+                continue
             body = defs.get(nm)
             if body is None:
                 continue
@@ -586,6 +607,14 @@ def main(argv=None):
         if dds_convert:
             print(f"  converting {len(dds_convert)} DDS-only textures to TGA", file=sys.stderr)
 
+        # Drop kept files matching a --drop-paths substring (e.g. the skipped
+        # intro cinematic's anims). Applied after the closure so it overrides.
+        drop_subs = [d.strip().lower() for d in args.drop_paths.split(",") if d.strip()]
+        if drop_subs:
+            before = len(keep)
+            keep = {n for n in keep if not any(d in n.lower() for d in drop_subs)}
+            print(f"  DROP-PATHS: removed {before - len(keep)} files", file=sys.stderr)
+
         def convert_dds(data, out_name, max_dim):
             import io
             from PIL import Image
@@ -707,6 +736,35 @@ def main(argv=None):
                 removed += 1; i = j
             return "".join(out).encode("latin-1"), removed
 
+        def filter_map_entities(data):
+            """Remove top-level entity blocks whose classname matches a --cut-defs
+            substring, so cut enemies never spawn (no box models). Brace-counted
+            (entity bodies nest { } for brushes/patches). worldspawn is never a
+            monster classname so the world brushes are untouched."""
+            if not (cut_subs and args.cut_map_entities):
+                return data, 0
+            text = data.decode("latin-1", errors="replace")
+            n = len(text); i = 0; out = []; removed = 0
+            while i < n:
+                if text[i] == "{":
+                    depth = 1; j = i + 1
+                    while j < n and depth:
+                        if text[j] == "{": depth += 1
+                        elif text[j] == "}": depth -= 1
+                        j += 1
+                    block = text[i:j]
+                    m = re.search(r'"classname"\s+"([^"]+)"', block)
+                    cls = m.group(1).lower() if m else ""
+                    if cls and any(c in cls for c in cut_subs):
+                        removed += 1
+                    else:
+                        out.append(block)
+                    i = j
+                else:
+                    out.append(text[i]); i += 1
+            return "".join(out).encode("latin-1"), removed
+
+        map_ents_removed = [0]
         proc_shadow_removed = [0]
         nonlocal_kept = [0]
         with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as out:
@@ -720,6 +778,9 @@ def main(argv=None):
                 if args.strip_proc_shadows and name.endswith(".proc"):
                     data, r = strip_proc_shadows(data)
                     proc_shadow_removed[0] += r
+                if name.endswith(".map"):
+                    data, r = filter_map_entities(data)
+                    map_ents_removed[0] += r
                 name, data = maybe_jpeg(data, name)
                 emit(name, data)
             for out_name, src_name in sorted(dds_convert.items()):
@@ -749,6 +810,9 @@ def main(argv=None):
         if args.strip_proc_shadows:
             print(f"  PROC: stripped {proc_shadow_removed[0]} shadowModel blocks",
                   file=sys.stderr)
+        if cut_subs:
+            print(f"  CUT-DEFS: skipped {len(cut_hits)} defs ({args.cut_defs}); "
+                  f"removed {map_ents_removed[0]} map entities", file=sys.stderr)
         for top, size in sorted(by_dir.items(), key=lambda kv: -kv[1]):
             print(f"  {top:<14} {size/1e6:8.1f} MB (uncompressed)", file=sys.stderr)
     finally:

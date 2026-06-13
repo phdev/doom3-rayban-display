@@ -1539,6 +1539,35 @@ the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
 MEASURE before declaring iPhone-safe) and before the new native
 side-by-side.
 
+**Iter 58 — content cut: wraith + sentry drone (and the progression
+trap that blocked the rest) (2026-06-13).** User wanted enpro enemies
+cut to just imp + zombie + the sentry "drone". Built reducer tooling:
+`--cut-defs <substrings>` (skip those defs in the asset closure → drop
+their unique models/anims/textures), `--cut-map-entities` (delete
+matching entity blocks from the .map so they don't spawn as box
+models), `--drop-paths <substrings>` (drop kept files by path). THE
+PROGRESSION TRAP (the key finding — do NOT blindly cut map enemies):
+DOOM 3 monsters fire their `target` ON DEATH, and enpro wires monster
+deaths into `trigger_count` gates ("kill N to proceed"). Measured: 10
+lostsouls + 3 maggots feed trigger_count_2/3/4 — and since a monster
+type's model/anims/textures are SHARED across all instances, cutting
+those assets requires removing EVERY instance incl. the gating ones →
+the count can never complete → player STRANDED mid-level (invisible at
+boot, breaks deep in). So only 0-gate enemies are safe: wraith (8, all
+target ai_lostcombat = AI nodes, not gates) + the sentry drone (1,
+only referenced by 2 target_callobjectfunction flashlight on/off which
+no-op when the target is missing; no script controls it). SHIPPED the
+wraith+drone cut (--cut-defs "wraith,sentry" --cut-map-entities):
+default boot 31.6→30.5MB, all tiers; verified boots to gameplay (pos
+publishes, no errors, spawn renders, imp combat works) — unlike the
+cinematic-anim cut which HUNG the boot (the fast-forwarded intro still
+plays its anims; --drop-paths md5/cinematics → red/cyan broken render,
+never reaches gameplay — those anims are load-bearing, leave them).
+LAW: before cutting any map enemy, check whether its death feeds a
+trigger_count/relay gate (grep the .map: monster "target" → trigger_*);
+shared-asset types are all-or-nothing. The --cut-defs tooling stays for
+future safe cuts.
+
 **Iter 57 — strip precomputed .proc shadowModels: -3.8MB free
 (2026-06-13).** Toward <5MB boot: enpro.proc (28.5MB raw / 6MB gzip)
 is 63%% `shadowModel` blocks (17.9MB raw, 332 of them) — precomputed
