@@ -1697,10 +1697,10 @@ index a4883b5..095506b 100644
  extern idCVar	r_aspectRatio;
  
 diff --git a/neo/idlib/MapFile.cpp b/neo/idlib/MapFile.cpp
-index afbfa1d..8240a1d 100644
+index afbfa1d..ce9a344 100644
 --- a/neo/idlib/MapFile.cpp
 +++ b/neo/idlib/MapFile.cpp
-@@ -716,7 +716,12 @@ unsigned int idMapEntity::GetGeometryCRC( void ) const {
+@@ -716,7 +716,21 @@ unsigned int idMapEntity::GetGeometryCRC( void ) const {
  idMapFile::Parse
  ===============
  */
@@ -1710,9 +1710,123 @@ index afbfa1d..8240a1d 100644
 +
  bool idMapFile::Parse( const char *filename, bool ignoreRegion, bool osPath ) {
 +	D3ParseTimer _pt("MapFile::Parse(.map)");
++	extern idCVar cm_binaryCache;   // unified binary-geometry-cache kill-switch (defined in cm/CollisionModel_files.cpp)
++
++	// Boot-speed: try the binary entities-only .map cache first (skips the
++	// ~564ms ASCII brush/patch parse; the game only needs entity epairs + CRC
++	// at runtime). Only used for the default game path (no region file).
++	if ( !ignoreRegion && !osPath && cm_binaryCache.GetBool() && LoadBinaryMapFile( filename ) ) {
++		return true;
++	}
++
  	// no string concatenation for epairs and allow path names for materials
  	idLexer src( LEXFL_NOSTRINGCONCAT | LEXFL_NOSTRINGESCAPECHARS | LEXFL_ALLOWPATHNAMES );
  	idToken token;
+@@ -821,6 +835,86 @@ bool idMapFile::Parse( const char *filename, bool ignoreRegion, bool osPath ) {
+ 	}
+ 
+ 	hasPrimitiveData = true;
++
++	// Boot-speed: write the binary entities-only cache for next boot, but ONLY
++	// when a precompiled collision file (.cm or .bcm) exists for this map — that
++	// guarantees the brush/patch primitives we skip are never needed at runtime.
++	if ( cm_binaryCache.GetBool() ) {
++		ID_TIME_T ts;
++		idStr cmName = name;  cmName.SetFileExtension( "cm" );
++		idStr bcmName = name; bcmName.SetFileExtension( "bcm" );
++		bool collisionPrecompiled = ( idLib::fileSystem->ReadFile( cmName, NULL, &ts ) >= 0 ) ||
++									( idLib::fileSystem->ReadFile( bcmName, NULL, &ts ) >= 0 );
++		if ( collisionPrecompiled ) {
++			WriteBinaryMapFile( filename );
++		}
++	}
++	return true;
++}
++
++/*
++============
++idMapFile::WriteBinaryMapFile / LoadBinaryMapFile — binary entities-only cache
++============
++*/
++#define BMAP_MAGIC		(('B'<<0)|('M'<<8)|('A'<<16)|('P'<<24))
++#define BMAP_VERSION	1
++
++void idMapFile::WriteBinaryMapFile( const char *filename ) const {
++	idStr qpath = filename;
++	qpath.SetFileExtension( "bmap" );
++	idFile *fp = idLib::fileSystem->OpenFileWrite( qpath, "fs_devpath" );
++	if ( !fp ) {
++		return;
++	}
++	fp->WriteInt( BMAP_MAGIC );
++	fp->WriteInt( BMAP_VERSION );
++	fp->WriteFloat( version );
++	fp->WriteInt( (int)geometryCRC );
++	fp->WriteInt( entities.Num() );
++	for ( int i = 0; i < entities.Num(); i++ ) {
++		entities[i]->epairs.WriteToFileHandle( fp );
++	}
++	idLib::fileSystem->CloseFile( fp );
++	idLib::common->Printf( "wrote binary map cache %s\n", qpath.c_str() );
++}
++
++bool idMapFile::LoadBinaryMapFile( const char *filename ) {
++	idStr qpath = filename;
++	qpath.SetFileExtension( "bmap" );
++	idFile *fp = idLib::fileSystem->OpenFileRead( qpath );
++	if ( !fp ) {
++		return false;
++	}
++	int magic = 0, ver = 0, n = 0, crc = 0;
++	float v = 0.0f;
++	fp->ReadInt( magic );
++	fp->ReadInt( ver );
++	if ( magic != BMAP_MAGIC || ver != BMAP_VERSION ) {
++		idLib::fileSystem->CloseFile( fp );
++		return false;
++	}
++	fp->ReadFloat( v );
++	fp->ReadInt( crc );
++	fp->ReadInt( n );
++	if ( n < 0 || n > 1000000 ) {
++		idLib::fileSystem->CloseFile( fp );
++		return false;
++	}
++	name = filename;
++	name.StripFileExtension();
++	version = v;
++	geometryCRC = (unsigned int)crc;
++	fileTime = 0;
++	{ idStr mapName = name; mapName.SetFileExtension( "map" ); idLib::fileSystem->ReadFile( mapName, NULL, &fileTime ); }
++	entities.DeleteContents( true );
++	for ( int i = 0; i < n; i++ ) {
++		idMapEntity *ent = new idMapEntity();
++		ent->epairs.ReadFromFileHandle( fp );
++		entities.Append( ent );
++	}
++	idLib::fileSystem->CloseFile( fp );
++	hasPrimitiveData = false;   // entities-only: brush/patch primitives were skipped
+ 	return true;
+ }
+ 
+diff --git a/neo/idlib/MapFile.h b/neo/idlib/MapFile.h
+index fb93339..925a089 100644
+--- a/neo/idlib/MapFile.h
++++ b/neo/idlib/MapFile.h
+@@ -228,6 +228,13 @@ protected:
+ 
+ private:
+ 	void					SetGeometryCRC( void );
++	// Boot-speed: binary entities-only .map cache. The game only reads entity
++	// epairs + the geometry CRC at runtime (brush/patch primitives feed only the
++	// collision/AAS compile, which is precompiled in .cm/.aas), so the binary
++	// cache stores epairs + CRC and skips the ~564ms ASCII brush/patch parse.
++	// Only written when a .cm exists for the map (so primitives are never needed).
++	void					WriteBinaryMapFile( const char *filename ) const;
++	bool					LoadBinaryMapFile( const char *filename );
+ };
+ 
+ ID_INLINE idMapFile::idMapFile( void ) {
 diff --git a/neo/renderer/Cinematic.cpp b/neo/renderer/Cinematic.cpp
 index e6bb4aa..e173c9f 100644
 --- a/neo/renderer/Cinematic.cpp

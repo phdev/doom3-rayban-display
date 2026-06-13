@@ -1901,7 +1901,7 @@ function findBcmFiles(FS, root) {
       }
       if (FS.isDir(st.mode)) {
         walk(full, depth + 1);
-      } else if (full.endsWith(".bcm")) {
+      } else if (full.endsWith(".bcm") || full.endsWith(".bmap") || full.endsWith(".bproc")) {
         hits.push(full);
       }
     }
