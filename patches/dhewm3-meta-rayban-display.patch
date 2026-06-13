@@ -1,5 +1,5 @@
 diff --git a/neo/CMakeLists.txt b/neo/CMakeLists.txt
-index 69f1892..57b3f82 100644
+index 69f1892..35325ea 100644
 --- a/neo/CMakeLists.txt
 +++ b/neo/CMakeLists.txt
 @@ -194,29 +194,46 @@ if(CMAKE_MAJOR_VERSION LESS 3 OR ( CMAKE_MAJOR_VERSION EQUAL 3 AND CMAKE_MINOR_V
@@ -98,7 +98,7 @@ index 69f1892..57b3f82 100644
 +		set(D3_EMSCRIPTEN_EMBED "${CMAKE_SOURCE_DIR}/sys/wasm/embed")
 +	endif()
 +
-+	set(d3_wasm_exports "[\"_main\",\"_D3_AddViewAngles\",\"_D3_SetViewYaw\",\"_D3_SetWearableAction\",\"_D3_ExecCommand\",\"_D3_GetEnemyIndicators\",\"_D3_GetEnemyYaw\",\"_D3_RequestEnemyTurn\",\"_D3_SetEnemyIndicators\",\"_D3_SetEnemyIndicatorYaw\",\"_D3_ConsumeEnemyTurn\"]")
++	set(d3_wasm_exports "[\"_main\",\"_D3_AddViewAngles\",\"_D3_SetViewYaw\",\"_D3_SetWearableAction\",\"_D3_ExecCommand\",\"_D3_ReloadStreamedImages\",\"_D3_GetEnemyIndicators\",\"_D3_GetEnemyYaw\",\"_D3_RequestEnemyTurn\",\"_D3_SetEnemyIndicators\",\"_D3_SetEnemyIndicatorYaw\",\"_D3_ConsumeEnemyTurn\"]")
 +
 +	# The game module is hard-linked (HARDLINK_GAME), so no dynamic linking /
 +	# MAIN_MODULE is required. SDL2 comes from Emscripten's built-in port, GL
@@ -314,10 +314,10 @@ index 6bba28f..9f732b9 100644
  			viewangles[PITCH] = oldAngles[PITCH] + 90;
 diff --git a/neo/framework/d3_wearable.cpp b/neo/framework/d3_wearable.cpp
 new file mode 100644
-index 0000000..25fe6de
+index 0000000..a223350
 --- /dev/null
 +++ b/neo/framework/d3_wearable.cpp
-@@ -0,0 +1,270 @@
+@@ -0,0 +1,285 @@
 +/*
 +===========================================================================
 +
@@ -496,6 +496,21 @@ index 0000000..25fe6de
 +	{
 +		cmdSystem->BufferCommandText( CMD_EXEC_APPEND, cmd );
 +		cmdSystem->BufferCommandText( CMD_EXEC_APPEND, "\n" );
++	}
++}
++
++EMSCRIPTEN_KEEPALIVE
++void
++D3_ReloadStreamedImages( void )
++{
++	// Iter 55 (progressive texture streaming): after the web shell writes a
++	// batch of streamed loose texture files into the FS, ask the renderer to
++	// re-read the images that are still showing the gray _default. APPEND so it
++	// runs at the safe next-frame point (never reentrantly from the JS callback,
++	// matching D3_ExecCommand's discipline).
++	if ( cmdSystem )
++	{
++		cmdSystem->BufferCommandText( CMD_EXEC_APPEND, "reloadStreamedImages\n" );
 +	}
 +}
 +
@@ -1262,6 +1277,74 @@ index e6bb4aa..e173c9f 100644
  	iFile->Read( file, RoQFrameSize+8 );
  	if ( RoQPlayed >= ROQSize ) {
  		if (looping) {
+diff --git a/neo/renderer/Image_init.cpp b/neo/renderer/Image_init.cpp
+index 1e0f640..17c329c 100644
+--- a/neo/renderer/Image_init.cpp
++++ b/neo/renderer/Image_init.cpp
+@@ -306,11 +306,16 @@ void idImage::MakeDefault() {
+ 		}
+ 	}
+ 
++	// Iter 55: set defaulted BEFORE GenerateImage so the WebGPU cache hook
++	// (D3_WebGPU_CacheImage, fired inside GenerateImage) sees it and marks the
++	// slot — the backend then uses its role-aware neutral fallback instead of
++	// this placeholder (which in release mode is solid black 0,0,0,0, the cause
++	// of black deferred surfaces). Harmless: GenerateImage does not read it.
++	defaulted = true;
++
+ 	GenerateImage( (byte *)data,
+ 		DEFAULT_SIZE, DEFAULT_SIZE,
+ 		TF_DEFAULT, true, TR_REPEAT, TD_DEFAULT );
+-
+-	defaulted = true;
+ }
+ 
+ static void R_DefaultImage( idImage *image ) {
+@@ -1119,6 +1124,36 @@ void R_ReloadImages_f( const idCmdArgs &args ) {
+ 	}
+ }
+ 
++/*
++===============
++R_ReloadStreamedImages_f
++
++Iter 55 (progressive texture streaming): re-read ONLY the images that
++currently hold the gray _default because their file was missing when first
++drawn (image_preload 0 → lazy first-Bind load). After a streaming batch writes
++the real loose files into the FS, this force-reloads just those — each Reload
++re-fires GenerateImage → D3_WebGPU_CacheImage, which records the ptr for the
++backend's per-image GPU-cache eviction. Non-defaulted images are untouched, so
++the cost is proportional to the newly-arrived textures, not the whole set.
++===============
++*/
++void R_ReloadStreamedImages_f( const idCmdArgs &args ) {
++	int reloaded = 0, stillDefault = 0;
++	for ( int i = 0 ; i < globalImages->images.Num() ; i++ ) {
++		idImage *image = globalImages->images[ i ];
++		if ( !image->defaulted || image->generatorFunction != NULL || image->isPartialImage ) {
++			continue;
++		}
++		// Clear defaulted first: if the file is STILL missing, ActuallyLoadImage
++		// re-sets it (MakeDefault) and a later batch retries; if it now loads,
++		// defaulted stays false.
++		image->defaulted = false;
++		image->Reload( false /*checkPrecompressed*/, true /*force*/ );
++		if ( image->defaulted ) stillDefault++; else reloaded++;
++	}
++	common->Printf( "[d3] reloadStreamedImages: %d reloaded, %d still missing\n", reloaded, stillDefault );
++}
++
+ typedef struct {
+ 	idImage	*image;
+ 	int		size;
+@@ -2012,6 +2047,7 @@ void idImageManager::Init() {
+ 	currentDepthImage = ImageFromFunction( "_currentDepth", R_DepthImage ); // #3877. Allow shaders to access scene depth
+ 
+ 	cmdSystem->AddCommand( "reloadImages", R_ReloadImages_f, CMD_FL_RENDERER, "reloads images" );
++	cmdSystem->AddCommand( "reloadStreamedImages", R_ReloadStreamedImages_f, CMD_FL_RENDERER, "iter 55: reload only defaulted images after a texture-stream batch" );
+ 	cmdSystem->AddCommand( "listImages", R_ListImages_f, CMD_FL_RENDERER, "lists images" );
+ 	cmdSystem->AddCommand( "combineCubeImages", R_CombineCubeImages_f, CMD_FL_RENDERER, "combines six images for roq compression" );
+ 
 diff --git a/neo/renderer/Image_load.cpp b/neo/renderer/Image_load.cpp
 index f9ae002..9430a1e 100644
 --- a/neo/renderer/Image_load.cpp
@@ -2108,10 +2191,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..14d2654
+index 0000000..ade61f2
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,4251 @@
+@@ -0,0 +1,4316 @@
 +/*
 +================================================================================
 +
@@ -2227,7 +2310,7 @@ index 0000000..14d2654
 +};
 +
 +// Iter 7b: mirrors WGPUImageSlot in tr_render.cpp (C linkage, layout-stable).
-+struct ImgSlot { const void* ptr; int w, h; uint8_t* pixels; char name[64]; int repeat; };
++struct ImgSlot { const void* ptr; int w, h; uint8_t* pixels; char name[64]; int repeat; int defaulted; };
 +extern "C" const ImgSlot* D3_WebGPU_LookupCachedImage(const void* img);
 +// Iter 13b: mirrors WGPUCubeSlot in tr_render.cpp.
 +struct CubeSlot { const void* ptr; int size; uint8_t* faces[6]; };
@@ -2248,6 +2331,11 @@ index 0000000..14d2654
 +extern "C" uint32_t g_capDetTest;       // iter 28: determinism self-test gate
 +extern "C" uint32_t g_capVertDedupCount; // iter 28: frame geometry-dedup table fill (reset on drain)
 +extern "C" float    g_capBfgSpec;       // iter 29: 1 = BFG analytic specular, 0 = classic LUT
++// Iter 55: progressive texture streaming — idImage ptrs whose CPU pixels were
++// just refreshed (a streamed file arrived + the image reloaded). The backend
++// evicts these from its GPU caches at the next drain so the real texture
++// replaces the stale gray _default.
++extern "C" { extern const void* g_capReuploadPtrs[]; extern int g_capReuploadCount; extern int g_capReuploadAll; }
 +
 +// ─── Backend class ──────────────────────────────────────────────────────────
 +
@@ -2378,6 +2466,11 @@ index 0000000..14d2654
 +            initReflectPipeline();
 +            initRecordSlots();
 +        }
++        // Iter 55: refresh GPU caches for any image whose pixels changed since
++        // last frame (streamed texture arrived → reloaded → re-cached). Runs
++        // BEFORE the drain's getEngineTextureView/getMaterialBindGroup calls so
++        // the rebuild picks up the new pixels this same frame.
++        processStreamReuploads();
 +        // Iter 30: on 120Hz displays rAF outpaces the 60Hz engine, so every
 +        // other EndFrame would re-encode and re-submit a byte-identical
 +        // frame — pure WebKit GPU-process churn (measured: the GPU helper
@@ -3808,6 +3901,50 @@ index 0000000..14d2654
 +        }, texCacheCount, (double)gpuTexBytes / (1024.0 * 1024.0), gpuTexDropped);
 +    }
 +
++    // Iter 55: drop GPU caches for images whose CPU pixels just changed (a
++    // streamed texture arrived → reloaded → re-cached). Per-image eviction
++    // keeps the cost proportional to the newly-arrived textures (NOT a full
++    // re-upload, which would re-trigger the iter-30 WebKit GPU-process churn).
++    // The evicted entries lazily rebuild from the fresh CPU pixels when next
++    // drawn; lastMatGroups[] self-heal next drain (rebuilt from matCache).
++    void processStreamReuploads() {
++        if (g_capReuploadAll) {
++            for (int i = 0; i < texCacheCount; ++i)
++                if (texCache[i].view) wgpuTextureViewRelease(texCache[i].view);
++            texCacheCount = 0; gpuTexBytes = 0;
++            for (int i = 0; i < matCacheCount; ++i)
++                if (matCache[i].group) wgpuBindGroupRelease(matCache[i].group);
++            matCacheCount = 0;
++            g_capReuploadAll = 0;
++            g_capReuploadCount = 0;
++            return;
++        }
++        for (int k = 0; k < g_capReuploadCount; ++k) {
++            const void* ptr = g_capReuploadPtrs[k];
++            for (int i = matCacheCount - 1; i >= 0; --i) {
++                bool hit = false;
++                for (int j = 0; j < 5; ++j) if (matCache[i].key[j] == ptr) { hit = true; break; }
++                if (hit) {
++                    if (matCache[i].group) wgpuBindGroupRelease(matCache[i].group);
++                    matCache[i] = matCache[matCacheCount - 1];
++                    matCache[matCacheCount - 1] = MatCacheEntry{};
++                    matCacheCount--;
++                }
++            }
++            for (int i = texCacheCount - 1; i >= 0; --i) {
++                if (texCache[i].ptr == ptr) {
++                    if (texCache[i].view) wgpuTextureViewRelease(texCache[i].view);
++                    gpuTexBytes -= texCache[i].bytes;
++                    texCache[i] = texCache[texCacheCount - 1];
++                    texCache[texCacheCount - 1] = TexCacheEntry{};
++                    texCacheCount--;
++                    break;  // at most one texCache entry per ptr
++                }
++            }
++        }
++        g_capReuploadCount = 0;
++    }
++
 +    // Iter 7b: GPU mirror of the engine's CPU image cache. One texture per
 +    // idImage pointer, created+uploaded on first use.
 +    WGPUTextureView getEngineTextureView(const void* imgPtr, WGPUTextureView fallback) {
@@ -3821,6 +3958,12 @@ index 0000000..14d2654
 +        }
 +        const ImgSlot* slot = D3_WebGPU_LookupCachedImage(imgPtr);
 +        if (!slot || !slot->pixels || slot->w <= 0 || slot->h <= 0) { noteImageFallback(imgPtr, "cpu-miss"); return fallback; }
++        // Iter 55: a streamed texture not yet arrived is cached as the gray
++        // _default — use the caller's role-aware neutral fallback (flat normal /
++        // checker diffuse / white spec) instead, so the surface renders gray-lit
++        // rather than black (a defaulted normal map would otherwise decode to
++        // garbage normals and collapse N·L). Reload swaps in the real pixels.
++        if (slot->defaulted) { return fallback; }
 +        if (texCacheCount >= (int)kTexCacheSize) { noteImageFallback(imgPtr, "gpu-cache-full"); return fallback; }
 +
 +        // Level 0 from the cache.
@@ -3909,8 +4052,13 @@ index 0000000..14d2654
 +        }
 +        free(cur);
 +        WGPUTextureView view = wgpuTextureCreateView(tex, nullptr);
++        // The view holds its own ref to the texture; release our creating
++        // handle so a later wgpuTextureViewRelease (iter-55 streaming evict)
++        // actually frees the texture instead of leaking it.
++        wgpuTextureRelease(tex);
 +        texCache[texCacheCount].ptr = imgPtr;
 +        texCache[texCacheCount].view = view;
++        texCache[texCacheCount].bytes = newBytes;
 +        texCacheCount++;
 +        gpuTexBytes += newBytes;
 +        publishTexStats();
@@ -6177,7 +6325,7 @@ index 0000000..14d2654
 +    // material bind-group cache (5-image tuple → group(1) bind group).
 +    static constexpr uint32_t kTexCacheSize = 2048;
 +    static constexpr uint32_t kMatCacheSize = 1024;
-+    struct TexCacheEntry { const void* ptr; WGPUTextureView view; };
++    struct TexCacheEntry { const void* ptr; WGPUTextureView view; size_t bytes; };
 +    struct MatCacheEntry { void* key[5]; WGPUBindGroup group; };
 +    TexCacheEntry           texCache[kTexCacheSize] = {};
 +    MatCacheEntry           matCache[kMatCacheSize] = {};
@@ -7272,7 +7420,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..ff2b665 100644
+index c83ebb5..78e8901 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -7298,7 +7446,7 @@ index c83ebb5..ff2b665 100644
  
  /*
  
-@@ -38,6 +50,911 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,943 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -7598,6 +7746,11 @@ index c83ebb5..ff2b665 100644
 +    char        name[64];   // imgName for diagnostics
 +    int         repeat;     // textureRepeat_t (0 = TR_REPEAT) — scrolling
 +                            // light projections (cloudscroll) MUST wrap
++    int         defaulted;  // iter 55: 1 when this is the gray _default (the
++                            // streamed file hasn't arrived). The backend then
++                            // uses its role-aware neutral fallback (flat normal
++                            // / checker diffuse) instead of these pixels, so a
++                            // deferred surface renders gray-lit, not black.
 +};
 +extern "C" {
 +    // 3072 was 2048: a full playthrough loads more images than the level's
@@ -7609,6 +7762,19 @@ index c83ebb5..ff2b665 100644
 +    WGPUImageSlot g_imgCache[kWGPUImageCacheSize] = {};
 +    int g_imgCacheCount = 0;
 +    size_t g_imgCacheBytes = 0;   // live RAM held by cached pixel buffers
++
++    // Iter 55: progressive texture streaming. When a streamed file arrives and
++    // its image is reloaded, GenerateImage re-runs D3_WebGPU_CacheImage for an
++    // ALREADY-cached idImage ptr (the gray _default was cached on first draw).
++    // The backend's GPU texCache/matCache key on the ptr and never re-read, so
++    // the stale gray texture stays on screen. We record each re-cached ptr here;
++    // the backend evicts JUST those from its GPU caches at the next drain (cheap
++    // per-image refresh — NOT a full re-upload, which would re-trigger the
++    // iter-30 WebKit GPU-process churn on iPhone). Overflow → flush-all flag.
++    enum { kWGPUReuploadMax = 512 };
++    const void* g_capReuploadPtrs[kWGPUReuploadMax] = {};
++    int g_capReuploadCount = 0;
++    int g_capReuploadAll = 0;     // set if the list overflowed: backend flushes all
 +}
 +
 +// Diag: cache occupancy for texture-budget measurements (window.__d3Logs).
@@ -7643,6 +7809,19 @@ index c83ebb5..ff2b665 100644
 +    for ( int i = 0; i < g_imgCacheCount; ++i ) {
 +        if ( g_imgCache[i].ptr == (const void*)img ) { slot = i; break; }
 +    }
++    if ( slot >= 0 ) {
++        // Re-caching an existing image (streamed file arrived → reloaded).
++        // Flag the GPU caches to drop the stale entry for this ptr.
++        if ( g_capReuploadCount < kWGPUReuploadMax ) {
++            bool dup = false;
++            for ( int i = 0; i < g_capReuploadCount; ++i ) {
++                if ( g_capReuploadPtrs[i] == (const void*)img ) { dup = true; break; }
++            }
++            if ( !dup ) g_capReuploadPtrs[g_capReuploadCount++] = (const void*)img;
++        } else {
++            g_capReuploadAll = 1;
++        }
++    }
 +    if ( slot < 0 ) {
 +        if ( g_imgCacheCount >= kWGPUImageCacheSize ) {
 +            static bool warned = false;
@@ -7661,6 +7840,7 @@ index c83ebb5..ff2b665 100644
 +        g_imgCache[slot].name[nl] = 0;
 +    }
 +    g_imgCache[slot].repeat = (int)img->repeat;
++    g_imgCache[slot].defaulted = img->defaulted ? 1 : 0;
 +    // Reallocate if size changed (e.g. reloaded at different mip level)
 +    const size_t bytes = (size_t)dw * (size_t)dh * 4u;
 +    if ( !g_imgCache[slot].pixels || g_imgCache[slot].w != dw || g_imgCache[slot].h != dh ) {
@@ -8210,7 +8390,7 @@ index c83ebb5..ff2b665 100644
  
  /*
  =================
-@@ -49,6 +966,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +998,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -8226,7 +8406,7 @@ index c83ebb5..ff2b665 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +1004,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +1036,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -8242,7 +8422,7 @@ index c83ebb5..ff2b665 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1051,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1083,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -8259,7 +8439,7 @@ index c83ebb5..ff2b665 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1111,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1143,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -8267,7 +8447,7 @@ index c83ebb5..ff2b665 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1338,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1370,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -8280,7 +8460,7 @@ index c83ebb5..ff2b665 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1507,72 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1539,72 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  

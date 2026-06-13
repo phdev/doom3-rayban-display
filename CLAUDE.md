@@ -1539,6 +1539,70 @@ the WebKit GPU churn re-measure (4-5 private passes/frame now vs ~1
 MEASURE before declaring iPhone-safe) and before the new native
 side-by-side.
 
+**Iter 55 — PROGRESSIVE TEXTURE STREAMING (?stream, 2026-06-13).**
+Phase 1 of the progressive-load request, built + verified on Mac Chrome
+(on-device is the open gate). `?stream` boots on a 35MB structural pak
+(geometry + decls + HUD/light textures) and streams the bulk world/
+model textures (13.2MB gzip) in after boot — surfaces render gray-lit,
+then pop to real as each batch lands. Determinism 6/6 IDENTICAL
+(streaming path inert in the det/normal path). HOW IT WORKS, end to end:
+- REDUCER `--defer-textures`: splits output into the boot .pk4 +
+  a `.stream` blob (gzip of the deferred textures, raw-concat) +
+  `.stream.json` (file manifest: path/off/len, offsets into the
+  UNCOMPRESSED blob). Deferred = images under textures/|models/|env/
+  EXCEPT lights/ (a missing falloff is BLACK not gray — worse),
+  guis/|fonts/|ui/ (HUD must be crisp). 1620 textures → 13.2MB gzip.
+- DELIVERY (loose-file override): the engine reads loose files in
+  /base/ in PREFERENCE to the pak (FileSystem.cpp search order — dir
+  entry precedes paks; proven by the existing zz_flashlight_fix.mtr).
+  A file written to MEMFS post-boot is found by the engine's live
+  fopen immediately (no stale dir-cache) — write LOWERCASE paths
+  (engine name.ToLower(); fs_caseSensitiveOS=1 under Emscripten).
+- JS (d3Runtime.js): STREAM_TIER boot pak = base-stream/; `image_preload 0`
+  so textures load lazily (not all default at level-end); 3s after main,
+  streamDeferredTextures() fetches the chunked gzip blob (reuses
+  fetchChunkedBytes), inflates via DecompressionStream('gzip'), and writes
+  each texture as a loose /base/ file in batches of 200, calling
+  D3_ReloadStreamedImages() per batch.
+- ENGINE reload: `reloadStreamedImages` cmd (R_ReloadStreamedImages_f,
+  Image_init.cpp) reloads ONLY images with `defaulted && !generatorFunction
+  && !isPartialImage` — clears defaulted, `Reload(false,true)` (force=true;
+  the WASM-zip timestamp gate is unreliable). Each reload re-fires
+  GenerateImage → D3_WebGPU_CacheImage. Exported via d3_wearable.cpp
+  (buffers the cmd, never reentrant) + CMakeLists + d3Runtime.
+- THE BLACK-SURFACE TRAP (the hard part): a deferred image first-drawn
+  with its file missing → MakeDefault → in RELEASE mode the _default is
+  SOLID BLACK (0,0,0,0), not the dev-mode checker — and a black NORMAL
+  map decodes to garbage normals → N·L collapses → BLACK surfaces, not
+  gray. FIX: (a) MakeDefault sets `defaulted=true` BEFORE GenerateImage
+  so the cache hook sees it; (b) WGPUImageSlot/ImgSlot carry a `defaulted`
+  flag (layout-stable mirror); (c) getEngineTextureView returns the
+  caller's role-aware NEUTRAL fallback (fbFlatNormalView / fbCheckerView /
+  fbWhiteView) for a defaulted slot instead of the cached black → surfaces
+  render gray-LIT (correct lighting, placeholder diffuse), then real.
+- WEBGPU CACHE INVALIDATION (per-image, NOT full-flush — full re-upload
+  would re-trigger the iter-30 WebKit GPU-process churn on iPhone): on a
+  re-cache (reload of an existing slot), tr_render appends the idImage ptr
+  to g_capReuploadPtrs[]; the backend's processStreamReuploads() (called at
+  EndFrame top) evicts JUST those ptrs from texCache + any matCache tuple
+  containing them; lastMatGroups self-heal next drain. Also fixed a latent
+  leak: the per-image WGPUTexture handle was never released after
+  CreateView (added wgpuTextureRelease so eviction frees GPU memory; struct
+  gained a per-entry `bytes` for the gpuTexBytes accounting). g_capReuploadAll
+  is the overflow fallback (>512 dirty → flush all).
+NUMBERS: monolithic JPEG pak 48.7MB → boot 35.4MB + 13.2MB gzip stream
+(total ≈ same; 13MB moved off the boot path = ~27% smaller initial
+download + progressive sharpening). OPT-IN via ?stream while it bakes;
+flip to default once on-device-verified. base-stream/ holds boot+stream
+chunks + 3 manifests (.pk4.manifest.json chunk, .stream.manifest.json
+chunk, .stream.json file). OPEN: (1) iPhone verification of the
+reload/evict path (the on-device gate — verify no GPU-churn re-crash);
+(2) stream blob not yet IndexedDB-cached (HTTP cache only — re-fetches
+on a cold cache; follow-up); (3) <5MB boot still needs animation
+deferral (11MB md5anim) + portal-area geometry streaming on TOP of this
+(the structural floor, iter 54). Build recipe: reduce ... --jpeg-textures
+--defer-textures, then chunk-pk4.py BOTH the .pk4 and the .pk4.stream.
+
 **Iter 54 — JPEG texture compression + progressive-load scoping
 (2026-06-13).** User asked: load the level in <5MB with assets
 streaming progressively up to ~20MB. PHASE 2 (texture compression,

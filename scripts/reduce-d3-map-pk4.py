@@ -274,6 +274,13 @@ def main(argv=None):
                              "height maps, alpha textures, and HUD/font art stay lossless TGA.")
     parser.add_argument("--jpeg-quality", type=int, default=85,
                         help="JPEG quality for --jpeg-textures (default 85).")
+    parser.add_argument("--defer-textures", action="store_true",
+                        help="split output: the boot .pk4 gets everything EXCEPT bulk "
+                             "world/model textures, which go into a concat <output>.stream "
+                             "blob + <output>.stream.json manifest for progressive streaming. "
+                             "HUD/font/light(falloff) images stay in the boot pak (their "
+                             "absence is worse than gray). The web shell streams the blob in "
+                             "after boot and reloads the defaulted images (iter 55).")
     args = parser.parse_args(argv)
 
     input_paths = resolve_inputs(args.input)
@@ -637,10 +644,42 @@ def main(argv=None):
             jpeg_stats[1] += len(data) - len(jb)
             return name[:-4] + ".jpg", jb
 
-        # 4. Write the reduced archive (downsampling audio on the way out).
+        IMAGE_EXTS_L = (".tga", ".jpg", ".jpeg", ".png")
+
+        def is_deferred(name):
+            """Bulk world/model textures safe to render gray for a beat while
+            streaming. EXCLUDE lights/ (a missing falloff = BLACK, not gray —
+            worse), guis/ + fonts/ + ui/ (HUD must be crisp immediately)."""
+            if not args.defer_textures or not name.lower().endswith(IMAGE_EXTS_L):
+                return False
+            b = name.lower()
+            if b.startswith(("lights/", "guis/", "fonts/", "ui/")):
+                return False
+            return b.startswith(("textures/", "models/", "env/"))
+
+        # 4. Write the boot archive; deferred textures go to a parallel .stream
+        #    blob (raw concatenated bytes) + a JSON file manifest.
         output_path.parent.mkdir(parents=True, exist_ok=True)
         kept_bytes = 0
         by_dir = {}
+        stream_path = output_path.with_suffix(output_path.suffix + ".stream")
+        stream_files = []     # [{path, off, len}] — offsets into the UNCOMPRESSED blob
+        stream_off = [0]
+        stream_buf = bytearray() if args.defer_textures else None
+
+        def emit(name, data):
+            # name/data are final (post downsize/jpeg). Route to boot pak or stream.
+            if stream_buf is not None and is_deferred(name):
+                stream_buf.extend(data)
+                stream_files.append({"path": name.lower(), "off": stream_off[0], "len": len(data)})
+                stream_off[0] += len(data)
+            else:
+                out.writestr(name, data)
+                nonlocal_kept[0] += len(data)
+                top = name.split("/", 1)[0] if "/" in name else "(root)"
+                by_dir[top] = by_dir.get(top, 0) + len(data)
+
+        nonlocal_kept = [0]
         with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as out:
             for name in sorted(keep):
                 zpath, original = entries[name]
@@ -650,10 +689,7 @@ def main(argv=None):
                 elif args.max_texture:
                     data = downsize_image(data, name, args.max_texture)
                 name, data = maybe_jpeg(data, name)
-                out.writestr(name, data)
-                kept_bytes += len(data)
-                top = name.split("/", 1)[0] if "/" in name else "(root)"
-                by_dir[top] = by_dir.get(top, 0) + len(data)
+                emit(name, data)
             for out_name, src_name in sorted(dds_convert.items()):
                 zpath, original = entries[src_name]
                 try:
@@ -662,10 +698,19 @@ def main(argv=None):
                     print(f"  dds convert FAILED for {src_name}: {e}", file=sys.stderr)
                     continue
                 out_name, data = maybe_jpeg(data, out_name)
-                out.writestr(out_name, data)
-                kept_bytes += len(data)
-                top = out_name.split("/", 1)[0] if "/" in out_name else "(root)"
-                by_dir[top] = by_dir.get(top, 0) + len(data)
+                emit(out_name, data)
+        kept_bytes = nonlocal_kept[0]
+        if stream_buf is not None:
+            import gzip
+            gz = gzip.compress(bytes(stream_buf), compresslevel=6)
+            with open(stream_path, "wb") as sf:
+                sf.write(gz)
+            manifest = {"totalSize": stream_off[0], "compressedSize": len(gz),
+                        "gzip": True, "count": len(stream_files), "files": stream_files}
+            with open(str(stream_path) + ".json", "w") as mf:
+                json.dump(manifest, mf)
+            print(f"  DEFERRED {len(stream_files)} textures -> {stream_off[0]/1e6:.1f} MB raw, "
+                  f"{len(gz)/1e6:.1f} MB gzip stream (boot pak excludes them)", file=sys.stderr)
         if args.jpeg_textures:
             print(f"  JPEG: recoded {jpeg_stats[0]} color textures, saved "
                   f"{jpeg_stats[1]/1e6:.1f} MB (uncompressed)", file=sys.stderr)

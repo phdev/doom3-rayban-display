@@ -16,8 +16,17 @@ const bustCache = (url) => `${url}${url.includes("?") ? "&" : "?"}v=${ENGINE_VER
 // on desktop). Both ship as same-origin 4MB chunk sets (GitHub release
 // assets send no CORS headers, so cross-origin hosting is a dead end).
 const HD_TIER = (typeof window !== "undefined") && /[?&]hd\b/.test(window.location.search);
-const BUNDLED_PK4_PATH = HD_TIER ? "base256/pak-display.pk4" : "base/pak-display.pk4";
+// Iter 55: progressive texture streaming. ?stream uses the deferred BOOT pak
+// (structural + HUD/light textures only, ~35MB) and streams the bulk world/
+// model textures (~13MB gzip) in after boot — they pop from gray _default to
+// real as each batch lands. Opt-in while it bakes; flip to default once
+// on-device-verified. base-stream/ holds the boot pak chunks + the .stream blob.
+const STREAM_TIER = (typeof window !== "undefined") && /[?&]stream\b/.test(window.location.search);
+const BUNDLED_PK4_PATH = STREAM_TIER
+  ? "base-stream/pak-display.pk4"
+  : (HD_TIER ? "base256/pak-display.pk4" : "base/pak-display.pk4");
 const BUNDLED_PK4_URL = `${ENGINE_BASE}${BUNDLED_PK4_PATH}`;
+const STREAM_BLOB_URL = `${ENGINE_BASE}base-stream/pak-display.pk4.stream`;
 const BUNDLED_PK4_GZIP_URL = `${BUNDLED_PK4_URL}.gz`;
 const URL_PK4_PARAM = "pk4";
 // Boot straight into the level so launch shows the rendered 3D world. The main
@@ -440,6 +449,19 @@ export async function bootDoom3({
     };
     window.d3cmd = execCommand;
 
+    // Iter 55: progressive texture streaming. Once the view is rendering (the
+    // boot pak gave us geometry + HUD; bulk textures show gray _default), pull
+    // the deferred-texture blob in the background and reveal it in batches.
+    if (STREAM_TIER) {
+      window.__d3StreamReload = () => reloadStreamedImages(module);
+      // Kick off after a short settle (the 13MB download dominates the wall
+      // clock; writes + reloads are harmless during level load — images drawn
+      // after their file lands just load correctly, the rest are reloaded).
+      setTimeout(() => {
+        streamDeferredTextures(module, log).catch((e) => console.warn("[stream] threw", e));
+      }, 3000);
+    }
+
     return {
       module,
       execCommand,
@@ -627,6 +649,11 @@ function buildArguments(config) {
     // object. The engine patch now bounds-checks (and the cap is 64), so
     // extra args are safe; keeping these conditional is just tidiness.
     ...(config.audioEnabled ? ["+set", "com_asyncSound", "0", "+set", "s_useEAXReverb", "0"] : []),
+
+    // Iter 55: with texture streaming, defer image loads to first draw so the
+    // bulk textures (not yet in the FS at boot) don't all default at level-end;
+    // each loads lazily and is reloaded by the stream batches as its file lands.
+    ...(STREAM_TIER ? ["+set", "image_preload", "0"] : []),
 
     "+set", "g_skill", String(getNumericConfig(config.skill, 0)),
     // Iter 46: one game tic per rendered frame on the wearable profile.
@@ -1709,6 +1736,107 @@ function fileExists(FS, path) {
     return FS.analyzePath(path).exists;
   } catch {
     return false;
+  }
+}
+
+// Iter 55: ask the engine to re-read images still showing the gray _default
+// (their streamed file just arrived). Buffered → runs next engine frame; the
+// WebGPU backend then evicts just those from its GPU caches (per-image).
+function reloadStreamedImages(module) {
+  try {
+    if (typeof module._D3_ReloadStreamedImages === "function") {
+      module._D3_ReloadStreamedImages();
+    } else if (typeof module.ccall === "function") {
+      module.ccall("D3_ReloadStreamedImages", null, [], []);
+    }
+  } catch {}
+}
+
+// Resolve true once the engine view is rendering (the pos chip publishes
+// window.__d3ViewPos every few views from RB_BeginDrawingView), or false on
+// timeout. Streaming waits for this so the FS isn't contended during level
+// load and the reload command reaches a live renderer.
+function pollViewRendering(timeoutMs) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const tick = () => {
+      if (typeof window !== "undefined" && typeof window.__d3ViewPos === "string") {
+        resolve(true);
+        return;
+      }
+      if (Date.now() - start > timeoutMs) {
+        resolve(false);
+        return;
+      }
+      setTimeout(tick, 250);
+    };
+    tick();
+  });
+}
+
+// Iter 55: download the deferred-texture blob, inflate it, and write each
+// texture into the live MEMFS as a loose file under /base (loose files override
+// the boot pak — proven by the existing zz_flashlight_fix.mtr). Reveal in
+// batches: after each batch reloadStreamedImages() repaints the surfaces that
+// were drawn gray before their file arrived; surfaces drawn AFTER their file
+// lands just load correctly on first Bind.
+async function streamDeferredTextures(module, log) {
+  try {
+    const FS = module.FS;
+    if (!FS || typeof FS.writeFile !== "function") return;
+    if (!("DecompressionStream" in globalThis)) {
+      log?.("Texture streaming skipped: no DecompressionStream");
+      return;
+    }
+    // File manifest (offsets into the uncompressed blob).
+    const fmResp = await fetch(`${STREAM_BLOB_URL}.json`, { cache: "no-store" }).catch(() => null);
+    if (!fmResp || !fmResp.ok) {
+      log?.("No texture-stream manifest; textures are all in the boot pak");
+      return;
+    }
+    const manifest = await fmResp.json();
+    const files = manifest.files || [];
+    if (!files.length) return;
+    log?.(`Streaming ${files.length} textures (${((manifest.compressedSize || 0) / 1e6).toFixed(1)} MB)...`);
+
+    // Download the gzip blob — prefer the chunked manifest (resumable + matches
+    // the pak delivery), fall back to a single fetch.
+    let gz;
+    try {
+      gz = await fetchChunkedBytes(
+        { manifestUrl: appendPathSuffix(STREAM_BLOB_URL, ".manifest.json") },
+        () => {}, log);
+    } catch {
+      const r = await fetch(STREAM_BLOB_URL, { cache: "force-cache" });
+      if (!r.ok) throw new Error(`stream blob fetch failed (${r.status})`);
+      gz = new Uint8Array(await r.arrayBuffer());
+    }
+
+    // Inflate the whole blob (manifest offsets are into the uncompressed bytes).
+    const ds = new DecompressionStream("gzip");
+    const inflated = await new Response(new Blob([gz]).stream().pipeThrough(ds)).arrayBuffer();
+    const raw = new Uint8Array(inflated);
+    log?.(`Texture stream: ${(raw.length / 1e6).toFixed(1)} MB inflated`);
+
+    const ensured = new Set();
+    const BATCH = 200;
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      const path = `/base/${f.path}`;
+      const dir = path.slice(0, path.lastIndexOf("/"));
+      if (!ensured.has(dir)) { mkdirTree(FS, dir); ensured.add(dir); }
+      try {
+        FS.writeFile(path, raw.subarray(f.off, f.off + f.len));
+      } catch {}
+      if ((i + 1) % BATCH === 0) {
+        reloadStreamedImages(module);
+        await new Promise((r) => setTimeout(r, 80)); // yield a frame for the reload + evict
+      }
+    }
+    reloadStreamedImages(module);
+    log?.("Texture streaming complete");
+  } catch (error) {
+    log?.(`Texture streaming error: ${formatError(error)}`);
   }
 }
 
