@@ -23,3 +23,4 @@ areadump-out/
 # experiment live). The monolithic boot pak (pak-display.pk4.*) stays tracked.
 public/wasm/base-stream/pak-display-stream.pk4*
 public/wasm/base-stream/enpro.areas.*
+.gstack/

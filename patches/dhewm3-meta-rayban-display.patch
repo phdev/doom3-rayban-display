@@ -2007,7 +2007,7 @@ index 0000000..bd37bff
 +
 +#endif // __D3_WEARABLE_GAME_H__
 diff --git a/neo/game/Game_local.cpp b/neo/game/Game_local.cpp
-index 1fca78f..eca7874 100644
+index 1fca78f..f69d1a1 100644
 --- a/neo/game/Game_local.cpp
 +++ b/neo/game/Game_local.cpp
 @@ -27,6 +27,10 @@ If you have questions concerning this license or the applicable additional terms
@@ -2037,7 +2037,7 @@ index 1fca78f..eca7874 100644
  
  	clip.Init();
  	pvs.Init();
-@@ -1177,6 +1183,280 @@ void idGameLocal::NextMap_f( const idCmdArgs &args ) {
+@@ -1177,6 +1183,282 @@ void idGameLocal::NextMap_f( const idCmdArgs &args ) {
  	gameLocal.MapRestart( );
  }
  
@@ -2059,9 +2059,11 @@ index 1fca78f..eca7874 100644
 +===================
 +*/
 +void idGameLocal::DumpAreaSplit_f( const idCmdArgs &args ) {
-+	// optional arg: comma-separated boot-region areas kept resident in the boot
-+	// .bcm (must match split-bproc-areas.py --boot-areas). Default: none.
-+	gameLocal.DumpAreaSplit( args.Argc() > 1 ? args.Argv( 1 ) : "" );
++	// Boot-region areas kept resident in the boot .bcm (must match
++	// split-bproc-areas.py --boot-areas). Use Args() (the whole arg string), NOT
++	// Argv(1): idCmdArgs tokenizes on commas, so "0,1,2" gives Argv(1)="0".
++	// DumpAreaSplit's parser accepts space- or comma-separated.
++	gameLocal.DumpAreaSplit( args.Args() );
 +}
 +
 +/*
@@ -2318,7 +2320,7 @@ index 1fca78f..eca7874 100644
  /*
  ===================
  idGameLocal::MapPopulate
-@@ -1769,12 +2049,21 @@ void idGameLocal::CacheDictionaryMedia( const idDict *dict ) {
+@@ -1769,12 +2051,21 @@ void idGameLocal::CacheDictionaryMedia( const idDict *dict ) {
  				|| !idStr::Icmp( kv->GetKey(), "gui_inventory" ) ) {
  				// unfortunate flag names, they aren't actually a gui
  			} else {
@@ -2340,7 +2342,7 @@ index 1fca78f..eca7874 100644
  			}
  		}
  		kv = dict->MatchPrefix( "gui", kv );
-@@ -2273,6 +2562,19 @@ gameReturn_t idGameLocal::RunFrame( const usercmd_t *clientCmds ) {
+@@ -2273,6 +2564,19 @@ gameReturn_t idGameLocal::RunFrame( const usercmd_t *clientCmds ) {
  			player->Think();
  		}
  	} else do {
@@ -2360,7 +2362,7 @@ index 1fca78f..eca7874 100644
  		// update the game time
  		framenum++;
  		previousTime = time;
-@@ -3276,6 +3578,7 @@ idGameLocal::SpawnMapEntities
+@@ -3276,6 +3580,7 @@ idGameLocal::SpawnMapEntities
  Parses textual entity definitions out of an entstring and spawns gentities.
  ==============
  */
@@ -2368,7 +2370,7 @@ index 1fca78f..eca7874 100644
  void idGameLocal::SpawnMapEntities( void ) {
  	int			i;
  	int			num;
-@@ -3960,9 +4263,30 @@ void idGameLocal::SetCamera( idCamera *cam ) {
+@@ -3960,9 +4265,30 @@ void idGameLocal::SetCamera( idCamera *cam ) {
  	}
  
  	camera = cam;

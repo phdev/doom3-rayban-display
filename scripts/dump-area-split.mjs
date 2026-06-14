@@ -46,16 +46,37 @@ try {
   await waitFor(() => evaluate(client, "Boolean(document.querySelector('#gameCanvas'))"), "app canvas");
   console.log(`Loaded ${APP_URL}`);
 
-  await waitForMapLoaded(client);
-  console.log("enpro loaded. Running dumpAreaSplit...");
+  // DUMP_BOOT_AREAS sets the boot region kept resident in the boot .bcm (must
+  // match split-bproc-areas.py). space-separated — idCmdArgs tokenizes on commas.
+  const bootAreas = (process.env.DUMP_BOOT_AREAS || "0,1,2,3,4,5,6,7,8,9").replace(/,/g, " ");
 
-  // run the bake command (buffers to next engine frame). DUMP_BOOT_AREAS sets the
-  // boot region kept resident in the boot .bcm (must match split-bproc-areas.py).
-  const bootAreas = process.env.DUMP_BOOT_AREAS || "0,1,2,3,4,5,6,7,8,9";
-  await evaluate(client, `(() => {
-    try { window.Module.ccall("D3_ExecCommand", null, ["string"], ["dumpAreaSplit ${bootAreas}"]); return "ok"; }
-    catch (e) { return "ERR " + e; }
-  })()`);
+  // Robust against the flaky headless boot (__d3ViewPos can lag minutes under
+  // swiftshader): retry dumpAreaSplit until it produces the json fragments. The
+  // map loads (gameRenderWorld ready) before the first render, and the command
+  // no-ops harmlessly until then.
+  console.log("Waiting for map + running dumpAreaSplit (retry until output)...");
+  const hasFragments = `(() => { try {
+    const FS = window.Module.FS;
+    const walk = (d) => { let r = []; let es; try { es = FS.readdir(d); } catch { return r; }
+      for (const e of es) { if (e === "." || e === "..") continue; const f = (d === "/" ? "" : d) + "/" + e;
+        let st; try { st = FS.stat(f); } catch { continue; }
+        if (FS.isDir(st.mode)) r = r.concat(walk(f)); else r.push(e); } return r; };
+    const ns = new Set(walk("/save"));
+    return ns.has("render.json") && ns.has("collision.json") && ns.has("entities.json");
+  } catch { return false; } })()`;
+  let dumped = false;
+  const dumpStart = Date.now();
+  while (Date.now() - dumpStart < BOOT_TIMEOUT_MS) {
+    const log = await evaluate(client, "Array.isArray(window.__d3Logs) ? window.__d3Logs.join('\\n') : ''");
+    if (/recursive shutdown|Error during initialization|ERROR: Couldn't load default/i.test(log)) {
+      throw new Error("Boot failed:\n" + log.split("\n").slice(-25).join("\n"));
+    }
+    await evaluate(client, `(() => { try { window.Module.ccall("D3_ExecCommand", null, ["string"], ["dumpAreaSplit ${bootAreas}"]); return 1; } catch (e) { return 0; } })()`);
+    await delay(4000);
+    if (await evaluate(client, hasFragments)) { dumped = true; break; }
+  }
+  if (!dumped) throw new Error("dumpAreaSplit never produced json fragments within timeout");
+  console.log("enpro loaded. dumpAreaSplit produced output.");
 
   // Walk /save (the engine nests writes under fs_savepath) and return every
   // dump file with its full path + size. Matches *.bproc.part, *.entities,
