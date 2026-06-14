@@ -224,7 +224,7 @@ index edb0365..30876a5 100644
  
  extern idCollisionModelManager *		collisionModelManager;
 diff --git a/neo/cm/CollisionModel_files.cpp b/neo/cm/CollisionModel_files.cpp
-index 9240b06..0156620 100644
+index 9240b06..51d867a 100644
 --- a/neo/cm/CollisionModel_files.cpp
 +++ b/neo/cm/CollisionModel_files.cpp
 @@ -45,6 +45,16 @@ If you have questions concerning this license or the applicable additional terms
@@ -244,7 +244,7 @@ index 9240b06..0156620 100644
  /*
  ===============================================================================
  
-@@ -261,6 +271,435 @@ void idCollisionModelManagerLocal::WriteCollisionModelsToFile( const char *filen
+@@ -261,6 +271,447 @@ void idCollisionModelManagerLocal::WriteCollisionModelsToFile( const char *filen
  	fileSystem->CloseFile( fp );
  }
  
@@ -520,7 +520,13 @@ index 9240b06..0156620 100644
 +		fp->WriteInt( BCM_MAGIC );
 +		fp->WriteInt( BCM_VERSION );
 +		fp->WriteInt( (int)mapCRC );
-+		fp->WriteInt( 1 );	// numModels
++		// MAP collision models only: model 0 (the world) is reduced/split per-area;
++		// the inline brush models 1..numMapModels-1 (func_door, movers, func_static)
++		// stay WHOLE and boot-resident — dropping them breaks every door/mover's
++		// collision. numMapModels (not numModels) excludes runtime trm/moveable
++		// models loaded after the map (else the boot .bcm carries stale junk).
++		int nMap = ( numMapModels > 0 ) ? numMapModels : numModels;
++		fp->WriteInt( nMap );
 +		fp->WriteString( model->name.c_str() );
 +		fp->WriteInt( model->numVertices );
 +		for ( int i = 0; i < model->numVertices; i++ ) {
@@ -553,6 +559,12 @@ index 9240b06..0156620 100644
 +		fp->WriteInt( residentBrushes );
 +		for ( int i = 0; i < brushes.Num(); i++ ) {
 +			if ( brushBkt[i] == -2 ) CM_WriteBrush( fp, brushes[i] );
++		}
++		// inline brush models (doors/movers/func_static) — whole, boot-resident.
++		for ( int mi = 1; mi < nMap; mi++ ) {
++			if ( models[mi] ) {
++				WriteBinaryCollisionModel( fp, models[mi] );
++			}
 +		}
 +		fileSystem->CloseFile( fp );
 +	}
@@ -680,7 +692,7 @@ index 9240b06..0156620 100644
  /*
  ================
  idCollisionModelManagerLocal::WriteCollisionModelForMapEntity
-@@ -615,3 +1054,329 @@ bool idCollisionModelManagerLocal::LoadCollisionModelFile( const char *name, uns
+@@ -615,3 +1066,329 @@ bool idCollisionModelManagerLocal::LoadCollisionModelFile( const char *name, uns
  
  	return true;
  }
@@ -1011,10 +1023,18 @@ index 9240b06..0156620 100644
 +	return true;
 +}
 diff --git a/neo/cm/CollisionModel_load.cpp b/neo/cm/CollisionModel_load.cpp
-index 199484c..29db6e6 100644
+index 199484c..5ce82c0 100644
 --- a/neo/cm/CollisionModel_load.cpp
 +++ b/neo/cm/CollisionModel_load.cpp
-@@ -3391,14 +3391,25 @@ void idCollisionModelManagerLocal::ListModels( void ) {
+@@ -184,6 +184,7 @@ void idCollisionModelManagerLocal::Clear( void ) {
+ 	checkCount = 0;
+ 	maxModels = 0;
+ 	numModels = 0;
++	numMapModels = 0;
+ 	models = NULL;
+ 	memset( trmPolygons, 0, sizeof( trmPolygons ) );
+ 	trmBrushes[0] = NULL;
+@@ -3391,14 +3392,25 @@ void idCollisionModelManagerLocal::ListModels( void ) {
  idCollisionModelManagerLocal::BuildModels
  ================
  */
@@ -1041,7 +1061,7 @@ index 199484c..29db6e6 100644
  
  		if ( !mapFile->GetNumEntities() ) {
  			return;
-@@ -3429,6 +3440,12 @@ void idCollisionModelManagerLocal::BuildModels( const idMapFile *mapFile ) {
+@@ -3429,6 +3441,12 @@ void idCollisionModelManagerLocal::BuildModels( const idMapFile *mapFile ) {
  		WriteCollisionModelsToFile( mapFile->GetName(), 0, numModels, mapFile->GetGeometryCRC() );
  	}
  
@@ -1054,8 +1074,20 @@ index 199484c..29db6e6 100644
  	timer.Stop();
  
  	// print statistics on collision data
+@@ -3481,6 +3499,11 @@ void idCollisionModelManagerLocal::LoadMap( const idMapFile *mapFile ) {
+ 	// build collision models
+ 	BuildModels( mapFile );
+ 
++	// remember how many models came from the map (.bcm). Runtime trace models
++	// (SetupTrmModel) and moveable .lwo collisions (LoadModel) append after this;
++	// the area-streaming bake must serialize only these map models.
++	numMapModels = numModels;
++
+ 	// save name and time stamp
+ 	mapName = mapFile->GetName();
+ 	mapFileTime = mapFile->GetFileTime();
 diff --git a/neo/cm/CollisionModel_local.h b/neo/cm/CollisionModel_local.h
-index 562344f..340743f 100644
+index 562344f..107f5cb 100644
 --- a/neo/cm/CollisionModel_local.h
 +++ b/neo/cm/CollisionModel_local.h
 @@ -345,6 +345,13 @@ public:
@@ -1093,6 +1125,14 @@ index 562344f..340743f 100644
  
  private:			// CollisionMap_debug
  	int				ContentsFromString( const char *string ) const;
+@@ -509,6 +530,7 @@ private:			// collision map data
+ 					// models
+ 	int				maxModels;
+ 	int				numModels;
++	int				numMapModels;		// models loaded from the map (.bcm) only; runtime trm/moveable models append after
+ 	cm_model_t **	models;
+ 					// polygons and brush for trm model
+ 	cm_polygonRef_t*trmPolygons[MAX_TRACEMODEL_POLYS];
 diff --git a/neo/framework/Common.cpp b/neo/framework/Common.cpp
 index dbf6c54..e63eb7f 100644
 --- a/neo/framework/Common.cpp
