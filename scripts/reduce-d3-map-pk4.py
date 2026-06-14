@@ -10,6 +10,10 @@ so this tool runs a heuristic dependency pass:
   3. Resolve the materials / sounds / models the map references to concrete
      image and audio files, and keep only those binaries.
   4. Optionally downsample retained WAV audio.
+  5. GUI closure: keep only the guis/ (.gui scripts + guis/assets/ images)
+     reachable from the engine GUIs, this map's entity gui keys, and the
+     loadout weapons — dropping other-level panel art the map never opens
+     (~2.3MB compressed on enpro). Disable with --keep-all-guis.
 
 It is intentionally conservative: it errs toward keeping a working map over the
 smallest possible size. Use --keep-list to force-include extra globs, and
@@ -292,6 +296,15 @@ def main(argv=None):
                         help="comma-list of path substrings; drop any kept file whose path "
                              "contains one (e.g. 'md5/cinematics' to drop the fast-forwarded "
                              "intro cutscene's animations). Applied AFTER the closure.")
+    parser.add_argument("--keep-all-guis", action="store_true",
+                        help="disable the GUI closure: keep guis/assets/ and every .gui "
+                             "wholesale (the old behavior). By default the reducer keeps only "
+                             "the guis/ that THIS map's entities, the HUD/PDA, the loadout "
+                             "weapons, and the engine reference — dropping ~2.3MB compressed of "
+                             "OTHER-LEVEL panel art (medical, marscity, delta, caverns...) that "
+                             "the map never opens. Reference-driven + fixpoint-walked, so it is "
+                             "first-frame-safe; use this flag only to A/B or if a custom map "
+                             "loads a .gui by runtime script in a way the static walk can't see.")
     parser.add_argument("--decimate-anims", action="store_true",
                         help="shrink .md5anim by truncating joint floats to fewer decimals "
                              "(default 3 → ~44%% smaller). SAFE: frame count is unchanged so "
@@ -619,6 +632,86 @@ def main(argv=None):
                 dds_convert[canon + ".tga"] = name
         if dds_convert:
             print(f"  converting {len(dds_convert)} DDS-only textures to TGA", file=sys.stderr)
+
+        # 5c. GUI closure. The stock keep set ships guis/assets/ wholesale
+        # (ALWAYS_KEEP) plus every .gui (TEXT_KEEP). On a single map that is
+        # mostly OTHER LEVELS' panel art — on enpro ~2.3MB compressed of
+        # medical/marscity/delta/caverns/etc. screens this map never opens.
+        # Keep only the guis/ reachable from: the engine-hardcoded GUIs, this
+        # map's entity gui keys, and the loadout-weapon/PDA GUIs — each parsed
+        # for its guis/assets images and nested .gui refs to a fixpoint. fonts/,
+        # ui/assets/, lights/, glprogs/ stay wholesale (small + engine-implicit,
+        # and the HUD uses the "alternate" fonts so they are NOT droppable).
+        # First-frame-safe: every asset a kept GUI references is retained;
+        # unreached files are pure other-level dead weight. Disable with
+        # --keep-all-guis.
+        if not args.keep_all_guis:
+            # idSession / idPlayer / idMultiplayer load these by literal name —
+            # not reachable through the map/def token graph.
+            ENGINE_GUIS = {
+                "guis/mainmenu.gui", "guis/pda.gui", "guis/intro.gui",
+                "guis/msg.gui", "guis/takenotes.gui", "guis/takenotes2.gui",
+                "guis/gameover.gui", "guis/endlevel.gui", "guis/restart.gui",
+                "guis/map/loading.gui", "guis/hud.gui", "guis/cursor.gui",
+                "guis/scoreboard.gui", "guis/mphud.gui", "guis/mpmain.gui",
+                "guis/mpmsgmode.gui", "guis/netmenu.gui", "guis/chat.gui",
+                "guis/spectate.gui", "guis/ctfscoreboard.gui",
+                "guis/demo_mainmenu.gui",
+            }
+            gui_files = {n for n in entries
+                         if n.startswith("guis/") and n.endswith(".gui")}
+            # Seed = engine GUIs + every .gui token the map/def closure reached
+            # (map entity gui/gui2/gui3 keys, weapon-def gui keys, etc.).
+            gui_seed = {g for g in ENGINE_GUIS if g in gui_files}
+            for t in used | seed_names | referenced:
+                tl = t.lower()
+                if tl.endswith(".gui") and tl in gui_files:
+                    gui_seed.add(tl)
+            # Walk .gui -> nested .gui to a fixpoint, collecting asset tokens.
+            GUI_RE = re.compile(r"guis/[A-Za-z0-9_./-]+")
+            keep_gui_scripts, gui_asset_toks = set(), set()
+            work = list(gui_seed)
+            while work:
+                g = work.pop()
+                if g in keep_gui_scripts or g not in gui_files:
+                    continue
+                keep_gui_scripts.add(g)
+                gz, go = entries[g]
+                gtext = pool.text(gz, go).lower()
+                for m in GUI_RE.findall(gtext):
+                    if m.endswith(".gui"):
+                        if m in gui_files and m not in keep_gui_scripts:
+                            work.append(m)
+                    else:
+                        gui_asset_toks.add(m)
+                # bare material-name backgrounds resolving to guis/assets images
+                for t in TOKEN_RE.findall(gtext):
+                    tl = t.lower()
+                    if tl in materials:
+                        gui_asset_toks |= {img for img in materials[tl]
+                                           if img.startswith("guis/assets/")}
+            gui_asset_stems = {strip_ext(t) for t in gui_asset_toks}
+            # Resolve to concrete guis/assets entries; keep device-context /
+            # cursor / splash essentials the engine loads directly.
+            keep_gui_assets = set()
+            for n in entries:
+                if not n.startswith("guis/assets/"):
+                    continue
+                if n.startswith("guis/assets/common/") or "cursor" in n \
+                   or "scrollbar" in n or n.startswith("guis/assets/splash") \
+                   or n == "guis/assets/white.tga":
+                    keep_gui_assets.add(n)
+                elif strip_ext(n) in gui_asset_stems or n in gui_asset_toks:
+                    keep_gui_assets.add(n)
+            gui_closure = keep_gui_scripts | keep_gui_assets
+            pruned = {n for n in keep
+                      if (n.endswith(".gui") or n.startswith("guis/assets/"))
+                      and n not in gui_closure}
+            keep -= pruned
+            print(f"  GUI-CLOSURE: kept {len(keep_gui_scripts)} .gui + "
+                  f"{len(keep_gui_assets)} assets; dropped {len(pruned)} "
+                  f"other-level guis/ files (use --keep-all-guis to disable)",
+                  file=sys.stderr)
 
         # Drop kept files matching a --drop-paths substring (e.g. the skipped
         # intro cinematic's anims). Applied after the closure so it overrides.
