@@ -36,7 +36,8 @@ import os
 import re
 import sys
 
-AREA_RE = re.compile(r"_area(\d+)\.(bproc\.part|entities)$")
+AREA_RE = re.compile(r"_area(\d+)\.(bproc\.part|bcm\.part|entities)$")
+_KIND = {"bproc.part": "render", "bcm.part": "collision", "entities": "entities"}
 
 
 def load_json(path):
@@ -55,9 +56,7 @@ def classify(filename):
     base = os.path.basename(filename)
     m = AREA_RE.search(base)
     if m:
-        area = int(m.group(1))
-        kind = "render" if m.group(2) == "bproc.part" else "entities"
-        return kind, area
+        return _KIND[m.group(2)], int(m.group(1))
     if base == "_shared.bproc.part":
         return "render", -1
     if base == "_boot.entities":

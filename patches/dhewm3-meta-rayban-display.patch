@@ -182,7 +182,7 @@ index 69f1892..9912f89 100644
  endif()
  if (AROS)
 diff --git a/neo/cm/CollisionModel.h b/neo/cm/CollisionModel.h
-index edb0365..abbbd69 100644
+index edb0365..30876a5 100644
 --- a/neo/cm/CollisionModel.h
 +++ b/neo/cm/CollisionModel.h
 @@ -92,6 +92,11 @@ typedef int cmHandle_t;
@@ -197,7 +197,7 @@ index edb0365..abbbd69 100644
  class idCollisionModelManager {
  public:
  	virtual					~idCollisionModelManager( void ) {}
-@@ -149,6 +154,13 @@ public:
+@@ -149,6 +154,25 @@ public:
  	virtual void			ListModels( void ) = 0;
  	// Writes a collision model file for the given map entity.
  	virtual bool			WriteCollisionModelForMapEntity( const idMapEntity *mapEnt, const char *filename, const bool testTraceModel = true ) = 0;
@@ -208,11 +208,23 @@ index edb0365..abbbd69 100644
 +	// per-area counts + cross-area-straddler + void totals (the go/no-go metric).
 +	// Non-pure so only idCollisionModelManagerLocal implements it. Read-only.
 +	virtual void			DumpAreaCollisionStats( const char *dir, int numAreas, cmAreaForPointFn fn, void *ctx ) {}
++
++	// Phase 2 (area-streaming bake): serialize the world collision model split by
++	// render area. Writes <dir>/enpro.boot.bcm (full vert/edge/node skeleton +
++	// only the resident polys/brushes: cross-area, void, and boot-region areas)
++	// and <dir>/_areaN.bcm.part (each non-boot area's polys/brushes). isBootArea
++	// is a numAreas-sized array marking which areas stay resident. Read-only.
++	virtual void			DumpAreaCollision( const char *dir, int numAreas, const bool *isBootArea, unsigned int mapCRC, cmAreaForPointFn fn, void *ctx ) {}
++
++	// Phase 2 (runtime): append one area's collision polys/brushes (from a
++	// _areaN.bcm.part) into the world model's existing BSP. Returns false if the
++	// part is missing/corrupt. Safe mid-game; never rebuilds the tree.
++	virtual bool			AppendAreaCollision( int areaNum ) { return false; }
  };
  
  extern idCollisionModelManager *		collisionModelManager;
 diff --git a/neo/cm/CollisionModel_files.cpp b/neo/cm/CollisionModel_files.cpp
-index 9240b06..8b3b78a 100644
+index 9240b06..0156620 100644
 --- a/neo/cm/CollisionModel_files.cpp
 +++ b/neo/cm/CollisionModel_files.cpp
 @@ -45,6 +45,16 @@ If you have questions concerning this license or the applicable additional terms
@@ -232,7 +244,7 @@ index 9240b06..8b3b78a 100644
  /*
  ===============================================================================
  
-@@ -261,6 +271,133 @@ void idCollisionModelManagerLocal::WriteCollisionModelsToFile( const char *filen
+@@ -261,6 +271,435 @@ void idCollisionModelManagerLocal::WriteCollisionModelsToFile( const char *filen
  	fileSystem->CloseFile( fp );
  }
  
@@ -363,10 +375,312 @@ index 9240b06..8b3b78a 100644
 +	Mem_Free( areaBrushes );
 +}
 +
++/*
++================
++Phase 2 collision serialization helpers
++================
++*/
++static int CM_PolySize( cm_polygon_t *p ) {
++	return sizeof( cm_polygon_t ) + ( p->numEdges - 1 ) * sizeof( p->edges[0] );
++}
++static int CM_BrushSize( cm_brush_t *b ) {
++	return sizeof( cm_brush_t ) + ( b->numPlanes - 1 ) * sizeof( b->planes[0] );
++}
++static void CM_WritePoly( idFile *fp, cm_polygon_t *p ) {
++	fp->WriteInt( p->numEdges );
++	for ( int i = 0; i < p->numEdges; i++ ) {
++		fp->WriteInt( p->edges[i] );
++	}
++	fp->WriteVec3( p->plane.Normal() );
++	fp->WriteFloat( p->plane.Dist() );
++	fp->WriteVec3( p->bounds[0] );
++	fp->WriteVec3( p->bounds[1] );
++	fp->WriteString( p->material->GetName() );
++}
++static void CM_WriteBrush( idFile *fp, cm_brush_t *b ) {
++	fp->WriteInt( b->numPlanes );
++	for ( int i = 0; i < b->numPlanes; i++ ) {
++		fp->WriteVec3( b->planes[i].Normal() );
++		fp->WriteFloat( b->planes[i].Dist() );
++	}
++	fp->WriteVec3( b->bounds[0] );
++	fp->WriteVec3( b->bounds[1] );
++	fp->WriteInt( b->contents );
++}
++
++// Returns the bucket for a polygon: -2 = resident (boot .bcm) for void /
++// cross-area straddler / boot-region; else the area number (-> _areaN.bcm.part).
++int idCollisionModelManagerLocal::PolyAreaBucket( cm_polygon_t *p, int numAreas, const bool *isBootArea, cmAreaForPointFn fn, void *ctx ) {
++	idVec3 centroid = ( p->bounds[0] + p->bounds[1] ) * 0.5f;
++	int a = fn( ctx, centroid );
++	if ( a < 0 || a >= numAreas ) {
++		return -2;
++	}
++	for ( int c = 0; c < 8; c++ ) {
++		idVec3 corner( p->bounds[(c>>0)&1][0], p->bounds[(c>>1)&1][1], p->bounds[(c>>2)&1][2] );
++		int ca = fn( ctx, corner );
++		if ( ca >= 0 && ca != a ) {
++			return -2;	// straddles an area boundary -> always-boot
++		}
++	}
++	if ( isBootArea && isBootArea[a] ) {
++		return -2;
++	}
++	return a;
++}
++
++int idCollisionModelManagerLocal::BrushAreaBucket( cm_brush_t *b, int numAreas, const bool *isBootArea, cmAreaForPointFn fn, void *ctx ) {
++	idVec3 centroid = ( b->bounds[0] + b->bounds[1] ) * 0.5f;
++	int a = fn( ctx, centroid );
++	if ( a < 0 || a >= numAreas ) {
++		return -2;
++	}
++	for ( int c = 0; c < 8; c++ ) {
++		idVec3 corner( b->bounds[(c>>0)&1][0], b->bounds[(c>>1)&1][1], b->bounds[(c>>2)&1][2] );
++		int ca = fn( ctx, corner );
++		if ( ca >= 0 && ca != a ) {
++			return -2;
++		}
++	}
++	if ( isBootArea && isBootArea[a] ) {
++		return -2;
++	}
++	return a;
++}
++
++/*
++================
++idCollisionModelManagerLocal::DumpAreaCollision
++
++Phase 2 bake: serialize the world collision model (model 0) split by render area.
++Boot .bcm = full vert/edge/node skeleton + resident polys/brushes (void, straddler,
++boot-region). Per-area parts = each non-boot area's polys/brushes (poly/brush
++sub-stream only; they reference the global edge array which lives in the boot
++.bcm). The append reader (AppendAreaCollision) filters them into the existing
++tree at runtime. mapCRC must be the live map's geometry CRC so the reduced boot
++.bcm passes LoadBinaryCollisionModelFile's freshness check. Read-only.
++================
++*/
++void idCollisionModelManagerLocal::DumpAreaCollision( const char *dir, int numAreas, const bool *isBootArea, unsigned int mapCRC, cmAreaForPointFn fn, void *ctx ) {
++	if ( numModels < 1 || models[0] == NULL || fn == NULL ) {
++		return;
++	}
++	cm_model_t *model = models[0];
++
++	// collect deduped polys + brushes with their bucket
++	idList<cm_polygon_t *> polys;
++	idList<int> polyBkt;
++	idList<cm_brush_t *> brushes;
++	idList<int> brushBkt;
++	idList<cm_node_t *> stack;
++
++	checkCount++;
++	stack.Append( model->node );
++	while ( stack.Num() ) {
++		cm_node_t *node = stack[ stack.Num() - 1 ];
++		stack.RemoveIndex( stack.Num() - 1 );
++		for ( cm_polygonRef_t *pr = node->polygons; pr; pr = pr->next ) {
++			if ( pr->p->checkcount == checkCount ) {
++				continue;
++			}
++			pr->p->checkcount = checkCount;
++			polys.Append( pr->p );
++			polyBkt.Append( PolyAreaBucket( pr->p, numAreas, isBootArea, fn, ctx ) );
++		}
++		if ( node->planeType != -1 ) {
++			stack.Append( node->children[0] );
++			stack.Append( node->children[1] );
++		}
++	}
++	checkCount++;
++	stack.Clear();
++	stack.Append( model->node );
++	while ( stack.Num() ) {
++		cm_node_t *node = stack[ stack.Num() - 1 ];
++		stack.RemoveIndex( stack.Num() - 1 );
++		for ( cm_brushRef_t *br = node->brushes; br; br = br->next ) {
++			if ( br->b->checkcount == checkCount ) {
++				continue;
++			}
++			br->b->checkcount = checkCount;
++			brushes.Append( br->b );
++			brushBkt.Append( BrushAreaBucket( br->b, numAreas, isBootArea, fn, ctx ) );
++		}
++		if ( node->planeType != -1 ) {
++			stack.Append( node->children[0] );
++			stack.Append( node->children[1] );
++		}
++	}
++
++	// --- boot .bcm: header + skeleton + resident (bucket == -2) polys/brushes ---
++	idStr bootPath = idStr( dir ) + "/enpro.boot.bcm";
++	idFile *fp = fileSystem->OpenFileWrite( bootPath );
++	int residentPolys = 0, residentBrushes = 0;
++	if ( fp ) {
++		fp->WriteInt( BCM_MAGIC );
++		fp->WriteInt( BCM_VERSION );
++		fp->WriteInt( (int)mapCRC );
++		fp->WriteInt( 1 );	// numModels
++		fp->WriteString( model->name.c_str() );
++		fp->WriteInt( model->numVertices );
++		for ( int i = 0; i < model->numVertices; i++ ) {
++			fp->WriteVec3( model->vertices[i].p );
++		}
++		fp->WriteInt( model->numEdges );
++		for ( int i = 0; i < model->numEdges; i++ ) {
++			fp->WriteInt( model->edges[i].vertexNum[0] );
++			fp->WriteInt( model->edges[i].vertexNum[1] );
++			fp->WriteInt( model->edges[i].internal );
++			fp->WriteInt( model->edges[i].numUsers );
++		}
++		WriteBinaryNodes( fp, model->node );
++		// resident polygons
++		int pm = 0;
++		for ( int i = 0; i < polys.Num(); i++ ) {
++			if ( polyBkt[i] == -2 ) { pm += CM_PolySize( polys[i] ); residentPolys++; }
++		}
++		fp->WriteInt( pm );
++		fp->WriteInt( residentPolys );
++		for ( int i = 0; i < polys.Num(); i++ ) {
++			if ( polyBkt[i] == -2 ) CM_WritePoly( fp, polys[i] );
++		}
++		// resident brushes
++		int bm = 0;
++		for ( int i = 0; i < brushes.Num(); i++ ) {
++			if ( brushBkt[i] == -2 ) { bm += CM_BrushSize( brushes[i] ); residentBrushes++; }
++		}
++		fp->WriteInt( bm );
++		fp->WriteInt( residentBrushes );
++		for ( int i = 0; i < brushes.Num(); i++ ) {
++			if ( brushBkt[i] == -2 ) CM_WriteBrush( fp, brushes[i] );
++		}
++		fileSystem->CloseFile( fp );
++	}
++
++	// --- per-area parts (non-boot areas only) ---
++	int streamedAreas = 0;
++	for ( int area = 0; area < numAreas; area++ ) {
++		if ( isBootArea && isBootArea[area] ) {
++			continue;
++		}
++		int pm = 0, pc = 0, bm = 0, bc = 0;
++		for ( int i = 0; i < polys.Num(); i++ ) {
++			if ( polyBkt[i] == area ) { pm += CM_PolySize( polys[i] ); pc++; }
++		}
++		for ( int i = 0; i < brushes.Num(); i++ ) {
++			if ( brushBkt[i] == area ) { bm += CM_BrushSize( brushes[i] ); bc++; }
++		}
++		if ( pc == 0 && bc == 0 ) {
++			continue;
++		}
++		idStr partPath = idStr( dir ) + "/_area" + area + ".bcm.part";
++		idFile *pf = fileSystem->OpenFileWrite( partPath );
++		if ( !pf ) {
++			continue;
++		}
++		pf->WriteInt( pm );
++		pf->WriteInt( pc );
++		for ( int i = 0; i < polys.Num(); i++ ) {
++			if ( polyBkt[i] == area ) CM_WritePoly( pf, polys[i] );
++		}
++		pf->WriteInt( bm );
++		pf->WriteInt( bc );
++		for ( int i = 0; i < brushes.Num(); i++ ) {
++			if ( brushBkt[i] == area ) CM_WriteBrush( pf, brushes[i] );
++		}
++		fileSystem->CloseFile( pf );
++		streamedAreas++;
++	}
++
++	common->Printf( "DumpAreaCollision: boot .bcm = %d/%d polys + %d/%d brushes resident; %d areas streamed\n",
++		residentPolys, polys.Num(), residentBrushes, brushes.Num(), streamedAreas );
++}
++
++/*
++================
++idCollisionModelManagerLocal::AppendAreaCollision
++
++Phase 2 runtime: append one area's polys/brushes (from areadump/_areaN.bcm.part)
++into the world model's existing BSP. Mirrors ParseBinaryPolygons/Brushes but does
++NOT reallocate polygonBlock — AllocPolygon/AllocBrush overflow to Mem_Alloc, so
++appended primitives just malloc individually. Edge normals are recomputed once
++(rotation traces need them). Never rebuilds the tree, so traces stay stable.
++================
++*/
++bool idCollisionModelManagerLocal::AppendAreaCollision( int areaNum ) {
++	if ( numModels < 1 || models[0] == NULL ) {
++		return false;
++	}
++	cm_model_t *model = models[0];
++	idStr path = va( "areadump/_area%i.bcm.part", areaNum );
++	idFile *fp = fileSystem->OpenFileRead( path );
++	if ( fp == NULL ) {
++		return false;
++	}
++
++	int pm = 0, numPolys = 0;
++	fp->ReadInt( pm );			// polygonMemory — intentionally ignored (no block realloc)
++	fp->ReadInt( numPolys );
++	for ( int n = 0; n < numPolys; n++ ) {
++		int numEdges = 0;
++		fp->ReadInt( numEdges );
++		cm_polygon_t *p = AllocPolygon( model, numEdges );
++		p->numEdges = numEdges;
++		for ( int i = 0; i < numEdges; i++ ) {
++			fp->ReadInt( p->edges[i] );
++		}
++		idVec3 normal;
++		fp->ReadVec3( normal );
++		p->plane.SetNormal( normal );
++		float dist;
++		fp->ReadFloat( dist );
++		p->plane.SetDist( dist );
++		fp->ReadVec3( p->bounds[0] );
++		fp->ReadVec3( p->bounds[1] );
++		idStr matName;
++		fp->ReadString( matName );
++		p->material = declManager->FindMaterial( matName );
++		p->contents = p->material->GetContentFlags();
++		p->checkcount = 0;
++		R_FilterPolygonIntoTree( model, model->node, NULL, p );
++		model->contents |= p->contents;
++	}
++
++	int bm = 0, numBrushes = 0;
++	fp->ReadInt( bm );
++	fp->ReadInt( numBrushes );
++	for ( int n = 0; n < numBrushes; n++ ) {
++		int numPlanes = 0;
++		fp->ReadInt( numPlanes );
++		cm_brush_t *b = AllocBrush( model, numPlanes );
++		b->numPlanes = numPlanes;
++		for ( int i = 0; i < numPlanes; i++ ) {
++			idVec3 normal;
++			fp->ReadVec3( normal );
++			b->planes[i].SetNormal( normal );
++			float dist;
++			fp->ReadFloat( dist );
++			b->planes[i].SetDist( dist );
++		}
++		fp->ReadVec3( b->bounds[0] );
++		fp->ReadVec3( b->bounds[1] );
++		fp->ReadInt( b->contents );
++		b->checkcount = 0;
++		b->primitiveNum = 0;
++		R_FilterBrushIntoTree( model, model->node, NULL, b );
++		model->contents |= b->contents;
++	}
++	fileSystem->CloseFile( fp );
++
++	// rotation traces need edge normals; recompute once for the whole tree.
++	CalculateEdgeNormals( model, model->node );
++	return true;
++}
++
  /*
  ================
  idCollisionModelManagerLocal::WriteCollisionModelForMapEntity
-@@ -615,3 +752,329 @@ bool idCollisionModelManagerLocal::LoadCollisionModelFile( const char *name, uns
+@@ -615,3 +1054,329 @@ bool idCollisionModelManagerLocal::LoadCollisionModelFile( const char *name, uns
  
  	return true;
  }
@@ -741,19 +1055,24 @@ index 199484c..29db6e6 100644
  
  	// print statistics on collision data
 diff --git a/neo/cm/CollisionModel_local.h b/neo/cm/CollisionModel_local.h
-index 562344f..ee49b2a 100644
+index 562344f..340743f 100644
 --- a/neo/cm/CollisionModel_local.h
 +++ b/neo/cm/CollisionModel_local.h
-@@ -345,6 +345,8 @@ public:
+@@ -345,6 +345,13 @@ public:
  	void			ListModels( void );
  	// write a collision model file for the map entity
  	bool			WriteCollisionModelForMapEntity( const idMapEntity *mapEnt, const char *filename, const bool testTraceModel = true );
 +	// Phase 0 (area-streaming bake): per-area collision poly/brush census
 +	void			DumpAreaCollisionStats( const char *dir, int numAreas, cmAreaForPointFn fn, void *ctx );
++	// Phase 2: per-area collision serialization + runtime append
++	void			DumpAreaCollision( const char *dir, int numAreas, const bool *isBootArea, unsigned int mapCRC, cmAreaForPointFn fn, void *ctx );
++	bool			AppendAreaCollision( int areaNum );
++	int				PolyAreaBucket( cm_polygon_t *p, int numAreas, const bool *isBootArea, cmAreaForPointFn fn, void *ctx );
++	int				BrushAreaBucket( cm_brush_t *b, int numAreas, const bool *isBootArea, cmAreaForPointFn fn, void *ctx );
  
  private:			// CollisionMap_translate.cpp
  	int				TranslateEdgeThroughEdge( idVec3 &cross, idPluecker &l1, idPluecker &l2, float *fraction );
-@@ -490,6 +492,20 @@ private:			// CollisionMap_files.cpp
+@@ -490,6 +497,20 @@ private:			// CollisionMap_files.cpp
  	void			ParseBrushes( idLexer *src, cm_model_t *model );
  	bool			ParseCollisionModel( idLexer *src );
  	bool			LoadCollisionModelFile( const char *name, unsigned int mapFileCRC );
@@ -1007,10 +1326,10 @@ index 6bba28f..9f732b9 100644
  			viewangles[PITCH] = oldAngles[PITCH] + 90;
 diff --git a/neo/framework/d3_wearable.cpp b/neo/framework/d3_wearable.cpp
 new file mode 100644
-index 0000000..17739a4
+index 0000000..e9aafa2
 --- /dev/null
 +++ b/neo/framework/d3_wearable.cpp
-@@ -0,0 +1,298 @@
+@@ -0,0 +1,302 @@
 +/*
 +===========================================================================
 +
@@ -1196,11 +1515,15 @@ index 0000000..17739a4
 +void
 +D3_AppendArea( int areaNum )
 +{
-+	// Area streaming (Phase 1): bind a deferred render area whose .bproc.part the
-+	// JS shell just wrote into the FS. APPEND so it runs at the safe next-frame
++	// Area streaming: bind a deferred area whose .bproc.part / .bcm.part the JS
++	// shell just wrote into the FS. APPEND so it runs at the safe next-frame
 +	// point (never reentrantly from the JS callback), like D3_ExecCommand.
++	// Collision is appended BEFORE render so a frame can never show walkable-
++	// looking floor the player would fall through (appendAreaCol no-ops if there
++	// is no collision part — render-only streaming).
 +	if ( cmdSystem )
 +	{
++		cmdSystem->BufferCommandText( CMD_EXEC_APPEND, va( "appendAreaCol %d\n", areaNum ) );
 +		cmdSystem->BufferCommandText( CMD_EXEC_APPEND, va( "appendArea %d\n", areaNum ) );
 +	}
 +}
@@ -1684,7 +2007,7 @@ index 0000000..bd37bff
 +
 +#endif // __D3_WEARABLE_GAME_H__
 diff --git a/neo/game/Game_local.cpp b/neo/game/Game_local.cpp
-index 1fca78f..104ddb9 100644
+index 1fca78f..eca7874 100644
 --- a/neo/game/Game_local.cpp
 +++ b/neo/game/Game_local.cpp
 @@ -27,6 +27,10 @@ If you have questions concerning this license or the applicable additional terms
@@ -1714,7 +2037,7 @@ index 1fca78f..104ddb9 100644
  
  	clip.Init();
  	pvs.Init();
-@@ -1177,6 +1183,231 @@ void idGameLocal::NextMap_f( const idCmdArgs &args ) {
+@@ -1177,6 +1183,280 @@ void idGameLocal::NextMap_f( const idCmdArgs &args ) {
  	gameLocal.MapRestart( );
  }
  
@@ -1736,7 +2059,9 @@ index 1fca78f..104ddb9 100644
 +===================
 +*/
 +void idGameLocal::DumpAreaSplit_f( const idCmdArgs &args ) {
-+	gameLocal.DumpAreaSplit();
++	// optional arg: comma-separated boot-region areas kept resident in the boot
++	// .bcm (must match split-bproc-areas.py --boot-areas). Default: none.
++	gameLocal.DumpAreaSplit( args.Argc() > 1 ? args.Argv( 1 ) : "" );
 +}
 +
 +/*
@@ -1762,6 +2087,28 @@ index 1fca78f..104ddb9 100644
 +
 +/*
 +===================
++idGameLocal::AppendAreaCollision_f
++
++Area streaming (Phase 2): append a deferred area's collision polys/brushes now.
++Driven from JS via D3_AppendArea too (it buffers both appendArea + appendAreaCol).
++`appendAreaCol <n>`.
++===================
++*/
++void idGameLocal::AppendAreaCollision_f( const idCmdArgs &args ) {
++	if ( args.Argc() < 2 ) {
++		common->Printf( "usage: appendAreaCol <areaNum>\n" );
++		return;
++	}
++	if ( collisionModelManager == NULL ) {
++		return;
++	}
++	int areaNum = atoi( args.Argv( 1 ) );
++	bool ok = collisionModelManager->AppendAreaCollision( areaNum );
++	common->Printf( "appendAreaCol %d: %s\n", areaNum, ok ? "appended" : "skipped (no part)" );
++}
++
++/*
++===================
 +idGameLocal::DumpAreaSplit
 +
 +Partition the loaded map by render area and write per-area render/collision/
@@ -1769,7 +2116,7 @@ index 1fca78f..104ddb9 100644
 +Read-only; never touches the running game. See the Phase 0 build spec.
 +===================
 +*/
-+void idGameLocal::DumpAreaSplit( void ) {
++void idGameLocal::DumpAreaSplit( const char *bootAreas ) {
 +	const char *dir = "areadump";
 +
 +	if ( gameRenderWorld == NULL ) {
@@ -1779,13 +2126,28 @@ index 1fca78f..104ddb9 100644
 +	int numAreas = gameRenderWorld->NumAreas();
 +	common->Printf( "dumpAreaSplit: %d render areas; writing to /save/%s\n", numAreas, dir );
 +
++	// boot region mask (areas kept resident in the boot .bcm), from the comma
++	// arg (e.g. "0,1,2,...,9"). Must match split-bproc-areas.py --boot-areas.
++	// Manual split — idLexer mis-tokenizes a bare comma-separated int list.
++	bool *isBootArea = (bool *)Mem_ClearedAlloc( numAreas * sizeof( bool ) );
++	int numBoot = 0;
++	if ( bootAreas && bootAreas[0] ) {
++		idStr s = bootAreas;
++		int start = 0;
++		for ( int i = 0; i <= s.Length(); i++ ) {
++			if ( i == s.Length() || s[i] == ',' || s[i] == ' ' ) {
++				if ( i > start ) {
++					int a = atoi( s.Mid( start, i - start ).c_str() );
++					if ( a >= 0 && a < numAreas && !isBootArea[a] ) { isBootArea[a] = true; numBoot++; }
++				}
++				start = i + 1;
++			}
++		}
++	}
++	common->Printf( "dumpAreaSplit: boot region = %d areas\n", numBoot );
++
 +	// (1) RENDER: per-area _areaN.bproc.part + _shared.bproc.part + render.json
 +	gameRenderWorld->DumpAreaModels( dir );
-+
-+	// (2) COLLISION: census world model 0 by area -> collision.json
-+	if ( collisionModelManager ) {
-+		collisionModelManager->DumpAreaCollisionStats( dir, numAreas, GameAreaForPoint, NULL );
-+	}
 +
 +	// (3) ENTITIES: bucket by origin; bootstrap (worldspawn/player/cross-area
 +	//     target+bind/void) forced into _boot. Re-parse the .map fresh so we
@@ -1797,8 +2159,17 @@ index 1fca78f..104ddb9 100644
 +			mf = &localMap;
 +		}
 +	}
++
++	// (2) COLLISION: census (collision.json) + per-area split (boot .bcm + parts)
++	if ( collisionModelManager ) {
++		collisionModelManager->DumpAreaCollisionStats( dir, numAreas, GameAreaForPoint, NULL );
++		unsigned int mapCRC = mf ? mf->GetGeometryCRC() : 0;
++		collisionModelManager->DumpAreaCollision( dir, numAreas, isBootArea, mapCRC, GameAreaForPoint, NULL );
++	}
++
 +	if ( mf == NULL ) {
 +		common->Printf( "dumpAreaSplit: no map file (%s) — skipped entity dump\n", mapFileName.c_str() );
++		Mem_Free( isBootArea );
 +		return;
 +	}
 +
@@ -1941,12 +2312,13 @@ index 1fca78f..104ddb9 100644
 +
 +	Mem_Free( areaCounts );
 +	Mem_Free( areaFiles );
++	Mem_Free( isBootArea );
 +}
 +
  /*
  ===================
  idGameLocal::MapPopulate
-@@ -1769,12 +2000,21 @@ void idGameLocal::CacheDictionaryMedia( const idDict *dict ) {
+@@ -1769,12 +2049,21 @@ void idGameLocal::CacheDictionaryMedia( const idDict *dict ) {
  				|| !idStr::Icmp( kv->GetKey(), "gui_inventory" ) ) {
  				// unfortunate flag names, they aren't actually a gui
  			} else {
@@ -1968,7 +2340,7 @@ index 1fca78f..104ddb9 100644
  			}
  		}
  		kv = dict->MatchPrefix( "gui", kv );
-@@ -2273,6 +2513,19 @@ gameReturn_t idGameLocal::RunFrame( const usercmd_t *clientCmds ) {
+@@ -2273,6 +2562,19 @@ gameReturn_t idGameLocal::RunFrame( const usercmd_t *clientCmds ) {
  			player->Think();
  		}
  	} else do {
@@ -1988,7 +2360,7 @@ index 1fca78f..104ddb9 100644
  		// update the game time
  		framenum++;
  		previousTime = time;
-@@ -3276,6 +3529,7 @@ idGameLocal::SpawnMapEntities
+@@ -3276,6 +3578,7 @@ idGameLocal::SpawnMapEntities
  Parses textual entity definitions out of an entstring and spawns gentities.
  ==============
  */
@@ -1996,7 +2368,7 @@ index 1fca78f..104ddb9 100644
  void idGameLocal::SpawnMapEntities( void ) {
  	int			i;
  	int			num;
-@@ -3960,9 +4214,30 @@ void idGameLocal::SetCamera( idCamera *cam ) {
+@@ -3960,9 +4263,30 @@ void idGameLocal::SetCamera( idCamera *cam ) {
  	}
  
  	camera = cam;
@@ -2028,7 +2400,7 @@ index 1fca78f..104ddb9 100644
  			camera->spawnArgs.SetBool( "disconnect", false );
  			cvarSystem->SetCVarFloat( "r_znear", 3.0f );
 diff --git a/neo/game/Game_local.h b/neo/game/Game_local.h
-index 60b0b88..6461f75 100644
+index 60b0b88..ce679bf 100644
 --- a/neo/game/Game_local.h
 +++ b/neo/game/Game_local.h
 @@ -265,6 +265,7 @@ public:
@@ -2039,16 +2411,18 @@ index 60b0b88..6461f75 100644
  	bool					inCinematic;			// game is playing cinematic (player controls frozen)
  	bool					skipCinematic;
  
-@@ -363,6 +364,13 @@ public:
+@@ -363,6 +364,15 @@ public:
  	bool					NextMap( void );	// returns wether serverinfo settings have been modified
  	static void				NextMap_f( const idCmdArgs &args );
  
 +	// Phase 0 (area-streaming bake): partition the loaded map by render area and
 +	// write per-area render/collision/entity dumps + json metrics to /save/areadump.
-+	void					DumpAreaSplit( void );
++	void					DumpAreaSplit( const char *bootAreas );
 +	static void				DumpAreaSplit_f( const idCmdArgs &args );
-+	// Phase 1 (area streaming): lazily bind a deferred area's render model.
++	// Phase 1/2 (area streaming): lazily bind a deferred area's render model /
++	// append its collision polys.
 +	static void				AppendArea_f( const idCmdArgs &args );
++	static void				AppendAreaCollision_f( const idCmdArgs &args );
 +
  	idMapFile *				GetLevelMap( void );
  	const char *			GetMapName( void ) const;
@@ -2155,7 +2529,7 @@ index 36a0cbe..58d9a22 100644
  
  	GetPhysics()->SetContents( CONTENTS_SOLID );
 diff --git a/neo/game/gamesys/SysCmds.cpp b/neo/game/gamesys/SysCmds.cpp
-index 105ff57..8b563b7 100644
+index 105ff57..e4b3f00 100644
 --- a/neo/game/gamesys/SysCmds.cpp
 +++ b/neo/game/gamesys/SysCmds.cpp
 @@ -692,15 +692,29 @@ void Cmd_SetViewpos_f( const idCmdArgs &args ) {
@@ -2189,12 +2563,13 @@ index 105ff57..8b563b7 100644
  
  	for ( i = 0 ; i < 3 ; i++ ) {
  		origin[i] = atof( args.Argv( i + 1 ) );
-@@ -2314,6 +2328,8 @@ void idGameLocal::InitConsoleCommands( void ) {
+@@ -2314,6 +2328,9 @@ void idGameLocal::InitConsoleCommands( void ) {
  	cmdSystem->AddCommand( "listActiveEntities",	Cmd_ActiveEntityList_f,		CMD_FL_GAME|CMD_FL_CHEAT,	"lists active game entities" );
  	cmdSystem->AddCommand( "listMonsters",			idAI::List_f,				CMD_FL_GAME|CMD_FL_CHEAT,	"lists monsters" );
  	cmdSystem->AddCommand( "listSpawnArgs",			Cmd_ListSpawnArgs_f,		CMD_FL_GAME|CMD_FL_CHEAT,	"list the spawn args of an entity", idGameLocal::ArgCompletion_EntityName );
 +	cmdSystem->AddCommand( "dumpAreaSplit",			idGameLocal::DumpAreaSplit_f,	CMD_FL_GAME|CMD_FL_CHEAT,	"area-streaming bake: dump per-area render/collision/entity split to /save/areadump" );
 +	cmdSystem->AddCommand( "appendArea",			idGameLocal::AppendArea_f,		CMD_FL_GAME|CMD_FL_CHEAT,	"area-streaming: lazily bind a deferred area's render model" );
++	cmdSystem->AddCommand( "appendAreaCol",			idGameLocal::AppendAreaCollision_f,	CMD_FL_GAME|CMD_FL_CHEAT,	"area-streaming: append a deferred area's collision polys/brushes" );
  	cmdSystem->AddCommand( "say",					Cmd_Say_f,					CMD_FL_GAME,				"text chat" );
  	cmdSystem->AddCommand( "sayTeam",				Cmd_SayTeam_f,				CMD_FL_GAME,				"team text chat" );
  	cmdSystem->AddCommand( "addChatLine",			Cmd_AddChatLine_f,			CMD_FL_GAME,				"internal use - core to game chat lines" );

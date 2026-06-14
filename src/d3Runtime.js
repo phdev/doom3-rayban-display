@@ -1914,10 +1914,18 @@ async function streamAreas(module, log) {
       return;
     }
     const manifest = await fmResp.json();
-    // Only the deferred per-area RENDER parts stream (shared/boot live in the pak).
-    const parts = (manifest.files || []).filter((f) => f.kind === "render" && f.area >= 0);
-    if (!parts.length) return;
-    log?.(`Streaming ${parts.length} render areas (${((manifest.compressedSize || 0) / 1e6).toFixed(1)} MB)...`);
+    // Group the deferred per-area parts (render + collision) by area; shared/boot
+    // (area < 0) live in the boot pak. Each area's parts are written before its
+    // single D3_AppendArea call (which binds collision-then-render atomically).
+    const byArea = new Map();
+    for (const f of (manifest.files || [])) {
+      if (f.area < 0 || (f.kind !== "render" && f.kind !== "collision")) continue;
+      if (!byArea.has(f.area)) byArea.set(f.area, []);
+      byArea.get(f.area).push(f);
+    }
+    const areas = [...byArea.keys()].sort((a, b) => a - b);
+    if (!areas.length) return;
+    log?.(`Streaming ${areas.length} areas (${((manifest.compressedSize || 0) / 1e6).toFixed(1)} MB)...`);
 
     // Single blob fetch (no chunk manifest — the dev/prod server SPA-fallbacks a
     // missing .manifest.json to 200+index.html, which would poison fetchChunkedBytes).
@@ -1941,15 +1949,16 @@ async function streamAreas(module, log) {
     mkdirTree(FS, "/base/areadump");
     let bound = 0;
     const BATCH = 8;   // append a handful per frame so the bind cost spreads
-    for (let i = 0; i < parts.length; i++) {
-      const f = parts[i];
-      const path = `/base/${f.path}`;
+    for (let i = 0; i < areas.length; i++) {
+      const area = areas[i];
       try {
-        FS.writeFile(path, raw.subarray(f.off, f.off + f.len));
-        module._D3_AppendArea(f.area);   // buffers appendArea; binds next frame
+        for (const f of byArea.get(area)) {
+          FS.writeFile(`/base/${f.path}`, raw.subarray(f.off, f.off + f.len));
+        }
+        module._D3_AppendArea(area);   // buffers appendAreaCol + appendArea; binds next frame
         bound++;
       } catch (e) {
-        log?.(`area ${f.area} write/append failed: ${formatError(e)}`);
+        log?.(`area ${area} write/append failed: ${formatError(e)}`);
       }
       if ((i + 1) % BATCH === 0) {
         await new Promise((r) => setTimeout(r, 32)); // yield ~2 frames

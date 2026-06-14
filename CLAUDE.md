@@ -134,13 +134,34 @@ similarly in-pak vs in-blob, so total bytes ≈ same; the win is the smaller boo
 1.69 MB deferred to background while the player starts in the boot region). Tighter boot region
 (spawn area + portal-hops, needs an adjacency dump — not yet built) shrinks the boot pak more.
 
-**Remaining (documented, not built):** P2 collision append (`.bcm` per-area stream — biggest
-asset but riskiest: physics fall-through if prefetch lags; needs boot `.bcm` reduction +
-collision-before-render atomic + AAS stays whole-map/boot). P3 entity per-area spawn
-(`SpawnEntityDef`, boot-only gate; Phase 0 already dumps the buckets). Adjacency dump +
-portal-hop boot region + prefetch-on-visibility (currently streams all areas after boot in
-manifest order). Same `streamAreas()` pipeline extends to collision/entity parts (manifest
-already carries `kind`).
+**Phase 2 (collision) DONE + headless VALIDATED.** Streams the world `.bcm` (8.6MB, the
+biggest asset) per render area. In-engine `idCollisionModelManagerLocal::DumpAreaCollision`
+(CollisionModel_files.cpp) walks model 0, buckets each poly/brush via `PointInArea(centroid)`
++ 8-corner straddle test: resident (void / straddler / boot-region) → reduced `enpro.boot.bcm`
+(full vert/edge/node skeleton + resident polys/brushes); else → `_areaN.bcm.part`. The boot
+`.bcm` carries the live map's `GetGeometryCRC()` so `LoadBinaryCollisionModelFile`'s freshness
+check passes (no ASCII `.cm` fallback exists in the baked pak — a CRC miss = no collision).
+`AppendAreaCollision(n)` mirrors `ParseBinaryPolygons` but appends into the LIVE model 0:
+`AllocPolygon`/`AllocBrush` (overflow the boot block → `Mem_Alloc`), `R_FilterPolygonIntoTree`
+/`R_FilterBrushIntoTree` into the existing BSP (NEVER rebuilt → traces stable), `contents|=`,
+`CalculateEdgeNormals` once. `D3_AppendArea(n)` buffers `appendAreaCol n` BEFORE `appendArea n`
+(collision-before-render atomic, so a frame never shows walkable-looking floor you fall
+through). AAS nav stays whole-map (`.aas*` unchanged). `dumpAreaSplit <bootAreas>` takes the
+boot region (must match split-bproc-areas.py --boot-areas; manual comma-split — idLexer
+mis-tokenizes a bare int list). `streamAreas()` writes both render + collision parts per area
+then one `D3_AppendArea`. Tools: `scripts/validate-bcm-split.py` (parses boot `.bcm` + parts,
+asserts resident+streamed == total). **Validated:** completeness EXACT (10856 resident + 37326
+streamed = 48182 polys; 5414+798 = 6212 brushes — every primitive in exactly one bucket);
+reduced boot `.bcm` boots clean (CRC ok, no crash); 81 collision parts appended live + render
+83/83, geometry filled, no fall-through. ~77% of collision polys stream.
+
+**Remaining (documented, not built):** P3 entity per-area spawn (`SpawnEntityDef`, boot-only
+gate; Phase 0 already dumps the buckets). Adjacency dump → portal-hop boot region +
+prefetch-on-visibility (currently streams all areas after boot in manifest order). Full
+`?areastream`-with-collision DEPLOY bake (the validated pieces exist — needs the streaming pak
+to also swap `enpro.bcm`→boot `.bcm` and the headless `dump-area-split.mjs` for the parts blob;
+`bake-area-stream.sh` is currently render-only/offline). Same `streamAreas()` pipeline already
+carries collision parts (manifest `kind`).
 
 ## State (2026-06)
 

@@ -55,15 +55,17 @@ try {
   }
   // Poll the log and UNION results before the 4000-line ring buffer evicts the
   // early "appendArea N: bound" lines (texture-stream spam churns the buffer).
-  const boundSet = new Set(), skippedSet = new Set(), errorSet = new Set();
+  const boundSet = new Set(), skippedSet = new Set(), errorSet = new Set(), colSet = new Set();
   for (let t = 0; t < 28; t++) {
     const chunk = await evaluate(client, "Array.isArray(window.__d3Logs) ? window.__d3Logs.slice(-3500).join('\\n') : ''");
     for (const m of chunk.matchAll(/appendArea (\d+): bound/g)) boundSet.add(Number(m[1]));
     for (const m of chunk.matchAll(/appendArea (\d+): skipped/g)) skippedSet.add(Number(m[1]));
     for (const m of chunk.matchAll(/AppendAreaModel: areadump\/_area(\d+)[^\n]*not found/g)) errorSet.add(Number(m[1]));
+    for (const m of chunk.matchAll(/appendAreaCol (\d+): appended/g)) colSet.add(Number(m[1]));
     await delay(250);
   }
-  const bound = boundSet.size, skipped = skippedSet.size, errors = errorSet.size;
+  const bound = boundSet.size, skipped = skippedSet.size, errors = errorSet.size, colAppended = colSet.size;
+  console.log(`  collision appended: ${colAppended}`);
 
   const shotB = await screenshot(client);
   await writeFile(join(ROOT, "areadump-out", "stream-B-filled.png"), Buffer.from(shotB, "base64"));

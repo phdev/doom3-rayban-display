@@ -49,9 +49,11 @@ try {
   await waitForMapLoaded(client);
   console.log("enpro loaded. Running dumpAreaSplit...");
 
-  // run the bake command (buffers to next engine frame)
+  // run the bake command (buffers to next engine frame). DUMP_BOOT_AREAS sets the
+  // boot region kept resident in the boot .bcm (must match split-bproc-areas.py).
+  const bootAreas = process.env.DUMP_BOOT_AREAS || "0,1,2,3,4,5,6,7,8,9";
   await evaluate(client, `(() => {
-    try { window.Module.ccall("D3_ExecCommand", null, ["string"], ["dumpAreaSplit"]); return "ok"; }
+    try { window.Module.ccall("D3_ExecCommand", null, ["string"], ["dumpAreaSplit ${bootAreas}"]); return "ok"; }
     catch (e) { return "ERR " + e; }
   })()`);
 
@@ -61,7 +63,7 @@ try {
   const walkExpr = `(() => {
     const FS = window.Module.FS;
     const out = [];
-    const isDump = (n) => /\\.(bproc\\.part|entities)$/.test(n) ||
+    const isDump = (n) => /\\.(bproc\\.part|bcm\\.part|entities)$/.test(n) || n === "enpro.boot.bcm" ||
       ["render.json","collision.json","entities.json","targets.json","adjacency.json"].includes(n);
     const walk = (dir, depth) => {
       if (depth > 8) return;
