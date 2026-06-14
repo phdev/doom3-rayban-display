@@ -163,6 +163,43 @@ to also swap `enpro.bcm`→boot `.bcm` and the headless `dump-area-split.mjs` fo
 `bake-area-stream.sh` is currently render-only/offline). Same `streamAreas()` pipeline already
 carries collision parts (manifest `kind`).
 
+**iPhone-VALIDATED (2026-06-14) + FEATURE COMPLETE (render+collision; P3 entities HELD by decision).**
+Tested on real iPhone Safari WebGPU via a cloudflared tunnel (memory's on-device path; built
+with emsdk **6.0.0** — the deploy's pinned WebGPU-safe toolchain, NOT the local 5.0.7 which is
+GL-only/headless). Result: **collision + render streaming work; the door opens; no fall-through.**
+Two bugs found + fixed on-device:
+- **Artifacts** = my URL mistake: `r_backend` defaults to `gl` (GL4ES has the known iPhone
+  chunky-tile/flicker bug). WebGPU is opt-in via `&backend=webgpu` — the on-device URL is
+  `?areastream&backend=webgpu`. The tunnel passes the COOP/COEP headers; wasm has no pthreads.
+- **Door didn't open** = the BIG one (commit 1c2ac7c): the map `.bcm` has 451 collision models
+  (model 0 = world + 450 inline brush models = every func_door/mover/func_static).
+  `DumpAreaCollision` only wrote model 0 → reduced boot `.bcm` dropped all 450 movers' collision.
+  Fix: write all MAP models (model 0 reduced/split + inline 1..numMapModels-1 whole, boot-resident).
+  Use new `idCollisionModelManagerLocal::numMapModels` (captured in `LoadMap` after `BuildModels`),
+  NOT `numModels` — at dump time the live cm manager also has ~64 runtime models (SetupTrmModel
+  trace models + moveable `.lwo` collisions that spawn on map load); serializing those bakes stale
+  junk. boot `.bcm` now 451 models / 5.12 MB. Also fixed: boot-region comma-parse (idCmdArgs splits
+  on commas → `args.Args()` not `Argv(1)`; commit eea2d10) + robust dump driver (retry until json,
+  not slow `__d3ViewPos`). Spawn-centered boot region = area 4 (spawn) + 2 portal hops = {0,1,3,4,5,6}
+  (computed offline via PointInArea + portal-adjacency on the `.bproc`).
+
+**P3 entity streaming — HELD (user decision).** An adversarial design workflow found per-area
+entity deferral has CRITICAL native-parity risks: post-boot spawns flip `FindTargets` to
+synchronous (same-area target/bind chains break on spawn order), save/load can't restore
+not-yet-streamed entities (dangling binds), and enpro's `trigger_count` progression gates can
+strand the player. Boot-gate alone (spawn only `_boot.entities`) leaves the level missing ~75% of
+entities. The ~1.4s boot-spawn win comes bundled with the risky part. User prioritizes parity →
+HELD; entities stay monolithic-spawned at boot. The boot-gate (`SpawnMapEntities` reads
+`_boot.entities` when streaming, frame-0 = deferred FindTargets preserved) + `SpawnAreaEntities(n)`
+(reads `_areaN.entities`, driven via a 3rd `D3_AppendArea` line, collision→render→entities order) +
+the cosmetic-only-leaf safe subset are designed in the workflow transcript (wf_9c0ca5b4) if ever
+revisited.
+
+**DEPLOY note:** the `?areastream` artifacts are GITIGNORED (intentional). For an on-device test,
+serve local dist over a cloudflared tunnel built with 6.0.0 (`.build/emsdk-600` + `.build/gl4es-600`).
+To ship the experiment live on Pages, un-gitignore + commit `pak-display-stream.pk4.*` +
+`enpro.areas.*` (CI builds the wasm with 6.0.0); the default monolithic game is unaffected (gated).
+
 ## State (2026-06)
 
 DOOM 3 **renders the 3D game world in the browser, including on a physical iPhone
