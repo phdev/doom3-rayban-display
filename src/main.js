@@ -513,8 +513,25 @@ try {
 (() => {
   let frames = 0;
   let last = performance.now();
+  let loadingHiddenByRender = false;
   const tick = () => {
     frames++;
+    // Dismiss the loading overlay the instant the engine renders a real game
+    // frame. __d3ViewPos (tr_render.cpp, per rendered view) and __d3ShadowVols
+    // (WebGPU backend, per frame drain) are BOTH published only once the 3D
+    // world is actually drawing — so the first appearance of either == the world
+    // is on screen == playable. This ties dismissal to actual rendering instead
+    // of the "--- Map Initialization ---" console match (which can fail to reach
+    // JS) + a 10s fallback — without it the overlay lingered for seconds after
+    // the player could already move, worse now that the GUI-closure/AAS-bake
+    // wins made boot faster. (Two signals: __d3ViewPos can be null under headless
+    // swiftshader while __d3ShadowVols is set, so either fires the hide.)
+    if (!loadingHiddenByRender &&
+        ((typeof window.__d3ViewPos === "string" && window.__d3ViewPos) ||
+         typeof window.__d3ShadowVols === "number")) {
+      loadingHiddenByRender = true;
+      setLoadingVisible(false);
+    }
     const now = performance.now();
     if (now - last >= 2000) {
       const mem = (typeof window.__d3HeapMB === "function") ? ` | wasm ${window.__d3HeapMB()}MB` : "";
