@@ -27,11 +27,21 @@ const HD_TIER = (typeof window !== "undefined") && /[?&]hd\b/.test(window.locati
 // boot pak chunks + the .stream blob + manifests.
 const NO_STREAM = (typeof window !== "undefined") && /[?&]nostream\b/.test(window.location.search);
 const STREAM_TIER = !HD_TIER && !NO_STREAM;
-const BUNDLED_PK4_PATH = STREAM_TIER
-  ? "base-stream/pak-display.pk4"
-  : (HD_TIER ? "base256/pak-display.pk4" : "base/pak-display.pk4");
+// ?areastream — experimental per-render-area streaming (Phase 4). The boot pak
+// carries only the boot region's render geometry (a reduced enpro.bproc); the
+// rest of the areas stream in after boot as a separate blob and bind via
+// D3_AppendArea. Off by default (full monolithic pak). See CLAUDE.md "Area
+// streaming". Enabling it also passes +set com_streamAreas 1 to the engine.
+const AREA_STREAM = (typeof window !== "undefined") && /[?&]areastream\b/.test(window.location.search);
+const BUNDLED_PK4_PATH = AREA_STREAM
+  ? "base-stream/pak-display-stream.pk4"
+  : (STREAM_TIER
+    ? "base-stream/pak-display.pk4"
+    : (HD_TIER ? "base256/pak-display.pk4" : "base/pak-display.pk4"));
 const BUNDLED_PK4_URL = `${ENGINE_BASE}${BUNDLED_PK4_PATH}`;
 const STREAM_BLOB_URL = `${ENGINE_BASE}base-stream/pak-display.pk4.stream`;
+// per-area render parts blob (pack-area-stream.py output)
+const AREA_STREAM_BLOB_URL = `${ENGINE_BASE}base-stream/enpro.areas.stream`;
 const BUNDLED_PK4_GZIP_URL = `${BUNDLED_PK4_URL}.gz`;
 const URL_PK4_PARAM = "pk4";
 // Boot straight into the level so launch shows the rendered 3D world. The main
@@ -473,6 +483,12 @@ export async function bootDoom3({
       }, 3000);
     }
 
+    // Phase 4: per-area render streaming. Once the view is rendering (boot region
+    // is up), pull the deferred area parts and bind them via D3_AppendArea.
+    if (AREA_STREAM) {
+      streamAreas(module, log).catch((e) => console.warn("[areastream] threw", e));
+    }
+
     // Boot-speed: persist the .bcm collision cache the engine writes during map
     // load, so the next boot restores it and skips the ASCII parse.
     setTimeout(() => {
@@ -693,6 +709,9 @@ function buildArguments(config) {
     // engine's base path there (default would be the executable dir).
     "+set", "fs_basepath", "/",
     "+set", "fs_savepath", "/save",
+    // Area streaming (Phase 4): boot pak carries only the boot region's render
+    // geometry; AddWorldModelEntities defers the rest, streamAreas() pulls them.
+    ...(AREA_STREAM ? ["+set", "com_streamAreas", "1"] : []),
     // Performance defaults for a software/WebGL renderer on a wearable: stencil
     // shadows are the single biggest cost in DOOM 3, so disable them, run the
     // low machine spec, and downsize textures for faster uploads.
@@ -1865,6 +1884,80 @@ async function streamDeferredTextures(module, log) {
     log?.("Texture streaming complete");
   } catch (error) {
     log?.(`Texture streaming error: ${formatError(error)}`);
+  }
+}
+
+// Phase 4: per-area render streaming. The boot pak carries only the boot region's
+// render geometry; this pulls the deferred area parts (pack-area-stream.py blob),
+// writes each into MEMFS as a loose file under /base/areadump, and binds it via
+// D3_AppendArea (which buffers `appendArea N` to the next engine frame; the file
+// is already on disk by then). Mirrors streamDeferredTextures' fetch/cache/inflate.
+async function streamAreas(module, log) {
+  try {
+    const FS = module.FS;
+    if (!FS || typeof FS.writeFile !== "function") return;
+    if (typeof module._D3_AppendArea !== "function") {
+      log?.("Area streaming skipped: D3_AppendArea not exported");
+      return;
+    }
+    if (!("DecompressionStream" in globalThis)) {
+      log?.("Area streaming skipped: no DecompressionStream");
+      return;
+    }
+    // Wait until the boot region is rendering so the FS isn't contended during
+    // level load and the appendArea commands reach a live render world.
+    await pollViewRendering(60000);
+
+    const fmResp = await fetch(`${AREA_STREAM_BLOB_URL}.json`, { cache: "no-store" }).catch(() => null);
+    if (!fmResp || !fmResp.ok) {
+      log?.("No area-stream manifest; render geometry is all in the boot pak");
+      return;
+    }
+    const manifest = await fmResp.json();
+    // Only the deferred per-area RENDER parts stream (shared/boot live in the pak).
+    const parts = (manifest.files || []).filter((f) => f.kind === "render" && f.area >= 0);
+    if (!parts.length) return;
+    log?.(`Streaming ${parts.length} render areas (${((manifest.compressedSize || 0) / 1e6).toFixed(1)} MB)...`);
+
+    // Single blob fetch (no chunk manifest — the dev/prod server SPA-fallbacks a
+    // missing .manifest.json to 200+index.html, which would poison fetchChunkedBytes).
+    let gz = null;
+    const cached = await readCachedUrlPk4(AREA_STREAM_BLOB_URL).catch(() => null);
+    if (cached && cached.byteLength === manifest.compressedSize) {
+      gz = cached;
+      log?.("Area stream: using cached blob");
+    } else {
+      const r = await fetch(AREA_STREAM_BLOB_URL);
+      if (!r.ok) throw new Error(`area stream blob fetch failed (${r.status})`);
+      gz = new Uint8Array(await r.arrayBuffer());
+      saveCachedUrlPk4(AREA_STREAM_BLOB_URL, gz, { name: "area stream blob" }).catch(() => {});
+    }
+
+    const ds = new DecompressionStream("gzip");
+    const inflated = await new Response(new Blob([gz]).stream().pipeThrough(ds)).arrayBuffer();
+    const raw = new Uint8Array(inflated);
+    log?.(`Area stream: ${(raw.length / 1e6).toFixed(1)} MB inflated`);
+
+    mkdirTree(FS, "/base/areadump");
+    let bound = 0;
+    const BATCH = 8;   // append a handful per frame so the bind cost spreads
+    for (let i = 0; i < parts.length; i++) {
+      const f = parts[i];
+      const path = `/base/${f.path}`;
+      try {
+        FS.writeFile(path, raw.subarray(f.off, f.off + f.len));
+        module._D3_AppendArea(f.area);   // buffers appendArea; binds next frame
+        bound++;
+      } catch (e) {
+        log?.(`area ${f.area} write/append failed: ${formatError(e)}`);
+      }
+      if ((i + 1) % BATCH === 0) {
+        await new Promise((r) => setTimeout(r, 32)); // yield ~2 frames
+      }
+    }
+    log?.(`Area streaming complete: requested ${bound} areas`);
+  } catch (error) {
+    log?.(`Area streaming error: ${formatError(error)}`);
   }
 }
 

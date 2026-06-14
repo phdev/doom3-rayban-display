@@ -112,7 +112,35 @@ Test pak must boot `com_streamAreas 1` (monolith mode Errors on absent area mode
 the gate is load-bearing). Next: Phase 2 collision append (`R_FilterPolygonIntoTree`
 into model 0; `ParseBinaryPolygons` is the template — skip the `polygonBlock` realloc,
 `AllocPolygon` falls back to `Mem_Alloc` on block overflow; `.bcm` is 8.6MB, the
-biggest asset). Then P3 entities, P4 policy + JS pipeline.
+biggest asset).
+
+**Phase 4 (render-only) DONE + headless VALIDATED end-to-end (PASS), behind `?areastream`
+(default OFF).** This is the first player-experienced step — it makes Phase 1 actually
+reduce time-to-first-playable. JS `streamAreas()` in `src/d3Runtime.js` (sibling of
+`streamDeferredTextures`): after the boot region renders (`pollViewRendering`), fetch the
+render-parts blob (`enpro.areas.stream` + `.json`, single fetch — NO chunked manifest, the
+SPA server 200s a missing `.manifest.json` to index.html and poisons `fetchChunkedBytes`),
+inflate, write each `_areaN.bproc.part` to `/base/areadump/` (loose override), call
+`module._D3_AppendArea(area)` (binds next frame). `?areastream` ⇒ load the reduced boot pak
+`pak-display-stream.pk4` + pass `+set com_streamAreas 1`. Bake: `scripts/bake-area-stream.sh
+[boot-areas]` (default 0–9) reassembles the pak → extracts `enpro.bproc` → `split-bproc-areas.py`
+→ reduced boot pak (chunked) + parts blob (`pack-area-stream.py`). **Artifacts gitignored**
+(`pak-display-stream.pk4*`, `enpro.areas.*`) — regenerate to deploy the experiment; commit
+them to ship it live. **Validated** (`scripts/test-areastream-e2e.mjs`, boot region 0–9):
+reduced boot pak 15.06 MB vs 16.47 MB monolith + parts blob 1.69 MB gzip streamed after boot;
+boot rendered, JS streamed + bound **93/93 areas, 0 fails**, geometry filled (screenshot
+165KB→340KB, no manual append). **Value = time-to-first-playable** (render geometry compresses
+similarly in-pak vs in-blob, so total bytes ≈ same; the win is the smaller boot pak + the
+1.69 MB deferred to background while the player starts in the boot region). Tighter boot region
+(spawn area + portal-hops, needs an adjacency dump — not yet built) shrinks the boot pak more.
+
+**Remaining (documented, not built):** P2 collision append (`.bcm` per-area stream — biggest
+asset but riskiest: physics fall-through if prefetch lags; needs boot `.bcm` reduction +
+collision-before-render atomic + AAS stays whole-map/boot). P3 entity per-area spawn
+(`SpawnEntityDef`, boot-only gate; Phase 0 already dumps the buckets). Adjacency dump +
+portal-hop boot region + prefetch-on-visibility (currently streams all areas after boot in
+manifest order). Same `streamAreas()` pipeline extends to collision/entity parts (manifest
+already carries `kind`).
 
 ## State (2026-06)
 

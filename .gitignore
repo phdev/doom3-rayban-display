@@ -17,3 +17,9 @@ public/wasm/base/
 #public/wasm-webgpu/triangle.js
 #public/wasm-webgpu/triangle.wasm
 areadump-out/
+
+# Area-streaming (Phase 4) build artifacts — experimental ?areastream only,
+# regenerate with scripts/bake-area-stream.sh (commit them only to deploy the
+# experiment live). The monolithic boot pak (pak-display.pk4.*) stays tracked.
+public/wasm/base-stream/pak-display-stream.pk4*
+public/wasm/base-stream/enpro.areas.*

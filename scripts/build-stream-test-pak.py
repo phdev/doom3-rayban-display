@@ -32,6 +32,8 @@ def main():
     ap.add_argument("--split", required=True, help="dir with enpro.boot.bproc + _area*.bproc.part")
     ap.add_argument("--out", required=True)
     ap.add_argument("--bproc-entry", default="maps/game/enpro.bproc")
+    ap.add_argument("--no-parts", action="store_true",
+                    help="do NOT bundle the per-area parts (Phase 4: they ship in a separate stream blob)")
     args = ap.parse_args()
 
     boot = os.path.join(args.split, "enpro.boot.bproc")
@@ -54,15 +56,17 @@ def main():
         with open(boot, "rb") as fh:
             out.writestr(args.bproc_entry, fh.read())
         # per-area render parts as loose pak entries the engine can OpenFileRead
+        # (Phase 1 test). Phase 4 omits these — they stream in via a blob instead.
         n = 0
-        for p in parts:
-            area = int(AREA_RE.search(p).group(1))
-            with open(p, "rb") as fh:
-                out.writestr(f"areadump/_area{area}.bproc.part", fh.read())
-            n += 1
-        if os.path.isfile(shared):
-            with open(shared, "rb") as fh:
-                out.writestr("areadump/_shared.bproc.part", fh.read())
+        if not args.no_parts:
+            for p in parts:
+                area = int(AREA_RE.search(p).group(1))
+                with open(p, "rb") as fh:
+                    out.writestr(f"areadump/_area{area}.bproc.part", fh.read())
+                n += 1
+            if os.path.isfile(shared):
+                with open(shared, "rb") as fh:
+                    out.writestr("areadump/_shared.bproc.part", fh.read())
     src.close()
 
     osize = os.path.getsize(args.pak)
