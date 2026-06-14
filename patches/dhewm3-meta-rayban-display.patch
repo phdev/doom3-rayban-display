@@ -602,7 +602,7 @@ index 562344f..deb79e9 100644
  private:			// CollisionMap_debug
  	int				ContentsFromString( const char *string ) const;
 diff --git a/neo/framework/Common.cpp b/neo/framework/Common.cpp
-index dbf6c54..4a389ac 100644
+index dbf6c54..68681c8 100644
 --- a/neo/framework/Common.cpp
 +++ b/neo/framework/Common.cpp
 @@ -874,7 +874,7 @@ doom set test blah + map test
@@ -689,7 +689,15 @@ index dbf6c54..4a389ac 100644
  }
  
  
-@@ -3357,6 +3388,14 @@ void idCommonLocal::InitGame( void ) {
+@@ -3245,6 +3276,7 @@ void idCommonLocal::Shutdown( void ) {
+ idCommonLocal::InitGame
+ =================
+ */
++
+ void idCommonLocal::InitGame( void ) {
+ 	// initialize the file system
+ 	fileSystem->Init();
+@@ -3357,6 +3389,14 @@ void idCommonLocal::InitGame( void ) {
  	// have to do this twice.. first one sets the correct r_mode for the renderer init
  	// this time around the backend is all setup correct.. a bit fugly but do not want
  	// to mess with all the gl init at this point.. an old vid card will never qualify for
@@ -704,7 +712,7 @@ index dbf6c54..4a389ac 100644
  	if ( sysDetect ) {
  		SetMachineSpec();
  		Com_ExecMachineSpec_f( args );
-@@ -3364,6 +3403,7 @@ void idCommonLocal::InitGame( void ) {
+@@ -3364,6 +3404,7 @@ void idCommonLocal::InitGame( void ) {
  		cmdSystem->BufferCommandText( CMD_EXEC_NOW, "s_restart\n" );
  		cmdSystem->ExecuteCommandBuffer();
  	}
@@ -730,7 +738,7 @@ index 7edeb4d..adae33e 100644
  		Sys_CreateThread( BackgroundDownloadThread, &backgroundThread_exit, backgroundThread, "backgroundDownload" );
  	} else {
 diff --git a/neo/framework/Session.cpp b/neo/framework/Session.cpp
-index 29745c6..575c044 100644
+index 29745c6..1c697f4 100644
 --- a/neo/framework/Session.cpp
 +++ b/neo/framework/Session.cpp
 @@ -126,6 +126,12 @@ static void Session_Map_f( const idCmdArgs &args ) {
@@ -759,6 +767,31 @@ index 29745c6..575c044 100644
  	switch ( ff ) {
  	case FIND_NO:
  		common->Printf( "Can't find map %s\n", string.c_str() );
+@@ -548,8 +560,16 @@ void idSessionLocal::ShowLoadingGui() {
+ 	// introduced in D3XP code. don't think it actually fixes anything, but doesn't hurt either
+ #if 1
+ 	// Try and prevent the while loop from being skipped over (long hitch on the main thread?)
++#ifdef __EMSCRIPTEN__
++	// Boot-speed: the 1s "animate out the loading gui" spin is pure cosmetic
++	// delay on every map load. On web/wearable just run a few frames so the
++	// loading gui appears, then proceed — saves ~1s off "Starting map".
++	int stop = Sys_Milliseconds();
++	int force = 3;
++#else
+ 	int stop = Sys_Milliseconds() + 1000;
+ 	int force = 10;
++#endif
+ 	while ( Sys_Milliseconds() < stop || force-- > 0 ) {
+ 		Com_UpdateFrameTime(); // DG: put updating com_frameTime into a function
+ 		session->Frame();
+@@ -1544,6 +1564,7 @@ create a game at all.
+ Exits with mapSpawned = true
+ ===============
+ */
++
+ void idSessionLocal::ExecuteMapChange( bool noFadeWipe ) {
+ 	int		i;
+ 	bool	reloadingSameMap;
 diff --git a/neo/framework/UsercmdGen.cpp b/neo/framework/UsercmdGen.cpp
 index 6bba28f..9f732b9 100644
 --- a/neo/framework/UsercmdGen.cpp
@@ -1451,7 +1484,7 @@ index 0000000..bd37bff
 +
 +#endif // __D3_WEARABLE_GAME_H__
 diff --git a/neo/game/Game_local.cpp b/neo/game/Game_local.cpp
-index 1fca78f..d106c90 100644
+index 1fca78f..8d0c262 100644
 --- a/neo/game/Game_local.cpp
 +++ b/neo/game/Game_local.cpp
 @@ -27,6 +27,10 @@ If you have questions concerning this license or the applicable additional terms
@@ -1523,7 +1556,15 @@ index 1fca78f..d106c90 100644
  		// update the game time
  		framenum++;
  		previousTime = time;
-@@ -3960,9 +3988,30 @@ void idGameLocal::SetCamera( idCamera *cam ) {
+@@ -3276,6 +3304,7 @@ idGameLocal::SpawnMapEntities
+ Parses textual entity definitions out of an entstring and spawns gentities.
+ ==============
+ */
++
+ void idGameLocal::SpawnMapEntities( void ) {
+ 	int			i;
+ 	int			num;
+@@ -3960,9 +3989,30 @@ void idGameLocal::SetCamera( idCamera *cam ) {
  	}
  
  	camera = cam;
