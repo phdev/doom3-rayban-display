@@ -18,9 +18,8 @@ public/wasm/base/
 #public/wasm-webgpu/triangle.wasm
 areadump-out/
 
-# Area-streaming (Phase 4) build artifacts — experimental ?areastream only,
-# regenerate with scripts/bake-area-stream.sh (commit them only to deploy the
-# experiment live). The monolithic boot pak (pak-display.pk4.*) stays tracked.
-public/wasm/base-stream/pak-display-stream.pk4*
-public/wasm/base-stream/enpro.areas.*
+# Area-streaming (Phase 4) artifacts — DEPLOYED 2026-06-14 so ?areastream works
+# live (smallest boot gate). Regenerate with scripts/bake-area-stream.sh after a
+# bproc/cache format bump or to retune the boot region, then re-commit.
+# (Previously gitignored as experimental.)
 .gstack/
