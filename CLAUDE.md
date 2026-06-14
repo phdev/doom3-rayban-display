@@ -39,8 +39,58 @@ The engine is **SDL3** + **GL4ES** (desktop-GL → WebGL2 translation), monolith
 `HARDLINK_GAME`, `-fexceptions`. The engine build tree used during development is
 a manual checkout (e.g. `/tmp/dhewm3` with a `build/` dir); the canonical path is
 `scripts/build-dhewm3.sh`, which applies the patch to a fresh clone. **If you edit
-engine source, regenerate the patch:** `git -C <dhewm3> diff <DHEWM3_COMMIT> >
-patches/dhewm3-meta-rayban-display.patch`.
+engine source, regenerate the patch — and you MUST `git add -A -N` first** so the
+patch includes the new files the patch adds (`d3_wearable.cpp`, the WebGPU
+backend, `neo/sys/wasm`, …). Plain `git diff` silently drops untracked files and
+the patch comes out ~half size:
+
+```bash
+git -C .build/dhewm3 add -A -N
+git -C .build/dhewm3 diff <DHEWM3_COMMIT> > patches/dhewm3-meta-rayban-display.patch
+```
+
+**Build-script trap (fixed 2026-06):** the patch *adds* files; those survive
+`git reset --hard`, so a re-build's `git apply` aborted with "already exists" and
+`build-dhewm3.sh` used to fall through to "continuing" and silently build the
+**unpatched** tree (e.g. `-march=pentium3` reaching wasm32 → idlib build error).
+The script now `git clean -fdq neo` before applying and fails loud if the patch
+doesn't apply. Toolchain: emsdk at `/Users/peterhowell/glquake2-rayban-display/.build/emsdk`
+(`source emsdk_env.sh`), `GL4ES_PATH=$PWD/.build/gl4es`.
+
+## Area streaming (experimental, default OFF — `com_streamAreas 0`)
+
+Incremental per-render-area load so the player can start in the boot region while
+the rest of the level streams/downloads (time-to-first-playable on Ray-Ban/iPhone).
+Default path is byte-identical (monolithic). Phased spec recovered from a design
+workflow; **AAS nav + most collision stay whole-map/boot-resident** (streaming nav
+→ monsters path through void), only render `_areaN` geometry (the bulk of the
+bytes) and leaf entities stream. Reuses the texture-stream substrate (`.stream`
+gzip blob + `{files:[{path,off,len}]}` manifest + `FS.writeFile` loose override +
+`D3_ExecCommand`).
+
+**Phase 0 DONE + on-device VALIDATED (VERDICT: GO).** `dumpAreaSplit` console
+command (`com_streamDump`) writes a per-area split to `/save/areadump`:
+`idRenderWorldLocal::DumpAreaModels` (`_areaN.bproc.part` + `_shared.bproc.part` +
+`render.json`), `idCollisionModelManagerLocal::DumpAreaCollisionStats` (walks world
+collision model 0, buckets every poly/brush by `PointInArea(centroid)`, 8-corner
+straddle test → `collision.json`), `idGameLocal::DumpAreaSplit` (entities bucketed
+by origin; worldspawn/player/void/cross-area-target/cross-bind → `_boot`;
+`entities.json` + `targets.json`). `scripts/pack-area-stream.py` assembles the blob
++ manifest in the texture-stream shape and prints GO/NO-GO. `scripts/dump-area-split.mjs`
+drives it headless (boots enpro in headless Chrome via CDP, waits on `window.__d3ViewPos`,
+runs the dump, pulls `/save/areadump`, packs). **enpro metrics:** 93 areas; collision
+48182 polys, **3.5% cross-area** (→ `_shared`), 15.5% void; entities 2107,
+**75.6% streamable** (514 boot, 216 cross-target + 8 cross-bind edges); render 93
+per-area + 450 shared inline-brush models; streamable payload 7.25 MB raw / 1.81 MB
+gzip. **Phase-1 caveat:** `DumpAreaModels` runs post-load so it serialises
+FinishSurfaces-mutated verts (counts correct, but the reader re-runs FinishSurfaces
+→ double back-sides); Phase 1 render `.part`s come from **offline-splitting the
+baked `enpro.bproc`** (raw pre-FinishSurfaces verts; format = `BPROC_MAGIC`,
+version, `[TAG_MODEL: string name, int numSurfaces, per-surface{string mat, int
+nVerts, int nIdx, verts(vec3 xyz, f st0, f st1, vec3 normal)=32B, idx×int}]`,
+`TAG_PORTALS`, `TAG_NODES`, `TAG_END`; `WriteInt`=LE i32, `WriteString`=len+raw).
+Collision/entity assignment stays in-engine (needs `PointInArea`). Next: Phase 1
+render append (`AppendDeferredArea` + `FloodConnectedAreas` re-mark + `D3_AppendArea`).
 
 ## State (2026-06)
 

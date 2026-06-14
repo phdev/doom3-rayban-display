@@ -181,8 +181,38 @@ index 69f1892..35325ea 100644
  	target_link_libraries(idlib SDL3::Headers) # so it can use SDL_Endian.h
  endif()
  if (AROS)
+diff --git a/neo/cm/CollisionModel.h b/neo/cm/CollisionModel.h
+index edb0365..abbbd69 100644
+--- a/neo/cm/CollisionModel.h
++++ b/neo/cm/CollisionModel.h
+@@ -92,6 +92,11 @@ typedef int cmHandle_t;
+ #define CM_BOX_EPSILON		1.0f			// should always be larger than clip epsilon
+ #define CM_MAX_TRACE_DIST	4096.0f			// maximum distance a trace model may be traced, point traces are unlimited
+ 
++// Phase 0 (area-streaming): caller-supplied "which render area is this point in"
++// lookup, so cm/ can bucket world collision geometry by area without depending
++// on the renderer. The game passes a thunk over gameRenderWorld->PointInArea.
++typedef int (*cmAreaForPointFn)( void *ctx, const idVec3 &point );
++
+ class idCollisionModelManager {
+ public:
+ 	virtual					~idCollisionModelManager( void ) {}
+@@ -149,6 +154,13 @@ public:
+ 	virtual void			ListModels( void ) = 0;
+ 	// Writes a collision model file for the given map entity.
+ 	virtual bool			WriteCollisionModelForMapEntity( const idMapEntity *mapEnt, const char *filename, const bool testTraceModel = true ) = 0;
++
++	// Phase 0 (area-streaming bake): walk the world collision model (model 0),
++	// bucket every polygon/brush by render area (via the supplied PointInArea
++	// thunk on each primitive's centroid), and write <dir>/collision.json with
++	// per-area counts + cross-area-straddler + void totals (the go/no-go metric).
++	// Non-pure so only idCollisionModelManagerLocal implements it. Read-only.
++	virtual void			DumpAreaCollisionStats( const char *dir, int numAreas, cmAreaForPointFn fn, void *ctx ) {}
+ };
+ 
+ extern idCollisionModelManager *		collisionModelManager;
 diff --git a/neo/cm/CollisionModel_files.cpp b/neo/cm/CollisionModel_files.cpp
-index 9240b06..f14a122 100644
+index 9240b06..8b3b78a 100644
 --- a/neo/cm/CollisionModel_files.cpp
 +++ b/neo/cm/CollisionModel_files.cpp
 @@ -45,6 +45,16 @@ If you have questions concerning this license or the applicable additional terms
@@ -202,7 +232,141 @@ index 9240b06..f14a122 100644
  /*
  ===============================================================================
  
-@@ -615,3 +625,329 @@ bool idCollisionModelManagerLocal::LoadCollisionModelFile( const char *name, uns
+@@ -261,6 +271,133 @@ void idCollisionModelManagerLocal::WriteCollisionModelsToFile( const char *filen
+ 	fileSystem->CloseFile( fp );
+ }
+ 
++/*
++================
++idCollisionModelManagerLocal::DumpAreaCollisionStats
++
++Phase 0 (area-streaming bake): census the world collision model (model 0) by
++render area. For every polygon/brush in the BSP (deduped via checkcount), the
++centroid is classified with the caller's PointInArea thunk; a primitive whose 8
++bound corners map to more than one area is a "straddler" that Phase 2 will keep
++in the always-boot _shared bucket. Writes <dir>/collision.json. Read-only.
++================
++*/
++void idCollisionModelManagerLocal::DumpAreaCollisionStats( const char *dir, int numAreas, cmAreaForPointFn fn, void *ctx ) {
++	if ( numModels < 1 || models[0] == NULL || fn == NULL ) {
++		return;
++	}
++	cm_model_t *model = models[0];
++
++	int *areaPolys = (int *)Mem_ClearedAlloc( numAreas * sizeof( int ) );
++	int *areaBrushes = (int *)Mem_ClearedAlloc( numAreas * sizeof( int ) );
++	int totalPolys = 0, crossPolys = 0, voidPolys = 0;
++	int totalBrushes = 0, crossBrushes = 0, voidBrushes = 0;
++
++	// explicit-stack BSP walk (avoids recursion-helper churn)
++	idList<cm_node_t *> stack;
++	stack.Append( model->node );
++
++	// --- polygons ---
++	checkCount++;
++	while ( stack.Num() ) {
++		cm_node_t *node = stack[ stack.Num() - 1 ];
++		stack.RemoveIndex( stack.Num() - 1 );
++		for ( cm_polygonRef_t *pref = node->polygons; pref; pref = pref->next ) {
++			cm_polygon_t *p = pref->p;
++			if ( p->checkcount == checkCount ) {
++				continue;
++			}
++			p->checkcount = checkCount;
++			totalPolys++;
++			idVec3 centroid = ( p->bounds[0] + p->bounds[1] ) * 0.5f;
++			int a = fn( ctx, centroid );
++			if ( a < 0 || a >= numAreas ) {
++				voidPolys++;
++			} else {
++				// straddle test: do the 8 bound corners agree on the area?
++				bool cross = false;
++				for ( int c = 0; c < 8 && !cross; c++ ) {
++					idVec3 corner( p->bounds[(c>>0)&1][0], p->bounds[(c>>1)&1][1], p->bounds[(c>>2)&1][2] );
++					int ca = fn( ctx, corner );
++					if ( ca >= 0 && ca != a ) {
++						cross = true;
++					}
++				}
++				if ( cross ) {
++					crossPolys++;
++				} else {
++					areaPolys[a]++;
++				}
++			}
++		}
++		if ( node->planeType != -1 ) {
++			stack.Append( node->children[0] );
++			stack.Append( node->children[1] );
++		}
++	}
++
++	// --- brushes ---
++	checkCount++;
++	stack.Clear();
++	stack.Append( model->node );
++	while ( stack.Num() ) {
++		cm_node_t *node = stack[ stack.Num() - 1 ];
++		stack.RemoveIndex( stack.Num() - 1 );
++		for ( cm_brushRef_t *bref = node->brushes; bref; bref = bref->next ) {
++			cm_brush_t *b = bref->b;
++			if ( b->checkcount == checkCount ) {
++				continue;
++			}
++			b->checkcount = checkCount;
++			totalBrushes++;
++			idVec3 centroid = ( b->bounds[0] + b->bounds[1] ) * 0.5f;
++			int a = fn( ctx, centroid );
++			if ( a < 0 || a >= numAreas ) {
++				voidBrushes++;
++			} else {
++				bool cross = false;
++				for ( int c = 0; c < 8 && !cross; c++ ) {
++					idVec3 corner( b->bounds[(c>>0)&1][0], b->bounds[(c>>1)&1][1], b->bounds[(c>>2)&1][2] );
++					int ca = fn( ctx, corner );
++					if ( ca >= 0 && ca != a ) {
++						cross = true;
++					}
++				}
++				if ( cross ) {
++					crossBrushes++;
++				} else {
++					areaBrushes[a]++;
++				}
++			}
++		}
++		if ( node->planeType != -1 ) {
++			stack.Append( node->children[0] );
++			stack.Append( node->children[1] );
++		}
++	}
++
++	// write json fragment
++	idStr path = idStr( dir ) + "/collision.json";
++	idFile *json = fileSystem->OpenFileWrite( path );
++	if ( json ) {
++		json->WriteFloatString( "{\n  \"numAreas\": %d,\n", numAreas );
++		json->WriteFloatString( "  \"totalPolys\": %d, \"crossAreaPolys\": %d, \"voidPolys\": %d,\n", totalPolys, crossPolys, voidPolys );
++		json->WriteFloatString( "  \"totalBrushes\": %d, \"crossAreaBrushes\": %d, \"voidBrushes\": %d,\n", totalBrushes, crossBrushes, voidBrushes );
++		json->WriteFloatString( "  \"perArea\": [\n" );
++		for ( int i = 0; i < numAreas; i++ ) {
++			json->WriteFloatString( "%s    { \"area\": %d, \"polys\": %d, \"brushes\": %d }",
++				i ? ",\n" : "", i, areaPolys[i], areaBrushes[i] );
++		}
++		json->WriteFloatString( "\n  ]\n}\n" );
++		fileSystem->CloseFile( json );
++	}
++	common->Printf( "DumpAreaCollisionStats: %d polys (%d cross-area, %d void), %d brushes (%d cross, %d void)\n",
++		totalPolys, crossPolys, voidPolys, totalBrushes, crossBrushes, voidBrushes );
++
++	Mem_Free( areaPolys );
++	Mem_Free( areaBrushes );
++}
++
+ /*
+ ================
+ idCollisionModelManagerLocal::WriteCollisionModelForMapEntity
+@@ -615,3 +752,329 @@ bool idCollisionModelManagerLocal::LoadCollisionModelFile( const char *name, uns
  
  	return true;
  }
@@ -577,10 +741,19 @@ index 199484c..29db6e6 100644
  
  	// print statistics on collision data
 diff --git a/neo/cm/CollisionModel_local.h b/neo/cm/CollisionModel_local.h
-index 562344f..deb79e9 100644
+index 562344f..ee49b2a 100644
 --- a/neo/cm/CollisionModel_local.h
 +++ b/neo/cm/CollisionModel_local.h
-@@ -490,6 +490,20 @@ private:			// CollisionMap_files.cpp
+@@ -345,6 +345,8 @@ public:
+ 	void			ListModels( void );
+ 	// write a collision model file for the map entity
+ 	bool			WriteCollisionModelForMapEntity( const idMapEntity *mapEnt, const char *filename, const bool testTraceModel = true );
++	// Phase 0 (area-streaming bake): per-area collision poly/brush census
++	void			DumpAreaCollisionStats( const char *dir, int numAreas, cmAreaForPointFn fn, void *ctx );
+ 
+ private:			// CollisionMap_translate.cpp
+ 	int				TranslateEdgeThroughEdge( idVec3 &cross, idPluecker &l1, idPluecker &l2, float *fraction );
+@@ -490,6 +492,20 @@ private:			// CollisionMap_files.cpp
  	void			ParseBrushes( idLexer *src, cm_model_t *model );
  	bool			ParseCollisionModel( idLexer *src );
  	bool			LoadCollisionModelFile( const char *name, unsigned int mapFileCRC );
@@ -602,10 +775,24 @@ index 562344f..deb79e9 100644
  private:			// CollisionMap_debug
  	int				ContentsFromString( const char *string ) const;
 diff --git a/neo/framework/Common.cpp b/neo/framework/Common.cpp
-index dbf6c54..68681c8 100644
+index dbf6c54..e63eb7f 100644
 --- a/neo/framework/Common.cpp
 +++ b/neo/framework/Common.cpp
-@@ -874,7 +874,7 @@ doom set test blah + map test
+@@ -108,6 +108,13 @@ idCVar com_timescale( "timescale", "1", CVAR_SYSTEM | CVAR_FLOAT, "scales the ti
+ idCVar com_makingBuild( "com_makingBuild", "0", CVAR_BOOL | CVAR_SYSTEM, "1 when making a build" );
+ idCVar com_updateLoadSize( "com_updateLoadSize", "0", CVAR_BOOL | CVAR_SYSTEM | CVAR_NOCHEAT, "update the load size after loading a map" );
+ 
++// Area-streaming (experimental, default OFF => monolithic load path unchanged).
++// com_streamAreas gates the per-area deferred render/collision/entity load.
++// com_streamDump is the bake helper: dumpAreaSplit writes per-area .part files
++// + json fragments under /save/areadump for scripts/pack-area-stream.py.
++idCVar com_streamAreas( "com_streamAreas", "0", CVAR_BOOL | CVAR_SYSTEM, "experimental: stream level geometry/entities per render-area (0 = monolithic)" );
++idCVar com_streamDump( "com_streamDump", "0", CVAR_BOOL | CVAR_SYSTEM, "bake helper: enables the dumpAreaSplit per-area dump command" );
++
+ idCVar com_enableDebuggerServer( "com_enableDebuggerServer", "0", CVAR_BOOL | CVAR_SYSTEM, "toggle debugger server and try to connect to com_dbgClientAdr" );
+ idCVar com_dbgClientAdr( "com_dbgClientAdr", "localhost", CVAR_SYSTEM | CVAR_ARCHIVE, "debuggerApp client address" );
+ idCVar com_dbgServerAdr( "com_dbgServerAdr", "localhost", CVAR_SYSTEM | CVAR_ARCHIVE, "debugger server address" );
+@@ -874,7 +881,7 @@ doom set test blah + map test
  ============================================================================
  */
  
@@ -614,7 +801,7 @@ index dbf6c54..68681c8 100644
  int			com_numConsoleLines;
  idCmdArgs	com_consoleLines[MAX_CONSOLE_LINES];
  
-@@ -885,14 +885,31 @@ idCommonLocal::ParseCommandLine
+@@ -885,14 +892,31 @@ idCommonLocal::ParseCommandLine
  */
  void idCommonLocal::ParseCommandLine( int argc, char **argv ) {
  	int i;
@@ -646,7 +833,7 @@ index dbf6c54..68681c8 100644
  			if ( !com_numConsoleLines ) {
  				com_numConsoleLines++;
  			}
-@@ -2531,7 +2548,6 @@ void idCommonLocal::Frame( void ) {
+@@ -2531,7 +2555,6 @@ void idCommonLocal::Frame( void ) {
  			}
  		} else {
  			session->Frame();
@@ -654,7 +841,7 @@ index dbf6c54..68681c8 100644
  			// normal, in-sequence screen update
  			session->UpdateScreen( false );
  		}
-@@ -2560,8 +2576,17 @@ void idCommonLocal::Frame( void ) {
+@@ -2560,8 +2583,17 @@ void idCommonLocal::Frame( void ) {
  		if ( com_editors == 0 )
  #endif
  		{
@@ -674,7 +861,7 @@ index dbf6c54..68681c8 100644
  				// if we're using vsync and the display is running at about 60Hz, start next tic
  				// immediately so our internal tic time and vsync don't drift apart
  				double now = Sys_MillisecondsPrecise();
-@@ -3175,8 +3200,14 @@ void idCommonLocal::Init( int argc, char **argv ) {
+@@ -3175,8 +3207,14 @@ void idCommonLocal::Init( int argc, char **argv ) {
  		Sys_Error( "Error during initialization" );
  	}
  
@@ -689,7 +876,7 @@ index dbf6c54..68681c8 100644
  }
  
  
-@@ -3245,6 +3276,7 @@ void idCommonLocal::Shutdown( void ) {
+@@ -3245,6 +3283,7 @@ void idCommonLocal::Shutdown( void ) {
  idCommonLocal::InitGame
  =================
  */
@@ -697,7 +884,7 @@ index dbf6c54..68681c8 100644
  void idCommonLocal::InitGame( void ) {
  	// initialize the file system
  	fileSystem->Init();
-@@ -3357,6 +3389,14 @@ void idCommonLocal::InitGame( void ) {
+@@ -3357,6 +3396,14 @@ void idCommonLocal::InitGame( void ) {
  	// have to do this twice.. first one sets the correct r_mode for the renderer init
  	// this time around the backend is all setup correct.. a bit fugly but do not want
  	// to mess with all the gl init at this point.. an old vid card will never qualify for
@@ -712,7 +899,7 @@ index dbf6c54..68681c8 100644
  	if ( sysDetect ) {
  		SetMachineSpec();
  		Com_ExecMachineSpec_f( args );
-@@ -3364,6 +3404,7 @@ void idCommonLocal::InitGame( void ) {
+@@ -3364,6 +3411,7 @@ void idCommonLocal::InitGame( void ) {
  		cmdSystem->BufferCommandText( CMD_EXEC_NOW, "s_restart\n" );
  		cmdSystem->ExecuteCommandBuffer();
  	}
@@ -1484,7 +1671,7 @@ index 0000000..bd37bff
 +
 +#endif // __D3_WEARABLE_GAME_H__
 diff --git a/neo/game/Game_local.cpp b/neo/game/Game_local.cpp
-index 1fca78f..8d0c262 100644
+index 1fca78f..c0388f7 100644
 --- a/neo/game/Game_local.cpp
 +++ b/neo/game/Game_local.cpp
 @@ -27,6 +27,10 @@ If you have questions concerning this license or the applicable additional terms
@@ -1514,7 +1701,218 @@ index 1fca78f..8d0c262 100644
  
  	clip.Init();
  	pvs.Init();
-@@ -1769,12 +1775,21 @@ void idGameLocal::CacheDictionaryMedia( const idDict *dict ) {
+@@ -1177,6 +1183,210 @@ void idGameLocal::NextMap_f( const idCmdArgs &args ) {
+ 	gameLocal.MapRestart( );
+ }
+ 
++/*
++===================
++GameAreaForPoint
++
++Phase 0 (area-streaming): thunk handed to the collision-model bake so cm/ can
++classify a world point's render area without depending on the renderer.
++===================
++*/
++static int GameAreaForPoint( void *ctx, const idVec3 &point ) {
++	return gameRenderWorld ? gameRenderWorld->PointInArea( point ) : -1;
++}
++
++/*
++===================
++idGameLocal::DumpAreaSplit_f
++===================
++*/
++void idGameLocal::DumpAreaSplit_f( const idCmdArgs &args ) {
++	gameLocal.DumpAreaSplit();
++}
++
++/*
++===================
++idGameLocal::DumpAreaSplit
++
++Partition the loaded map by render area and write per-area render/collision/
++entity dumps + json metrics to /save/areadump for scripts/pack-area-stream.py.
++Read-only; never touches the running game. See the Phase 0 build spec.
++===================
++*/
++void idGameLocal::DumpAreaSplit( void ) {
++	const char *dir = "areadump";
++
++	if ( gameRenderWorld == NULL ) {
++		common->Printf( "dumpAreaSplit: no render world loaded\n" );
++		return;
++	}
++	int numAreas = gameRenderWorld->NumAreas();
++	common->Printf( "dumpAreaSplit: %d render areas; writing to /save/%s\n", numAreas, dir );
++
++	// (1) RENDER: per-area _areaN.bproc.part + _shared.bproc.part + render.json
++	gameRenderWorld->DumpAreaModels( dir );
++
++	// (2) COLLISION: census world model 0 by area -> collision.json
++	if ( collisionModelManager ) {
++		collisionModelManager->DumpAreaCollisionStats( dir, numAreas, GameAreaForPoint, NULL );
++	}
++
++	// (3) ENTITIES: bucket by origin; bootstrap (worldspawn/player/cross-area
++	//     target+bind/void) forced into _boot. Re-parse the .map fresh so we
++	//     do not depend on the live mapFile (may be freed mid-game).
++	idMapFile  localMap;
++	idMapFile *mf = mapFile;
++	if ( mf == NULL ) {
++		if ( localMap.Parse( idStr( mapFileName ) + ".map" ) ) {
++			mf = &localMap;
++		}
++	}
++	if ( mf == NULL ) {
++		common->Printf( "dumpAreaSplit: no map file (%s) — skipped entity dump\n", mapFileName.c_str() );
++		return;
++	}
++
++	int numEnt = mf->GetNumEntities();
++	idList<idStr>	names;		names.SetNum( numEnt );
++	idList<int>		areas;		areas.SetNum( numEnt );
++	idList<bool>	boot;		boot.SetNum( numEnt );
++	idHashIndex		nameHash;
++
++	for ( int i = 0; i < numEnt; i++ ) {
++		const idDict &ep = mf->GetEntity( i )->epairs;
++		idStr nm = ep.GetString( "name", "" );
++		nm.ToLower();
++		names[i] = nm;
++		idVec3 org = ep.GetVector( "origin", "0 0 0" );
++		int a = gameRenderWorld->PointInArea( org );
++		areas[i] = a;
++		boot[i] = false;
++		if ( nm.Length() ) {
++			nameHash.Add( nameHash.GenerateKey( nm, false ), i );
++		}
++	}
++
++	// bootstrap classification (pass 1): worldspawn / player / void
++	for ( int i = 0; i < numEnt; i++ ) {
++		const idDict &ep = mf->GetEntity( i )->epairs;
++		idStr cls = ep.GetString( "classname", "" );
++		cls.ToLower();
++		if ( i == 0 || cls == "worldspawn" || cls.Cmpn( "info_player", 11 ) == 0 ) {
++			boot[i] = true;
++		}
++		if ( areas[i] < 0 || areas[i] >= numAreas ) {
++			boot[i] = true;	// unclassifiable -> always boot
++		}
++	}
++
++	// edge analysis (target* + bind*): record edges, force cross-area pairs boot
++	idFile *targets = fileSystem->OpenFileWrite( idStr( dir ) + "/targets.json" );
++	if ( targets ) {
++		targets->WriteFloatString( "{\n  \"targetEdges\": [\n" );
++	}
++	bool firstEdge = true;
++	int crossTargetEdges = 0, crossBindEdges = 0;
++
++	for ( int i = 0; i < numEnt; i++ ) {
++		const idDict &ep = mf->GetEntity( i )->epairs;
++		// gather outgoing references: target*, and bind / bindMaster
++		for ( int pass = 0; pass < 2; pass++ ) {
++			const char *prefix = ( pass == 0 ) ? "target" : "bind";
++			const idKeyValue *kv = NULL;
++			while ( ( kv = ep.MatchPrefix( prefix, kv ) ) != NULL ) {
++				idStr tname = kv->GetValue();
++				tname.ToLower();
++				if ( !tname.Length() ) {
++					continue;
++				}
++				int j = -1;
++				for ( int h = nameHash.First( nameHash.GenerateKey( tname, false ) ); h >= 0; h = nameHash.Next( h ) ) {
++					if ( names[h] == tname ) { j = h; break; }
++				}
++				if ( j < 0 ) {
++					continue;
++				}
++				bool cross = ( areas[i] != areas[j] );
++				if ( cross ) {
++					boot[i] = true;
++					boot[j] = true;
++					if ( pass == 0 ) crossTargetEdges++; else crossBindEdges++;
++				}
++				if ( targets ) {
++					targets->WriteFloatString( "%s    { \"kind\": \"%s\", \"from\": \"%s\", \"fromArea\": %d, \"to\": \"%s\", \"toArea\": %d }",
++						firstEdge ? "" : ",\n", prefix, names[i].c_str(), areas[i], names[j].c_str(), areas[j] );
++					firstEdge = false;
++				}
++			}
++		}
++	}
++	if ( targets ) {
++		targets->WriteFloatString( "\n  ],\n  \"crossTargetEdges\": %d,\n  \"crossBindEdges\": %d\n}\n", crossTargetEdges, crossBindEdges );
++		fileSystem->CloseFile( targets );
++	}
++
++	// write per-area + boot entity buckets (binary idDict blocks: count, then dicts)
++	int *areaCounts = (int *)Mem_ClearedAlloc( numAreas * sizeof( int ) );
++	int bootCount = 0;
++	idFile **areaFiles = (idFile **)Mem_ClearedAlloc( numAreas * sizeof( idFile * ) );
++	idFile *bootFile = fileSystem->OpenFileWrite( idStr( dir ) + "/_boot.entities" );
++	// reserve a slot for the count by writing a placeholder we patch via re-count:
++	// simplest: two-pass — first count, then write counts as headers.
++	// Here we stream and keep counts; rewrite headers by closing/reopening is
++	// awkward, so write count LAST is not possible with a forward file. Instead
++	// write each bucket as: repeated [int hasMore=1, dict]; terminate with int 0.
++	for ( int i = 0; i < numEnt; i++ ) {
++		const idDict &ep = mf->GetEntity( i )->epairs;
++		if ( boot[i] ) {
++			if ( bootFile ) {
++				bootFile->WriteInt( 1 );
++				ep.WriteToFileHandle( bootFile );
++			}
++			bootCount++;
++		} else {
++			int a = areas[i];
++			if ( areaFiles[a] == NULL ) {
++				areaFiles[a] = fileSystem->OpenFileWrite( idStr( dir ) + "/_area" + a + ".entities" );
++			}
++			if ( areaFiles[a] ) {
++				areaFiles[a]->WriteInt( 1 );
++				ep.WriteToFileHandle( areaFiles[a] );
++			}
++			areaCounts[a]++;
++		}
++	}
++	if ( bootFile ) {
++		bootFile->WriteInt( 0 );	// terminator
++		fileSystem->CloseFile( bootFile );
++	}
++	for ( int a = 0; a < numAreas; a++ ) {
++		if ( areaFiles[a] ) {
++			areaFiles[a]->WriteInt( 0 );	// terminator
++			fileSystem->CloseFile( areaFiles[a] );
++		}
++	}
++
++	// entities.json metrics
++	idFile *ej = fileSystem->OpenFileWrite( idStr( dir ) + "/entities.json" );
++	if ( ej ) {
++		ej->WriteFloatString( "{\n  \"numEntities\": %d,\n  \"bootEntities\": %d,\n", numEnt, bootCount );
++		ej->WriteFloatString( "  \"streamablePct\": %f,\n", numEnt ? ( 100.0f * ( numEnt - bootCount ) / numEnt ) : 0.0f );
++		ej->WriteFloatString( "  \"perArea\": [\n" );
++		for ( int a = 0; a < numAreas; a++ ) {
++			ej->WriteFloatString( "%s    { \"area\": %d, \"entities\": %d }", a ? ",\n" : "", a, areaCounts[a] );
++		}
++		ej->WriteFloatString( "\n  ]\n}\n" );
++		fileSystem->CloseFile( ej );
++	}
++
++	common->Printf( "dumpAreaSplit: %d entities (%d boot, %d streamable), %d cross-target + %d cross-bind edges\n",
++		numEnt, bootCount, numEnt - bootCount, crossTargetEdges, crossBindEdges );
++	common->Printf( "dumpAreaSplit: done. Pull /save/%s with scripts/pack-area-stream.py\n", dir );
++
++	Mem_Free( areaCounts );
++	Mem_Free( areaFiles );
++}
++
+ /*
+ ===================
+ idGameLocal::MapPopulate
+@@ -1769,12 +1979,21 @@ void idGameLocal::CacheDictionaryMedia( const idDict *dict ) {
  				|| !idStr::Icmp( kv->GetKey(), "gui_inventory" ) ) {
  				// unfortunate flag names, they aren't actually a gui
  			} else {
@@ -1536,7 +1934,7 @@ index 1fca78f..8d0c262 100644
  			}
  		}
  		kv = dict->MatchPrefix( "gui", kv );
-@@ -2273,6 +2288,19 @@ gameReturn_t idGameLocal::RunFrame( const usercmd_t *clientCmds ) {
+@@ -2273,6 +2492,19 @@ gameReturn_t idGameLocal::RunFrame( const usercmd_t *clientCmds ) {
  			player->Think();
  		}
  	} else do {
@@ -1556,7 +1954,7 @@ index 1fca78f..8d0c262 100644
  		// update the game time
  		framenum++;
  		previousTime = time;
-@@ -3276,6 +3304,7 @@ idGameLocal::SpawnMapEntities
+@@ -3276,6 +3508,7 @@ idGameLocal::SpawnMapEntities
  Parses textual entity definitions out of an entstring and spawns gentities.
  ==============
  */
@@ -1564,7 +1962,7 @@ index 1fca78f..8d0c262 100644
  void idGameLocal::SpawnMapEntities( void ) {
  	int			i;
  	int			num;
-@@ -3960,9 +3989,30 @@ void idGameLocal::SetCamera( idCamera *cam ) {
+@@ -3960,9 +4193,30 @@ void idGameLocal::SetCamera( idCamera *cam ) {
  	}
  
  	camera = cam;
@@ -1596,7 +1994,7 @@ index 1fca78f..8d0c262 100644
  			camera->spawnArgs.SetBool( "disconnect", false );
  			cvarSystem->SetCVarFloat( "r_znear", 3.0f );
 diff --git a/neo/game/Game_local.h b/neo/game/Game_local.h
-index 60b0b88..b249b5b 100644
+index 60b0b88..3c7669b 100644
 --- a/neo/game/Game_local.h
 +++ b/neo/game/Game_local.h
 @@ -265,6 +265,7 @@ public:
@@ -1606,6 +2004,18 @@ index 60b0b88..b249b5b 100644
 +	int						cinSkipArmedFrame;		// iter 34 (g_skipCinematics): SetCamera arms, RunFrame applies one frame later (-1 = unarmed)
  	bool					inCinematic;			// game is playing cinematic (player controls frozen)
  	bool					skipCinematic;
+ 
+@@ -363,6 +364,11 @@ public:
+ 	bool					NextMap( void );	// returns wether serverinfo settings have been modified
+ 	static void				NextMap_f( const idCmdArgs &args );
+ 
++	// Phase 0 (area-streaming bake): partition the loaded map by render area and
++	// write per-area render/collision/entity dumps + json metrics to /save/areadump.
++	void					DumpAreaSplit( void );
++	static void				DumpAreaSplit_f( const idCmdArgs &args );
++
+ 	idMapFile *				GetLevelMap( void );
+ 	const char *			GetMapName( void ) const;
  
 diff --git a/neo/game/Item.cpp b/neo/game/Item.cpp
 index 97ae952..ac0a910 100644
@@ -1709,7 +2119,7 @@ index 36a0cbe..58d9a22 100644
  
  	GetPhysics()->SetContents( CONTENTS_SOLID );
 diff --git a/neo/game/gamesys/SysCmds.cpp b/neo/game/gamesys/SysCmds.cpp
-index 105ff57..5f83fc6 100644
+index 105ff57..727e1a3 100644
 --- a/neo/game/gamesys/SysCmds.cpp
 +++ b/neo/game/gamesys/SysCmds.cpp
 @@ -692,15 +692,29 @@ void Cmd_SetViewpos_f( const idCmdArgs &args ) {
@@ -1743,6 +2153,14 @@ index 105ff57..5f83fc6 100644
  
  	for ( i = 0 ; i < 3 ; i++ ) {
  		origin[i] = atof( args.Argv( i + 1 ) );
+@@ -2314,6 +2328,7 @@ void idGameLocal::InitConsoleCommands( void ) {
+ 	cmdSystem->AddCommand( "listActiveEntities",	Cmd_ActiveEntityList_f,		CMD_FL_GAME|CMD_FL_CHEAT,	"lists active game entities" );
+ 	cmdSystem->AddCommand( "listMonsters",			idAI::List_f,				CMD_FL_GAME|CMD_FL_CHEAT,	"lists monsters" );
+ 	cmdSystem->AddCommand( "listSpawnArgs",			Cmd_ListSpawnArgs_f,		CMD_FL_GAME|CMD_FL_CHEAT,	"list the spawn args of an entity", idGameLocal::ArgCompletion_EntityName );
++	cmdSystem->AddCommand( "dumpAreaSplit",			idGameLocal::DumpAreaSplit_f,	CMD_FL_GAME|CMD_FL_CHEAT,	"area-streaming bake: dump per-area render/collision/entity split to /save/areadump" );
+ 	cmdSystem->AddCommand( "say",					Cmd_Say_f,					CMD_FL_GAME,				"text chat" );
+ 	cmdSystem->AddCommand( "sayTeam",				Cmd_SayTeam_f,				CMD_FL_GAME,				"team text chat" );
+ 	cmdSystem->AddCommand( "addChatLine",			Cmd_AddChatLine_f,			CMD_FL_GAME,				"internal use - core to game chat lines" );
 diff --git a/neo/game/gamesys/SysCvar.cpp b/neo/game/gamesys/SysCvar.cpp
 index 824d9c2..42c0adc 100644
 --- a/neo/game/gamesys/SysCvar.cpp
@@ -7373,8 +7791,25 @@ index 2f77916..63f0485 100644
  
  	generateAllInteractionsCalled = false;
  
+diff --git a/neo/renderer/RenderWorld.h b/neo/renderer/RenderWorld.h
+index 462774e..4109cb2 100644
+--- a/neo/renderer/RenderWorld.h
++++ b/neo/renderer/RenderWorld.h
+@@ -282,6 +282,12 @@ public:
+ 	// a NULL or empty mapName will create an empty, single area world
+ 	virtual bool			InitFromMap( const char *mapName ) = 0;
+ 
++	// Area-streaming bake helper (Phase 0): write each "_areaN" world model to
++	// <dir>/_areaN.bproc.part, everything else to <dir>/_shared.bproc.part, and a
++	// <dir>/render.json fragment with per-area surf/byte counts. Non-pure so only
++	// idRenderWorldLocal needs to implement it. Read-only; default path untouched.
++	virtual void			DumpAreaModels( const char *dir ) {}
++
+ 	//-------------- Entity and Light Defs -----------------
+ 
+ 	// entityDefs and lightDefs are added to a given world to determine
 diff --git a/neo/renderer/RenderWorld_load.cpp b/neo/renderer/RenderWorld_load.cpp
-index 33cbbe0..11dc8c7 100644
+index 33cbbe0..5f56407 100644
 --- a/neo/renderer/RenderWorld_load.cpp
 +++ b/neo/renderer/RenderWorld_load.cpp
 @@ -179,6 +179,13 @@ idRenderModel *idRenderWorldLocal::ParseModel( idLexer *src ) {
@@ -7391,7 +7826,7 @@ index 33cbbe0..11dc8c7 100644
  	model->FinishSurfaces();
  
  	return model;
-@@ -370,6 +377,225 @@ void idRenderWorldLocal::ParseNodes( idLexer *src ) {
+@@ -370,6 +377,317 @@ void idRenderWorldLocal::ParseNodes( idLexer *src ) {
  	src->ExpectTokenString( "}" );
  }
  
@@ -7614,10 +8049,102 @@ index 33cbbe0..11dc8c7 100644
 +	return true;
 +}
 +
++/*
++================
++idRenderWorldLocal::DumpAreaModels
++
++Phase 0 (area-streaming bake): write every parsed world model to a per-area
++.bproc.part stream so scripts/pack-area-stream.py can assemble the streaming
++blob. "_areaN" models go to <dir>/_areaN.bproc.part (one per render area);
++everything else (inline brush models, shared geometry) is concatenated into
++<dir>/_shared.bproc.part and is always boot-loaded. Each .part is the same
++tagged stream LoadBinaryProc reads (MAGIC, VERSION, [MODEL...], END), so the
++Phase 1 reader needs no new parser. A render.json fragment records counts.
++Read-only: never called unless the dumpAreaSplit console command runs.
++================
++*/
++void idRenderWorldLocal::DumpAreaModels( const char *dir ) {
++	idStr			path;
++	idFile *		shared;
++	int				sharedModels = 0, sharedSurfs = 0;
++
++	// _shared.bproc.part — all non-_areaN models (always boot-loaded).
++	path = idStr( dir ) + "/_shared.bproc.part";
++	shared = fileSystem->OpenFileWrite( path );
++	if ( shared ) {
++		shared->WriteInt( BPROC_MAGIC );
++		shared->WriteInt( BPROC_VERSION );
++	}
++
++	// render.json fragment (per-area surf/vert/index counts; the packer reads
++	// the actual .part byte sizes off disk).
++	idStr jsonPath = idStr( dir ) + "/render.json";
++	idFile *json = fileSystem->OpenFileWrite( jsonPath );
++	if ( json ) {
++		json->WriteFloatString( "{\n  \"numAreas\": %d,\n  \"areas\": [\n", numPortalAreas );
++	}
++	bool firstArea = true;
++
++	for ( int m = 0; m < localModels.Num(); m++ ) {
++		idRenderModel *model = localModels[m];
++		const char *name = model->Name();
++		int areaNum = -1;
++		if ( idStr::Cmpn( name, "_area", 5 ) == 0 ) {
++			areaNum = atoi( name + 5 );
++		}
++
++		// count verts/indexes for the json fragment
++		int surfs = model->NumSurfaces();
++		int verts = 0, indexes = 0;
++		for ( int s = 0; s < surfs; s++ ) {
++			const srfTriangles_t *tri = model->Surface( s )->geometry;
++			if ( tri ) {
++				verts += tri->numVerts;
++				indexes += tri->numIndexes;
++			}
++		}
++
++		if ( areaNum >= 0 && areaNum < numPortalAreas ) {
++			path = idStr( dir ) + "/" + name + ".bproc.part";
++			idFile *fp = fileSystem->OpenFileWrite( path );
++			if ( fp ) {
++				fp->WriteInt( BPROC_MAGIC );
++				fp->WriteInt( BPROC_VERSION );
++				WriteBinaryProcModel( fp, model );
++				fp->WriteInt( BPROC_TAG_END );
++				fileSystem->CloseFile( fp );
++			}
++			if ( json ) {
++				json->WriteFloatString( "%s    { \"area\": %d, \"surfs\": %d, \"verts\": %d, \"indexes\": %d }",
++					firstArea ? "" : ",\n", areaNum, surfs, verts, indexes );
++				firstArea = false;
++			}
++		} else {
++			// shared / inline brush model
++			if ( shared ) {
++				WriteBinaryProcModel( shared, model );
++			}
++			sharedModels++;
++			sharedSurfs += surfs;
++		}
++	}
++
++	if ( shared ) {
++		shared->WriteInt( BPROC_TAG_END );
++		fileSystem->CloseFile( shared );
++	}
++	if ( json ) {
++		json->WriteFloatString( "\n  ],\n  \"shared\": { \"models\": %d, \"surfs\": %d }\n}\n", sharedModels, sharedSurfs );
++		fileSystem->CloseFile( json );
++	}
++	common->Printf( "DumpAreaModels: wrote %d area models + %d shared models to %s\n",
++		numPortalAreas, sharedModels, dir );
++}
++
  /*
  ================
  idRenderWorldLocal::CommonChildrenArea_r
-@@ -477,7 +703,12 @@ A NULL or empty name will make a world without a map model, which
+@@ -477,7 +795,12 @@ A NULL or empty name will make a world without a map model, which
  is still useful for displaying a bare model
  =================
  */
@@ -7630,7 +8157,7 @@ index 33cbbe0..11dc8c7 100644
  	idLexer *		src;
  	idToken			token;
  	idStr			filename;
-@@ -518,6 +749,23 @@ bool idRenderWorldLocal::InitFromMap( const char *name ) {
+@@ -518,6 +841,23 @@ bool idRenderWorldLocal::InitFromMap( const char *name ) {
  
  	FreeWorld();
  
@@ -7654,7 +8181,7 @@ index 33cbbe0..11dc8c7 100644
  	src = new idLexer( filename, LEXFL_NOSTRINGCONCAT | LEXFL_NODOLLARPRECOMPILE );
  	if ( !src->IsLoaded() ) {
  		common->Printf( "idRenderWorldLocal::InitFromMap: %s not found\n", filename.c_str() );
-@@ -529,6 +777,22 @@ bool idRenderWorldLocal::InitFromMap( const char *name ) {
+@@ -529,6 +869,22 @@ bool idRenderWorldLocal::InitFromMap( const char *name ) {
  	mapName = name;
  	mapTimeStamp = currentTimeStamp;
  
@@ -7677,7 +8204,7 @@ index 33cbbe0..11dc8c7 100644
  	// if we are writing a demo, archive the load command
  	if ( session->writeDemo ) {
  		WriteLoadMap();
-@@ -565,16 +829,29 @@ bool idRenderWorldLocal::InitFromMap( const char *name ) {
+@@ -565,16 +921,29 @@ bool idRenderWorldLocal::InitFromMap( const char *name ) {
  
  			// save it in the list to free when clearing this map
  			localModels.Append( lastModel );
@@ -7707,7 +8234,7 @@ index 33cbbe0..11dc8c7 100644
  			continue;
  		}
  
-@@ -583,6 +860,14 @@ bool idRenderWorldLocal::InitFromMap( const char *name ) {
+@@ -583,6 +952,14 @@ bool idRenderWorldLocal::InitFromMap( const char *name ) {
  
  	delete src;
  
@@ -7722,7 +8249,7 @@ index 33cbbe0..11dc8c7 100644
  	// if it was a trivial map without any areas, create a single area
  	if ( !numPortalAreas ) {
  		ClearWorld();
-@@ -594,6 +879,7 @@ bool idRenderWorldLocal::InitFromMap( const char *name ) {
+@@ -594,6 +971,7 @@ bool idRenderWorldLocal::InitFromMap( const char *name ) {
  	AddWorldModelEntities();
  	ClearPortalStates();
  
@@ -7731,7 +8258,7 @@ index 33cbbe0..11dc8c7 100644
  	return true;
  }
 diff --git a/neo/renderer/RenderWorld_local.h b/neo/renderer/RenderWorld_local.h
-index 0a129c5..9a4f7db 100644
+index 0a129c5..4341807 100644
 --- a/neo/renderer/RenderWorld_local.h
 +++ b/neo/renderer/RenderWorld_local.h
 @@ -183,6 +183,16 @@ public:
@@ -7751,6 +8278,14 @@ index 0a129c5..9a4f7db 100644
  	int						CommonChildrenArea_r( areaNode_t *node );
  	void					FreeWorld();
  	void					ClearWorld();
+@@ -191,6 +201,7 @@ public:
+ 	void					AddWorldModelEntities();
+ 	void					ClearPortalStates();
+ 	virtual	bool			InitFromMap( const char *mapName );
++	virtual void			DumpAreaModels( const char *dir );	// Phase 0 per-area render dump
+ 
+ 	//--------------------------
+ 	// RenderWorld_portals.cpp
 diff --git a/neo/renderer/VertexCache.cpp b/neo/renderer/VertexCache.cpp
 index ec0184e..2cfe895 100644
 --- a/neo/renderer/VertexCache.cpp

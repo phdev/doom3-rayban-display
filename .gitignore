@@ -16,3 +16,4 @@ public/wasm/base/
 # dev server can't test). Add CI build step + re-ignore later.
 #public/wasm-webgpu/triangle.js
 #public/wasm-webgpu/triangle.wasm
+areadump-out/

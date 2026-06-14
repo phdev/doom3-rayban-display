@@ -38,12 +38,23 @@ cd "$BUILD_DIR"
 git fetch --all --tags --quiet || true
 git checkout --quiet "$DHEWM3_COMMIT"
 git reset --hard --quiet "$DHEWM3_COMMIT"
+# The patch ADDS new files (d3_wearable.cpp, the WebGPU backend, neo/sys/wasm,
+# etc.). Those are untracked, so `git reset --hard` does NOT remove them, and a
+# subsequent `git apply` aborts with "already exists in working directory" —
+# which previously fell through to "continuing" and silently built the
+# UNPATCHED tree (e.g. -march=pentium3 reaching wasm32 → idlib build failure).
+# Clean untracked files under neo/ so the patch always applies to a pristine
+# tree. The CMake build dir lives at $BUILD_DIR/build (outside neo/), so this
+# preserves incremental build state.
+git clean -fdq neo
 
 if git apply --check "$PATCH_FILE" >/dev/null 2>&1; then
   git apply "$PATCH_FILE"
   echo "Applied Meta Ray-Ban Display patch."
 else
-  echo "dhewm3 patch is already applied or does not match this checkout; continuing." >&2
+  echo "ERROR: dhewm3 patch does not apply cleanly to $DHEWM3_COMMIT; aborting" >&2
+  echo "       (regenerate patches/dhewm3-meta-rayban-display.patch from the working tree)" >&2
+  exit 1
 fi
 
 # Generate embedded WGSL header from webgpu-port/shaders/*.wgsl. The patch's
