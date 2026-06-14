@@ -5,8 +5,14 @@ const p = await (await b.newContext({ viewport: { width: 800, height: 600 } })).
 const log = [];
 p.on("console", m => { const t = m.text(); if (/wrote binary|stencil shadows|Saved/i.test(t)) log.push(t); });
 await p.goto("http://localhost:5173/?backend=webgpu&nodiag&cb=bake" + Date.now(), { waitUntil: "domcontentloaded" });
-// wait until all 3 .b* exist + stencil shadows (map fully loaded)
-const want = ["/save/base/maps/game/enpro.bcm", "/save/base/maps/game/enpro.bmap", "/save/base/maps/game/enpro.bproc"];
+// wait until the binaries the engine writes for this pak exist. The engine
+// only WRITES a binary when it loaded the ASCII source — so against an
+// already-geometry-baked pak only .baas48 appears (the ASCII .aas48 is still
+// present). The AAS loads LAST (game InitFromNewMap, after collision/render),
+// so wait on it as the settle signal, then extract whatever was written (>0).
+const want = ["/save/base/maps/game/enpro.bcm", "/save/base/maps/game/enpro.bmap",
+              "/save/base/maps/game/enpro.bproc", "/save/base/maps/game/enpro.baas48"];
+const settleOn = "/save/base/maps/game/enpro.baas48";  // last binary written
 const dl = Date.now() + 90000;
 let sizes = null;
 while (Date.now() < dl) {
@@ -16,12 +22,13 @@ while (Date.now() < dl) {
     for (const f of paths) { try { out[f] = FS.stat(f).size; } catch { out[f] = -1; } }
     return out;
   }, want);
-  if (sizes && want.every(f => sizes[f] > 0)) { await p.waitForTimeout(1500); break; }  // settle
+  if (sizes && sizes[settleOn] > 0) { await p.waitForTimeout(1500); break; }  // settle
   await p.waitForTimeout(800);
 }
 console.log("sizes:", JSON.stringify(sizes));
 mkdirSync("/tmp/baked-geo/maps/game", { recursive: true });
 for (const f of want) {
+  if (!(sizes && sizes[f] > 0)) { console.log("  skip (not written): " + f); continue; }
   const b64 = await p.evaluate((path) => {
     const FS = window.Module.FS; const u8 = FS.readFile(path);
     let s = ""; const C = 0x8000; for (let i = 0; i < u8.length; i += C) s += String.fromCharCode.apply(null, u8.subarray(i, i + C));

@@ -12041,3 +12041,338 @@ index 0000000..350f6f7
 +seta r_customHeight "600"
 +seta r_mode "-1"
 +seta in_mouse "0"
+diff --git a/neo/tools/compilers/aas/AASFile.cpp b/neo/tools/compilers/aas/AASFile.cpp
+index bcbb8a0..297416a 100644
+--- a/neo/tools/compilers/aas/AASFile.cpp
++++ b/neo/tools/compilers/aas/AASFile.cpp
+@@ -1200,6 +1200,272 @@ bool idAASFileLocal::Load( const idStr &fileName, unsigned int mapFileCRC ) {
+ 	return true;
+ }
+ 
++/*
++================================================================================
++
++	Binary AAS cache (.baas48)
++
++	Boot-speed: the ASCII .aas48 is multi-MB and parsed by idLexer at map load —
++	the same tokenizer cost class the .bcm/.bmap/.bproc bakes eliminated (CLAUDE.md
++	iter 62). WriteBinary dumps the in-memory lists raw; because the bake writes the
++	binary right after an ASCII Load, the dumped floats are exactly the %f-rounded
++	values the engine already uses, so a binary load is bit-identical to the ASCII
++	load (same routing tables, same AI). The small/complex idAASSettings is kept as
++	an embedded ASCII blob (cheap to parse, zero risk of missing a field) and the
++	rare TFL_SPECIAL reach dicts go through idDict's binary I/O. CRC-guarded with
++	ASCII fallback; toggle off with aas_binaryCache 0.
++
++================================================================================
++*/
++
++idCVar aas_binaryCache( "aas_binaryCache", "1", CVAR_SYSTEM | CVAR_BOOL, "use the binary .baas48 AAS cache (0 = ASCII .aas48 only)" );
++
++static const int BAAS_MAGIC   = ('B'<<0) | ('A'<<8) | ('A'<<16) | ('S'<<24);	// "BAAS"
++static const int BAAS_VERSION = 1;
++
++static void Reachability_WriteBinary( idFile *fp, idReachability *reach ) {
++	fp->WriteInt( reach->travelType );
++	fp->WriteInt( reach->toAreaNum );
++	fp->WriteFloat( reach->start.x ); fp->WriteFloat( reach->start.y ); fp->WriteFloat( reach->start.z );
++	fp->WriteFloat( reach->end.x );   fp->WriteFloat( reach->end.y );   fp->WriteFloat( reach->end.z );
++	fp->WriteInt( reach->edgeNum );
++	fp->WriteInt( reach->travelTime );
++}
++
++static void Reachability_ReadBinary( idFile *fp, idReachability *reach ) {
++	int i;
++	fp->ReadInt( i ); reach->travelType = i;
++	fp->ReadInt( i ); reach->toAreaNum = i;
++	fp->ReadFloat( reach->start.x ); fp->ReadFloat( reach->start.y ); fp->ReadFloat( reach->start.z );
++	fp->ReadFloat( reach->end.x );   fp->ReadFloat( reach->end.y );   fp->ReadFloat( reach->end.z );
++	fp->ReadInt( i ); reach->edgeNum = i;
++	fp->ReadInt( i ); reach->travelTime = i;
++}
++
++/*
++================
++idAASFileLocal::WriteBinary
++================
++*/
++bool idAASFileLocal::WriteBinary( const idStr &fileName, unsigned int mapFileCRC ) {
++	int i, num;
++	idReachability *reach;
++
++	idFile *fp = fileSystem->OpenFileWrite( fileName, "fs_devpath" );
++	if ( !fp ) {
++		common->Warning( "Error opening %s", fileName.c_str() );
++		return false;
++	}
++	name = fileName;
++	crc = mapFileCRC;
++
++	fp->WriteInt( BAAS_MAGIC );
++	fp->WriteInt( BAAS_VERSION );
++	fp->WriteUnsignedInt( mapFileCRC );
++
++	// settings as an embedded ASCII blob (parsed by FromParser on load)
++	idFile_Memory mem( "aassettings" );
++	settings.WriteToFile( &mem );
++	int slen = mem.Length();
++	fp->WriteInt( slen );
++	if ( slen > 0 ) {
++		fp->Write( mem.GetDataPtr(), slen );
++	}
++
++	fp->WriteInt( planeList.Num() );
++	for ( i = 0; i < planeList.Num(); i++ ) {
++		fp->WriteFloat( planeList[i].Normal().x );
++		fp->WriteFloat( planeList[i].Normal().y );
++		fp->WriteFloat( planeList[i].Normal().z );
++		fp->WriteFloat( planeList[i].Dist() );
++	}
++	fp->WriteInt( vertices.Num() );
++	for ( i = 0; i < vertices.Num(); i++ ) {
++		fp->WriteFloat( vertices[i].x ); fp->WriteFloat( vertices[i].y ); fp->WriteFloat( vertices[i].z );
++	}
++	fp->WriteInt( edges.Num() );
++	for ( i = 0; i < edges.Num(); i++ ) {
++		fp->WriteInt( edges[i].vertexNum[0] ); fp->WriteInt( edges[i].vertexNum[1] );
++	}
++	fp->WriteInt( edgeIndex.Num() );
++	for ( i = 0; i < edgeIndex.Num(); i++ ) { fp->WriteInt( edgeIndex[i] ); }
++	fp->WriteInt( faces.Num() );
++	for ( i = 0; i < faces.Num(); i++ ) {
++		fp->WriteInt( faces[i].planeNum ); fp->WriteInt( faces[i].flags );
++		fp->WriteInt( faces[i].areas[0] ); fp->WriteInt( faces[i].areas[1] );
++		fp->WriteInt( faces[i].firstEdge ); fp->WriteInt( faces[i].numEdges );
++	}
++	fp->WriteInt( faceIndex.Num() );
++	for ( i = 0; i < faceIndex.Num(); i++ ) { fp->WriteInt( faceIndex[i] ); }
++	fp->WriteInt( areas.Num() );
++	for ( i = 0; i < areas.Num(); i++ ) {
++		fp->WriteInt( areas[i].flags ); fp->WriteInt( areas[i].contents );
++		fp->WriteInt( areas[i].firstFace ); fp->WriteInt( areas[i].numFaces );
++		fp->WriteInt( areas[i].cluster ); fp->WriteInt( areas[i].clusterAreaNum );
++		for ( num = 0, reach = areas[i].reach; reach; reach = reach->next ) { num++; }
++		fp->WriteInt( num );
++		for ( reach = areas[i].reach; reach; reach = reach->next ) {
++			Reachability_WriteBinary( fp, reach );
++			if ( reach->travelType == TFL_SPECIAL ) {
++				static_cast<idReachability_Special *>( reach )->dict.WriteToFileHandle( fp );
++			}
++		}
++	}
++	fp->WriteInt( nodes.Num() );
++	for ( i = 0; i < nodes.Num(); i++ ) {
++		fp->WriteInt( nodes[i].planeNum ); fp->WriteInt( nodes[i].children[0] ); fp->WriteInt( nodes[i].children[1] );
++	}
++	fp->WriteInt( portals.Num() );
++	for ( i = 0; i < portals.Num(); i++ ) {
++		fp->WriteInt( portals[i].areaNum );
++		fp->WriteInt( portals[i].clusters[0] ); fp->WriteInt( portals[i].clusters[1] );
++		fp->WriteInt( portals[i].clusterAreaNum[0] ); fp->WriteInt( portals[i].clusterAreaNum[1] );
++	}
++	fp->WriteInt( portalIndex.Num() );
++	for ( i = 0; i < portalIndex.Num(); i++ ) { fp->WriteInt( portalIndex[i] ); }
++	fp->WriteInt( clusters.Num() );
++	for ( i = 0; i < clusters.Num(); i++ ) {
++		fp->WriteInt( clusters[i].numAreas ); fp->WriteInt( clusters[i].numReachableAreas );
++		fp->WriteInt( clusters[i].firstPortal ); fp->WriteInt( clusters[i].numPortals );
++	}
++
++	fileSystem->CloseFile( fp );
++	return true;
++}
++
++/*
++================
++idAASFileLocal::LoadBinary
++================
++*/
++bool idAASFileLocal::LoadBinary( const idStr &fileName, unsigned int mapFileCRC ) {
++	int i, j, num, n, t;
++
++	idFile *fp = fileSystem->OpenFileRead( fileName );
++	if ( !fp ) {
++		return false;	// no binary cache -> caller falls back to ASCII
++	}
++
++	int magic = 0, version = 0;
++	unsigned int c = 0;
++	fp->ReadInt( magic );
++	fp->ReadInt( version );
++	if ( magic != BAAS_MAGIC || version != BAAS_VERSION ) {
++		fileSystem->CloseFile( fp );
++		return false;
++	}
++	fp->ReadUnsignedInt( c );
++	if ( mapFileCRC && c != mapFileCRC ) {
++		common->Warning( "Binary AAS '%s' is out of date", fileName.c_str() );
++		fileSystem->CloseFile( fp );
++		return false;
++	}
++
++	name = fileName;
++	crc = mapFileCRC;
++	Clear();
++
++	// settings blob
++	int slen = 0;
++	fp->ReadInt( slen );
++	if ( slen > 0 ) {
++		char *buf = (char *)Mem_Alloc( slen + 1 );
++		fp->Read( buf, slen );
++		buf[slen] = '\0';
++		idLexer lex( buf, slen, "aassettings", LEXFL_NOFATALERRORS | LEXFL_NOSTRINGESCAPECHARS | LEXFL_NOSTRINGCONCAT | LEXFL_ALLOWPATHNAMES );
++		settings.FromParser( lex );
++		Mem_Free( buf );
++	}
++
++	fp->ReadInt( num ); planeList.Resize( num );
++	for ( i = 0; i < num; i++ ) {
++		float a, b, d, e;
++		fp->ReadFloat( a ); fp->ReadFloat( b ); fp->ReadFloat( d ); fp->ReadFloat( e );
++		idPlane plane; plane.SetNormal( idVec3( a, b, d ) ); plane.SetDist( e );
++		planeList.Append( plane );
++	}
++	fp->ReadInt( num ); vertices.Resize( num );
++	for ( i = 0; i < num; i++ ) {
++		idVec3 v; fp->ReadFloat( v.x ); fp->ReadFloat( v.y ); fp->ReadFloat( v.z );
++		vertices.Append( v );
++	}
++	fp->ReadInt( num ); edges.Resize( num );
++	for ( i = 0; i < num; i++ ) {
++		aasEdge_t edge; fp->ReadInt( t ); edge.vertexNum[0] = t; fp->ReadInt( t ); edge.vertexNum[1] = t;
++		edges.Append( edge );
++	}
++	fp->ReadInt( num ); edgeIndex.Resize( num );
++	for ( i = 0; i < num; i++ ) { aasIndex_t idx; fp->ReadInt( t ); idx = t; edgeIndex.Append( idx ); }
++	fp->ReadInt( num ); faces.Resize( num );
++	for ( i = 0; i < num; i++ ) {
++		aasFace_t face;
++		fp->ReadInt( t ); face.planeNum = t; fp->ReadInt( t ); face.flags = t;
++		fp->ReadInt( t ); face.areas[0] = t; fp->ReadInt( t ); face.areas[1] = t;
++		fp->ReadInt( t ); face.firstEdge = t; fp->ReadInt( t ); face.numEdges = t;
++		faces.Append( face );
++	}
++	fp->ReadInt( num ); faceIndex.Resize( num );
++	for ( i = 0; i < num; i++ ) { aasIndex_t idx; fp->ReadInt( t ); idx = t; faceIndex.Append( idx ); }
++	fp->ReadInt( num ); areas.Resize( num );
++	for ( i = 0; i < num; i++ ) {
++		aasArea_t area;
++		fp->ReadInt( t ); area.flags = t; fp->ReadInt( t ); area.contents = t;
++		fp->ReadInt( t ); area.firstFace = t; fp->ReadInt( t ); area.numFaces = t;
++		fp->ReadInt( t ); area.cluster = t; fp->ReadInt( t ); area.clusterAreaNum = t;
++		area.reach = NULL; area.rev_reach = NULL; area.bounds.Zero(); area.center.Zero(); area.travelFlags = 0;
++		areas.Append( area );
++		// reachabilities (appended to preserve the exact ASCII-load order)
++		fp->ReadInt( n );
++		areas[i].travelFlags = AreaContentsTravelFlags( i );
++		idReachability *lastReach = NULL;
++		for ( j = 0; j < n; j++ ) {
++			idReachability rbase, *newReach;
++			Reachability_ReadBinary( fp, &rbase );
++			if ( rbase.travelType == TFL_SPECIAL ) {
++				idReachability_Special *special = new idReachability_Special();
++				special->dict.ReadFromFileHandle( fp );
++				newReach = special;
++			} else {
++				newReach = new idReachability();
++			}
++			newReach->CopyBase( rbase );
++			newReach->fromAreaNum = i;
++			newReach->next = NULL;
++			if ( lastReach ) { lastReach->next = newReach; } else { areas[i].reach = newReach; }
++			lastReach = newReach;
++		}
++	}
++	LinkReversedReachability();
++	fp->ReadInt( num ); nodes.Resize( num );
++	for ( i = 0; i < num; i++ ) {
++		aasNode_t node; fp->ReadInt( t ); node.planeNum = t; fp->ReadInt( t ); node.children[0] = t; fp->ReadInt( t ); node.children[1] = t;
++		nodes.Append( node );
++	}
++	fp->ReadInt( num ); portals.Resize( num );
++	for ( i = 0; i < num; i++ ) {
++		aasPortal_t portal;
++		fp->ReadInt( t ); portal.areaNum = t;
++		fp->ReadInt( t ); portal.clusters[0] = t; fp->ReadInt( t ); portal.clusters[1] = t;
++		fp->ReadInt( t ); portal.clusterAreaNum[0] = t; fp->ReadInt( t ); portal.clusterAreaNum[1] = t;
++		portals.Append( portal );
++	}
++	fp->ReadInt( num ); portalIndex.Resize( num );
++	for ( i = 0; i < num; i++ ) { aasIndex_t idx; fp->ReadInt( t ); idx = t; portalIndex.Append( idx ); }
++	fp->ReadInt( num ); clusters.Resize( num );
++	for ( i = 0; i < num; i++ ) {
++		aasCluster_t cluster;
++		fp->ReadInt( t ); cluster.numAreas = t; fp->ReadInt( t ); cluster.numReachableAreas = t;
++		fp->ReadInt( t ); cluster.firstPortal = t; fp->ReadInt( t ); cluster.numPortals = t;
++		clusters.Append( cluster );
++	}
++
++	fileSystem->CloseFile( fp );
++
++	FinishAreas();
++
++	return true;
++}
++
+ /*
+ ================
+ idAASFileLocal::MemorySize
+diff --git a/neo/tools/compilers/aas/AASFileManager.cpp b/neo/tools/compilers/aas/AASFileManager.cpp
+index 1a89498..be22ca9 100644
+--- a/neo/tools/compilers/aas/AASFileManager.cpp
++++ b/neo/tools/compilers/aas/AASFileManager.cpp
+@@ -27,6 +27,7 @@ If you have questions concerning this license or the applicable additional terms
+ */
+ 
+ #include "sys/platform.h"
++#include "framework/CVarSystem.h"
+ #include "tools/compilers/aas/AASFileManager.h"
+ 
+ #include "tools/compilers/aas/AASFile_local.h"
+@@ -56,12 +57,30 @@ idAASFileManager *				AASFileManager = &AASFileManagerLocal;
+ idAASFileManagerLocal::LoadAAS
+ ================
+ */
++extern idCVar aas_binaryCache;
++
+ idAASFile *idAASFileManagerLocal::LoadAAS( const char *fileName, unsigned int mapFileCRC ) {
+ 	idAASFileLocal *file = new idAASFileLocal();
++
++	// Boot-speed: prefer the binary .baas48 cache (skips the idLexer ASCII parse
++	// of the multi-MB .aas48 — same lever as the .bcm/.bmap/.bproc bakes).
++	idStr binaryName = fileName;
++	binaryName.SetFileExtension( "baas48" );
++	if ( aas_binaryCache.GetBool() && file->LoadBinary( binaryName, mapFileCRC ) ) {
++		return file;
++	}
++
+ 	if ( !file->Load( fileName, mapFileCRC ) ) {
+ 		delete file;
+ 		return NULL;
+ 	}
++
++	// Write the binary cache so the bake / next boot can skip the ASCII parse.
++	// (Verified bit-identical to the ASCII load via a round-trip ASCII-dump diff.)
++	if ( aas_binaryCache.GetBool() ) {
++		file->WriteBinary( binaryName, mapFileCRC );
++	}
++
+ 	return file;
+ }
+ 
+diff --git a/neo/tools/compilers/aas/AASFile_local.h b/neo/tools/compilers/aas/AASFile_local.h
+index cb91cf5..dfcf586 100644
+--- a/neo/tools/compilers/aas/AASFile_local.h
++++ b/neo/tools/compilers/aas/AASFile_local.h
+@@ -66,6 +66,10 @@ public:
+ public:
+ 	bool						Load( const idStr &fileName, unsigned int mapFileCRC );
+ 	bool						Write( const idStr &fileName, unsigned int mapFileCRC );
++	// Boot-speed: binary .baas48 cache that skips the idLexer ASCII parse of the
++	// multi-MB .aas48 (same lever as the .bcm/.bmap/.bproc bakes, CLAUDE.md iter 62).
++	bool						LoadBinary( const idStr &fileName, unsigned int mapFileCRC );
++	bool						WriteBinary( const idStr &fileName, unsigned int mapFileCRC );
+ 
+ 	int							MemorySize( void ) const;
+ 	void						ReportRoutingEfficiency( void ) const;
