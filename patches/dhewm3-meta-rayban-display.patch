@@ -1,5 +1,5 @@
 diff --git a/neo/CMakeLists.txt b/neo/CMakeLists.txt
-index 69f1892..35325ea 100644
+index 69f1892..9912f89 100644
 --- a/neo/CMakeLists.txt
 +++ b/neo/CMakeLists.txt
 @@ -194,29 +194,46 @@ if(CMAKE_MAJOR_VERSION LESS 3 OR ( CMAKE_MAJOR_VERSION EQUAL 3 AND CMAKE_MINOR_V
@@ -98,7 +98,7 @@ index 69f1892..35325ea 100644
 +		set(D3_EMSCRIPTEN_EMBED "${CMAKE_SOURCE_DIR}/sys/wasm/embed")
 +	endif()
 +
-+	set(d3_wasm_exports "[\"_main\",\"_D3_AddViewAngles\",\"_D3_SetViewYaw\",\"_D3_SetWearableAction\",\"_D3_ExecCommand\",\"_D3_ReloadStreamedImages\",\"_D3_GetEnemyIndicators\",\"_D3_GetEnemyYaw\",\"_D3_RequestEnemyTurn\",\"_D3_SetEnemyIndicators\",\"_D3_SetEnemyIndicatorYaw\",\"_D3_ConsumeEnemyTurn\"]")
++	set(d3_wasm_exports "[\"_main\",\"_D3_AddViewAngles\",\"_D3_SetViewYaw\",\"_D3_SetWearableAction\",\"_D3_ExecCommand\",\"_D3_ReloadStreamedImages\",\"_D3_AppendArea\",\"_D3_GetEnemyIndicators\",\"_D3_GetEnemyYaw\",\"_D3_RequestEnemyTurn\",\"_D3_SetEnemyIndicators\",\"_D3_SetEnemyIndicatorYaw\",\"_D3_ConsumeEnemyTurn\"]")
 +
 +	# The game module is hard-linked (HARDLINK_GAME), so no dynamic linking /
 +	# MAIN_MODULE is required. SDL2 comes from Emscripten's built-in port, GL
@@ -1007,10 +1007,10 @@ index 6bba28f..9f732b9 100644
  			viewangles[PITCH] = oldAngles[PITCH] + 90;
 diff --git a/neo/framework/d3_wearable.cpp b/neo/framework/d3_wearable.cpp
 new file mode 100644
-index 0000000..a223350
+index 0000000..17739a4
 --- /dev/null
 +++ b/neo/framework/d3_wearable.cpp
-@@ -0,0 +1,285 @@
+@@ -0,0 +1,298 @@
 +/*
 +===========================================================================
 +
@@ -1189,6 +1189,19 @@ index 0000000..a223350
 +	{
 +		cmdSystem->BufferCommandText( CMD_EXEC_APPEND, cmd );
 +		cmdSystem->BufferCommandText( CMD_EXEC_APPEND, "\n" );
++	}
++}
++
++EMSCRIPTEN_KEEPALIVE
++void
++D3_AppendArea( int areaNum )
++{
++	// Area streaming (Phase 1): bind a deferred render area whose .bproc.part the
++	// JS shell just wrote into the FS. APPEND so it runs at the safe next-frame
++	// point (never reentrantly from the JS callback), like D3_ExecCommand.
++	if ( cmdSystem )
++	{
++		cmdSystem->BufferCommandText( CMD_EXEC_APPEND, va( "appendArea %d\n", areaNum ) );
 +	}
 +}
 +
@@ -1671,7 +1684,7 @@ index 0000000..bd37bff
 +
 +#endif // __D3_WEARABLE_GAME_H__
 diff --git a/neo/game/Game_local.cpp b/neo/game/Game_local.cpp
-index 1fca78f..c0388f7 100644
+index 1fca78f..104ddb9 100644
 --- a/neo/game/Game_local.cpp
 +++ b/neo/game/Game_local.cpp
 @@ -27,6 +27,10 @@ If you have questions concerning this license or the applicable additional terms
@@ -1701,7 +1714,7 @@ index 1fca78f..c0388f7 100644
  
  	clip.Init();
  	pvs.Init();
-@@ -1177,6 +1183,210 @@ void idGameLocal::NextMap_f( const idCmdArgs &args ) {
+@@ -1177,6 +1183,231 @@ void idGameLocal::NextMap_f( const idCmdArgs &args ) {
  	gameLocal.MapRestart( );
  }
  
@@ -1724,6 +1737,27 @@ index 1fca78f..c0388f7 100644
 +*/
 +void idGameLocal::DumpAreaSplit_f( const idCmdArgs &args ) {
 +	gameLocal.DumpAreaSplit();
++}
++
++/*
++===================
++idGameLocal::AppendArea_f
++
++Area streaming (Phase 1): bind a deferred area's render model now. Driven from
++JS via D3_AppendArea (buffered to a frame boundary). `appendArea <n>`.
++===================
++*/
++void idGameLocal::AppendArea_f( const idCmdArgs &args ) {
++	if ( args.Argc() < 2 ) {
++		common->Printf( "usage: appendArea <areaNum>\n" );
++		return;
++	}
++	if ( gameRenderWorld == NULL ) {
++		return;
++	}
++	int areaNum = atoi( args.Argv( 1 ) );
++	bool ok = gameRenderWorld->AppendAreaModel( areaNum );
++	common->Printf( "appendArea %d: %s\n", areaNum, ok ? "bound" : "skipped (absent/already loaded)" );
 +}
 +
 +/*
@@ -1912,7 +1946,7 @@ index 1fca78f..c0388f7 100644
  /*
  ===================
  idGameLocal::MapPopulate
-@@ -1769,12 +1979,21 @@ void idGameLocal::CacheDictionaryMedia( const idDict *dict ) {
+@@ -1769,12 +2000,21 @@ void idGameLocal::CacheDictionaryMedia( const idDict *dict ) {
  				|| !idStr::Icmp( kv->GetKey(), "gui_inventory" ) ) {
  				// unfortunate flag names, they aren't actually a gui
  			} else {
@@ -1934,7 +1968,7 @@ index 1fca78f..c0388f7 100644
  			}
  		}
  		kv = dict->MatchPrefix( "gui", kv );
-@@ -2273,6 +2492,19 @@ gameReturn_t idGameLocal::RunFrame( const usercmd_t *clientCmds ) {
+@@ -2273,6 +2513,19 @@ gameReturn_t idGameLocal::RunFrame( const usercmd_t *clientCmds ) {
  			player->Think();
  		}
  	} else do {
@@ -1954,7 +1988,7 @@ index 1fca78f..c0388f7 100644
  		// update the game time
  		framenum++;
  		previousTime = time;
-@@ -3276,6 +3508,7 @@ idGameLocal::SpawnMapEntities
+@@ -3276,6 +3529,7 @@ idGameLocal::SpawnMapEntities
  Parses textual entity definitions out of an entstring and spawns gentities.
  ==============
  */
@@ -1962,7 +1996,7 @@ index 1fca78f..c0388f7 100644
  void idGameLocal::SpawnMapEntities( void ) {
  	int			i;
  	int			num;
-@@ -3960,9 +4193,30 @@ void idGameLocal::SetCamera( idCamera *cam ) {
+@@ -3960,9 +4214,30 @@ void idGameLocal::SetCamera( idCamera *cam ) {
  	}
  
  	camera = cam;
@@ -1994,7 +2028,7 @@ index 1fca78f..c0388f7 100644
  			camera->spawnArgs.SetBool( "disconnect", false );
  			cvarSystem->SetCVarFloat( "r_znear", 3.0f );
 diff --git a/neo/game/Game_local.h b/neo/game/Game_local.h
-index 60b0b88..3c7669b 100644
+index 60b0b88..6461f75 100644
 --- a/neo/game/Game_local.h
 +++ b/neo/game/Game_local.h
 @@ -265,6 +265,7 @@ public:
@@ -2005,7 +2039,7 @@ index 60b0b88..3c7669b 100644
  	bool					inCinematic;			// game is playing cinematic (player controls frozen)
  	bool					skipCinematic;
  
-@@ -363,6 +364,11 @@ public:
+@@ -363,6 +364,13 @@ public:
  	bool					NextMap( void );	// returns wether serverinfo settings have been modified
  	static void				NextMap_f( const idCmdArgs &args );
  
@@ -2013,6 +2047,8 @@ index 60b0b88..3c7669b 100644
 +	// write per-area render/collision/entity dumps + json metrics to /save/areadump.
 +	void					DumpAreaSplit( void );
 +	static void				DumpAreaSplit_f( const idCmdArgs &args );
++	// Phase 1 (area streaming): lazily bind a deferred area's render model.
++	static void				AppendArea_f( const idCmdArgs &args );
 +
  	idMapFile *				GetLevelMap( void );
  	const char *			GetMapName( void ) const;
@@ -2119,7 +2155,7 @@ index 36a0cbe..58d9a22 100644
  
  	GetPhysics()->SetContents( CONTENTS_SOLID );
 diff --git a/neo/game/gamesys/SysCmds.cpp b/neo/game/gamesys/SysCmds.cpp
-index 105ff57..727e1a3 100644
+index 105ff57..8b563b7 100644
 --- a/neo/game/gamesys/SysCmds.cpp
 +++ b/neo/game/gamesys/SysCmds.cpp
 @@ -692,15 +692,29 @@ void Cmd_SetViewpos_f( const idCmdArgs &args ) {
@@ -2153,11 +2189,12 @@ index 105ff57..727e1a3 100644
  
  	for ( i = 0 ; i < 3 ; i++ ) {
  		origin[i] = atof( args.Argv( i + 1 ) );
-@@ -2314,6 +2328,7 @@ void idGameLocal::InitConsoleCommands( void ) {
+@@ -2314,6 +2328,8 @@ void idGameLocal::InitConsoleCommands( void ) {
  	cmdSystem->AddCommand( "listActiveEntities",	Cmd_ActiveEntityList_f,		CMD_FL_GAME|CMD_FL_CHEAT,	"lists active game entities" );
  	cmdSystem->AddCommand( "listMonsters",			idAI::List_f,				CMD_FL_GAME|CMD_FL_CHEAT,	"lists monsters" );
  	cmdSystem->AddCommand( "listSpawnArgs",			Cmd_ListSpawnArgs_f,		CMD_FL_GAME|CMD_FL_CHEAT,	"list the spawn args of an entity", idGameLocal::ArgCompletion_EntityName );
 +	cmdSystem->AddCommand( "dumpAreaSplit",			idGameLocal::DumpAreaSplit_f,	CMD_FL_GAME|CMD_FL_CHEAT,	"area-streaming bake: dump per-area render/collision/entity split to /save/areadump" );
++	cmdSystem->AddCommand( "appendArea",			idGameLocal::AppendArea_f,		CMD_FL_GAME|CMD_FL_CHEAT,	"area-streaming: lazily bind a deferred area's render model" );
  	cmdSystem->AddCommand( "say",					Cmd_Say_f,					CMD_FL_GAME,				"text chat" );
  	cmdSystem->AddCommand( "sayTeam",				Cmd_SayTeam_f,				CMD_FL_GAME,				"team text chat" );
  	cmdSystem->AddCommand( "addChatLine",			Cmd_AddChatLine_f,			CMD_FL_GAME,				"internal use - core to game chat lines" );
@@ -7792,10 +7829,10 @@ index 2f77916..63f0485 100644
  	generateAllInteractionsCalled = false;
  
 diff --git a/neo/renderer/RenderWorld.h b/neo/renderer/RenderWorld.h
-index 462774e..4109cb2 100644
+index 462774e..d0fb180 100644
 --- a/neo/renderer/RenderWorld.h
 +++ b/neo/renderer/RenderWorld.h
-@@ -282,6 +282,12 @@ public:
+@@ -282,6 +282,18 @@ public:
  	// a NULL or empty mapName will create an empty, single area world
  	virtual bool			InitFromMap( const char *mapName ) = 0;
  
@@ -7805,11 +7842,17 @@ index 462774e..4109cb2 100644
 +	// idRenderWorldLocal needs to implement it. Read-only; default path untouched.
 +	virtual void			DumpAreaModels( const char *dir ) {}
 +
++	// Area streaming (Phase 1): lazily bind a deferred area's "_areaN" render
++	// model from areadump/_areaN.bproc.part. Returns true if loaded + bound,
++	// false if absent/corrupt or already present. Non-pure (only
++	// idRenderWorldLocal implements it).
++	virtual bool			AppendAreaModel( int areaNum ) { return false; }
++
  	//-------------- Entity and Light Defs -----------------
  
  	// entityDefs and lightDefs are added to a given world to determine
 diff --git a/neo/renderer/RenderWorld_load.cpp b/neo/renderer/RenderWorld_load.cpp
-index 33cbbe0..5f56407 100644
+index 33cbbe0..6ceb7d3 100644
 --- a/neo/renderer/RenderWorld_load.cpp
 +++ b/neo/renderer/RenderWorld_load.cpp
 @@ -179,6 +179,13 @@ idRenderModel *idRenderWorldLocal::ParseModel( idLexer *src ) {
@@ -8257,11 +8300,192 @@ index 33cbbe0..5f56407 100644
  	// done!
  	return true;
  }
+@@ -625,61 +1003,140 @@ void idRenderWorldLocal::ClearPortalStates() {
+ idRenderWorldLocal::AddWorldModelEntities
+ =====================
+ */
+-void idRenderWorldLocal::AddWorldModelEntities() {
+-	int		i;
++// Bind one area's "_areaN" world model into its portal area as a render entity.
++// Extracted from AddWorldModelEntities so the streaming path (AppendAreaModel)
++// can run the exact same binding for a single, lazily-loaded area.
++void idRenderWorldLocal::AddSingleAreaModelEntity( int areaNum ) {
++	idRenderEntityLocal	*def;
++	int			index;
++
++	def = new idRenderEntityLocal;
++
++	// try and reuse a free spot
++	index = entityDefs.FindNull();
++	if ( index == -1 ) {
++		index = entityDefs.Append(def);
++	} else {
++		entityDefs[index] = def;
++	}
+ 
+-	// add the world model for each portal area
+-	// we can't just call AddEntityDef, because that would place the references
+-	// based on the bounding box, rather than explicitly into the correct area
+-	for ( i = 0 ; i < numPortalAreas ; i++ ) {
+-		idRenderEntityLocal	*def;
+-		int			index;
++	def->index = index;
++	def->world = this;
+ 
+-		def = new idRenderEntityLocal;
++	def->parms.hModel = renderModelManager->FindModel( va("_area%i", areaNum ) );
++	if ( def->parms.hModel->IsDefaultModel() || !def->parms.hModel->IsStaticWorldModel() ) {
++		common->Error( "idRenderWorldLocal::AddSingleAreaModelEntity: bad area model lookup" );
++	}
+ 
+-		// try and reuse a free spot
+-		index = entityDefs.FindNull();
+-		if ( index == -1 ) {
+-			index = entityDefs.Append(def);
+-		} else {
+-			entityDefs[index] = def;
+-		}
++	idRenderModel *hModel = def->parms.hModel;
+ 
+-		def->index = index;
+-		def->world = this;
++	for ( int j = 0; j < hModel->NumSurfaces(); j++ ) {
++		const modelSurface_t *surf = hModel->Surface( j );
+ 
+-		def->parms.hModel = renderModelManager->FindModel( va("_area%i", i ) );
+-		if ( def->parms.hModel->IsDefaultModel() || !def->parms.hModel->IsStaticWorldModel() ) {
+-			common->Error( "idRenderWorldLocal::InitFromMap: bad area model lookup" );
++		if ( ( surf->shader->GetName() ==  idStr( "textures/smf/portal_sky" ) ) || ( surf->shader->GetName() == idStr( "textures/editor/portal_sky" ) ) ) {
++			def->needsPortalSky = true;
+ 		}
++	}
+ 
+-		idRenderModel *hModel = def->parms.hModel;
++	def->referenceBounds = def->parms.hModel->Bounds();
+ 
+-		for ( int j = 0; j < hModel->NumSurfaces(); j++ ) {
+-			const modelSurface_t *surf = hModel->Surface( j );
++	def->parms.axis[0][0] = 1;
++	def->parms.axis[1][1] = 1;
++	def->parms.axis[2][2] = 1;
+ 
+-			if ( ( surf->shader->GetName() ==  idStr( "textures/smf/portal_sky" ) ) || ( surf->shader->GetName() == idStr( "textures/editor/portal_sky" ) ) ) { 
+-				def->needsPortalSky = true;
+-			}
+-		}
++	R_AxisToModelMatrix( def->parms.axis, def->parms.origin, def->modelMatrix );
+ 
+-		def->referenceBounds = def->parms.hModel->Bounds();
++	// in case an explicit shader is used on the world, we don't
++	// want it to have a 0 alpha or color
++	def->parms.shaderParms[0] =
++	def->parms.shaderParms[1] =
++	def->parms.shaderParms[2] =
++	def->parms.shaderParms[3] = 1;
+ 
+-		def->parms.axis[0][0] = 1;
+-		def->parms.axis[1][1] = 1;
+-		def->parms.axis[2][2] = 1;
++	AddEntityRefToArea( def, &portalAreas[areaNum] );
++}
+ 
+-		R_AxisToModelMatrix( def->parms.axis, def->parms.origin, def->modelMatrix );
++void idRenderWorldLocal::AddWorldModelEntities() {
++	int		i;
++	extern idCVar com_streamAreas;
+ 
+-		// in case an explicit shader is used on the world, we don't
+-		// want it to have a 0 alpha or color
+-		def->parms.shaderParms[0] =
+-		def->parms.shaderParms[1] =
+-		def->parms.shaderParms[2] =
+-		def->parms.shaderParms[3] = 1;
++	// add the world model for each portal area
++	// we can't just call AddEntityDef, because that would place the references
++	// based on the bounding box, rather than explicitly into the correct area
++	for ( i = 0 ; i < numPortalAreas ; i++ ) {
++		// Area streaming: when on, the boot .bproc only contains the boot
++		// region's "_areaN" models. Areas whose model is absent are deferred —
++		// they get bound later by AppendAreaModel as their .part streams in.
++		// (The portal graph + BSP for ALL areas already loaded, so connectivity
++		// is correct; only the render geometry is lazy.)
++		if ( com_streamAreas.GetBool() ) {
++			idRenderModel *m = renderModelManager->CheckModel( va("_area%i", i ) );
++			if ( m == NULL || m->IsDefaultModel() ) {
++				continue;
++			}
++		}
++		AddSingleAreaModelEntity( i );
++	}
++}
+ 
+-		AddEntityRefToArea( def, &portalAreas[i] );
++/*
++=====================
++idRenderWorldLocal::AppendAreaModel
++
++Area streaming (Phase 1): lazily load a deferred area's "_areaN" render model
++from areadump/_areaN.bproc.part (a one-MODEL .bproc stream written into the FS
++by the JS shell, or present in the pak), register it, and bind it into its
++portal area. Returns false if the part is missing/corrupt or the area is already
++present. Safe mid-game (the JS shell buffers the call to a frame boundary via
++D3_AppendArea -> the `appendArea` console command).
++=====================
++*/
++bool idRenderWorldLocal::AppendAreaModel( int areaNum ) {
++	if ( areaNum < 0 || areaNum >= numPortalAreas ) {
++		return false;
++	}
++	// already bound? (model present and a static world model)
++	idRenderModel *present = renderModelManager->CheckModel( va("_area%i", areaNum ) );
++	if ( present != NULL && !present->IsDefaultModel() ) {
++		return false;	// already loaded — nothing to do
+ 	}
++
++	idStr path = va( "areadump/_area%i.bproc.part", areaNum );
++	idFile *fp = fileSystem->OpenFileRead( path );
++	if ( fp == NULL ) {
++		common->Printf( "AppendAreaModel: %s not found\n", path.c_str() );
++		return false;
++	}
++	int magic = 0, ver = 0;
++	fp->ReadInt( magic );
++	fp->ReadInt( ver );
++	if ( magic != BPROC_MAGIC || ver != BPROC_VERSION ) {
++		fileSystem->CloseFile( fp );
++		return false;
++	}
++	idRenderModel *model = NULL;
++	while ( 1 ) {
++		int tag = BPROC_TAG_END;
++		if ( fp->ReadInt( tag ) != (int)sizeof( int ) ) {
++			break;
++		}
++		if ( tag == BPROC_TAG_END ) {
++			break;
++		} else if ( tag == BPROC_TAG_MODEL ) {
++			model = ParseBinaryProcModel( fp );
++			renderModelManager->AddModel( model );
++			localModels.Append( model );
++		} else {
++			break;	// unexpected tag — stop
++		}
++	}
++	fileSystem->CloseFile( fp );
++	if ( model == NULL ) {
++		return false;
++	}
++
++	AddSingleAreaModelEntity( areaNum );
++	return true;
+ }
+ 
+ /*
 diff --git a/neo/renderer/RenderWorld_local.h b/neo/renderer/RenderWorld_local.h
-index 0a129c5..4341807 100644
+index 0a129c5..f4e64a2 100644
 --- a/neo/renderer/RenderWorld_local.h
 +++ b/neo/renderer/RenderWorld_local.h
-@@ -183,6 +183,16 @@ public:
+@@ -183,14 +183,27 @@ public:
  	void					SetupAreaRefs();
  	void					ParseInterAreaPortals( idLexer *src );
  	void					ParseNodes( idLexer *src );
@@ -8278,11 +8502,14 @@ index 0a129c5..4341807 100644
  	int						CommonChildrenArea_r( areaNode_t *node );
  	void					FreeWorld();
  	void					ClearWorld();
-@@ -191,6 +201,7 @@ public:
+ 	void					FreeDefs();
+ 	void					TouchWorldModels( void );
  	void					AddWorldModelEntities();
++	void					AddSingleAreaModelEntity( int areaNum );	// bind one _areaN model (streaming)
  	void					ClearPortalStates();
  	virtual	bool			InitFromMap( const char *mapName );
 +	virtual void			DumpAreaModels( const char *dir );	// Phase 0 per-area render dump
++	virtual bool			AppendAreaModel( int areaNum );		// Phase 1 lazy area render load
  
  	//--------------------------
  	// RenderWorld_portals.cpp

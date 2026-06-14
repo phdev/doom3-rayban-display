@@ -89,8 +89,30 @@ baked `enpro.bproc`** (raw pre-FinishSurfaces verts; format = `BPROC_MAGIC`,
 version, `[TAG_MODEL: string name, int numSurfaces, per-surface{string mat, int
 nVerts, int nIdx, verts(vec3 xyz, f st0, f st1, vec3 normal)=32B, idx×int}]`,
 `TAG_PORTALS`, `TAG_NODES`, `TAG_END`; `WriteInt`=LE i32, `WriteString`=len+raw).
-Collision/entity assignment stays in-engine (needs `PointInArea`). Next: Phase 1
-render append (`AppendDeferredArea` + `FloodConnectedAreas` re-mark + `D3_AppendArea`).
+Collision/entity assignment stays in-engine (needs `PointInArea`).
+
+**Phase 1 DONE + headless VALIDATED (PASS).** Render append: `AddWorldModelEntities`
+gates the per-area loop on `com_streamAreas` (skips areas whose `_areaN` model is
+absent via `CheckModel`, no Error); `AddSingleAreaModelEntity` extracted as the
+per-area binder; `idRenderWorldLocal::AppendAreaModel(n)` lazily loads
+`areadump/_areaN.bproc.part` (one-MODEL .bproc, reuses `ParseBinaryProcModel`),
+`AddModel` + binds via the extracted helper. NO `FloodConnectedAreas` re-mark
+needed — all 93 portalAreas + portals + BSP load at boot (connectivity already
+correct); only the render entity defers. Console `appendArea <n>` +
+`D3_AppendArea(int)` export (buffers to a frame boundary like `D3_ExecCommand`;
+added to `EXPORTED_FUNCTIONS`). Tooling: `scripts/split-bproc-areas.py`
+(offline-splits the baked `enpro.bproc` by `_areaN` name → per-area `.part` (raw
+verts) + `_shared.part` + `enpro.boot.bproc` keeping `--boot-areas` resident;
+`--verify` proved byte-identical 546-block round-trip), `scripts/build-stream-test-pak.py`
+(swaps boot proc + bundles parts under `areadump/`), `scripts/test-stream-render.mjs`
+(headless: boot `com_streamAreas 1`, append, screenshot A/B). **Result:** boot region
+= areas 0–9 → boot proc 1.52 MB vs 7.13 MB monolith; streaming boot OK (83 deferred,
+no crash); appended 83/83, 0 not-found, geometry rendered (screenshot 124KB→371KB).
+Test pak must boot `com_streamAreas 1` (monolith mode Errors on absent area models —
+the gate is load-bearing). Next: Phase 2 collision append (`R_FilterPolygonIntoTree`
+into model 0; `ParseBinaryPolygons` is the template — skip the `polygonBlock` realloc,
+`AllocPolygon` falls back to `Mem_Alloc` on block overflow; `.bcm` is 8.6MB, the
+biggest asset). Then P3 entities, P4 policy + JS pipeline.
 
 ## State (2026-06)
 
