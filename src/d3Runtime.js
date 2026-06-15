@@ -8,6 +8,24 @@ import {
 } from "./storage.js";
 
 const ENGINE_BASE = `${import.meta.env.BASE_URL}wasm/`;
+// Iter 75: the display paks (reduced DOOM 3 game data) are NOT shipped in the
+// repo. Host them yourself and pass the base URL via ?pak=<url> (URL-encoded).
+// Only the pak + stream-blob fetches use PAK_BASE; the engine .js/.wasm/.data
+// stay on the GitHub Pages origin (ENGINE_BASE). The base should be the folder
+// that contains base/, base-stream/, base256/ (e.g. a Cloudflare R2 bucket).
+// After the first load the chunks/blobs cache in browser storage (keyed by URL).
+function resolvePakBase() {
+  try {
+    const raw = new URLSearchParams(window.location.search).get("pak");
+    if (raw && raw.trim()) {
+      let base = raw.trim();
+      if (!/\/$/.test(base)) base += "/";
+      return base;
+    }
+  } catch { /* no window (SSR) */ }
+  return ENGINE_BASE; // default: same-origin /wasm/ (only works if paks are local)
+}
+const PAK_BASE = resolvePakBase();
 // Per-build cache-buster for the fixed-name engine artifacts (dhewm3.js/.wasm/.data),
 // which iOS Safari otherwise caches across deploys (so engine rebuilds never load).
 // Injected by Vite (define); falls back to a constant in dev.
@@ -62,10 +80,10 @@ const BUNDLED_PK4_PATH = AREA_STREAM
   : (STREAM_TIER
     ? "base-stream/pak-display.pk4"
     : (HD_TIER ? "base256/pak-display.pk4" : "base/pak-display.pk4"));
-const BUNDLED_PK4_URL = `${ENGINE_BASE}${BUNDLED_PK4_PATH}`;
-const STREAM_BLOB_URL = `${ENGINE_BASE}base-stream/pak-display.pk4.stream`;
+const BUNDLED_PK4_URL = `${PAK_BASE}${BUNDLED_PK4_PATH}`;
+const STREAM_BLOB_URL = `${PAK_BASE}base-stream/pak-display.pk4.stream`;
 // per-area render parts blob (pack-area-stream.py output)
-const AREA_STREAM_BLOB_URL = `${ENGINE_BASE}base-stream/enpro.areas.stream`;
+const AREA_STREAM_BLOB_URL = `${PAK_BASE}base-stream/enpro.areas.stream`;
 const BUNDLED_PK4_GZIP_URL = `${BUNDLED_PK4_URL}.gz`;
 const URL_PK4_PARAM = "pk4";
 // Boot straight into the level so launch shows the rendered 3D world. The main

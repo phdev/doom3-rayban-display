@@ -23,3 +23,10 @@ areadump-out/
 # bproc/cache format bump or to retune the boot region, then re-commit.
 # (Previously gitignored as experimental.)
 .gstack/
+
+# Display paks (reduced DOOM 3 game data, ~113MB) — NOT shipped in the repo.
+# Host them yourself (e.g. Cloudflare R2) and pass the base URL via ?pak=<url>.
+# The engine .js/.wasm/.data stay on the GitHub Pages origin.
+public/wasm/base/
+public/wasm/base-stream/
+public/wasm/base256/

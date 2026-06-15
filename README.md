@@ -1,354 +1,167 @@
-# DOOM 3 Display
+# DOOM 3 — Meta Ray-Ban Display
 
-This is an open-source DOOM 3-compatible engine/demo shell for Meta Ray-Ban
-Display. It is designed around a [dhewm3](https://github.com/dhewm/dhewm3)
-WebAssembly engine build, a user-supplied `base/pak0XX.pk4`, Meta Neural Band
-gesture input, and W3C `DeviceOrientationEvent` head turning.
+An open-source [dhewm3](https://github.com/dhewm/dhewm3) (DOOM 3, GPL idTech4)
+build compiled to WebAssembly and rendered with a **custom WebGPU backend**,
+packaged as a web app shell for the **Meta Ray-Ban Display**. It uses Meta
+Neural Band pinch gestures + W3C `DeviceOrientationEvent` head-turning for input,
+and streams a reduced first-level (`maps/game/enpro`, the Enpro Plant) so it
+loads fast on a wearable.
 
 It is the DOOM 3 sibling of
 [glquake2-rayban-display](https://github.com/phdev/glquake2-rayban-display) and
-follows the same architecture: a Vite web app shell, an engine source patch, and
-a local packaging workflow.
+follows the same architecture: a Vite web shell, an engine source **patch**, and
+a local packaging workflow. It boots into the level and renders the 3D world —
+industrial geometry, per-pixel lighting, stencil shadows — at ~50–60 fps on real
+GPU hardware.
 
-> **Status — DOOM 3 renders the 3D game world in the browser.** The engine
-> compiles, boots, loads real data, runs the render loop at ~50–60 fps, and
-> **presents to the canvas**: the app boots into `game/mars_city1` and renders the
-> **3D world** — Mars-base geometry, per-pixel lighting, glowing light panels — on
-> real GPU hardware (Apple M1 via ANGLE/Metal). The main menu present path is also
-> proven (an earlier menu render confirmed the pipeline), but the menu currently
-> draws black with the level-complete reduced pak (the GUI cursor renders; the
-> main-page windows don't — see [Limitations](#limitations)), so the app bypasses
-> it and boots straight into the level. Unlike Quake II (Qwasm2/Yamagi), dhewm3
-> ships no official Emscripten target, so this repo adds one. The patch + build
-> scripts have been
-> verified end to end against real, owned DOOM 3 data: dhewm3 builds to a ~6 MB
-> `dhewm3.wasm` with GL4ES, instantiates against a WebGL2 context on the
-> `#gameCanvas` element, mounts a user PK4, and runs the **complete engine
-> bring-up, main loop, and present**:
->
-> ```
-> dhewm3 1.5.5 emscripten-x86 ... using SDL v3.x
-> Loaded pk4 /base/pak-display.pk4 with checksum 0x...  (4021 files)
-> ----- Initializing Decls -----      5206 strings read from strings/english.lang
-> LIBGL: Initialising gl4es ... Using GLES 2.0 backend
-> OpenGL renderer: GL4ES using WebKit WebGL    (600x600)
-> ARB2 renderer: Available.
-> ----- Initializing Game -----  Compiled 'script/doom_main.script'
-> ----- Initializing Session -----
-> ... main loop running at ~50–60 fps; main menu compositing to #gameCanvas ...
-> ```
->
-> Every hard browser blocker is solved (anti-root check, networking, worker
-> threads, the async-sound tic, terminal/stdin input, mouse-grab pointer-lock,
-> the legacy-GL proc table, C++ exceptions, the blocking frame loop, the
-> GL4ES↔WebGL binding, **the present/compositing path**
-> ([canvas-selector fix](#the-canvas-selector-fix-how-doom-3-reaches-the-screen)),
-> graceful handling of reduced-pak gaps, and the **ROQ-cinematic null-function
-> trap** that black-screened any view containing a video surface (skipped via
-> `r_skipROQ 1`)). **Remaining items:** ROQ video textures are disabled (so the
-> menu's animated logo panel and in-game monitors show a black placeholder), and
-> the bundled reduced pak must be regenerated from your owned data to include a
-> level's full dependencies. See [Limitations](#limitations). This repo does
-> **not** include DOOM 3 game data — you must own DOOM 3 and provide your own
-> `base/*.pk4`.
+---
 
 ## Play URL
 
-The app **boots straight into a level** (`game/mars_city1` by default) so launch
-renders the 3D world. Override the map with `?args=%2Bmap%20<name>`. (The main
-menu is bypassed on boot — it currently draws black in the browser build with the
-reduced pak; see [Limitations](#limitations).)
+**The reduced DOOM 3 paks are not shipped in this repo** (they contain
+copyrighted id Software game data). Host them yourself and pass the base URL:
 
-URL:
-
-```text
-https://phdev.github.io/doom3-rayban-display/?pk4=
+```
+https://phdev.github.io/doom3-rayban-display/?pak=<URL-encoded base URL>
 ```
 
-Add the URL for your legally obtained, display-optimized `pak-display.pk4` after
-`?pk4=`. The PK4 URL should be URL-encoded:
+`<base URL>` is the folder that contains `base/`, `base-stream/`, and `base256/`
+(e.g. a Cloudflare R2 bucket). After the first load the chunks/blobs cache in
+browser storage, so later launches with the same URL are offline-fast.
 
-```text
-https://phdev.github.io/doom3-rayban-display/?pk4=https%3A%2F%2Fexample.com%2Fbase%2Fpak-display.pk4
+Example:
+
+```
+https://phdev.github.io/doom3-rayban-display/?pak=https%3A%2F%2Fcdn.example.com%2Fdoom3%2F
 ```
 
-The PK4 must be served over HTTP(S) with browser fetch access enabled. A local
-filesystem path such as `/Users/.../pak-display.pk4` cannot be fetched by the
-hosted app. After the first successful URL load, the app caches the PK4 in
-browser storage for later launches with the same URL.
+The engine itself (`.js`/`.wasm`/`.data`) is served from GitHub Pages; only the
+paks come from your `?pak=` host.
 
-PK4 files are ordinary ZIP archives, so they can be large. The app supports
-gzip (`?pk4=…/pak-display.pk4` will also try `pak-display.pk4.gz`) and a chunk
-manifest (`pak-display.pk4.manifest.json`) for resilient loading inside the
-glasses' WebView. `scripts/install-demo-data.sh` produces all three.
+### Hosting the paks on Cloudflare R2
 
-## Optimize Your PK4
+1. Build the paks locally (see [Build](#build)) — they land in
+   `public/wasm/{base,base-stream,base256}/`.
+2. Create a public R2 bucket and add a CORS rule allowing `https://phdev.github.io`
+   to `GET` (see the header of `scripts/upload-paks-to-r2.sh`).
+3. Upload:
+   ```bash
+   R2_BUCKET=<bucket> R2_ENDPOINT=https://<account_id>.r2.cloudflarestorage.com \
+     scripts/upload-paks-to-r2.sh
+   ```
+4. Launch with `?pak=<your public base URL>/doom3/`.
 
-DOOM 3's base data is several gigabytes across `pak000.pk4`–`pak008.pk4` — far
-too large for Meta Ray-Ban Display. Build a reduced single-map package from your
-own legally obtained DOOM 3 data.
+---
 
-Recommended target:
+## Status & features
 
-- Start with your owned `base/` directory (all `pak0XX.pk4`).
-- Keep one playable map, usually `game/mars_city1` (the opening level).
-- Keep all declaration files (`materials/*.mtr`, `def/*.def`, `script/*.script`,
-  `*.sndshd`, `guis/*.gui`) plus the textures, models, animations, sounds, and
-  GUIs the map actually references.
-- Remove unused maps, cinematics (`.bik` videos), other levels, multiplayer-only
-  assets, and anything the target map never references.
-- Downsample retained WAV audio to reduce size while preserving first-level
-  sounds.
-- Gzip and chunk the final PK4 for transfer.
+The engine compiles, boots, mounts a reduced PK4, and renders the enpro level in
+the browser. Highlights of what this fork adds on top of stock dhewm3:
 
-Do not delete by folder or filename alone. DOOM 3 asset dependencies are
-connected through declaration files, so run a dependency pass first.
-`scripts/reduce-d3-map-pk4.py` does this automatically:
+### Renderer — WebGPU (primary)
+- A **hand-written WebGPU backend** is the default renderer. It captures the
+  engine's per-frame draw records (interactions, shadows, blend/fog, sky, GUI)
+  and replays them through WGSL pipelines. This fixes the iPhone WebKit-WebGL
+  "chunky-tile"/flicker artifact that GL4ES exhibits (byte-identical frames on
+  device).
+- **GL4ES (WebGL2) fallback** auto-engages if the browser lacks WebGPU.
+  `?backend=gl` forces it; `?echo` runs both side-by-side.
+
+### Boot speed
+- **Binary geometry cache baked into the pak**: `.bcm` (collision), `.bproc`
+  (render), `.bmap` (entities), `.baas48` (AI nav) replace the slow ASCII
+  `.cm`/`.proc`/`.map`/`.aas48` parse — the ~2.3 s tokenizer cost is gone, even
+  on first visit.
+- **Per-area geometry streaming** (default): the boot pak carries every texture +
+  the boot-region render geometry; the rest of the render geometry streams in
+  per render-area after the player is already playing.
+- GUI reference-closure pruning, main-menu deferral, and decl-purge tuning trim
+  the rest of the "Configuring / Starting map" time.
+
+### Asset size
+- A **reduced display pak** contains only the assets `maps/game/enpro` references
+  (built by `scripts/reduce-d3-map-pk4.py` — a decl-aware closure over the map).
+- Unused monsters that never spawn in enpro (cacodemon/spectre/skeleton) are
+  stripped. Current download: **~17.7 MB boot + ~2.7 MB streamed geometry**.
+
+### Wearable / glasses build
+- **Clean UI on the glasses**: the debug readout, log/copy buttons, fx panel, and
+  on-screen D-pad are hidden on the wearable (small-display / Android-WebView /
+  `?glasses`). `?diag` forces the debug UI back on any device.
+- **Permanent flashlight** — a view-attached projected light that stays lit with
+  any weapon equipped (toggle with the on-screen chip / the flashlight gesture).
+- **Unlimited ammo** — reserves are kept topped up; the readout shows real
+  numbers and never depletes.
+- **Auto-fire assist** — traces forward from the view and fires when a hostile is
+  centered; a line-of-fire trace holds fire when the friendly Sentry Bot is in
+  the way.
+- **Sound disabled** (`s_noSound 1`) — no audio ships and the engine skips audio
+  init.
+
+### Input
+- Meta Neural Band **pinch** = attack, **pinch-hold** = flashlight; head turning
+  via `DeviceOrientationEvent`; an on-screen D-pad is the touch/desktop fallback.
+
+---
+
+## URL parameters
+
+| Param | Effect |
+|---|---|
+| `?pak=<url>` | Base URL for the paks (required when hosting externally). |
+| `?backend=gl` | Force the GL4ES (WebGL2) renderer instead of WebGPU. |
+| `?echo` | Render GL + WebGPU side-by-side (debug). |
+| `?noareastream` / `?nostream` | Load the monolith (everything at boot, no geometry streaming). |
+| `?hd` | 256px-texture monolith tier. |
+| `?diag` / `?debug` | Force the debug overlay on (incl. on the glasses). |
+| `?glasses` | Force the clean wearable UI (hides debug + D-pad). |
+| `?nodiag` | Hide the debug overlay. |
+
+---
+
+## Build
+
+Requires the pinned Emscripten + GL4ES toolchains (set up under `.build/`).
 
 ```bash
-# Merge your owned base/*.pk4 and build a reduced, gzipped, chunked
-# pak-display.pk4 into public/wasm/base/ for the target map.
-D3_DATA_DIR="/path/to/owned/doom3/base" \
-D3_MAP="game/mars_city1" \
-  npm run install:demo-data
+# engine (regenerates neo/ from the patch, builds dhewm3.wasm + installs to public/wasm/)
+source .build/emsdk-600/emsdk_env.sh
+GL4ES_PATH=$PWD/.build/gl4es-600 bash scripts/build-dhewm3.sh
+
+# web shell
+npm install && npm run dev      # local dev server (serves public/wasm paks locally)
+npm run build                   # dist/ for deploy
 ```
 
-Or reduce a single owned PK4 directly:
+Engine source lives in `patches/dhewm3-meta-rayban-display.patch` (applied onto a
+pinned dhewm3 commit). The WebGPU shaders are in `webgpu-port/shaders/*.wgsl`
+(embedded into the build by `scripts/embed_wgsl.py`). `dhewm3.wasm` is gitignored;
+CI (`.github/workflows/deploy-pages.yml`) rebuilds it from the patch and bundles
+`src` → `dist` with Vite.
 
-```bash
-python3 scripts/reduce-d3-map-pk4.py \
-  --input /path/to/owned/base/pak000.pk4 \
-  --map game/mars_city1 \
-  --audio-rate 11025 --audio-width 1 \
-  --output dist-pak/base/pak-display.pk4
-```
+### Packaging the paks
+- `scripts/reduce-d3-map-pk4.py` — build the reduced display pak from your owned
+  DOOM 3 PK4s (keeps only enpro-referenced assets).
+- `scripts/bake-area-stream.sh` + `scripts/pack-area-stream.py` — split the
+  binary render geometry into the boot region + the per-area stream blob.
+- `scripts/chunk-pk4.py` — chunk a pak for HTTP-friendly fetching.
+- `scripts/upload-paks-to-r2.sh` — push `public/wasm/{base,base-stream,base256}`
+  to a Cloudflare R2 bucket.
 
-The reducer is conservative (it favors a working map over the smallest size) and
-prints a report. Use `--keep-list scripts/reduced-pk4.example.json` to
-force-include extra globs. Do not paste or upload copyrighted PK4 contents into a
-third-party chat service.
+You must own DOOM 3 and supply your own PK4s; this repo ships no game data.
 
-## Controls
+---
 
-Meta Neural Band gestures are translated through platform input events into
-DOOM 3 actions:
+## Known limitations
+- **iPhone "orange panel" bug (open):** at the enpro spawn, two panels render
+  bright orange on iPhone WebKit-WebGPU (correct/dark on Chrome/Dawn and on Mac
+  Safari — it does not reproduce on the Mac GPU). NaN-safe guards were added to
+  the lit-pass shader per the documented WebKit near-plane interpolation
+  pathology, but the iPhone-GPU mechanism is still unresolved.
+- Cutscenes are kept (the cutscene `idAnimated` entities fatally error on a
+  missing anim, so they cannot simply be stripped).
+- Saves use volatile Emscripten MEMFS, so on death the level reloads from the
+  boot autosave but there is no cross-reload persistence.
 
-- Pinch tap → toggle perpetual forward
-- **Pinch and hold → toggle flashlight** (DOOM 3's signature mechanic)
-- Swipe up → jump
-- Swipe down → recenter IMU
-- Swipe left/right → large turn burst
-
-On the **mobile / wearable profile** an on-screen **movement pad** (bottom-left:
-forward / back / strafe-left / strafe-right) drives the engine's `w/a/s/d` binds via
-synthetic key events, and the **flashlight auto-enables** shortly after spawn. A
-touchscreen tap no longer swings the fists (the `MOUSE1 -> _attack` bind is cleared
-on this profile, since SDL maps a tap to the left mouse button). The **opening
-cinematic is auto-skipped** (`g_skipCinematics 1`; see the engine patch) so you drop
-straight into gameplay.
-
-Head turning (`DeviceOrientationEvent` yaw) steers the view through the exported
-C function `D3_AddViewAngles`, with a deadzone and comfort-tuned sensitivity.
-
-Auto-fire engages when a valid enemy target is centered in view. When auto-fire
-starts, sticky forward is toggled off and IMU yaw sensitivity is halved briefly.
-Left/right edge indicators light up when a hostile is off-screen to your side; a
-turn-burst gesture toward an indicator snaps your view onto that enemy.
-
-The app intercepts platform navigation-style input in the capture phase so the
-WebView layer has less opportunity to consume it first. The primary camera path
-is the exported C function, not browser-generated mouse movement.
-
-## Game-Module & Engine Changes
-
-All native changes live in `patches/dhewm3-meta-rayban-display.patch`, generated
-against the pinned dhewm3 commit in `scripts/build-dhewm3.sh`. The patch adds:
-
-- `neo/framework/d3_wearable.{h,cpp}` — the wearable bridge. JavaScript head
-  tracking calls `D3_AddViewAngles`; gestures call `D3_SetWearableAction`. View
-  deltas and latched actions are folded into the usercmd inside
-  `idUsercmdGenLocal::MakeCurrent`.
-- `neo/game/D3Wearable.{h,cpp}` — game-side enemy assist. Traces forward from the
-  player view and injects attack when a valid hostile is centered; lights side
-  indicators; snaps to side enemies on a turn request. Hooked with a single line
-  in `idPlayer::Think`.
-- `neo/sys/wasm/d3_runtime_exports.js` — re-exposes Emscripten runtime helpers
-  (`FS`, `callMain`, …) on `Module` so the web shell installs PK4 data itself.
-- `neo/CMakeLists.txt` — an `if(EMSCRIPTEN)` block with the WebAssembly link
-  flags, exported functions, and `--preload-file`, plus the two new sources.
-
-The client view-control export is:
-
-```c
-EMSCRIPTEN_KEEPALIVE
-void D3_AddViewAngles(float dyaw, float dpitch);
-```
-
-JavaScript reads head orientation, calculates a yaw step, and calls the engine
-directly.
-
-## Build the Engine (experimental)
-
-Requires the [Emscripten SDK](https://emscripten.org/) active in your shell.
-
-```bash
-# 1. Build GL4ES (OpenGL -> WebGL) with Emscripten.
-npm run build:gl4es
-
-# 2. Build dhewm3 to WebAssembly with the wearable patch (monolithic,
-#    HARDLINK_GAME). Outputs public/wasm/dhewm3.{js,wasm,data}.
-GL4ES_PATH="$PWD/.build/gl4es" npm run build:dhewm3
-
-# 3. Stage your owned, reduced DOOM 3 data.
-D3_DATA_DIR="/path/to/owned/doom3/base" npm run install:demo-data
-
-# 4. Build and preview the web app shell.
-npm run build && npm run preview
-```
-
-The web app shell alone (no engine) builds with `npm run build` and is what CI
-deploys to GitHub Pages.
-
-## What the Emscripten patch does to dhewm3
-
-dhewm3 has no Emscripten target, so the patch adds one. Beyond the wearable
-bridge, it makes these engine changes (all guarded by `#ifdef __EMSCRIPTEN__`)
-that were needed to get DOOM 3 running in a browser:
-
-- **Build system** (`CMakeLists.txt`): skip `-march`; use Emscripten's built-in
-  SDL3 + OpenAL ports instead of `find_package`; emit `dhewm3.{js,wasm,data}`
-  with the `D3_*` exports (monolithic `HARDLINK_GAME`); enable `-fexceptions` so
-  dhewm3's recoverable `idException` errors drop to the console instead of
-  hard-aborting (Emscripten disables C++ exceptions by default).
-- **GL4ES binding** (`sys/glimp.cpp`): initialize GL4ES against the SDL/WebGL2
-  context (`set_getprocaddress` / `set_getmainfbsize` / `initialize_gl4es`) and
-  resolve all runtime GL lookups through `gl4es_GetProcAddress` — otherwise the
-  engine gets the browser's bare GLES2 pointers and every fixed-function entry
-  point (`glBegin`, `glColor*`, …) is null. Also pin the canvas size, since
-  Emscripten's SDL reports a 0×0 window. GL4ES must be **whole-archived** at link
-  (see `scripts/build-dhewm3.sh`).
-- **Present / canvas selector** (`sys/glimp.cpp`): set
-  `SDL_HINT_EMSCRIPTEN_CANVAS_SELECTOR` to `#gameCanvas` before window creation so
-  SDL3 builds the WebGL context on the page's actual canvas, then present with
-  `SDL_GL_SwapWindow` (flushing GL4ES via `gl4es_pre_swap` first). See
-  [the canvas-selector fix](#the-canvas-selector-fix-how-doom-3-reaches-the-screen).
-- **GL proc table** (`renderer/RenderSystem_init.cpp`): warn instead of aborting
-  on the legacy GL entry points GL4ES legitimately omits (accumulation buffer).
-- **Sound** (`snd_local.h`): pull in vendored OpenAL-Soft EFX headers, since
-  Emscripten's OpenAL port ships only a stub `alext.h` (see `vendor/openal-efx`).
-- **Startup / main loop** (`sys/linux/main.cpp`): skip the anti-root check
-  (sandbox uid 0) and **convert the blocking `while(1)` frame loop to
-  `emscripten_set_main_loop`** so frames yield to the browser.
-- **Input** (`sys/events.cpp`): skip `handleMouseGrab` (pointer-lock) and
-  `Sys_ConsoleInput` (stdin) in `Sys_GenerateEvents` — both **deadlock** in the
-  browser; the wearable bridge drives the camera instead.
-- **Networking** (`posix_net.cpp`): skip `getifaddrs` interface enumeration.
-- **Threads** (`FileSystem.cpp`, `Common.cpp`): skip the background-download and
-  async worker threads (no pthreads); the async sound tic is simply not run.
-- **Graceful missing-asset handling** (`Moveable.cpp`, `Item.cpp`,
-  `SecurityCamera.cpp`): a reduced single-map PK4 can omit a prop's collision
-  model. Upstream that's a fatal `gameLocal.Error` that aborts the whole map;
-  here it warns and drops just that entity so the level keeps loading. (Missing
-  *character* models still abort later via a fatal joint lookup — see
-  [Limitations](#limitations).)
-
-## The canvas-selector fix (how DOOM 3 reaches the screen)
-
-For a long time the engine ran the full main loop at ~60 fps but the canvas
-stayed **black** — frames rendered, nothing showed. The root cause was the
-WebGL context landing on the wrong canvas:
-
-- SDL3's Emscripten video driver creates its WebGL context with
-  `emscripten_webgl_create_context(selector, …)`, where `selector` defaults to
-  **`#canvas`** (`SDL_HINT_EMSCRIPTEN_CANVAS_SELECTOR`).
-- Emscripten 6 resolves that selector with `document.querySelector(selector)` —
-  there is no `#canvas`→`Module.canvas` alias anymore.
-- This app hosts the engine on **`#gameCanvas`**, so the selector resolved to
-  `null`, context creation returned `0`, `GLctx` stayed undefined (the
-  `getSupportedExtensions` crash), and every frame rendered into a context that
-  was never composited to the visible canvas.
-
-The fix is one line — tell SDL3 which canvas to use, before creating the window:
-
-```c
-SDL_SetHint(SDL_HINT_EMSCRIPTEN_CANVAS_SELECTOR, "#gameCanvas");
-```
-
-With the context on the right canvas, the normal path works: render through
-GL4ES, `gl4es_pre_swap()` to flush, then `SDL_GL_SwapWindow()` to present — the
-same approach the working Quake II reference ([Qwasm2](https://github.com/yamagi/Qwasm2)'s
-GL4ES `ref_gl1`) uses with SDL2 (which passes the canvas *element* directly via
-`Browser.createContext`, so it never hit this). No `GL_PREINITIALIZED_CONTEXT`
-and no manual `emscripten_webgl_make_context_current` are needed.
-
-## Limitations
-
-- **Main menu draws black (boot bypasses it).** Loading a level renders the 3D
-  world, but the main menu currently draws black with the reduced pak, so the app
-  boots straight into `game/mars_city1` instead (`D3_AUTO_MAP`). It's been traced
-  a long way: the GUI device context initializes and the **cursor renders**
-  (proving the 2-D GUI pipeline works), and it's independent of the intro /
-  `StartMenu` mode — but the main-menu page windows stay invisible. The reducer
-  now keeps the menu's assets (`fonts/`, `guis/assets/`, `ui/assets/`); the
-  remaining cause (a GUI window-render/state detail specific to the browser build)
-  is still open. An earlier capture *did* render the full menu, so the present
-  path itself is fine.
-- **ROQ video textures are disabled (`r_skipROQ 1`).** DOOM 3 plays `.roq`
-  cinematics on video-screen surfaces and behind the main-menu logo. The RoQ
-  decoder in this WASM build calls a **null function pointer**
-  (`idCinematicLocal::ImageForTime`, reached from `RB_BindVariableStageImage`
-  when a cinematic surface is drawn), which traps the whole render loop — so the
-  *instant* any video surface enters the view, the screen goes black. The config
-  sets `r_skipROQ 1`, which makes the decoder return empty early; the renderer
-  then binds a black image for those surfaces and **everything else renders**.
-  Cost: the menu's animated logo panel and in-game monitors show a black
-  placeholder. Fixing the decoder itself (so videos play) is future work.
-- **Reduced-pak completeness (in-level load).** Loading a full level needs the
-  map's complete dependency set, which `scripts/reduce-d3-map-pk4.py` originally
-  under-included (it crashed `mars_city1` on missing collision models, then
-  character models/anims). The reducer now (1) walks the entityDef/model def
-  graph to a **fixpoint**, (2) **accumulates** same-named decl blocks (DOOM 3
-  names an entityDef and its model def identically, so a naïve overwrite dropped
-  body meshes), (3) seeds the **player + default weapons/PDA/flashlight** (no map
-  token references them), (4) always keeps **`glprogs/`** (the ARB shader
-  programs the lit 3D path needs), and (5) scans **every model format**
-  (`.lwo`/`.ase`/`.ma`/`.md5mesh`) for the material names DOOM 3 embeds in them and
-  keeps those materials' images — both explicit (`.mtr`) and **implicit**
-  (`<name>_d/_local/_s/_add` by convention). Step 5 is what makes a level *look*
-  right: a map's walls/doors/lights/props are `.lwo`/`.ase` models, and scanning
-  only `.md5mesh` (animated characters) dropped **481 textures** on `admin` —
-  including the elevator's own wall texture — so those surfaces rendered **pure
-  black** (a missing diffuse map = black, which looks like missing lighting). The
-  engine also drops a missing **moveable/item/camera collision model** entity
-  instead of aborting the map. With a pak regenerated from owned data this way,
-  `mars_city1` loads with **zero fatal errors** and renders. Regenerate with
-  `scripts/install-demo-data.sh` (point `D3_DATA_DIR` at your owned `base/`).
-- **Performance / headless.** A full level is far heavier than the menu; under
-  headless *software* WebGL (swiftshader) the first frame can take minutes. On
-  real GPU hardware (Apple M1 via ANGLE/Metal, and the glasses) it renders
-  promptly.
-- **Darkness / no working gamma.** DOOM 3 is a dark game that leans on gamma
-  correction, and **this build has none that works**: SDL3 removed hardware gamma
-  (`GLimp_SetGamma` is a no-op), and dhewm3's in-shader gamma (`r_gammaInShader 1`)
-  has no observable effect through GL4ES, so `r_gamma`/`r_brightness`/`r_lightScale`
-  don't move the frame. The only working lever is the **CSS `filter: brightness()`**
-  on the canvas (`config.displayBrightness`), a compositor multiply that can't
-  rescue a truly unlit surface. Most levels also *start* in a deliberately dark
-  airlock/elevator transition room (`admin`, `alphalabs1`); walk forward into the
-  lit level, or use the **flashlight** (long pinch). `mars_city1` opens directly
-  into a lit space and is the best demo.
-- **Single-threaded.** SDL thread/condvar creation fails (non-pthread build).
-  Harmless for boot, but sound and any worker threads are stubbed. A fuller
-  build may want `-pthread` + `-sPROXY_TO_PTHREAD` (the app already sends the
-  COOP/COEP headers SharedArrayBuffer needs).
-- **Performance.** DOOM 3's renderer (per-pixel lighting, stencil shadows) is
-  heavy; the app defaults to `r_shadows 0`, low machine spec, and downsized
-  textures. Headless software WebGL hits ~50 fps at 600×600; real GPU hardware
-  (and the glasses) should do better.
-- **Game data is proprietary.** Nothing here downloads DOOM 3 data; you must own
-  it and reduce it locally. If you bump `DHEWM3_COMMIT`, regenerate the patch.
-
-## License & Notices
-
-GPL-3.0-or-later. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md) for upstream
-engine sources (dhewm3, id Tech 4, GL4ES, Emscripten) and their licenses.
+## License
+Engine: GPL (dhewm3 / idTech4). Game data: not included — owned separately.
