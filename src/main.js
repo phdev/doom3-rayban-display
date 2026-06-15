@@ -82,14 +82,19 @@ const refs = {
   webgpuCanvas: document.querySelector("#webgpuCanvas")
 };
 
-// Iter 73: when actually running on the Ray-Ban Display glasses (an Android
-// WebView), hide the developer debug overlay — the render-info readout, the
+// Iter 73b: hide the developer debug overlay — render-info readout, the
 // log/copy/fx buttons, and the on-screen movement D-pad — so the wearable
-// shows a clean game view. Keyed off the Android-WebView UA specifically (NOT
-// a small-screen heuristic) so the readout STAYS visible when testing in a
-// phone browser (iOS Safari). The fx button is created later in wireFxPanel
-// (skipped there), and the D-pad show is gated on !onGlasses below.
-const onGlasses = /Android.*wv/i.test(navigator.userAgent);
+// shows a clean game view. The Ray-Ban Display may NOT report an Android-wv UA,
+// so detect the glasses broadly: Android WebView OR a small wearable/phone
+// display (<=640px) OR an explicit ?glasses. ?diag / ?debug forces the debug UI
+// back on ANY device (for on-device debugging). The fx button is skipped in
+// wireFxPanel and the D-pad show is gated on !onGlasses below.
+const forceDebugUI = /[?&](diag|debug)\b/.test(location.search);
+const onGlasses = !forceDebugUI && (
+  /[?&]glasses\b/.test(location.search)
+  || /Android.*wv/i.test(navigator.userAgent)
+  || (typeof window !== "undefined" && window.screen && window.screen.width <= 640)
+);
 if (onGlasses) {
   for (const id of ["diag", "diagToggle", "diagCopy", "posLine", "glDiag"]) {
     const el = document.querySelector("#" + id);
