@@ -7,6 +7,11 @@ Neural Band pinch gestures + W3C `DeviceOrientationEvent` head-turning for input
 and streams a reduced first-level (`maps/game/enpro`, the Enpro Plant) so it
 loads fast on a wearable.
 
+**It is not glasses-only.** It's a standard web app that runs in any modern
+browser with WebGPU — **mobile Safari (iOS) and mobile Chrome (Android)** on
+phones, and desktop Chrome / Safari — and falls back to WebGL2 (GL4ES) where
+WebGPU isn't available. The glasses just get the clean, gesture-driven UI.
+
 It is the DOOM 3 sibling of
 [glquake2-rayban-display](https://github.com/phdev/glquake2-rayban-display) and
 follows the same architecture: a Vite web shell, an engine source **patch**, and
