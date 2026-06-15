@@ -33,7 +33,6 @@ app.innerHTML = `
     <canvas id="webgpuCanvas" class="webgpu-canvas" width="448" height="448" aria-hidden="true"></canvas>
     <div id="enemyLeftIndicator" class="enemy-indicator enemy-indicator-left" aria-hidden="true"></div>
     <div id="enemyRightIndicator" class="enemy-indicator enemy-indicator-right" aria-hidden="true"></div>
-    <div id="flashlightIndicator" class="flashlight-indicator" role="button" tabindex="0">Flashlight</div>
     <section id="loadingPanel" class="loading-panel" role="status" aria-live="polite">
       <div id="loadingLabel" class="loading-label">Loading</div>
       <div
@@ -68,7 +67,6 @@ const refs = {
   canvas: document.querySelector("#gameCanvas"),
   enemyLeftIndicator: document.querySelector("#enemyLeftIndicator"),
   enemyRightIndicator: document.querySelector("#enemyRightIndicator"),
-  flashlightIndicator: document.querySelector("#flashlightIndicator"),
   loadingPanel: document.querySelector("#loadingPanel"),
   loadingLabel: document.querySelector("#loadingLabel"),
   loadingProgress: document.querySelector("#loadingProgress"),
@@ -1618,14 +1616,10 @@ async function start() {
     wearableInput = createWearableInput({
       getEngine: () => engine,
       onRecenter: () => headTracking.recenter(),
-      onTurnBurst: (direction) => headTracking.addTurnBurst(direction),
-      onFlashlightChange: (enabled) => {
-        // Iter 72: the flashlight is now a permanent player-attached light,
-        // decoupled from the weapon — toggling it must NOT switch weapons (the
-        // old iter-43 "return to assault rifle" behavior was for the flashlight
-        // WEAPON and would now spuriously swap guns). Just reflect the chip.
-        setFlashlightIndicator(enabled);
-      }
+      onTurnBurst: (direction) => headTracking.addTurnBurst(direction)
+      // Iter 76: the on-screen flashlight chip was removed. The flashlight is a
+      // permanent player-attached light (default on, engine-side) and still
+      // toggles via the wearable gesture, so no UI callback is needed.
     });
 
     wearableInput.install();
@@ -1857,21 +1851,6 @@ function setEnemyIndicators({ left, right }) {
   refs.enemyLeftIndicator.classList.toggle("is-visible", enemyPresence.left);
   refs.enemyRightIndicator.classList.toggle("is-visible", enemyPresence.right);
 }
-
-function setFlashlightIndicator(on) {
-  refs.flashlightIndicator.classList.toggle("is-on", Boolean(on));
-}
-
-// Iter 37: the chip is a tap-toggle (the only flashlight control on touch
-// devices now that auto-enable is off — native-parity boots dark-corridor
-// correct, and the player lights up on demand like in the native game).
-refs.flashlightIndicator.addEventListener("click", (e) => {
-  e.preventDefault();
-  wearableInput?.toggleFlashlight();
-});
-// Iter 72: the permanent flashlight is ON by default in the engine, so the
-// chip starts lit and stays in sync with the wearable state's default.
-setFlashlightIndicator(true);
 
 function handleAutoFireStarted() {
   wearableInput?.setForward(false);

@@ -128,32 +128,6 @@ body {
   border-left: 24px solid #d6332b;
 }
 
-.flashlight-indicator {
-  position: fixed;
-  left: 50%;
-  top: 12px;
-  z-index: 12;
-  padding: 3px 12px;
-  border-radius: 10px;
-  font-size: 0.62rem;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: #f4d35e;
-  background: rgba(20, 20, 20, 0.7);
-  border: 1px solid rgba(244, 211, 94, 0.5);
-  opacity: 0.55;
-  pointer-events: auto;
-  cursor: pointer;
-  transform: translateX(-50%);
-  transition: opacity 120ms ease, background 120ms ease, color 120ms ease;
-}
-
-.flashlight-indicator.is-on {
-  opacity: 0.95;
-  color: #0a0a0a;
-  background: #f4d35e;
-}
-
 .loading-panel {
   position: absolute;
   inset: 0;
