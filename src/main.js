@@ -2,7 +2,7 @@ import "./styles.css";
 import "./webgl-record.js";
 import { installTAA } from "./taa.js";
 import { createHeadTracking } from "./headTracking.js";
-import { createRuntimeConfig, bootDoom3 } from "./d3Runtime.js";
+import { createRuntimeConfig, bootDoom3, wantWebGPU } from "./d3Runtime.js";
 import { createWearableInput } from "./wearableInput.js";
 
 const app = document.querySelector("#app");
@@ -85,7 +85,7 @@ const refs = {
 // Phase 5d: when ?backend=webgpu, reveal the side-by-side WebGPU canvas
 // so the user can see what the WebGPU backend is rendering (currently a
 // debug clear; will become real engine output as call sites migrate).
-if (/[?&]backend=webgpu\b/.test(location.search) && refs.webgpuCanvas) {
+if (wantWebGPU(location.search) && refs.webgpuCanvas) {
   refs.webgpuCanvas.classList.add("is-active");
   // DEFAULT (cutover): with ?backend=webgpu, the WebGPU canvas IS the
   // fullscreen primary display and the GL canvas is hidden (opacity, not
@@ -222,7 +222,7 @@ function updateGlDiag() {
   // Lead with the ACTIVE render backend — the GL context still exists
   // (fallback + lightgem + texture uploads) but under WebGPU-primary it no
   // longer renders the scene, and "GPU: GL4ES" read as if it did.
-  const wgpuPrimary = /[?&]backend=webgpu\b/.test(location.search) && !/[?&]echo\b/.test(location.search);
+  const wgpuPrimary = wantWebGPU(location.search);
   const backendLine = wgpuPrimary
     ? "render: WebGPU (Dawn) — GL idle (fallback/lightgem only)\n"
     : "";
@@ -1811,7 +1811,7 @@ let cinShadowGuardTimer = null;
 function armCinematicShadowGuard() {
   if (runtimeConfig.inputMode !== "wearable") return;
   const qs = window.location.search;
-  if (!/[?&]backend=webgpu\b/.test(qs) || /[?&]noshadows\b/.test(qs)) return;
+  if (!wantWebGPU(qs) || /[?&]noshadows\b/.test(qs)) return;
   let parked = false;
   window.clearInterval(cinShadowGuardTimer);
   cinShadowGuardTimer = window.setInterval(() => {

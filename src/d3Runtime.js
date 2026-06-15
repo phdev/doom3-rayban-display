@@ -27,12 +27,21 @@ const HD_TIER = (typeof window !== "undefined") && /[?&]hd\b/.test(window.locati
 // boot pak chunks + the .stream blob + manifests.
 const NO_STREAM = (typeof window !== "undefined") && /[?&]nostream\b/.test(window.location.search);
 const STREAM_TIER = !HD_TIER && !NO_STREAM;
-// ?areastream — experimental per-render-area streaming (Phase 4). The boot pak
-// carries only the boot region's render geometry (a reduced enpro.bproc); the
-// rest of the areas stream in after boot as a separate blob and bind via
-// D3_AppendArea. Off by default (full monolithic pak). See CLAUDE.md "Area
-// streaming". Enabling it also passes +set com_streamAreas 1 to the engine.
-const AREA_STREAM = (typeof window !== "undefined") && /[?&]areastream\b/.test(window.location.search);
+// ?areastream — per-render-area streaming (Phase 4). DEFAULT ON for the stream
+// tier: the boot pak carries only the boot region's render geometry (a reduced
+// enpro.bproc); the rest of the areas stream in after boot as a separate blob and
+// bind via D3_AppendArea (also passes +set com_streamAreas 1). Opt out with
+// ?noareastream (full geometry in the boot pak, no streaming dependency). Not used
+// by ?hd / ?nostream (monolithic tiers). See CLAUDE.md "Area streaming".
+const AREA_STREAM = STREAM_TIER && (typeof window !== "undefined")
+  && !/[?&]noareastream\b/.test(window.location.search);
+// ?backend — the WebGPU renderer is the DEFAULT (it fixes the iPhone GL4ES
+// chunky-tile/flicker bug). Opt out with ?backend=gl (or ?echo for the GL/WebGPU
+// side-by-side). If the browser lacks WebGPU, the JS pre-acquire fails and the
+// engine's r_backend=webgpu arg is demoted to gl automatically (see bootDoom3).
+export function wantWebGPU(qs) {
+  return !/[?&]backend=gl\b/.test(qs || "") && !/[?&]echo\b/.test(qs || "");
+}
 const BUNDLED_PK4_PATH = AREA_STREAM
   ? "base-stream/pak-display-stream.pk4"
   : (STREAM_TIER
@@ -178,7 +187,7 @@ export function createRuntimeConfig() {
   // ?render2x/?render4x still override; ?lowres keeps the old 448.
   try {
     const qs2 = typeof window !== "undefined" ? window.location.search : "";
-    const webgpuPrimary = /[?&]backend=webgpu\b/.test(qs2) && !/[?&]echo\b/.test(qs2);
+    const webgpuPrimary = wantWebGPU(qs2);
     if (webgpuPrimary && renderScale === 1 && config.width < 640 && !/[?&]lowres\b/.test(qs2)) {
       config.width = 640;
       config.height = 640;
@@ -653,13 +662,13 @@ function buildArguments(config) {
     // ?backend=webgpu selects the WebGPU backend (requires navigator.gpu).
     // Default "gl" keeps the existing pass-through wrapper.
     "+set", "r_backend",
-        /[?&]backend=webgpu\b/.test(typeof window !== "undefined" ? window.location.search : "")
+        wantWebGPU(typeof window !== "undefined" ? window.location.search : "")
             ? "webgpu" : "gl",
     // Cutover default: when WebGPU is the primary display (i.e. webgpu
     // backend without &echo), skip the GL draw calls entirely (lightgem
     // excepted — see r_skipGLDraw).
     "+set", "r_skipGLDraw",
-        (/[?&]backend=webgpu\b/.test(typeof window !== "undefined" ? window.location.search : "")
+        (wantWebGPU(typeof window !== "undefined" ? window.location.search : "")
          && !/[?&]echo\b/.test(typeof window !== "undefined" ? window.location.search : ""))
             ? "1" : "0",
     "+set", "r_gamma", String(getNumericConfig(config.rGamma, 1.1)),
@@ -740,7 +749,7 @@ function buildArguments(config) {
     // so the capture-replay could never see their verts and light fixtures
     // lost their glow aura. GL draw perf doesn't matter here (draws are
     // skipped under WebGPU-primary; echo is a debug harness).
-    ...(/[?&]backend=webgpu\b/.test(typeof window !== "undefined" ? window.location.search : "")
+    ...(wantWebGPU(typeof window !== "undefined" ? window.location.search : "")
         ? ["+set", "r_useVertexBuffers", "0"] : []),
     // Iter 28: WebGPU GPU-memory diet. iOS Safari kills the whole TAB when
     // total GPU memory tips over (the "82% Starting DOOM 3" crash: WebGL
@@ -781,7 +790,7 @@ function buildArguments(config) {
     // (one copyTextureToTexture, none of the GL blit storm: GL draws are
     // skipped via r_skipGLDraw and the GL copy is gated in CopyFramebuffer).
     "+set", "r_skipPostProcess",
-        ((/[?&]backend=webgpu\b/.test(typeof window !== "undefined" ? window.location.search : "")
+        ((wantWebGPU(typeof window !== "undefined" ? window.location.search : "")
           && !/[?&]echo\b/.test(typeof window !== "undefined" ? window.location.search : ""))
          || /[?&]heathaze\b/.test(typeof window !== "undefined" ? window.location.search : "")) ? "0" : "1",
     // image_downSize=0 disables the downsize pass entirely (full-resolution
@@ -875,7 +884,7 @@ function shadowsEnabledForBoot() {
   const qs = typeof window !== "undefined" ? window.location.search : "";
   if (/[?&]noshadows\b/.test(qs)) return false;
   if (/[?&]shadows\b/.test(qs)) return true;
-  return /[?&]backend=webgpu\b/.test(qs) && !/[?&]echo\b/.test(qs);
+  return wantWebGPU(qs);
 }
 
 function buildAutoexecConfig(config) {
