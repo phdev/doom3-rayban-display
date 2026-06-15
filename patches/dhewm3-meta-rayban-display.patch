@@ -1830,10 +1830,10 @@ index 0000000..4b45b72
 +#endif // __D3_WEARABLE_H__
 diff --git a/neo/game/D3Wearable.cpp b/neo/game/D3Wearable.cpp
 new file mode 100644
-index 0000000..ef1357d
+index 0000000..a44a89c
 --- /dev/null
 +++ b/neo/game/D3Wearable.cpp
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,312 @@
 +/*
 +===========================================================================
 +
@@ -2031,6 +2031,53 @@ index 0000000..ef1357d
 +	return best;
 +}
 +
++// A friendly AI on the player's team (e.g. the enpro Sentry Bot, which flies
++// around fighting demons and wanders into the aim cone) would be hit by the
++// auto-fire if it sits in the line of fire. Return true when a same-team AI is
++// at least as centered as the targeted enemy so the caller suppresses the shot
++// — don't auto-fire through / at the friendly drone.
++static bool
++D3_WearableFriendlyBlocks( idPlayer *player, const idVec3 &eye, const idVec3 &forward, float enemy_dot )
++{
++	for ( int i = 0; i < MAX_GENTITIES; i++ )
++	{
++		idEntity *candidate = gameLocal.entities[i];
++
++		if ( !candidate || candidate == player )
++		{
++			continue;
++		}
++
++		if ( !candidate->IsType( idAI::Type ) || ( candidate->health <= 0 ) )
++		{
++			continue;
++		}
++
++		idActor *actor = static_cast<idActor *>( candidate );
++
++		if ( actor->team != player->team )
++		{
++			continue;	// only same-team friendlies block friendly fire
++		}
++
++		idVec3 target = D3_WearableTargetCenter( candidate );
++		idVec3 dir = target - eye;
++		float dist = dir.Normalize();
++
++		if ( ( dist <= 1.0f ) || ( dist > D3_WEARABLE_ENEMY_RANGE ) )
++		{
++			continue;
++		}
++
++		if ( ( ( dir * forward ) >= enemy_dot ) && D3_WearableCanSee( player, candidate, eye, target ) )
++		{
++			return true;
++		}
++	}
++
++	return false;
++}
++
 +void
 +D3_WearablePlayerAssist( idPlayer *player, usercmd_t *cmd )
 +{
@@ -2082,8 +2129,19 @@ index 0000000..ef1357d
 +
 +	if ( centered )
 +	{
-+		cmd->buttons |= BUTTON_ATTACK;
-+		D3_NotifyAutoFireStarted();
++		// Don't shoot a friendly (e.g. the Sentry Bot) that is in the line of
++		// fire: suppress the auto-fire if a same-team AI is at least as centered
++		// as the targeted enemy.
++		idVec3 etarget = D3_WearableTargetCenter( centered );
++		idVec3 edir = etarget - eye;
++		edir.Normalize();
++		float enemy_dot = edir * forward;
++
++		if ( !D3_WearableFriendlyBlocks( player, eye, forward, enemy_dot ) )
++		{
++			cmd->buttons |= BUTTON_ATTACK;
++			D3_NotifyAutoFireStarted();
++		}
 +	}
 +}
 +
