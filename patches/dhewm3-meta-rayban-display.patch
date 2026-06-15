@@ -1830,10 +1830,10 @@ index 0000000..4b45b72
 +#endif // __D3_WEARABLE_H__
 diff --git a/neo/game/D3Wearable.cpp b/neo/game/D3Wearable.cpp
 new file mode 100644
-index 0000000..c32b42a
+index 0000000..c0957e5
 --- /dev/null
 +++ b/neo/game/D3Wearable.cpp
-@@ -0,0 +1,339 @@
+@@ -0,0 +1,296 @@
 +/*
 +===========================================================================
 +
@@ -1865,7 +1865,6 @@ index 0000000..c32b42a
 +
 +#define D3_WEARABLE_ENEMY_RANGE			1200.0f
 +#define D3_WEARABLE_AUTOFIRE_DOT		0.9063078f	// cos(25 degrees)
-+#define D3_WEARABLE_FRIENDLY_BLOCK_DOT	0.8191520f	// cos(35 degrees) — wider than the fire cone
 +#define D3_WEARABLE_VIEW_HALF_ANGLE		35.0f
 +#define D3_WEARABLE_REAR_BOTH_ANGLE		160.0f
 +
@@ -2032,78 +2031,36 @@ index 0000000..c32b42a
 +	return best;
 +}
 +
-+// A friendly AI on the player's team (e.g. the enpro Sentry Bot, which flies
-+// around fighting demons and wanders into the aim cone) must never be hit by
-+// the auto-fire. The auto-fire just presses BUTTON_ATTACK; the weapon then
-+// fires along the player's `forward` (the crosshair), NOT at the targeted
-+// enemy. So a friendly is at risk whenever it is near that forward ray —
-+// regardless of how centered the enemy is. The previous guard only suppressed
-+// when the friendly was at least as centered as the enemy, so a Sentry Bot
-+// that was slightly off-centre (or simply the first thing the straight shot
-+// would hit) still got shot. Return true if EITHER:
-+//   (1) a straight shot along `forward` would hit a same-team friendly first
-+//       (precise line-of-fire trace), or
-+//   (2) a same-team friendly sits anywhere inside a cone slightly WIDER than
-+//       the auto-fire cone and is visible (margin for the flying drone).
++// A friendly AI on the player's team (e.g. the enpro Sentry Bot) must not be
++// hit by the auto-fire, but the auto-fire must still work on enemies. The
++// auto-fire presses BUTTON_ATTACK and the weapon fires along the player's
++// `forward` (the crosshair). So the ONLY time a friendly is actually hit is
++// when a straight shot along `forward` would strike it — exactly what a
++// line-of-fire trace detects. Suppress in that case only. This never blocks
++// firing at an enemy (the trace hits the enemy, a different team, and returns
++// false), and it does NOT over-suppress when the escort drone merely hovers
++// near the view (an earlier wide-cone guard did, which broke auto-fire in the
++// sentry section). If the trace hits the enemy first, fire goes through even
++// with a friendly somewhere behind it.
 +static bool
 +D3_WearableFriendlyBlocks( idPlayer *player, const idVec3 &eye, const idVec3 &forward )
 +{
-+	// (1) Precise line-of-fire: trace the shot the weapon is about to take.
++	trace_t tr;
++	idVec3 end = eye + forward * D3_WEARABLE_ENEMY_RANGE;
++	gameLocal.clip.TracePoint( tr, eye, end, MASK_SHOT_BOUNDINGBOX, player );
++
++	if ( tr.fraction < 1.0f )
 +	{
-+		trace_t tr;
-+		idVec3 end = eye + forward * D3_WEARABLE_ENEMY_RANGE;
-+		gameLocal.clip.TracePoint( tr, eye, end, MASK_SHOT_BOUNDINGBOX, player );
++		idEntity *hit = gameLocal.GetTraceEntity( tr );
 +
-+		if ( tr.fraction < 1.0f )
++		if ( hit && ( hit != player ) && hit->IsType( idAI::Type ) && ( hit->health > 0 ) )
 +		{
-+			idEntity *hit = gameLocal.GetTraceEntity( tr );
++			idActor *actor = static_cast<idActor *>( hit );
 +
-+			if ( hit && ( hit != player ) && hit->IsType( idAI::Type ) && ( hit->health > 0 ) )
++			if ( actor->team == player->team )
 +			{
-+				idActor *actor = static_cast<idActor *>( hit );
-+
-+				if ( actor->team == player->team )
-+				{
-+					return true;
-+				}
++				return true;	// a same-team friendly is in the line of fire
 +			}
-+		}
-+	}
-+
-+	// (2) Margin cone: any same-team friendly near the line of fire.
-+	for ( int i = 0; i < MAX_GENTITIES; i++ )
-+	{
-+		idEntity *candidate = gameLocal.entities[i];
-+
-+		if ( !candidate || candidate == player )
-+		{
-+			continue;
-+		}
-+
-+		if ( !candidate->IsType( idAI::Type ) || ( candidate->health <= 0 ) )
-+		{
-+			continue;
-+		}
-+
-+		idActor *actor = static_cast<idActor *>( candidate );
-+
-+		if ( actor->team != player->team )
-+		{
-+			continue;	// only same-team friendlies block friendly fire
-+		}
-+
-+		idVec3 target = D3_WearableTargetCenter( candidate );
-+		idVec3 dir = target - eye;
-+		float dist = dir.Normalize();
-+
-+		if ( ( dist <= 1.0f ) || ( dist > D3_WEARABLE_ENEMY_RANGE ) )
-+		{
-+			continue;
-+		}
-+
-+		if ( ( ( dir * forward ) >= D3_WEARABLE_FRIENDLY_BLOCK_DOT ) && D3_WearableCanSee( player, candidate, eye, target ) )
-+		{
-+			return true;
 +		}
 +	}
 +
@@ -2686,7 +2643,7 @@ index e3458b3..4443dad 100644
  
  	// if the model should be shrinked
 diff --git a/neo/game/Player.cpp b/neo/game/Player.cpp
-index 01b05ab..a38488a 100644
+index 01b05ab..f1d9ed6 100644
 --- a/neo/game/Player.cpp
 +++ b/neo/game/Player.cpp
 @@ -37,6 +37,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -2697,42 +2654,7 @@ index 01b05ab..a38488a 100644
  #include "Camera.h"
  #include "Fx.h"
  #include "Misc.h"
-@@ -889,13 +890,10 @@ int idInventory::HasAmmo( ammo_t type, int amount ) {
- 		return -1;
- 	}
- 
--	// check if we have infinite ammo
--	if ( ammo[ type ] < 0 ) {
--		return -1;
--	}
--
--	// return how many shots we can fire
--	return ammo[ type ] / amount;
-+	// Iter 72: unlimited ammo — always report infinite reserve (-1). The
-+	// engine already treats a negative reserve as infinite, so the HUD and
-+	// every weapon-script ammo query keep working; only the supply is endless.
-+	return -1;
- }
- 
- /*
-@@ -919,12 +917,10 @@ bool idInventory::UseAmmo( ammo_t type, int amount ) {
- 		return false;
- 	}
- 
--	// take an ammo away if not infinite
--	if ( ammo[ type ] >= 0 ) {
--		ammo[ type ] -= amount;
--		ammoPredictTime = gameLocal.time; // mp client: we predict this. mark time so we're not confused by snapshots
--	}
--
-+	// Iter 72: unlimited ammo — never decrement the reserve. The per-weapon
-+	// clip still empties and reloads from the (now infinite) reserve, so reload
-+	// animations and the clip counter keep their normal feel; you just never
-+	// run out.
- 	return true;
- }
- 
-@@ -1133,6 +1129,15 @@ idPlayer::idPlayer() {
+@@ -1133,6 +1134,15 @@ idPlayer::idPlayer() {
  	isChatting				= false;
  
  	selfSmooth				= false;
@@ -2748,7 +2670,7 @@ index 01b05ab..a38488a 100644
  }
  
  /*
-@@ -1609,6 +1614,12 @@ Release any resources used by the player.
+@@ -1609,6 +1619,12 @@ Release any resources used by the player.
  ==============
  */
  idPlayer::~idPlayer() {
@@ -2761,7 +2683,7 @@ index 01b05ab..a38488a 100644
  	delete weapon.GetEntity();
  	weapon = NULL;
  }
-@@ -5575,6 +5586,16 @@ void idPlayer::PerformImpulse( int impulse ) {
+@@ -5575,6 +5591,16 @@ void idPlayer::PerformImpulse( int impulse ) {
  		ClientSendEvent( EVENT_IMPULSE, &msg );
  	}
  
@@ -2778,7 +2700,7 @@ index 01b05ab..a38488a 100644
  	if ( impulse >= IMPULSE_0 && impulse <= IMPULSE_12 ) {
  		SelectWeapon( impulse, false );
  		return;
-@@ -6206,6 +6227,78 @@ idPlayer::Think
+@@ -6206,6 +6232,78 @@ idPlayer::Think
  Called every tic for each player
  ==============
  */
@@ -2857,19 +2779,28 @@ index 01b05ab..a38488a 100644
  void idPlayer::Think( void ) {
  	renderEntity_t *headRenderEnt;
  
-@@ -6220,6 +6313,11 @@ void idPlayer::Think( void ) {
+@@ -6220,6 +6318,20 @@ void idPlayer::Think( void ) {
  	buttonMask &= usercmd.buttons;
  	usercmd.buttons &= ~buttonMask;
  
 +#ifdef __EMSCRIPTEN__
 +	// Meta Ray-Ban Display: enemy indicators + auto-fire assist.
 +	D3_WearablePlayerAssist( this, &usercmd );
++	// Iter 72: unlimited ammo — keep every reserve topped up to 999 each frame
++	// (mirrors the engine's own give-all). The stock HasAmmo/UseAmmo are left
++	// intact, so the HUD + gun ammo readout show a real number; it just never
++	// runs down. Clip still empties + reloads normally.
++	if ( !gameLocal.isMultiplayer && health > 0 ) {
++		for ( int ai = 0; ai < AMMO_NUMTYPES; ai++ ) {
++			inventory.ammo[ ai ] = 999;
++		}
++	}
 +#endif
 +
  	if ( gameLocal.inCinematic && gameLocal.skipCinematic ) {
  		return;
  	}
-@@ -6343,6 +6441,11 @@ void idPlayer::Think( void ) {
+@@ -6343,6 +6455,11 @@ void idPlayer::Think( void ) {
  	// this may use firstPersonView, or a thirdPeroson / camera view
  	CalculateRenderView();
  
