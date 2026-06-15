@@ -1284,7 +1284,7 @@ index 7edeb4d..adae33e 100644
  		Sys_CreateThread( BackgroundDownloadThread, &backgroundThread_exit, backgroundThread, "backgroundDownload" );
  	} else {
 diff --git a/neo/framework/Session.cpp b/neo/framework/Session.cpp
-index 29745c6..1c697f4 100644
+index 29745c6..df9c81e 100644
 --- a/neo/framework/Session.cpp
 +++ b/neo/framework/Session.cpp
 @@ -126,6 +126,12 @@ static void Session_Map_f( const idCmdArgs &args ) {
@@ -1338,6 +1338,24 @@ index 29745c6..1c697f4 100644
  void idSessionLocal::ExecuteMapChange( bool noFadeWipe ) {
  	int		i;
  	bool	reloadingSameMap;
+@@ -1604,7 +1625,17 @@ void idSessionLocal::ExecuteMapChange( bool noFadeWipe ) {
+ 	}
+ 
+ 	uiManager->BeginLevelLoad();
++#ifdef __EMSCRIPTEN__
++	// Boot-speed: Reload(true) FORCE-reparses every registered GUI ignoring file
++	// timestamps — a dev-workflow rebuild for live-edited .gui files. The web pak
++	// is an immutable MEMFS, so .gui timestamps never advance; Reload(false) does
++	// the timestamp check and skips every (just-loaded, unchanged) GUI. Measured
++	// the force reparse at ~9.5s on Chromium headless — it was the dominant
++	// "pre-load" cost (the decl/render/sound BeginLevelLoad are all ~0ms).
++	uiManager->Reload( false );
++#else
+ 	uiManager->Reload( true );
++#endif
+ 
+ 	// set the loading gui that we will wipe to
+ 	LoadLoadingGui( mapString );
 diff --git a/neo/framework/UsercmdGen.cpp b/neo/framework/UsercmdGen.cpp
 index 6bba28f..9f732b9 100644
 --- a/neo/framework/UsercmdGen.cpp
