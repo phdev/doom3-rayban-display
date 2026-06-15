@@ -22,11 +22,19 @@ const HD_TIER = (typeof window !== "undefined") && /[?&]hd\b/.test(window.locati
 // BOOT pak (structural + HUD/light textures, ~35MB) loads first; the bulk world/
 // model textures (~13MB gzip) stream in after boot, popping from gray-lit to
 // real as each batch lands (the stream blob IndexedDB-caches, so repeat/cellular
-// visits don't re-fetch). ?nostream falls back to the monolithic 47MB pak;
-// ?hd uses the 256px monolith (no stream variant baked). base-stream/ holds the
-// boot pak chunks + the .stream blob + manifests.
+// visits don't re-fetch). base-stream/ holds the boot pak chunks + the .stream
+// blob + manifests.
+//
+// Iter 73: streaming is now OPT-IN (?stream). By DEFAULT the monolithic base/
+// pak loads EVERYTHING at boot — no player-gun / environment / enemy textures
+// (or per-area geometry) streaming in after launch (user request: no post-boot
+// asset loading). The monolith is 22.7MB all-at-boot, vs 13MB boot + 11.6MB
+// streamed-after, so it's also fewer total bytes — just front-loaded. ?stream
+// restores the streamed boot (faster time-to-first-playable, textures pop in);
+// ?hd uses the 256px monolith; ?nostream also forces the monolith.
 const NO_STREAM = (typeof window !== "undefined") && /[?&]nostream\b/.test(window.location.search);
-const STREAM_TIER = !HD_TIER && !NO_STREAM;
+const STREAM_TIER = !HD_TIER && !NO_STREAM
+  && (typeof window !== "undefined") && /[?&]stream\b/.test(window.location.search);
 // ?areastream — per-render-area streaming (Phase 4). DEFAULT ON for the stream
 // tier: the boot pak carries only the boot region's render geometry (a reduced
 // enpro.bproc); the rest of the areas stream in after boot as a separate blob and
@@ -690,6 +698,11 @@ function buildArguments(config) {
     // the limit — two extra "+set"s overflowed it and stomped the console
     // object. The engine patch now bounds-checks (and the cap is 64), so
     // extra args are safe; keeping these conditional is just tidiness.
+    // Iter 73: sound fully disabled (user request: "delete all sounds"). The
+    // display pak ships ZERO audio binaries already; s_noSound 1 additionally
+    // skips OpenAL init and every sample-load attempt, so the engine never even
+    // tries to fetch the (absent) .wav/.ogg files — trimming boot work.
+    "+set", "s_noSound", "1",
     ...(config.audioEnabled ? ["+set", "com_asyncSound", "0", "+set", "s_useEAXReverb", "0"] : []),
 
     // Iter 55: with texture streaming, defer image loads to first draw so the

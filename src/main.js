@@ -82,6 +82,21 @@ const refs = {
   webgpuCanvas: document.querySelector("#webgpuCanvas")
 };
 
+// Iter 73: when actually running on the Ray-Ban Display glasses (an Android
+// WebView), hide the developer debug overlay — the render-info readout, the
+// log/copy/fx buttons, and the on-screen movement D-pad — so the wearable
+// shows a clean game view. Keyed off the Android-WebView UA specifically (NOT
+// a small-screen heuristic) so the readout STAYS visible when testing in a
+// phone browser (iOS Safari). The fx button is created later in wireFxPanel
+// (skipped there), and the D-pad show is gated on !onGlasses below.
+const onGlasses = /Android.*wv/i.test(navigator.userAgent);
+if (onGlasses) {
+  for (const id of ["diag", "diagToggle", "diagCopy", "posLine", "glDiag"]) {
+    const el = document.querySelector("#" + id);
+    if (el) el.style.display = "none";
+  }
+}
+
 // Phase 5d: when ?backend=webgpu, reveal the side-by-side WebGPU canvas
 // so the user can see what the WebGPU backend is rendering (currently a
 // debug clear; will become real engine output as call sites migrate).
@@ -365,6 +380,8 @@ function wireTouchLook() {
 // FX panel: live sliders for bloom + lighting calibration (every change runs
 // a console command next frame via d3cmd — no rebuild, works on-device too).
 function wireFxPanel() {
+  // Iter 73: no dev fx panel on the glasses (clean wearable view).
+  if (onGlasses) return;
   const btn = document.createElement("button");
   btn.id = "fxToggle";
   btn.type = "button";
@@ -450,7 +467,7 @@ let glProbeLine = "";
 let framePxLine = "";
 // Lines are always collected so the "show log" button can reveal them even when
 // the overlay started hidden (?nodiag). Visibility is just a CSS toggle.
-let diagHidden = /[?&]nodiag\b/.test(location.search);
+let diagHidden = onGlasses || /[?&]nodiag\b/.test(location.search);
 function applyDiagVisibility() {
   if (diagEl) diagEl.style.display = diagHidden ? "none" : "block";
   if (diagToggle) diagToggle.textContent = diagHidden ? "show log" : "hide log";
@@ -1612,7 +1629,7 @@ async function start() {
     wireFxPanel();
     // Show the on-screen movement pad on the touch/wearable profile (desktop has a
     // keyboard). It lives on the left so the right stays clear for head-aiming.
-    if (runtimeConfig.inputMode === "wearable" && refs.moveControls) {
+    if (runtimeConfig.inputMode === "wearable" && refs.moveControls && !onGlasses) {
       refs.moveControls.hidden = false;
     }
     startEnemyIndicatorPolling();
