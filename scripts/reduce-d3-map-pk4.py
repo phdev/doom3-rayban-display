@@ -296,6 +296,15 @@ def main(argv=None):
                         help="comma-list of path substrings; drop any kept file whose path "
                              "contains one (e.g. 'md5/cinematics' to drop the fast-forwarded "
                              "intro cutscene's animations). Applied AFTER the closure.")
+    parser.add_argument("--hires-paths", default="",
+                        help="comma-list of path substrings whose textures keep a HIGHER "
+                             "resolution (--hires-max) than the global --max-texture cap — e.g. "
+                             "'models/weapons/machinegun,models/mapobjects/doors,models/mapobjects/airlock' "
+                             "to keep the assault rifle + doors sharp while the rest stay small. "
+                             "Streamed textures (--defer-textures) only grow the post-boot blob, "
+                             "not the boot pak.")
+    parser.add_argument("--hires-max", type=int, default=256,
+                        help="max texture size (longest side) for --hires-paths matches (default 256).")
     parser.add_argument("--keep-all-guis", action="store_true",
                         help="disable the GUI closure: keep guis/assets/ and every .gui "
                              "wholesale (the old behavior). By default the reducer keeps only "
@@ -715,6 +724,7 @@ def main(argv=None):
 
         # Drop kept files matching a --drop-paths substring (e.g. the skipped
         # intro cinematic's anims). Applied after the closure so it overrides.
+        hires_subs = [h.strip().lower() for h in args.hires_paths.split(",") if h.strip()]
         drop_subs = [d.strip().lower() for d in args.drop_paths.split(",") if d.strip()]
         if drop_subs:
             before = len(keep)
@@ -899,7 +909,14 @@ def main(argv=None):
                 if args.audio_rate and name.endswith(".wav"):
                     data = downsample_wav(data, args.audio_rate, args.audio_width)
                 elif args.max_texture:
-                    data = downsize_image(data, name, args.max_texture)
+                    # Per-path resolution override: keep --hires-paths textures
+                    # (e.g. the assault rifle + doors the player views up close)
+                    # at --hires-max instead of the global --max-texture cap.
+                    nl = name.lower()
+                    md = args.max_texture
+                    if hires_subs and args.hires_max and any(h in nl for h in hires_subs):
+                        md = args.hires_max
+                    data = downsize_image(data, name, md)
                 if args.strip_proc_shadows and name.endswith(".proc"):
                     data, r = strip_proc_shadows(data)
                     proc_shadow_removed[0] += r
