@@ -33,15 +33,22 @@ const HD_TIER = (typeof window !== "undefined") && /[?&]hd\b/.test(window.locati
 // restores the streamed boot (faster time-to-first-playable, textures pop in);
 // ?hd uses the 256px monolith; ?nostream also forces the monolith.
 const NO_STREAM = (typeof window !== "undefined") && /[?&]nostream\b/.test(window.location.search);
-const STREAM_TIER = !HD_TIER && !NO_STREAM
-  && (typeof window !== "undefined") && /[?&]stream\b/.test(window.location.search);
+// Iter 74: TEXTURE streaming is gone — every texture ships in the boot pak.
+const STREAM_TIER = false;
 // ?areastream — per-render-area streaming (Phase 4). DEFAULT ON for the stream
 // tier: the boot pak carries only the boot region's render geometry (a reduced
 // enpro.bproc); the rest of the areas stream in after boot as a separate blob and
 // bind via D3_AppendArea (also passes +set com_streamAreas 1). Opt out with
 // ?noareastream (full geometry in the boot pak, no streaming dependency). Not used
 // by ?hd / ?nostream (monolithic tiers). See CLAUDE.md "Area streaming".
-const AREA_STREAM = STREAM_TIER && (typeof window !== "undefined")
+// Iter 74: per-area GEOMETRY streaming is the DEFAULT. The boot pak carries ALL
+// textures + the boot-region binary render geometry; the rest of the render
+// geometry streams per render-area (enpro.areas.stream + D3_AppendArea). So no
+// gun/environment/enemy TEXTURES load after boot (they're resident), only the
+// far-area render geometry. Boot ~16.8MB + ~2.7MB geometry = ~19.5MB total
+// (vs the 22.25MB all-at-boot monolith). Opt out with ?noareastream / ?nostream
+// (monolith) or ?hd (256px monolith).
+const AREA_STREAM = !HD_TIER && !NO_STREAM && (typeof window !== "undefined")
   && !/[?&]noareastream\b/.test(window.location.search);
 // ?backend — the WebGPU renderer is the DEFAULT (it fixes the iPhone GL4ES
 // chunky-tile/flicker bug). Opt out with ?backend=gl (or ?echo for the GL/WebGPU
