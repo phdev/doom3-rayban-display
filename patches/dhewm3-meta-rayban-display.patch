@@ -1134,10 +1134,18 @@ index 562344f..107f5cb 100644
  					// polygons and brush for trm model
  	cm_polygonRef_t*trmPolygons[MAX_TRACEMODEL_POLYS];
 diff --git a/neo/framework/Common.cpp b/neo/framework/Common.cpp
-index dbf6c54..e63eb7f 100644
+index dbf6c54..cecbc33 100644
 --- a/neo/framework/Common.cpp
 +++ b/neo/framework/Common.cpp
-@@ -108,6 +108,13 @@ idCVar com_timescale( "timescale", "1", CVAR_SYSTEM | CVAR_FLOAT, "scales the ti
+@@ -26,6 +26,7 @@ If you have questions concerning this license or the applicable additional terms
+ ===========================================================================
+ */
+ 
++
+ #include "sys/sys_sdl.h"
+ 
+ #if SDL_VERSION_ATLEAST(3, 0, 0)
+@@ -108,6 +109,13 @@ idCVar com_timescale( "timescale", "1", CVAR_SYSTEM | CVAR_FLOAT, "scales the ti
  idCVar com_makingBuild( "com_makingBuild", "0", CVAR_BOOL | CVAR_SYSTEM, "1 when making a build" );
  idCVar com_updateLoadSize( "com_updateLoadSize", "0", CVAR_BOOL | CVAR_SYSTEM | CVAR_NOCHEAT, "update the load size after loading a map" );
  
@@ -1151,7 +1159,7 @@ index dbf6c54..e63eb7f 100644
  idCVar com_enableDebuggerServer( "com_enableDebuggerServer", "0", CVAR_BOOL | CVAR_SYSTEM, "toggle debugger server and try to connect to com_dbgClientAdr" );
  idCVar com_dbgClientAdr( "com_dbgClientAdr", "localhost", CVAR_SYSTEM | CVAR_ARCHIVE, "debuggerApp client address" );
  idCVar com_dbgServerAdr( "com_dbgServerAdr", "localhost", CVAR_SYSTEM | CVAR_ARCHIVE, "debugger server address" );
-@@ -874,7 +881,7 @@ doom set test blah + map test
+@@ -874,7 +882,7 @@ doom set test blah + map test
  ============================================================================
  */
  
@@ -1160,7 +1168,7 @@ index dbf6c54..e63eb7f 100644
  int			com_numConsoleLines;
  idCmdArgs	com_consoleLines[MAX_CONSOLE_LINES];
  
-@@ -885,14 +892,31 @@ idCommonLocal::ParseCommandLine
+@@ -885,14 +893,31 @@ idCommonLocal::ParseCommandLine
  */
  void idCommonLocal::ParseCommandLine( int argc, char **argv ) {
  	int i;
@@ -1192,7 +1200,7 @@ index dbf6c54..e63eb7f 100644
  			if ( !com_numConsoleLines ) {
  				com_numConsoleLines++;
  			}
-@@ -2531,7 +2555,6 @@ void idCommonLocal::Frame( void ) {
+@@ -2531,7 +2556,6 @@ void idCommonLocal::Frame( void ) {
  			}
  		} else {
  			session->Frame();
@@ -1200,7 +1208,7 @@ index dbf6c54..e63eb7f 100644
  			// normal, in-sequence screen update
  			session->UpdateScreen( false );
  		}
-@@ -2560,8 +2583,17 @@ void idCommonLocal::Frame( void ) {
+@@ -2560,8 +2584,17 @@ void idCommonLocal::Frame( void ) {
  		if ( com_editors == 0 )
  #endif
  		{
@@ -1220,7 +1228,7 @@ index dbf6c54..e63eb7f 100644
  				// if we're using vsync and the display is running at about 60Hz, start next tic
  				// immediately so our internal tic time and vsync don't drift apart
  				double now = Sys_MillisecondsPrecise();
-@@ -3175,8 +3207,14 @@ void idCommonLocal::Init( int argc, char **argv ) {
+@@ -3175,8 +3208,14 @@ void idCommonLocal::Init( int argc, char **argv ) {
  		Sys_Error( "Error during initialization" );
  	}
  
@@ -1235,7 +1243,7 @@ index dbf6c54..e63eb7f 100644
  }
  
  
-@@ -3245,6 +3283,7 @@ void idCommonLocal::Shutdown( void ) {
+@@ -3245,6 +3284,7 @@ void idCommonLocal::Shutdown( void ) {
  idCommonLocal::InitGame
  =================
  */
@@ -1243,7 +1251,7 @@ index dbf6c54..e63eb7f 100644
  void idCommonLocal::InitGame( void ) {
  	// initialize the file system
  	fileSystem->Init();
-@@ -3357,6 +3396,14 @@ void idCommonLocal::InitGame( void ) {
+@@ -3357,6 +3397,14 @@ void idCommonLocal::InitGame( void ) {
  	// have to do this twice.. first one sets the correct r_mode for the renderer init
  	// this time around the backend is all setup correct.. a bit fugly but do not want
  	// to mess with all the gl init at this point.. an old vid card will never qualify for
@@ -1258,7 +1266,7 @@ index dbf6c54..e63eb7f 100644
  	if ( sysDetect ) {
  		SetMachineSpec();
  		Com_ExecMachineSpec_f( args );
-@@ -3364,6 +3411,7 @@ void idCommonLocal::InitGame( void ) {
+@@ -3364,6 +3412,7 @@ void idCommonLocal::InitGame( void ) {
  		cmdSystem->BufferCommandText( CMD_EXEC_NOW, "s_restart\n" );
  		cmdSystem->ExecuteCommandBuffer();
  	}
@@ -1284,7 +1292,7 @@ index 7edeb4d..adae33e 100644
  		Sys_CreateThread( BackgroundDownloadThread, &backgroundThread_exit, backgroundThread, "backgroundDownload" );
  	} else {
 diff --git a/neo/framework/Session.cpp b/neo/framework/Session.cpp
-index 29745c6..df9c81e 100644
+index 29745c6..9fe2198 100644
 --- a/neo/framework/Session.cpp
 +++ b/neo/framework/Session.cpp
 @@ -126,6 +126,12 @@ static void Session_Map_f( const idCmdArgs &args ) {
@@ -1356,6 +1364,55 @@ index 29745c6..df9c81e 100644
  
  	// set the loading gui that we will wipe to
  	LoadLoadingGui( mapString );
+@@ -3024,6 +3055,14 @@ void idSessionLocal::Init() {
+ 	menuSoundWorld = soundSystem->AllocSoundWorld( rw );
+ 
+ 	// we have a single instance of the main menu
++#ifdef __EMSCRIPTEN__
++	// Boot-speed: mainmenu.gui is 680KB (2861 windowDefs + ROQ cinematics) and
++	// costs ~8.6s to parse — the single biggest "Configuring" cost — but the web
++	// build auto-boots into the map and never shows the menu. Defer the load to
++	// StartMenu (first menu open); if the menu is never opened it's never parsed.
++	guiMainMenu = NULL;
++	guiMainMenu_MapList = NULL;
++#else
+ 	guiMainMenu = uiManager->FindGui( "guis/mainmenu.gui", true, false, true );
+ 	if (!guiMainMenu) {
+ 		guiMainMenu = uiManager->FindGui( "guis/demo_mainmenu.gui", true, false, true );
+@@ -3032,6 +3071,7 @@ void idSessionLocal::Init() {
+ 	guiMainMenu_MapList = uiManager->AllocListGUI();
+ 	guiMainMenu_MapList->Config( guiMainMenu, "mapList" );
+ 	idAsyncNetwork::client.serverList.GUIConfig( guiMainMenu, "serverList" );
++#endif
+ 	guiRestartMenu = uiManager->FindGui( "guis/restart.gui", true, false, true );
+ 	guiGameOver = uiManager->FindGui( "guis/gameover.gui", true, false, true );
+ 	guiMsg = uiManager->FindGui( "guis/msg.gui", true, false, true );
+diff --git a/neo/framework/Session_menu.cpp b/neo/framework/Session_menu.cpp
+index 73b58db..d2f748d 100644
+--- a/neo/framework/Session_menu.cpp
++++ b/neo/framework/Session_menu.cpp
+@@ -58,6 +58,21 @@ idSessionLocal::StartMainMenu
+ ==============
+ */
+ void idSessionLocal::StartMenu( bool playIntro ) {
++#ifdef __EMSCRIPTEN__
++	// Boot-speed: mainmenu.gui is loaded lazily (deferred from session->Init, which
++	// saves ~8.6s of boot parse since the web build auto-boots into the map). Load
++	// it now on first menu open.
++	if ( !guiMainMenu ) {
++		guiMainMenu = uiManager->FindGui( "guis/mainmenu.gui", true, false, true );
++		if ( !guiMainMenu ) {
++			guiMainMenu = uiManager->FindGui( "guis/demo_mainmenu.gui", true, false, true );
++			demoversion = (guiMainMenu != NULL);
++		}
++		guiMainMenu_MapList = uiManager->AllocListGUI();
++		guiMainMenu_MapList->Config( guiMainMenu, "mapList" );
++		idAsyncNetwork::client.serverList.GUIConfig( guiMainMenu, "serverList" );
++	}
++#endif
+ 	if ( guiActive == guiMainMenu ) {
+ 		return;
+ 	}
 diff --git a/neo/framework/UsercmdGen.cpp b/neo/framework/UsercmdGen.cpp
 index 6bba28f..9f732b9 100644
 --- a/neo/framework/UsercmdGen.cpp
