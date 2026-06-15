@@ -1830,10 +1830,10 @@ index 0000000..4b45b72
 +#endif // __D3_WEARABLE_H__
 diff --git a/neo/game/D3Wearable.cpp b/neo/game/D3Wearable.cpp
 new file mode 100644
-index 0000000..a44a89c
+index 0000000..c32b42a
 --- /dev/null
 +++ b/neo/game/D3Wearable.cpp
-@@ -0,0 +1,312 @@
+@@ -0,0 +1,339 @@
 +/*
 +===========================================================================
 +
@@ -1865,6 +1865,7 @@ index 0000000..a44a89c
 +
 +#define D3_WEARABLE_ENEMY_RANGE			1200.0f
 +#define D3_WEARABLE_AUTOFIRE_DOT		0.9063078f	// cos(25 degrees)
++#define D3_WEARABLE_FRIENDLY_BLOCK_DOT	0.8191520f	// cos(35 degrees) — wider than the fire cone
 +#define D3_WEARABLE_VIEW_HALF_ANGLE		35.0f
 +#define D3_WEARABLE_REAR_BOTH_ANGLE		160.0f
 +
@@ -2032,13 +2033,44 @@ index 0000000..a44a89c
 +}
 +
 +// A friendly AI on the player's team (e.g. the enpro Sentry Bot, which flies
-+// around fighting demons and wanders into the aim cone) would be hit by the
-+// auto-fire if it sits in the line of fire. Return true when a same-team AI is
-+// at least as centered as the targeted enemy so the caller suppresses the shot
-+// — don't auto-fire through / at the friendly drone.
++// around fighting demons and wanders into the aim cone) must never be hit by
++// the auto-fire. The auto-fire just presses BUTTON_ATTACK; the weapon then
++// fires along the player's `forward` (the crosshair), NOT at the targeted
++// enemy. So a friendly is at risk whenever it is near that forward ray —
++// regardless of how centered the enemy is. The previous guard only suppressed
++// when the friendly was at least as centered as the enemy, so a Sentry Bot
++// that was slightly off-centre (or simply the first thing the straight shot
++// would hit) still got shot. Return true if EITHER:
++//   (1) a straight shot along `forward` would hit a same-team friendly first
++//       (precise line-of-fire trace), or
++//   (2) a same-team friendly sits anywhere inside a cone slightly WIDER than
++//       the auto-fire cone and is visible (margin for the flying drone).
 +static bool
-+D3_WearableFriendlyBlocks( idPlayer *player, const idVec3 &eye, const idVec3 &forward, float enemy_dot )
++D3_WearableFriendlyBlocks( idPlayer *player, const idVec3 &eye, const idVec3 &forward )
 +{
++	// (1) Precise line-of-fire: trace the shot the weapon is about to take.
++	{
++		trace_t tr;
++		idVec3 end = eye + forward * D3_WEARABLE_ENEMY_RANGE;
++		gameLocal.clip.TracePoint( tr, eye, end, MASK_SHOT_BOUNDINGBOX, player );
++
++		if ( tr.fraction < 1.0f )
++		{
++			idEntity *hit = gameLocal.GetTraceEntity( tr );
++
++			if ( hit && ( hit != player ) && hit->IsType( idAI::Type ) && ( hit->health > 0 ) )
++			{
++				idActor *actor = static_cast<idActor *>( hit );
++
++				if ( actor->team == player->team )
++				{
++					return true;
++				}
++			}
++		}
++	}
++
++	// (2) Margin cone: any same-team friendly near the line of fire.
 +	for ( int i = 0; i < MAX_GENTITIES; i++ )
 +	{
 +		idEntity *candidate = gameLocal.entities[i];
@@ -2069,7 +2101,7 @@ index 0000000..a44a89c
 +			continue;
 +		}
 +
-+		if ( ( ( dir * forward ) >= enemy_dot ) && D3_WearableCanSee( player, candidate, eye, target ) )
++		if ( ( ( dir * forward ) >= D3_WEARABLE_FRIENDLY_BLOCK_DOT ) && D3_WearableCanSee( player, candidate, eye, target ) )
 +		{
 +			return true;
 +		}
@@ -2129,15 +2161,10 @@ index 0000000..a44a89c
 +
 +	if ( centered )
 +	{
-+		// Don't shoot a friendly (e.g. the Sentry Bot) that is in the line of
-+		// fire: suppress the auto-fire if a same-team AI is at least as centered
-+		// as the targeted enemy.
-+		idVec3 etarget = D3_WearableTargetCenter( centered );
-+		idVec3 edir = etarget - eye;
-+		edir.Normalize();
-+		float enemy_dot = edir * forward;
-+
-+		if ( !D3_WearableFriendlyBlocks( player, eye, forward, enemy_dot ) )
++		// Don't shoot a friendly (e.g. the Sentry Bot) near the line of fire:
++		// the shot goes along `forward`, so suppress if a same-team AI is in
++		// the way or near the aim cone.
++		if ( !D3_WearableFriendlyBlocks( player, eye, forward ) )
 +		{
 +			cmd->buttons |= BUTTON_ATTACK;
 +			D3_NotifyAutoFireStarted();
@@ -2659,7 +2686,7 @@ index e3458b3..4443dad 100644
  
  	// if the model should be shrinked
 diff --git a/neo/game/Player.cpp b/neo/game/Player.cpp
-index 01b05ab..c89878a 100644
+index 01b05ab..a38488a 100644
 --- a/neo/game/Player.cpp
 +++ b/neo/game/Player.cpp
 @@ -37,6 +37,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -2670,7 +2697,167 @@ index 01b05ab..c89878a 100644
  #include "Camera.h"
  #include "Fx.h"
  #include "Misc.h"
-@@ -6220,6 +6221,11 @@ void idPlayer::Think( void ) {
+@@ -889,13 +890,10 @@ int idInventory::HasAmmo( ammo_t type, int amount ) {
+ 		return -1;
+ 	}
+ 
+-	// check if we have infinite ammo
+-	if ( ammo[ type ] < 0 ) {
+-		return -1;
+-	}
+-
+-	// return how many shots we can fire
+-	return ammo[ type ] / amount;
++	// Iter 72: unlimited ammo — always report infinite reserve (-1). The
++	// engine already treats a negative reserve as infinite, so the HUD and
++	// every weapon-script ammo query keep working; only the supply is endless.
++	return -1;
+ }
+ 
+ /*
+@@ -919,12 +917,10 @@ bool idInventory::UseAmmo( ammo_t type, int amount ) {
+ 		return false;
+ 	}
+ 
+-	// take an ammo away if not infinite
+-	if ( ammo[ type ] >= 0 ) {
+-		ammo[ type ] -= amount;
+-		ammoPredictTime = gameLocal.time; // mp client: we predict this. mark time so we're not confused by snapshots
+-	}
+-
++	// Iter 72: unlimited ammo — never decrement the reserve. The per-weapon
++	// clip still empties and reloads from the (now infinite) reserve, so reload
++	// animations and the clip counter keep their normal feel; you just never
++	// run out.
+ 	return true;
+ }
+ 
+@@ -1133,6 +1129,15 @@ idPlayer::idPlayer() {
+ 	isChatting				= false;
+ 
+ 	selfSmooth				= false;
++
++#ifdef __EMSCRIPTEN__
++	// Permanent view-attached flashlight (iter 72). Zero the light def now; its
++	// static fields are lazily set on first UpdateFlashlight (so the material
++	// decl lookup happens once the decl system is up). Default ON.
++	memset( &flashlight, 0, sizeof( flashlight ) );
++	flashlightHandle		= -1;
++	flashlightOn			= true;
++#endif
+ }
+ 
+ /*
+@@ -1609,6 +1614,12 @@ Release any resources used by the player.
+ ==============
+ */
+ idPlayer::~idPlayer() {
++#ifdef __EMSCRIPTEN__
++	if ( flashlightHandle != -1 ) {
++		gameRenderWorld->FreeLightDef( flashlightHandle );
++		flashlightHandle = -1;
++	}
++#endif
+ 	delete weapon.GetEntity();
+ 	weapon = NULL;
+ }
+@@ -5575,6 +5586,16 @@ void idPlayer::PerformImpulse( int impulse ) {
+ 		ClientSendEvent( EVENT_IMPULSE, &msg );
+ 	}
+ 
++#ifdef __EMSCRIPTEN__
++	// Iter 72: the overlay FLASHLIGHT button (bound to _impulse11) toggles the
++	// permanent view-attached flashlight instead of equipping the flashlight
++	// weapon — the light now stays on with any weapon held.
++	if ( impulse == IMPULSE_11 ) {
++		ToggleFlashlight();
++		return;
++	}
++#endif
++
+ 	if ( impulse >= IMPULSE_0 && impulse <= IMPULSE_12 ) {
+ 		SelectWeapon( impulse, false );
+ 		return;
+@@ -6206,6 +6227,78 @@ idPlayer::Think
+ Called every tic for each player
+ ==============
+ */
++#ifdef __EMSCRIPTEN__
++/*
++==============
++idPlayer::UpdateFlashlight
++
++Iter 72: a permanent, view-attached projected flashlight, decoupled from the
++base-DOOM-3 weapon_flashlight (which is a weapon that replaces your gun).
++Mirrors the weapon's projected-light construction (lights/flashlight5 + the
++def's flashRadius/flashTarget/flashUp/flashRight) but follows the player view
++and stays lit no matter which weapon is equipped. Never drains.
++==============
++*/
++void idPlayer::UpdateFlashlight( void ) {
++	// Off / dead / spectating / cinematic: drop the light.
++	if ( !flashlightOn || ( health <= 0 ) || spectating || gameLocal.inCinematic ) {
++		if ( flashlightHandle != -1 ) {
++			gameRenderWorld->FreeLightDef( flashlightHandle );
++			flashlightHandle = -1;
++		}
++		return;
++	}
++
++	// One-time static setup (the decl system is up by the first Think).
++	if ( flashlight.shader == NULL ) {
++		flashlight.pointLight = false;					// projected spotlight
++		flashlight.shader = declManager->FindMaterial( "lights/flashlight5", false );
++		flashlight.lightRadius[0] = flashlight.lightRadius[1] = flashlight.lightRadius[2] = 400.0f;
++		flashlight.shaderParms[ SHADERPARM_RED ]		= 1.0f;
++		flashlight.shaderParms[ SHADERPARM_GREEN ]		= 1.0f;
++		flashlight.shaderParms[ SHADERPARM_BLUE ]		= 1.0f;
++		flashlight.shaderParms[ SHADERPARM_TIMESCALE ]	= 1.0f;
++		// Projection frustum from weapon_flashlight.def (light-local space).
++		flashlight.target	= idVec3(    0.0f,   0.0f, 1280.0f );
++		flashlight.up		= idVec3(    0.0f, 640.0f,    0.0f );
++		flashlight.right	= idVec3( -640.0f,   0.0f,    0.0f );
++		flashlight.end		= flashlight.target;
++		// A view-following shadow-casting light re-derives every frame; skip
++		// shadows so the always-on light stays cheap on the mobile target.
++		flashlight.noShadows = true;
++	}
++
++	// Follow the eye/view each frame. The frustum target is light-local +Z, up
++	// is +Y, right is -X (per the def), so map +Z->forward, +Y->up, +X->left.
++	idVec3 forward, right, up;
++	viewAngles.ToVectors( &forward, &right, &up );
++	flashlight.origin = GetEyePosition() + forward * 8.0f;
++	flashlight.axis[0] = -right;
++	flashlight.axis[1] = up;
++	flashlight.axis[2] = forward;
++	flashlight.shaderParms[ SHADERPARM_TIMEOFFSET ] = -MS2SEC( gameLocal.time );
++
++	if ( flashlightHandle == -1 ) {
++		flashlightHandle = gameRenderWorld->AddLightDef( &flashlight );
++	} else {
++		gameRenderWorld->UpdateLightDef( flashlightHandle, &flashlight );
++	}
++}
++
++/*
++==============
++idPlayer::ToggleFlashlight
++==============
++*/
++void idPlayer::ToggleFlashlight( void ) {
++	flashlightOn = !flashlightOn;
++	if ( !flashlightOn && flashlightHandle != -1 ) {
++		gameRenderWorld->FreeLightDef( flashlightHandle );
++		flashlightHandle = -1;
++	}
++}
++#endif // __EMSCRIPTEN__
++
+ void idPlayer::Think( void ) {
+ 	renderEntity_t *headRenderEnt;
+ 
+@@ -6220,6 +6313,11 @@ void idPlayer::Think( void ) {
  	buttonMask &= usercmd.buttons;
  	usercmd.buttons &= ~buttonMask;
  
@@ -2682,6 +2869,51 @@ index 01b05ab..c89878a 100644
  	if ( gameLocal.inCinematic && gameLocal.skipCinematic ) {
  		return;
  	}
+@@ -6343,6 +6441,11 @@ void idPlayer::Think( void ) {
+ 	// this may use firstPersonView, or a thirdPeroson / camera view
+ 	CalculateRenderView();
+ 
++#ifdef __EMSCRIPTEN__
++	// Iter 72: keep the permanent flashlight following the view.
++	UpdateFlashlight();
++#endif
++
+ 	inventory.UpdateArmor();
+ 
+ 	if ( spectating ) {
+diff --git a/neo/game/Player.h b/neo/game/Player.h
+index b411a0c..eeafeb5 100644
+--- a/neo/game/Player.h
++++ b/neo/game/Player.h
+@@ -325,6 +325,16 @@ public:
+ 	idVec3					firstPersonViewOrigin;
+ 	idMat3					firstPersonViewAxis;
+ 
++#ifdef __EMSCRIPTEN__
++	// Meta Ray-Ban Display (iter 72): a permanent, view-attached projected
++	// flashlight that stays lit regardless of the equipped weapon and never
++	// drains. Decoupled from the base-DOOM-3 weapon_flashlight (a weapon that
++	// replaces your gun). Default on; the overlay FLASHLIGHT button toggles it.
++	renderLight_t			flashlight;
++	int						flashlightHandle;
++	bool					flashlightOn;
++#endif
++
+ 	idDragEntity			dragEntity;
+ 
+ public:
+@@ -336,6 +346,11 @@ public:
+ 	void					Spawn( void );
+ 	void					Think( void );
+ 
++#ifdef __EMSCRIPTEN__
++	void					UpdateFlashlight( void );
++	void					ToggleFlashlight( void );
++#endif
++
+ 	// save games
+ 	void					Save( idSaveGame *savefile ) const;					// archives object for save game file
+ 	void					Restore( idRestoreGame *savefile );					// unarchives object from save game file
 diff --git a/neo/game/SecurityCamera.cpp b/neo/game/SecurityCamera.cpp
 index 36a0cbe..58d9a22 100644
 --- a/neo/game/SecurityCamera.cpp

@@ -13,7 +13,9 @@ const actionState = {
   jump: false,
   crouch: false,
   use: false,
-  flashlight: false
+  // Iter 72: the engine's permanent view-attached flashlight defaults ON, so
+  // the overlay state starts on too (first tap turns it off, in sync).
+  flashlight: true
 };
 
 // A pinch held longer than this toggles the DOOM 3 flashlight instead of

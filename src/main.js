@@ -1598,18 +1598,11 @@ async function start() {
       onRecenter: () => headTracking.recenter(),
       onTurnBurst: (direction) => headTracking.addTurnBurst(direction),
       onFlashlightChange: (enabled) => {
+        // Iter 72: the flashlight is now a permanent player-attached light,
+        // decoupled from the weapon — toggling it must NOT switch weapons (the
+        // old iter-43 "return to assault rifle" behavior was for the flashlight
+        // WEAPON and would now spuriously swap guns). Just reflect the chip.
         setFlashlightIndicator(enabled);
-        // Iter 43: lowering the flashlight returns to the assault rifle
-        // explicitly (the engine's own previous-weapon return can land on
-        // the pistol/fists depending on what was held when the light was
-        // first raised), then tops off the clip — the reload impulse is a
-        // no-op on a full clip, so it only acts when ammo was spent.
-        if (!enabled) {
-          window.setTimeout(() => {
-            tapKey(WEAPON_MACHINEGUN_KEY);
-            window.setTimeout(() => tapKey(RELOAD_KEY), 800);  // no-op on a full clip
-          }, 250);
-        }
       }
     });
 
@@ -1854,6 +1847,9 @@ refs.flashlightIndicator.addEventListener("click", (e) => {
   e.preventDefault();
   wearableInput?.toggleFlashlight();
 });
+// Iter 72: the permanent flashlight is ON by default in the engine, so the
+// chip starts lit and stays in sync with the wearable state's default.
+setFlashlightIndicator(true);
 
 function handleAutoFireStarted() {
   wearableInput?.setForward(false);
