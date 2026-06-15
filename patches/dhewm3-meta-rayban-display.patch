@@ -3870,7 +3870,7 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..82249b3
+index 0000000..a45fa4e
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
 @@ -0,0 +1,4323 @@
@@ -7975,7 +7975,7 @@ index 0000000..82249b3
 +    // buffers + per-slot group(0) bind groups (one set for the interaction
 +    // pipeline layout, one for the depth pipeline layout). Material
 +    // textures live in group(1), cached per unique 5-image tuple.
-+    static constexpr uint32_t kMaxRecordSlots = 896;   // mirrors kWGPUMaxRecords
++    static constexpr uint32_t kMaxRecordSlots = 24576;   // iter 69: mirrors kWGPUMaxRecords (896→24576)
 +    WGPUBuffer              recordVertexBuf = nullptr;
 +    WGPUBuffer              recordIndexBuf  = nullptr;
 +    uint32_t                recordVertexCap = 0;   // bytes
@@ -9081,7 +9081,7 @@ index ec0184e..2cfe895 100644
  		}
  	}
 diff --git a/neo/renderer/draw_arb2.cpp b/neo/renderer/draw_arb2.cpp
-index c1d0d3e..99a7f6b 100644
+index c1d0d3e..b24e36d 100644
 --- a/neo/renderer/draw_arb2.cpp
 +++ b/neo/renderer/draw_arb2.cpp
 @@ -31,6 +31,10 @@ If you have questions concerning this license or the applicable additional terms
@@ -9158,7 +9158,7 @@ index c1d0d3e..99a7f6b 100644
 +// kWGPUIndexAccumBytes (and the backend's kMaxRecordSlots) — these gates
 +// going stale at 256 while the arrays grew was why CHARACTERS (drawn after
 +// the world) stayed black through two cap raises.
-+enum { kWGPUMaxRec = 896, kWGPUVertCap = 24*1024*1024, kWGPUIdxCap = 6*1024*1024 };
++enum { kWGPUMaxRec = 24576, kWGPUVertCap = 48*1024*1024, kWGPUIdxCap = 12*1024*1024 };  // iter 69: 896→24576 (enpro heavy views; see tr_render.cpp)
 +
 +// Column-major 4x4 multiply (out = lhs * rhs), matching OpenGL storage.
 +// Used to bake the full MVP per record at capture time — records can span
@@ -9803,7 +9803,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..3ae3b2a 100644
+index c83ebb5..52a33bb 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -9829,7 +9829,7 @@ index c83ebb5..3ae3b2a 100644
  
  /*
  
-@@ -38,6 +50,954 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,961 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -9847,9 +9847,16 @@ index c83ebb5..3ae3b2a 100644
 +    // 1024 was 512 was 256: entity surfaces (CHARACTERS) draw after the
 +    // world, so they are the consistent victims when a heavy view overflows
 +    // the cap — black people/crates with a lit world is the signature.
-+    kWGPUMaxRecords      = 896,                 // hard cap on per-frame draws
-+    kWGPUVertAccumBytes  = 24 * 1024 * 1024,    // vertex accumulator
-+    kWGPUIndexAccumBytes = 6 * 1024 * 1024,     // u16 index accumulator
++    // Iter 69: 896 was FAR too low for enpro — heavy spawn/reactor views need up
++    // to ~16450 draw records (measured: avg 28 verts/record, so the RECORD count,
++    // not the byte accumulators, is the limiter). At 896 the overflow surfaces
++    // (the orange ceiling panel, characters) dropped and vanished view-dependently.
++    // 24576 = 1.5x the observed spawn peak (~16448) for deeper/busier-area headroom;
++    // vert accumulator 48MB matches (24576 rec x 28 verts x 60B ~= 41MB). +~50MB RAM
++    // (growth is on, MAXIMUM_MEMORY=2GB, so this just lifts the baseline).
++    kWGPUMaxRecords      = 24576,               // hard cap on per-frame draws
++    kWGPUVertAccumBytes  = 48 * 1024 * 1024,    // vertex accumulator
++    kWGPUIndexAccumBytes = 12 * 1024 * 1024,    // u16 index accumulator
 +};
 +struct WGPUInteractionRecord {
 +    uint32_t vertOffset;
@@ -10784,7 +10791,7 @@ index c83ebb5..3ae3b2a 100644
  
  /*
  =================
-@@ -49,6 +1009,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +1016,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -10800,7 +10807,7 @@ index c83ebb5..3ae3b2a 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +1047,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +1054,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -10816,7 +10823,7 @@ index c83ebb5..3ae3b2a 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1094,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1101,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -10833,7 +10840,7 @@ index c83ebb5..3ae3b2a 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1154,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1161,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -10841,7 +10848,7 @@ index c83ebb5..3ae3b2a 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1381,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1388,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -10854,7 +10861,7 @@ index c83ebb5..3ae3b2a 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1550,72 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1557,72 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
