@@ -147,23 +147,66 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         NdotH = 0.0;
     }
 
-    // Light projection cookie (perspective-corrected projection)
-    let proj_uv = in.light_proj_uvw.xy / max(in.light_proj_uvw.z, 0.001);
-    var light_proj_color = textureSample(t_lightProj, s_lighting, proj_uv).rgb;
-    // zeroClamp emulation (params2.z): vanilla GL gives these cookies a
-    // black border + border-clamp sampler, so the light is ZERO outside its
-    // projection frustum (and behind the light, w<=0). Mask explicitly —
-    // edge-clamp alone smears the cookie's edge texels everywhere.
-    let zc_in = step(0.0, proj_uv.x) * step(proj_uv.x, 1.0)
-              * step(0.0, proj_uv.y) * step(proj_uv.y, 1.0)
-              * step(0.0001, in.light_proj_uvw.z);
+    // Light projection cookie (perspective-corrected projection).
+    //
+    // Iter 71 (enpro orange-panel fix): light_proj_uvw and light_falloff_u are
+    // INTERPOLATED attributes. On WebKit, geometry that crosses the near plane
+    // / has projective w~0 interpolates these differently than Dawn and they
+    // can blow up to inf/NaN — the documented iter 47b near-plane pathology
+    // (the same WebKit-only-orange-warm-wash class). The original mask used
+    // step() and sampled the cookie at the RAW proj_uv; both are unsafe:
+    //   * step()/min/max/clamp PASS NaN THROUGH on Apple GPUs, so a NaN proj_uv
+    //     can flip the in-frustum mask to 1 and un-mask the cookie — and the
+    //     cookie carries the LIGHT COLOR (the orange squarelight1 lights), which
+    //     is exactly the bright-orange-where-it-should-be-black symptom;
+    //   * an inf/NaN uv can sample the bright cookie interior.
+    // Fix, per the iter 47b law (clamp AND NaN-guard anything derived from an
+    // interpolated attribute; comparisons are FALSE for NaN and select() does
+    // not pass NaN, unlike step/min/max):
+    //   1. build the in-frustum mask from ordered comparisons + select(), so a
+    //      non-finite fragment is masked OFF;
+    //   2. feed the sampler a finite, [0,1]-clamped uv.
+    // For all FINITE inputs this is byte-identical to the old step() mask
+    // (Dawn/GL never produce the NaN), so it cannot regress those backends.
+    // params2.w = 1 (debug A/B) restores the raw step()+unclamped path.
+    let pz = in.light_proj_uvw.z;
+    let proj_uv = in.light_proj_uvw.xy / max(pz, 0.001);
+    let fix_on = u.params2.w < 0.5;
+    let proj_finite = proj_uv.x == proj_uv.x && proj_uv.y == proj_uv.y; // false for NaN
+    let in_frustum = proj_finite && pz >= 0.0001
+                  && proj_uv.x >= 0.0 && proj_uv.x <= 1.0
+                  && proj_uv.y >= 0.0 && proj_uv.y <= 1.0;
+    let zc_in_fixed = select(0.0, 1.0, in_frustum);
+    let zc_in_raw   = step(0.0, proj_uv.x) * step(proj_uv.x, 1.0)
+                    * step(0.0, proj_uv.y) * step(proj_uv.y, 1.0)
+                    * step(0.0001, pz);
+    let zc_in = select(zc_in_raw, zc_in_fixed, fix_on);
+    // Finite, clamped uv when the fix is on (2.0 on NaN -> sampler clamps to the
+    // dark cookie edge, and zc_in has already masked it off anyway).
+    let puv_fixed = select(vec2<f32>(2.0, 2.0),
+                           clamp(proj_uv, vec2<f32>(0.0), vec2<f32>(1.0)), proj_finite);
+    let puv = select(proj_uv, puv_fixed, fix_on);
+    var light_proj_color = textureSample(t_lightProj, s_lighting, puv).rgb;
+    // zeroClamp emulation (params2.z): vanilla GL gives these cookies a black
+    // border + border-clamp sampler, so the light is ZERO outside its frustum
+    // (and behind the light, w<=0). Mask explicitly.
     light_proj_color = light_proj_color * mix(1.0, zc_in, u.params2.z);
-    // Falloff ramp: vanilla interaction.vfp does `MUL light, light, falloff`
-    // with the full RGBA sample — the ramp lives in RGB (TGA / makeintensity
-    // images replicate intensity across channels). Sampling .a here was a
-    // GL4ES-on-WebKit artifact, not the engine convention.
+
+    // Axial falloff ramp: vanilla interaction.vfp does `MUL light, light,
+    // falloff` with the full RGBA sample — the ramp lives in RGB (TGA /
+    // makeintensity images replicate intensity across channels). Sampling .a
+    // here was a GL4ES-on-WebKit artifact, not the engine convention.
+    //
+    // Same iter 71 guard: a panel straddling the light box has falloff_u
+    // outside [0,1] on its outside vertices; clamping the COORDINATE reads the
+    // DARK falloff edge (bounds the light axially), and a NaN-safe select reads
+    // the dark edge rather than the bright center for a non-finite falloff_u.
+    // No-op where the sampler already clamps a finite coord (Dawn/GL).
+    let fo_finite = in.light_falloff_u == in.light_falloff_u;
+    let fo_clamped = select(2.0, clamp(in.light_falloff_u, 0.0, 1.0), fo_finite);
+    let fo_u = select(in.light_falloff_u, fo_clamped, fix_on);
     let light_falloff = textureSample(t_lightFalloff, s_lighting,
-                                       vec2<f32>(in.light_falloff_u, 0.5)).rgb;
+                                       vec2<f32>(fo_u, 0.5)).rgb;
 
     // Material lookups
     let diffuse = textureSample(t_diffuse, s_material, in.tex_diffuse).rgb

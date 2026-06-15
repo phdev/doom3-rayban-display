@@ -46,8 +46,23 @@ fn vs_main(in: VSIn) -> VSOut {
 
 @fragment
 fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
-    let uv = in.uvq.xy / max(in.uvq.z, 0.001);
+    // Iter 71 (sibling of the interaction.wgsl orange-panel fix): uvq and sF
+    // are interpolated attributes carrying this blend light's projective cookie
+    // and axial falloff coords. On WebKit, near-plane / projective-w~0 geometry
+    // can interpolate them to inf/NaN (the documented iter 47b pathology), and
+    // an unclamped/NaN coord on the shared ClampToEdge+LOD-0 light sampler
+    // reads the BRIGHT cookie/falloff interior instead of the dark bounded edge
+    // — the same WebKit-only light bleed. Clamp both coords to [0,1] with a
+    // NaN-safe select (clamp() alone passes NaN through). This is byte-identical
+    // to ClampToEdge for every FINITE coord, so it cannot change Dawn/GL output;
+    // it only bounds the degenerate non-finite WebKit fragments.
+    let uv_raw = in.uvq.xy / max(in.uvq.z, 0.001);
+    let uv_finite = uv_raw.x == uv_raw.x && uv_raw.y == uv_raw.y; // false for NaN
+    let uv = select(vec2<f32>(2.0, 2.0),
+                    clamp(uv_raw, vec2<f32>(0.0), vec2<f32>(1.0)), uv_finite);
+    let sf_finite = in.sF == in.sF;
+    let sf = select(2.0, clamp(in.sF, 0.0, 1.0), sf_finite);
     let c0 = textureSample(t_proj, samp, uv);
-    let c1 = textureSample(t_falloff, samp, vec2<f32>(in.sF, 0.5));
+    let c1 = textureSample(t_falloff, samp, vec2<f32>(sf, 0.5));
     return c0 * c1 * u.color;
 }

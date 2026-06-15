@@ -3870,10 +3870,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..a45fa4e
+index 0000000..502d7ee
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,4323 @@
+@@ -0,0 +1,4345 @@
 +/*
 +================================================================================
 +
@@ -5758,6 +5758,23 @@ index 0000000..a45fa4e
 +    // imgs order matches the capture in draw_arb2.cpp:
 +    //   [0]=bump [1]=lightFalloff [2]=lightProj [3]=diffuse [4]=specular
 +    WGPUBindGroup getMaterialBindGroup(void* const imgs[5]) {
++        // Iter 71 debug: r_wgpuSingleLight -870/-871 force the light sampler to
++        // WRAP instead of ClampToEdge — a Dawn run can then simulate the WebKit
++        // falloff-bleed that makes the enpro orange lights wash should-be-dark
++        // panels (WebKit appears not to honor ClampToEdge on this LOD-0 light
++        // sampler). The bind group cache keys on image pointers only, so flush
++        // it whenever this debug state toggles or stale clamp-sampler groups
++        // would survive the switch.
++        extern int g_capWgpuSingleLight;
++        const bool dbgFalloffWrap = (g_capWgpuSingleLight == -870 || g_capWgpuSingleLight == -871);
++        static bool s_lastDbgFalloffWrap = false;
++        if (dbgFalloffWrap != s_lastDbgFalloffWrap) {
++            for (int i = 0; i < matCacheCount; ++i) {
++                if (matCache[i].group) wgpuBindGroupRelease(matCache[i].group);
++            }
++            matCacheCount = 0;
++            s_lastDbgFalloffWrap = dbgFalloffWrap;
++        }
 +        for (int i = 0; i < matCacheCount; ++i) {
 +            if (memcmp(matCache[i].key, imgs, sizeof(void*) * 5) == 0) {
 +                return matCache[i].group;
@@ -5810,7 +5827,7 @@ index 0000000..a45fa4e
 +        // Iter 33: both lighting-sampler variants are LOD-0 only (vanilla
 +        // GL_LINEAR semantics) — repeat cookies (scrolling lights) get the
 +        // wrap LOD-0 sampler, NOT the mipped material sampler.
-+        e[1].binding = 1; e[1].sampler = projRepeats ? interactionLightWrapSampler : interactionLightSampler;
++        e[1].binding = 1; e[1].sampler = (projRepeats || dbgFalloffWrap) ? interactionLightWrapSampler : interactionLightSampler;
 +        e[2].binding = 2; e[2].textureView = vNormal;
 +        e[3].binding = 3; e[3].textureView = vSpecular;
 +        e[4].binding = 4; e[4].textureView = vDiffuse;
@@ -6178,7 +6195,12 @@ index 0000000..a45fa4e
 +                    }
 +                }
 +            }
-+            ub[55] = 0.0f;
++            // params2.w: falloff-coordinate-clamp disable (iter 71 debug A/B).
++            // Default 0 = clamp the axial falloff coord to [0,1] in the shader
++            // (the enpro orange-panel fix). r_wgpuSingleLight -871/-872 set it
++            // to 1 to reproduce the raw (unclamped) behavior; -870/-1 keep the
++            // fix on. Lets a Dawn run simulate the WebKit falloff-bleed.
++            ub[55] = (g_capWgpuSingleLight == -871 || g_capWgpuSingleLight == -872) ? 1.0f : 0.0f;
 +            memcpy(recordUBStage + (size_t)i * kUBStride, ub, 224);
 +            if (i + 1 > recordUBHigh) recordUBHigh = i + 1;
 +            // Iter 7b: resolve the material bind group (creates GPU textures
@@ -10946,10 +10968,10 @@ index c83ebb5..52a33bb 100644
  	// ensures that depth writes are enabled for the depth clear
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..bea17d9
+index 0000000..28ccbc9
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,871 @@
+@@ -0,0 +1,929 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -11084,9 +11106,24 @@ index 0000000..bea17d9
 +"\n"
 +"@fragment\n"
 +"fn fs_main(in: VSOut) -> @location(0) vec4<f32> {\n"
-+"    let uv = in.uvq.xy / max(in.uvq.z, 0.001);\n"
++"    // Iter 71 (sibling of the interaction.wgsl orange-panel fix): uvq and sF\n"
++"    // are interpolated attributes carrying this blend light's projective cookie\n"
++"    // and axial falloff coords. On WebKit, near-plane / projective-w~0 geometry\n"
++"    // can interpolate them to inf/NaN (the documented iter 47b pathology), and\n"
++"    // an unclamped/NaN coord on the shared ClampToEdge+LOD-0 light sampler\n"
++"    // reads the BRIGHT cookie/falloff interior instead of the dark bounded edge\n"
++"    // — the same WebKit-only light bleed. Clamp both coords to [0,1] with a\n"
++"    // NaN-safe select (clamp() alone passes NaN through). This is byte-identical\n"
++"    // to ClampToEdge for every FINITE coord, so it cannot change Dawn/GL output;\n"
++"    // it only bounds the degenerate non-finite WebKit fragments.\n"
++"    let uv_raw = in.uvq.xy / max(in.uvq.z, 0.001);\n"
++"    let uv_finite = uv_raw.x == uv_raw.x && uv_raw.y == uv_raw.y; // false for NaN\n"
++"    let uv = select(vec2<f32>(2.0, 2.0),\n"
++"                    clamp(uv_raw, vec2<f32>(0.0), vec2<f32>(1.0)), uv_finite);\n"
++"    let sf_finite = in.sF == in.sF;\n"
++"    let sf = select(2.0, clamp(in.sF, 0.0, 1.0), sf_finite);\n"
 +"    let c0 = textureSample(t_proj, samp, uv);\n"
-+"    let c1 = textureSample(t_falloff, samp, vec2<f32>(in.sF, 0.5));\n"
++"    let c1 = textureSample(t_falloff, samp, vec2<f32>(sf, 0.5));\n"
 +"    return c0 * c1 * u.color;\n"
 +"}\n"
 +"";
@@ -11545,23 +11582,66 @@ index 0000000..bea17d9
 +"        NdotH = 0.0;\n"
 +"    }\n"
 +"\n"
-+"    // Light projection cookie (perspective-corrected projection)\n"
-+"    let proj_uv = in.light_proj_uvw.xy / max(in.light_proj_uvw.z, 0.001);\n"
-+"    var light_proj_color = textureSample(t_lightProj, s_lighting, proj_uv).rgb;\n"
-+"    // zeroClamp emulation (params2.z): vanilla GL gives these cookies a\n"
-+"    // black border + border-clamp sampler, so the light is ZERO outside its\n"
-+"    // projection frustum (and behind the light, w<=0). Mask explicitly —\n"
-+"    // edge-clamp alone smears the cookie's edge texels everywhere.\n"
-+"    let zc_in = step(0.0, proj_uv.x) * step(proj_uv.x, 1.0)\n"
-+"              * step(0.0, proj_uv.y) * step(proj_uv.y, 1.0)\n"
-+"              * step(0.0001, in.light_proj_uvw.z);\n"
++"    // Light projection cookie (perspective-corrected projection).\n"
++"    //\n"
++"    // Iter 71 (enpro orange-panel fix): light_proj_uvw and light_falloff_u are\n"
++"    // INTERPOLATED attributes. On WebKit, geometry that crosses the near plane\n"
++"    // / has projective w~0 interpolates these differently than Dawn and they\n"
++"    // can blow up to inf/NaN — the documented iter 47b near-plane pathology\n"
++"    // (the same WebKit-only-orange-warm-wash class). The original mask used\n"
++"    // step() and sampled the cookie at the RAW proj_uv; both are unsafe:\n"
++"    //   * step()/min/max/clamp PASS NaN THROUGH on Apple GPUs, so a NaN proj_uv\n"
++"    //     can flip the in-frustum mask to 1 and un-mask the cookie — and the\n"
++"    //     cookie carries the LIGHT COLOR (the orange squarelight1 lights), which\n"
++"    //     is exactly the bright-orange-where-it-should-be-black symptom;\n"
++"    //   * an inf/NaN uv can sample the bright cookie interior.\n"
++"    // Fix, per the iter 47b law (clamp AND NaN-guard anything derived from an\n"
++"    // interpolated attribute; comparisons are FALSE for NaN and select() does\n"
++"    // not pass NaN, unlike step/min/max):\n"
++"    //   1. build the in-frustum mask from ordered comparisons + select(), so a\n"
++"    //      non-finite fragment is masked OFF;\n"
++"    //   2. feed the sampler a finite, [0,1]-clamped uv.\n"
++"    // For all FINITE inputs this is byte-identical to the old step() mask\n"
++"    // (Dawn/GL never produce the NaN), so it cannot regress those backends.\n"
++"    // params2.w = 1 (debug A/B) restores the raw step()+unclamped path.\n"
++"    let pz = in.light_proj_uvw.z;\n"
++"    let proj_uv = in.light_proj_uvw.xy / max(pz, 0.001);\n"
++"    let fix_on = u.params2.w < 0.5;\n"
++"    let proj_finite = proj_uv.x == proj_uv.x && proj_uv.y == proj_uv.y; // false for NaN\n"
++"    let in_frustum = proj_finite && pz >= 0.0001\n"
++"                  && proj_uv.x >= 0.0 && proj_uv.x <= 1.0\n"
++"                  && proj_uv.y >= 0.0 && proj_uv.y <= 1.0;\n"
++"    let zc_in_fixed = select(0.0, 1.0, in_frustum);\n"
++"    let zc_in_raw   = step(0.0, proj_uv.x) * step(proj_uv.x, 1.0)\n"
++"                    * step(0.0, proj_uv.y) * step(proj_uv.y, 1.0)\n"
++"                    * step(0.0001, pz);\n"
++"    let zc_in = select(zc_in_raw, zc_in_fixed, fix_on);\n"
++"    // Finite, clamped uv when the fix is on (2.0 on NaN -> sampler clamps to the\n"
++"    // dark cookie edge, and zc_in has already masked it off anyway).\n"
++"    let puv_fixed = select(vec2<f32>(2.0, 2.0),\n"
++"                           clamp(proj_uv, vec2<f32>(0.0), vec2<f32>(1.0)), proj_finite);\n"
++"    let puv = select(proj_uv, puv_fixed, fix_on);\n"
++"    var light_proj_color = textureSample(t_lightProj, s_lighting, puv).rgb;\n"
++"    // zeroClamp emulation (params2.z): vanilla GL gives these cookies a black\n"
++"    // border + border-clamp sampler, so the light is ZERO outside its frustum\n"
++"    // (and behind the light, w<=0). Mask explicitly.\n"
 +"    light_proj_color = light_proj_color * mix(1.0, zc_in, u.params2.z);\n"
-+"    // Falloff ramp: vanilla interaction.vfp does `MUL light, light, falloff`\n"
-+"    // with the full RGBA sample — the ramp lives in RGB (TGA / makeintensity\n"
-+"    // images replicate intensity across channels). Sampling .a here was a\n"
-+"    // GL4ES-on-WebKit artifact, not the engine convention.\n"
++"\n"
++"    // Axial falloff ramp: vanilla interaction.vfp does `MUL light, light,\n"
++"    // falloff` with the full RGBA sample — the ramp lives in RGB (TGA /\n"
++"    // makeintensity images replicate intensity across channels). Sampling .a\n"
++"    // here was a GL4ES-on-WebKit artifact, not the engine convention.\n"
++"    //\n"
++"    // Same iter 71 guard: a panel straddling the light box has falloff_u\n"
++"    // outside [0,1] on its outside vertices; clamping the COORDINATE reads the\n"
++"    // DARK falloff edge (bounds the light axially), and a NaN-safe select reads\n"
++"    // the dark edge rather than the bright center for a non-finite falloff_u.\n"
++"    // No-op where the sampler already clamps a finite coord (Dawn/GL).\n"
++"    let fo_finite = in.light_falloff_u == in.light_falloff_u;\n"
++"    let fo_clamped = select(2.0, clamp(in.light_falloff_u, 0.0, 1.0), fo_finite);\n"
++"    let fo_u = select(in.light_falloff_u, fo_clamped, fix_on);\n"
 +"    let light_falloff = textureSample(t_lightFalloff, s_lighting,\n"
-+"                                       vec2<f32>(in.light_falloff_u, 0.5)).rgb;\n"
++"                                       vec2<f32>(fo_u, 0.5)).rgb;\n"
 +"\n"
 +"    // Material lookups\n"
 +"    let diffuse = textureSample(t_diffuse, s_material, in.tex_diffuse).rgb\n"
