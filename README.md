@@ -29,27 +29,30 @@ https://phdev.github.io/doom3-rayban-display/?pak=<URL-encoded base URL>
 (e.g. a Cloudflare R2 bucket). After the first load the chunks/blobs cache in
 browser storage, so later launches with the same URL are offline-fast.
 
-Example:
+The reference deployment hosts the paks on **Cloudflare Pages** at
+`https://doom3-pak.pages.dev/`, so the play URL is:
 
 ```
-https://phdev.github.io/doom3-rayban-display/?pak=https%3A%2F%2Fcdn.example.com%2Fdoom3%2F
+https://phdev.github.io/doom3-rayban-display/?pak=https://doom3-pak.pages.dev/
 ```
 
 The engine itself (`.js`/`.wasm`/`.data`) is served from GitHub Pages; only the
 paks come from your `?pak=` host.
 
-### Hosting the paks on Cloudflare R2
+### Hosting the paks (Cloudflare Pages)
 
-1. Build the paks locally (see [Build](#build)) — they land in
-   `public/wasm/{base,base-stream,base256}/`.
-2. Create a public R2 bucket and add a CORS rule allowing `https://phdev.github.io`
-   to `GET` (see the header of `scripts/upload-paks-to-r2.sh`).
-3. Upload:
-   ```bash
-   R2_BUCKET=<bucket> R2_ENDPOINT=https://<account_id>.r2.cloudflarestorage.com \
-     scripts/upload-paks-to-r2.sh
-   ```
-4. Launch with `?pak=<your public base URL>/doom3/`.
+R2 needs to be enabled on the account; Cloudflare **Pages** works out of the box
+(public by default, CORS via a `_headers` file) and is what the reference deploy
+uses. With `wrangler` authenticated to your account:
+
+```bash
+scripts/upload-paks-to-pages.sh        # stages base/ + lean areastream set + _headers, deploys
+# -> https://doom3-pak.pages.dev/  ;  launch with ?pak=https://doom3-pak.pages.dev/
+```
+
+If you prefer R2 (enable it in the dashboard first), `scripts/upload-paks-to-r2.sh`
+does the equivalent with `aws s3 sync`. Either way the host needs CORS allowing
+the Pages origin to `GET` (the scripts set `Access-Control-Allow-Origin`).
 
 ---
 
