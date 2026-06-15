@@ -733,6 +733,10 @@ function buildArguments(config) {
     // Iter 55: with texture streaming, defer image loads to first draw so the
     // bulk textures (not yet in the FS at boot) don't all default at level-end;
     // each loads lazily and is reloaded by the stream batches as its file lands.
+    // (Glasses doors+gun-untextured fix lives in r_wgpuTexBudgetMB below, NOT
+    // here — the WebGPU texCache is filled lazily by DRAW REPLAY, so image_preload
+    // doesn't change the GPU working set. Keep image_preload at its iter-73/74
+    // everything-at-boot default off the stream tier.)
     ...(STREAM_TIER ? ["+set", "image_preload", "0"] : []),
 
     "+set", "g_skill", String(getNumericConfig(config.skill, 0)),
@@ -799,8 +803,29 @@ function buildArguments(config) {
     // + readback buffers. ?texbudget=N / ?texdim=N override anywhere (0 =
     // unlimited/uncapped).
     "+set", "r_wgpuTexBudgetMB",
-        String((() => { const m = /[?&]texbudget=(\d+)\b/.exec(typeof window !== "undefined" ? window.location.search : "");
-                        return m ? Number(m[1]) : (config.inputMode === "wearable" ? 80 : 0); })()),
+        String((() => {
+          const search = typeof window !== "undefined" ? window.location.search : "";
+          const m = /[?&]texbudget=(\d+)\b/.exec(search);
+          if (m) return Number(m[1]);
+          if (config.inputMode !== "wearable") return 0; // desktop: unlimited
+          // iter 78: the 80MB cap above is a non-evicting budget — once
+          // gpuTexBytes tops it, every still-unseen image binds the checker
+          // fallback AND re-runs its full malloc+box-reduce build every frame
+          // (no decision cache on the deny path, RenderBackend_WebGPU.cpp:1801).
+          // The world draws first and eats the 80MB; the doors (func_door
+          // movers) and the view weapon draw LAST, so they're exactly the
+          // surfaces that get starved — untextured + slow. That cap only ever
+          // existed to dodge the iOS-Safari whole-tab jetsam ("82% Starting
+          // DOOM 3" crash); the Meta Ray-Ban glasses are an Android WebView
+          // where that jetsam doesn't apply, so keep iOS pinned at the safe
+          // 80MB but give the glasses (any non-iOS wearable) real headroom.
+          // ?texbudget=N still overrides on either platform.
+          const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
+          const isIOS = /iPad|iPhone|iPod/.test(ua)
+            || (typeof navigator !== "undefined" && navigator.platform === "MacIntel"
+                && navigator.maxTouchPoints > 1);
+          return isIOS ? 80 : 160;
+        })()),
     "+set", "r_wgpuTexMaxDim",
         String((() => { const m = /[?&]texdim=(\d+)\b/.exec(typeof window !== "undefined" ? window.location.search : "");
                         return m ? Number(m[1]) : (config.inputMode === "wearable" ? 128 : 0); })()),
