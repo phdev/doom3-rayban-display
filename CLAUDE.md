@@ -200,6 +200,50 @@ serve local dist over a cloudflared tunnel built with 6.0.0 (`.build/emsdk-600` 
 To ship the experiment live on Pages, un-gitignore + commit `pak-display-stream.pk4.*` +
 `enpro.areas.*` (CI builds the wasm with 6.0.0); the default monolithic game is unaffected (gated).
 
+### Orange sky-leak fix — original-map texturing bug, NOT a renderer bug (2026-06-16, SHIPPED)
+
+**Symptom:** an orange/peach panel ("skybox/cubemap leaking through") in the enpro interior,
+visible e.g. from area 51 (transfer walkway, ~`-333 4010 -156`, yaw ~110). Survived every
+renderer angle of attack (sorting, culling, `r_usePortals`, depth-fill). **Root cause: the
+ORIGINAL id DOOM 3 `enpro.proc` mis-textures exactly 2 world surfaces** as
+`textures/skies/desert` (a `cameraCubeMap env/desert`, `texgen skybox`, `blend add`,
+`forceOpaque` material) instead of solid wall — one surface each in **render-areas 48 and 66**
+(interior rooms). idTech4's portal/PVS flood then draws that desert cubemap through
+`interAreaPortals` into neighbouring areas → the "leak." Our portal/vis data is byte-identical
+to retail (`interAreaPortals` md5 `7dba84cd`, nodes `e7623db7`); the renderer/flood code is
+stock. So this was a **content fix, not a code fix** (no engine rebuild).
+
+**The fix:** re-texture those 2 surfaces to solid enpro walls. By `numVerts`: surface w/
+numVerts 48 (numIndexes 96) → `textures/enpro/enwall8a3` (area 48); numVerts 24 (numIndexes 42)
+→ `textures/enpro/enwall14` (area 66). Applied to **all 3 pak variants**:
+- **base/ + base256/** (monolith, ASCII `maps/game/enpro.proc`): swapped in `enpro_fixed.proc`
+  (the original proc with those 2 surface materials edited; 0 `skies/desert` refs, +5 bytes).
+- **base-stream/** (binary `enpro.bproc`, raw-verts): length-prefixed material patch at the 2
+  occurrences (`<int32 len=21> textures/skies/desert` → `len=24 …enwall8a3` / `len=23 …enwall14`).
+  The collision `.cm`/`.bcm` still carry `skies/desert` brush-sides — harmless, collision never
+  renders; only the **render** surface drives the orange.
+
+**CRITICAL bake gotcha — `bake-area-stream.sh` is RENDER-ONLY; re-running it drops streamed
+collision.** The deployed `enpro.areas.stream` blob = **94 render parts + 85 collision
+`.bcm.part`** (the P2 per-area collision built by the in-engine dump, NOT by
+`split-bproc-areas.py`). `bake-area-stream.sh` only re-splits render geometry, so a naive
+re-bake yields 94 render + **0** collision → all 83 streamed areas go non-solid (fall-through,
+no hit detection). To regenerate a render-only fix without losing collision: (1) patch
+`enpro.bproc`, re-split it (`split-bproc-areas.py`) for fresh `_areaN.bproc.part`; (2) extract
+the OLD collision parts from the prior blob (slice by `enpro.areas.stream.json` `off`/`len`,
+`kind==collision`) into the same split dir; (3) `pack-area-stream.py` to recombine. Result:
+**only areas 48 & 66 render parts differ; all 85 collision parts byte-identical**, part count
+unchanged (179). (`graph.json` metrics + manifest `adjacency` are null in the working blob, so
+they need no reconstruction.) The reduced boot pak (areas 0–9) has no sky surface → unchanged.
+
+**Verified** via live CDP A/B against the user's debug Chrome (port 9222, Pixel-7 emu): old
+paks show the orange at `-333 4010 -156` across yaw 70–132; new paks show solid wall, no orange,
+across the same sweep; boot logs confirm "Area streaming complete: requested 93 areas" (collision
++ render) with no errors. Data-level: 0 `skies/desert` in all render parts. **Deployed to
+Cloudflare Pages** (`scripts/upload-paks-to-pages.sh`, base/ + lean base-stream set). base256/ is
+patched locally but NOT deployed (it was never live — 404). Clients cache paks `immutable` under
+the same filenames, so a retest needs a cache-bust: `…?pak=https://doom3-pak.pages.dev/&cb=<new>`.
+
 ## State (2026-06)
 
 DOOM 3 **renders the 3D game world in the browser, including on a physical iPhone
