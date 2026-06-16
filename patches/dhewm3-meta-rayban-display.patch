@@ -4033,10 +4033,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..eb27bf1
+index 0000000..1c6d3af
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,4416 @@
+@@ -0,0 +1,4442 @@
 +/*
 +================================================================================
 +
@@ -6483,7 +6483,7 @@ index 0000000..eb27bf1
 +                    mainView = g_passRecords[pTotal - 1].pad0;
 +                    for (int i = (int)pTotal - 1; i >= 0; --i) {
 +                        const uint32_t kind = g_passRecords[i].pad3;
-+                        if (kind == 0u || kind == 2u || kind == 3u) {
++                        if (kind == 0u || kind == 2u || kind == 3u || kind == 4u) {
 +                            mainView = g_passRecords[i].pad0;
 +                            break;
 +                        }
@@ -6658,7 +6658,9 @@ index 0000000..eb27bf1
 +                    // cached engine image.
 +                    // Iter 42: own a reference (see lastMatGroups note).
 +                    if (lastPassGroups[pn]) wgpuBindGroupRelease(lastPassGroups[pn]);
-+                    lastPassGroups[pn] = (r.sPad3 > 0)
++                    lastPassGroups[pn] = (r.pad3 == 4u)
++                        ? nullptr   // iter-120 depth-fill record: prepass-only, no color group (would be a null-image bind)
++                        : (r.sPad3 > 0)
 +                        ? getCinPassBindGroup(pn, r.sPad3 - 1u)
 +                        : getPassBindGroup(pn, g_passImagePtrs[i]);
 +                    if (lastPassGroups[pn]) wgpuBindGroupAddRef(lastPassGroups[pn]);
@@ -7187,17 +7189,40 @@ index 0000000..eb27bf1
 +            // 2D/sky/reflect (pad3 1/2/3 — sky+reflect already self-write depth)
 +            // and translucent (sPad2); main view only.
 +            {
-+                const uint32_t mvPrepass = lastRecordCount > 0
++                // Main-view tag. Derive from the last interaction, but in a
++                // DARK scene (no lit surfaces, lastRecordCount==0) fall back to
++                // the last pass/depth record's tag — otherwise mvPrepass=0 and
++                // the depth fills below never match, leaving the sky-leak in
++                // exactly the unlit views the iter-120 fill exists to cover.
++                uint32_t mvPrepass = lastRecordCount > 0
 +                    ? lastRecords[lastRecordCount - 1].pad0 : 0u;
++                if (!mvPrepass) {
++                    // Scan back for the last 3D/depth-fill/sky/reflect record —
++                    // NOT 2D (lastPassRecords is ordered 3D-then-2D, so the bare
++                    // last entry is a HUD record from the GUI view).
++                    for (int i = (int)lastPassCount - 1; i >= 0; --i) {
++                        const uint32_t k = lastPassRecords[i].pad3;
++                        if (k == 0u || k == 4u || k == 2u || k == 3u) { mvPrepass = lastPassRecords[i].pad0; break; }
++                    }
++                }
++                // iter-81 pad3==0 (opaque material pass) + iter-120 pad3==4
++                // (RB_T_FillDepthBuffer no-stage walls) both fill prepass depth.
++                uint32_t dfDrawn = 0;
 +                for (uint32_t i = 0; i < lastPassCount; ++i) {
 +                    const Rec& r = lastPassRecords[i];
-+                    if (r.pad3 != 0u || r.sPad2 || r.pad0 != mvPrepass) continue;
++                    if ((r.pad3 != 0u && r.pad3 != 4u) || r.sPad2 || r.pad0 != mvPrepass) continue;
 +                    if (!passDepthBindGroups[i]) continue;
++                    if (r.pad3 == 4u) dfDrawn++;
 +                    wgpuRenderPassEncoderSetBindGroup(rp, 0, passDepthBindGroups[i], 0, nullptr);
 +                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
 +                    wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
 +                    wgpuRenderPassEncoderDrawIndexed(rp, r.indexCount, 1, 0, 0, 0);
 +                }
++                // iter-120 instrument: depth-fill (pad3==4) records drawn this
++                // frame — confirms the RB_T_FillDepthBuffer capture is active
++                // (non-zero) locally and on the live build.
++                static uint32_t dfPub = 0xFFFFFFFFu;
++                if (dfDrawn != dfPub) { dfPub = dfDrawn; EM_ASM_({ window.__d3DepthFillCount = $0; }, dfDrawn); }
 +            }
 +            wgpuRenderPassEncoderEnd(rp);
 +            wgpuRenderPassEncoderRelease(rp);
@@ -7457,6 +7482,7 @@ index 0000000..eb27bf1
 +            }
 +            for (uint32_t i = 0; i < lastPassCount; ++i) {
 +                const Rec& r = lastPassRecords[i];
++                if (r.pad3 == 4u) continue;   // iter-120 depth-fill: prepass-only, no color
 +                // iter 46 debug: -900-N isolates pass record N (find which
 +                // record paints what); -899 disables ALL pass records.
 +                {
@@ -9648,7 +9674,7 @@ index c1d0d3e..b24e36d 100644
  ==================
  R_ReloadARBPrograms_f
 diff --git a/neo/renderer/draw_common.cpp b/neo/renderer/draw_common.cpp
-index 0cabbfd..5c5b417 100644
+index 0cabbfd..439ed4d 100644
 --- a/neo/renderer/draw_common.cpp
 +++ b/neo/renderer/draw_common.cpp
 @@ -30,10 +30,29 @@ If you have questions concerning this license or the applicable additional terms
@@ -9681,7 +9707,28 @@ index 0cabbfd..5c5b417 100644
  /*
  =====================
  RB_BakeTextureMatrixIntoTexgen
-@@ -774,12 +793,19 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
+@@ -499,6 +518,20 @@ void RB_T_FillDepthBuffer( const drawSurf_t *surf ) {
+ 
+ 		// draw it
+ 		RB_DrawElementsWithCounters( tri );
++
++#ifdef __EMSCRIPTEN__
++		// WebGPU z-prepass depth fill: capture every opaque surface GL solid-fills
++		// here so UNLIT no-material-stage walls write prepass depth and occlude the
++		// sky (iter-81 missed them — they have no pass record). drawSolid==true is
++		// exactly GL's full opaque depth write (MC_OPAQUE + perforated-with-no-alpha
++		// fallback); alpha-tested grates that drew their stages keep drawSolid false
++		// and are NOT captured, so their holes stay see-through. Skip polygon-offset
++		// decals (already pass-covered; depth-filling them z-fights the wall behind).
++		if ( !shader->TestMaterialFlag( MF_POLYGONOFFSET ) ) {
++			extern void D3_WebGPU_CaptureDepthFill( const drawSurf_t*, const srfTriangles_t* );
++			D3_WebGPU_CaptureDepthFill( surf, tri );
++		}
++#endif
+ 	}
+ 
+ 
+@@ -774,12 +807,19 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
  	}
  
  	// change the scissor if needed
@@ -9705,7 +9752,7 @@ index 0cabbfd..5c5b417 100644
  	}
  
  	// some deforms may disable themselves by setting numIndexes = 0
-@@ -898,6 +924,10 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
+@@ -898,6 +938,10 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
  			qglBindProgramARB( GL_FRAGMENT_PROGRAM_ARB, newStage->fragmentProgram );
  			qglEnable( GL_FRAGMENT_PROGRAM_ARB );
  
@@ -9716,7 +9763,7 @@ index 0cabbfd..5c5b417 100644
  			// draw it
  			RB_DrawElementsWithCounters( tri );
  
-@@ -1175,6 +1205,12 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
+@@ -1175,6 +1219,12 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
  
  		RB_PrepareStageTexturing( pStage, surf, ac );
  
@@ -9729,7 +9776,7 @@ index 0cabbfd..5c5b417 100644
  		// draw it
  		RB_DrawElementsWithCounters( tri );
  
-@@ -1305,7 +1341,9 @@ static void RB_T_Shadow( const drawSurf_t *surf ) {
+@@ -1305,7 +1355,9 @@ static void RB_T_Shadow( const drawSurf_t *surf ) {
  
  	tri = surf->geo;
  
@@ -9739,7 +9786,7 @@ index 0cabbfd..5c5b417 100644
  		return;
  	}
  
-@@ -1345,6 +1383,16 @@ static void RB_T_Shadow( const drawSurf_t *surf ) {
+@@ -1345,6 +1397,16 @@ static void RB_T_Shadow( const drawSurf_t *surf ) {
  		qglDepthBoundsEXT( surf->scissorRect.zmin, surf->scissorRect.zmax );
  	}
  
@@ -9756,7 +9803,7 @@ index 0cabbfd..5c5b417 100644
  	// debug visualization
  	if ( r_showShadows.GetInteger() ) {
  		if ( r_showShadows.GetInteger() == 3 ) {
-@@ -1568,6 +1616,18 @@ static void RB_T_BlendLight( const drawSurf_t *surf ) {
+@@ -1568,6 +1630,18 @@ static void RB_T_BlendLight( const drawSurf_t *surf ) {
  		qglTexGenfv( GL_S, GL_OBJECT_PLANE, lightProject[3].ToFloatPtr() );
  	}
  
@@ -9775,7 +9822,7 @@ index 0cabbfd..5c5b417 100644
  	// this gets used for both blend lights and shadow draws
  	if ( tri->ambientCache ) {
  		idDrawVert	*ac = (idDrawVert *)vertexCache.Position( tri->ambientCache );
-@@ -1630,6 +1690,11 @@ static void RB_BlendLight( const drawSurf_t *drawSurfs,  const drawSurf_t *drawS
+@@ -1630,6 +1704,11 @@ static void RB_BlendLight( const drawSurf_t *drawSurfs,  const drawSurf_t *drawS
  
  		GL_SelectTexture( 0 );
  		stage->texture.image->Bind();
@@ -9787,7 +9834,7 @@ index 0cabbfd..5c5b417 100644
  
  		if ( stage->texture.hasMatrix ) {
  			RB_LoadShaderTextureMatrix( regs, &stage->texture );
-@@ -1700,6 +1765,28 @@ local[0] = local[1] = local[2] = 0; local[3] = 0.5;
+@@ -1700,6 +1779,28 @@ local[0] = local[1] = local[2] = 0; local[3] = 0.5;
  		qglTexGenfv( GL_S, GL_OBJECT_PLANE, local.ToFloatPtr() );
  	}
  
@@ -9816,7 +9863,7 @@ index 0cabbfd..5c5b417 100644
  	RB_T_RenderTriangleSurface( surf );
  }
  
-@@ -1758,6 +1845,8 @@ static void RB_FogPass( const drawSurf_t *drawSurfs,  const drawSurf_t *drawSurf
+@@ -1758,6 +1859,8 @@ static void RB_FogPass( const drawSurf_t *drawSurfs,  const drawSurf_t *drawSurf
  	// texture 0 is the falloff image
  	GL_SelectTexture( 0 );
  	globalImages->fogImage->Bind();
@@ -9825,7 +9872,7 @@ index 0cabbfd..5c5b417 100644
  	//GL_Bind( tr.whiteImage );
  	qglDisableClientState( GL_TEXTURE_COORD_ARRAY );
  	qglEnable( GL_TEXTURE_GEN_S );
-@@ -1851,10 +1940,15 @@ void RB_STD_FogAllLights( void ) {
+@@ -1851,10 +1954,15 @@ void RB_STD_FogAllLights( void ) {
  			// units from the origin
  			backEnd.currentScissor = vLight->scissorRect;
  			if ( r_useScissor.GetBool() ) {
@@ -9845,7 +9892,7 @@ index 0cabbfd..5c5b417 100644
  			}
  			qglClear( GL_STENCIL_BUFFER_BIT );
  
-@@ -1903,10 +1997,15 @@ void RB_STD_LightScale( void ) {
+@@ -1903,10 +2011,15 @@ void RB_STD_LightScale( void ) {
  
  	// the scissor may be smaller than the viewport for subviews
  	if ( r_useScissor.GetBool() ) {
@@ -10060,7 +10107,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..f3ad6a8 100644
+index c83ebb5..02b19ba 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -10086,7 +10133,7 @@ index c83ebb5..f3ad6a8 100644
  
  /*
  
-@@ -38,6 +50,982 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,1065 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -10992,6 +11039,89 @@ index c83ebb5..f3ad6a8 100644
 +	g_capFrameId++;
 +}
 +
++// Iter 120: WebGPU z-prepass DEPTH FILL. Capture the opaque surfaces GL solid-
++// fills in RB_T_FillDepthBuffer as DEPTH-ONLY records so UNLIT no-material-stage
++// walls write depth and occlude the skybox. iter-81 filled prepass depth from
++// opaque PASS records, but pass records exist only for surfaces WITH material
++// stages; the no-stage world walls (drawn only by depth-fill + light
++// interactions in GL) were missed → when unlit they wrote no depth → the sky,
++// drawn last at its real depth with LessEqual, painted THROUGH them (black hole
++// / peach leak). The flashlight added a lit interaction → depth+color → solid,
++// which is why the leak was flashlight-dependent. These records ride the pass
++// family (g_passRecords) tagged pad3==4: drawn ONLY in the prepass, never as
++// color (the color loops skip pad3==4; their image ptr is null). Geometry shares
++// the main vert/index accumulators through the SAME dedup table the interaction
++// pass uses — and because depth fill runs FIRST in the view, it SEEDS the dedup
++// so the later interaction/pass captures reuse its verts → zero extra vertex
++// bytes for any wall that is also lit or passed (the cost is one record slot +
++// the surface's own index range).
++void D3_WebGPU_CaptureDepthFill( const drawSurf_t* surf, const srfTriangles_t* tri ) {
++	if ( !backEnd.viewDef ) return;
++	// Depth fill only runs with view entities (RB_STD_FillDepthBuffer bails on
++	// the lightgem), so this just drops the <128px lightgem view.
++	if ( backEnd.viewDef->viewEntitys &&
++	     ( backEnd.viewDef->viewport.x2 - backEnd.viewDef->viewport.x1 ) < 128 ) return;
++	if ( !surf || !tri || !tri->indexes ) return;
++	if ( tri->numVerts <= 0 || tri->numIndexes <= 0 ) return;
++	if ( tri->numVerts > 32768 || tri->numIndexes > kWGPUMaxCaptureIndexes ) { g_capDropped++; return; }
++	const idDrawVert* capVerts = tri->verts;
++	if ( !capVerts && tri->ambientCache ) capVerts = (const idDrawVert*)vertexCache.Position( tri->ambientCache );
++	if ( !capVerts ) { g_capDropped++; return; }
++	if ( g_passRecordCount >= (uint32_t)kWGPUMaxRecords ) { g_capDropped++; return; }
++
++	const uint32_t vbytes = (uint32_t)tri->numVerts * 60u;
++	const uint32_t ibytes = (uint32_t)tri->numIndexes * 2u;
++	const uint32_t vR = (vbytes + 3u) & ~3u;
++	const uint32_t iR = (ibytes + 3u) & ~3u;
++	// Dedup against the shared table (keyed on the verts pointer, exactly like
++	// draw_arb2's interaction dedup) so a wall captured here for depth and later
++	// for lighting/passes shares ONE copy of its verts.
++	int dedupHit = -1;
++	for ( uint32_t k = 0; k < g_capVertDedupCount; ++k ) {
++		if ( g_capVertDedup[k].verts == (const void*)capVerts &&
++		     g_capVertDedup[k].vertCount == (uint32_t)tri->numVerts ) { dedupHit = (int)k; break; }
++	}
++	const uint32_t vGrow = ( dedupHit >= 0 ) ? 0u : vR;
++	if ( g_capVertBytes + vGrow > (uint32_t)kWGPUVertAccumBytes ||
++	     g_capIndexBytes + iR > (uint32_t)kWGPUIndexAccumBytes ) { g_capDropped++; return; }
++
++	WGPUInteractionRecord& r = g_passRecords[g_passRecordCount];
++	memset( &r, 0, sizeof(r) );
++	if ( dedupHit >= 0 ) {
++		r.vertOffset = g_capVertDedup[dedupHit].vertOffset;
++	} else {
++		memcpy( g_capVertsAccum + g_capVertBytes, capVerts, vbytes );
++		r.vertOffset = g_capVertBytes;
++		if ( g_capVertDedupCount < (uint32_t)kWGPUMaxRecords ) {
++			g_capVertDedup[g_capVertDedupCount].verts = (const void*)capVerts;
++			g_capVertDedup[g_capVertDedupCount].vertOffset = g_capVertBytes;
++			g_capVertDedup[g_capVertDedupCount].vertCount = (uint32_t)tri->numVerts;
++			g_capVertDedupCount++;
++		}
++		g_capVertBytes += vR;
++	}
++	for ( int i = 0; i < tri->numIndexes; ++i ) {
++		g_capIndexesAccum[(g_capIndexBytes / 2) + i] = (uint16_t)tri->indexes[i];
++	}
++	r.indexOffset = g_capIndexBytes;
++	g_capIndexBytes += iR;
++	r.vertCount  = (uint32_t)tri->numVerts;
++	r.indexCount = (uint32_t)tri->numIndexes;
++	static const float kIdent[16] = {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
++	float capProj[16];
++	memcpy( capProj, backEnd.viewDef->projectionMatrix, sizeof(capProj) );
++	if ( surf->space ) {
++		if ( surf->space->weaponDepthHack ) capProj[14] *= 0.25f;
++		else if ( surf->space->modelDepthHack != 0.0f ) capProj[14] -= surf->space->modelDepthHack;
++	}
++	WGPU_PassMatMul4( r.modelMatrix, capProj, surf->space ? surf->space->modelViewMatrix : kIdent );
++	r.pad0  = (uint32_t)(uintptr_t)backEnd.viewDef;   // main-view tag
++	r.pad3  = 4u;     // depth-fill sentinel: prepass-only, never drawn as color
++	r.sPad2 = 0u;     // opaque (writes depth)
++	g_passImagePtrs[g_passRecordCount] = NULL;
++	g_passRecordCount++;
++}
++
 +// Iter 16: capture heat-haze ARB new stages (the only new-stage programs the
 +// demo pak's materials reference besides colorProcess). Called from
 +// draw_common.cpp's newStage branch, where the vertex parms are evaluated
@@ -11069,7 +11199,7 @@ index c83ebb5..f3ad6a8 100644
  
  /*
  =================
-@@ -49,6 +1037,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +1120,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -11085,7 +11215,7 @@ index c83ebb5..f3ad6a8 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +1075,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +1158,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -11101,7 +11231,7 @@ index c83ebb5..f3ad6a8 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1122,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1205,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -11118,7 +11248,7 @@ index c83ebb5..f3ad6a8 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1182,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1265,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -11126,7 +11256,7 @@ index c83ebb5..f3ad6a8 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1409,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1492,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -11139,7 +11269,7 @@ index c83ebb5..f3ad6a8 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1578,72 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1661,72 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
