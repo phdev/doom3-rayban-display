@@ -4033,10 +4033,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..18d3cdc
+index 0000000..eb27bf1
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,4388 @@
+@@ -0,0 +1,4416 @@
 +/*
 +================================================================================
 +
@@ -6686,6 +6686,8 @@ index 0000000..18d3cdc
 +            extern uint8_t  g_shadowVertsAccum[];
 +            extern uint32_t g_shadowVertBytes;
 +            extern uint32_t g_shadowRecordCount;
++            extern uint16_t g_shadowIndexesAccum[];
++            extern uint32_t g_shadowIndexBytes;
 +            uint32_t sn = 0;
 +            if (g_shadowRecordCount > 0 && lastRecordCount > 0 && shadowBGL) {
 +                const uint32_t vNeedS = (g_shadowVertBytes + 3u) & ~3u;
@@ -6707,6 +6709,25 @@ index 0000000..18d3cdc
 +                    deltaUpload(shadowVertexBuf, g_shadowVertsAccum, vNeedS,
 +                                shadowMirror, shadowMirrorBytes, shadowMirrorCap, shadowBufFresh);
 +                }
++                // Iter 119: upload the separate shadow INDEX accumulator.
++                const uint32_t iNeedS = (g_shadowIndexBytes + 3u) & ~3u;
++                bool shadowIdxFresh = false;
++                if (iNeedS > shadowIndexCap) {
++                    if (shadowIndexBuf) wgpuBufferRelease(shadowIndexBuf);
++                    uint32_t cap = iNeedS + iNeedS / 2; if (cap < 256*1024) cap = 256*1024;
++                    WGPUBufferDescriptor d = {};
++                    d.size = cap;
++                    d.usage = WGPUBufferUsage_Index | WGPUBufferUsage_CopyDst;
++                    shadowIndexBuf = wgpuDeviceCreateBuffer(device, &d);
++                    shadowIndexCap = cap;
++                    shadowIdxFresh = true;
++                }
++                if (shadowIndexBuf && iNeedS > 0) {
++                    deltaUpload(shadowIndexBuf, (const uint8_t*)g_shadowIndexesAccum, iNeedS,
++                                shadowIndexMirror, shadowIndexMirrorBytes, shadowIndexMirrorCap, shadowIdxFresh);
++                }
++                // Peak shadow index usage — confirm headroom vs kWGPUShadowIndexBytes (8MB).
++                EM_ASM_({ if (window.__d3ShadowIdxKB === undefined || $0 > window.__d3ShadowIdxKB) window.__d3ShadowIdxKB = $0; }, iNeedS / 1024u);
 +                const uint32_t mainView = lastRecords[lastRecordCount - 1].pad0;
 +                const uint32_t sTotal = (g_shadowRecordCount < kMaxRecordSlots) ? g_shadowRecordCount : kMaxRecordSlots;
 +                for (uint32_t i = 0; i < sTotal; ++i) {
@@ -6762,6 +6783,7 @@ index 0000000..18d3cdc
 +            }
 +            g_shadowRecordCount = 0;
 +            g_shadowVertBytes = 0;
++            g_shadowIndexBytes = 0;
 +        }
 +
 +        // Iter 12b: drain fog records (geometry already in the shared
@@ -7242,7 +7264,7 @@ index 0000000..18d3cdc
 +                (g_capWgpuSingleLight == -993) ? shadowDebugDepthPipeline : nullptr;
 +            const bool volsOK = shadowZFailPipeline && shadowZPassPipeline &&
 +                                shadowZFailUndoPipeline && shadowZPassUndoPipeline &&
-+                                shadowVertexBuf;
++                                shadowVertexBuf && shadowIndexBuf;
 +            auto drawVolumes = [&](uint32_t light, bool undo) {
 +                for (uint32_t sIdx = 0; sIdx < lastShadowCount; ++sIdx) {
 +                    const Rec& sr = lastShadowRecords[sIdx];
@@ -7254,7 +7276,7 @@ index 0000000..18d3cdc
 +                    wgpuRenderPassEncoderSetPipeline(rp, p);
 +                    wgpuRenderPassEncoderSetBindGroup(rp, 0, shadowBindGroups[sIdx], 0, nullptr);
 +                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, shadowVertexBuf, sr.vertOffset, (uint64_t)sr.vertCount * 16u);
-+                    wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, sr.indexOffset, (uint64_t)sr.indexCount * 2u);
++                    wgpuRenderPassEncoderSetIndexBuffer(rp, shadowIndexBuf, WGPUIndexFormat_Uint16, sr.indexOffset, (uint64_t)sr.indexCount * 2u);
 +                    wgpuRenderPassEncoderDrawIndexed(rp, sr.indexCount, 1, 0, 0, 0);
 +                }
 +            };
@@ -7289,7 +7311,7 @@ index 0000000..18d3cdc
 +        const int dbgStencilRef =
 +            (g_capWgpuSingleLight == -992) ? 129 :
 +            (g_capWgpuSingleLight == -991) ? 127 : 0;
-+        if (shadowDarkenPipeline && shadowDarkenUB && bloomBGL && shadowVertexBuf &&
++        if (shadowDarkenPipeline && shadowDarkenUB && bloomBGL && shadowVertexBuf && shadowIndexBuf &&
 +            shadowZFailPipeline && shadowZPassPipeline && lastShadowCount > 0 &&
 +            (dbgStencilRef || g_capShadowDarken < 0.999f) && colorCleared) {
 +            if (!shadowDarkenBG && fbWhiteView) {
@@ -7337,7 +7359,7 @@ index 0000000..18d3cdc
 +                    wgpuRenderPassEncoderSetPipeline(rp, sr.pad1 ? shadowZPassPipeline : shadowZFailPipeline);
 +                    wgpuRenderPassEncoderSetBindGroup(rp, 0, shadowBindGroups[sIdx], 0, nullptr);
 +                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, shadowVertexBuf, sr.vertOffset, (uint64_t)sr.vertCount * 16u);
-+                    wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, sr.indexOffset, (uint64_t)sr.indexCount * 2u);
++                    wgpuRenderPassEncoderSetIndexBuffer(rp, shadowIndexBuf, WGPUIndexFormat_Uint16, sr.indexOffset, (uint64_t)sr.indexCount * 2u);
 +                    wgpuRenderPassEncoderDrawIndexed(rp, sr.indexCount, 1, 0, 0, 0);
 +                }
 +                if (dbgStencilRef) {
@@ -8307,6 +8329,12 @@ index 0000000..18d3cdc
 +    WGPUBindGroup           shadowBindGroups[kMaxRecordSlots]  = {nullptr};
 +    WGPUBuffer              shadowVertexBuf = nullptr;
 +    uint32_t                shadowVertexCap = 0;
++    // Iter 119: shadow indices live in their OWN GPU buffer now (mirrors
++    // shadowVertexBuf) so they can't starve the surface index buffer.
++    WGPUBuffer              shadowIndexBuf = nullptr;
++    uint32_t                shadowIndexCap = 0;
++    uint8_t*                shadowIndexMirror = nullptr;
++    uint32_t                shadowIndexMirrorBytes = 0, shadowIndexMirrorCap = 0;
 +    Rec                     lastShadowRecords[kMaxRecordSlots] = {};
 +    uint32_t                lastShadowCount = 0;
 +    // Iter 12b: fog lights — one pipeline (SrcAlpha blend, depth LessEqual
@@ -9838,7 +9866,7 @@ index 0cabbfd..5c5b417 100644
  	}
  
 diff --git a/neo/renderer/tr_backend.cpp b/neo/renderer/tr_backend.cpp
-index cf1c571..bb78d7d 100644
+index cf1c571..6999235 100644
 --- a/neo/renderer/tr_backend.cpp
 +++ b/neo/renderer/tr_backend.cpp
 @@ -29,6 +29,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -9947,7 +9975,7 @@ index cf1c571..bb78d7d 100644
 +extern "C" {
 +	extern uint32_t g_capRecordCount, g_passRecordCount, g_shadowRecordCount;
 +	extern uint32_t g_fogRecordCount, g_blendRecordCount;
-+	extern uint32_t g_capVertBytes, g_capIndexBytes, g_shadowVertBytes;
++	extern uint32_t g_capVertBytes, g_capIndexBytes, g_shadowVertBytes, g_shadowIndexBytes;
 +	extern uint32_t g_skyDirBytes, g_capVertDedupCount;
 +}
 +#endif
@@ -9955,7 +9983,7 @@ index cf1c571..bb78d7d 100644
  int		backEndStartTime, backEndFinishTime;
  void RB_ExecuteBackEndCommands( const emptyCommand_t *cmds ) {
  	// r_debugRenderToTexture
-@@ -651,6 +695,32 @@ void RB_ExecuteBackEndCommands( const emptyCommand_t *cmds ) {
+@@ -651,6 +695,33 @@ void RB_ExecuteBackEndCommands( const emptyCommand_t *cmds ) {
  
  	backEndStartTime = Sys_Milliseconds();
  
@@ -9979,6 +10007,7 @@ index cf1c571..bb78d7d 100644
 +			g_capVertBytes = 0;
 +			g_capIndexBytes = 0;
 +			g_shadowVertBytes = 0;
++			g_shadowIndexBytes = 0;
 +			g_skyDirBytes = 0;
 +			g_capVertDedupCount = 0;
 +		}
@@ -10031,7 +10060,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..825a829 100644
+index c83ebb5..f3ad6a8 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -10057,7 +10086,7 @@ index c83ebb5..825a829 100644
  
  /*
  
-@@ -38,6 +50,970 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,982 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -10178,6 +10207,18 @@ index c83ebb5..825a829 100644
 +    enum { kWGPUShadowVertBytes = 4 * 1024 * 1024 };
 +    uint8_t  g_shadowVertsAccum[kWGPUShadowVertBytes];
 +    uint32_t g_shadowVertBytes = 0;
++    // Iter 119: shadow INDICES get their own accumulator + GPU buffer too.
++    // Previously they shared g_capIndexesAccum / g_capIndexBytes with world
++    // SURFACE records, so a flickering light's stencil shadow volumes filled
++    // the shared 20MB index space and STARVED later surface records → that
++    // geometry was dropped and rendered as void (you saw through the level).
++    // r_shadows 0 made the drops vanish (live-confirmed). Surfaces alone fit
++    // the full kWGPUIndexAccumBytes; shadows now keep to their own budget so
++    // they can never starve geometry. Sized to the shadow vert accumulator's
++    // reach (4MB verts ⇒ ≤~3MB indices); 8MB is ~2.6x headroom.
++    enum { kWGPUShadowIndexBytes = 8 * 1024 * 1024 };
++    uint16_t g_shadowIndexesAccum[kWGPUShadowIndexBytes / 2];
++    uint32_t g_shadowIndexBytes = 0;
 +    WGPUInteractionRecord g_shadowRecords[kWGPUMaxRecords];
 +    uint32_t g_shadowRecordCount = 0;
 +    // Iter 12b: fog light records. lightProjS/T/Q hold the LOCAL fog planes
@@ -10586,17 +10627,17 @@ index c83ebb5..825a829 100644
 +	const uint32_t ibytes = (uint32_t)numIndexes * 2u;
 +	const uint32_t iR = (ibytes + 3u) & ~3u;
 +	if ( g_shadowVertBytes + vbytes > (uint32_t)kWGPUShadowVertBytes ||
-+	     g_capIndexBytes + iR > (uint32_t)kWGPUIndexAccumBytes ) { D3_WebGPU_ShadowProbe( 6, g_shadowVertBytes + vbytes, g_capIndexBytes + iR, 0 ); g_capDropped++; return; }
++	     g_shadowIndexBytes + iR > (uint32_t)kWGPUShadowIndexBytes ) { D3_WebGPU_ShadowProbe( 6, g_shadowVertBytes + vbytes, g_shadowIndexBytes + iR, 0 ); g_capDropped++; return; }
 +	memcpy( g_shadowVertsAccum + g_shadowVertBytes, srcVerts, vbytes );
 +	for ( int i = 0; i < numIndexes; ++i ) {
-+		g_capIndexesAccum[(g_capIndexBytes / 2) + i] = (uint16_t)tri->indexes[i];
++		g_shadowIndexesAccum[(g_shadowIndexBytes / 2) + i] = (uint16_t)tri->indexes[i];
 +	}
 +
 +	WGPUInteractionRecord& r = g_shadowRecords[g_shadowRecordCount];
 +	memset( &r, 0, sizeof(r) );
 +	r.vertOffset  = g_shadowVertBytes;
 +	r.vertCount   = (uint32_t)numVerts;
-+	r.indexOffset = g_capIndexBytes;
++	r.indexOffset = g_shadowIndexBytes;
 +	r.indexCount  = (uint32_t)numIndexes;
 +	static const float kIdent[16] = {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
 +	WGPU_PassMatMul4( r.modelMatrix,
@@ -10606,8 +10647,8 @@ index c83ebb5..825a829 100644
 +	r.pad0 = (uint32_t)(uintptr_t)backEnd.viewDef;
 +	r.pad1 = external ? 1u : 0u;
 +	r.lightId = g_capLightId;
-+	g_shadowVertBytes += vbytes;
-+	g_capIndexBytes   += iR;
++	g_shadowVertBytes  += vbytes;
++	g_shadowIndexBytes += iR;
 +	g_shadowRecords[g_shadowRecordCount].sPad3 = playerBody ? 1u : 0u;
 +	g_shadowRecordCount++;
 +	g_capFrameId++;
@@ -11028,7 +11069,7 @@ index c83ebb5..825a829 100644
  
  /*
  =================
-@@ -49,6 +1025,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +1037,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -11044,7 +11085,7 @@ index c83ebb5..825a829 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +1063,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +1075,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -11060,7 +11101,7 @@ index c83ebb5..825a829 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1110,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1122,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -11077,7 +11118,7 @@ index c83ebb5..825a829 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1170,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1182,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -11085,7 +11126,7 @@ index c83ebb5..825a829 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1397,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1409,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -11098,7 +11139,7 @@ index c83ebb5..825a829 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1566,72 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1578,72 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
