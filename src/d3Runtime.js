@@ -31,6 +31,32 @@ const PAK_BASE = resolvePakBase();
 // Injected by Vite (define); falls back to a constant in dev.
 const ENGINE_VER = (typeof __ENGINE_VER__ !== "undefined") ? __ENGINE_VER__ : "dev";
 const bustCache = (url) => `${url}${url.includes("?") ? "&" : "?"}v=${ENGINE_VER}`;
+
+// iOS detection (iPhone/iPad/iPod, incl. iPadOS desktop-mode which reports
+// MacIntel + touch points). Used by the com_fixedTic policy below.
+const isIOSDevice = () => {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent || "";
+  return /iPad|iPhone|iPod/.test(ua)
+    || (navigator.platform === "MacIntel" && (navigator.maxTouchPoints || 0) > 1);
+};
+
+// iter 80: com_fixedTic policy. idTech4 simulates at a fixed 60Hz; com_fixedTic>0
+// forces EXACTLY that many sim tics per RENDERED frame (Session.cpp:2859 pins
+// lastGameTic = latched - fixedTic), so `1` only runs real-time-correct at 60fps.
+// On the Ray-Ban glasses, which render at a stable ~30fps, 1 tic/frame = HALF
+// game speed (slow motion). com_fixedTic 0 uses the stock catch-up (Common.cpp:289
+// numTics = 1 + timeDiff*0.06 → ~2 tics/frame at 30fps), keeping sim-time locked
+// to wall-clock; the WASM build already neutralizes that path's busy-wait
+// (Common.cpp:2595 forces vsynced60) and D3_EmscriptenFrame gates calls to ≤60Hz,
+// so 0 is correct at 30/60/120. We keep iOS on 1 (its 120Hz ProMotion pacing was
+// tuned for fixedTic 1, iter 46b — untouched until tested) and give every other
+// wearable (the glasses) 0. ?fixedtic=N overrides anywhere for on-device A/B.
+const computeFixedTic = (config) => {
+  const m = /[?&]fixedtic=(\d+)\b/.exec(typeof window !== "undefined" ? window.location.search : "");
+  if (m) return m[1];
+  return (config.inputMode === "wearable" && isIOSDevice()) ? "1" : "0";
+};
 // Iter 36: texture tiers. The bundled default is the 128px bake (phone-
 // friendly, ~57MB); ?hd switches to the 256px bake (~98MB, visibly sharper
 // on desktop). Both ship as same-origin 4MB chunk sets (GitHub release
@@ -752,12 +778,11 @@ function buildArguments(config) {
 
     "+set", "g_skill", String(getNumericConfig(config.skill, 0)),
     // Iter 46: one game tic per rendered frame on the wearable profile.
-    // idTech4's sim tick is 1000/60 truncated to 16ms (62.5Hz) — against a
-    // 60Hz display every ~400ms a frame runs two tics and the view visibly
-    // skips (iPhone pace probe: rAF clean 16.7ms, so presentation was
-    // exonerated). fixedTic ties sim to the render loop; the 4% slowdown is
-    // imperceptible. CVAR_ARCHIVE — pinned in autoexec too.
-    "+set", "com_fixedTic", config.inputMode === "wearable" ? "1" : "0",
+    // com_fixedTic policy (see computeFixedTic near the top): glasses get 0 so the
+    // sim catches up at <60fps (1 tic/frame = half speed at 30fps slow-motion); iOS
+    // keeps 1 (its iter-46b 120Hz pacing). ?fixedtic=N overrides. CVAR_ARCHIVE —
+    // pinned in autoexec too.
+    "+set", "com_fixedTic", computeFixedTic(config),
     // The wearable drives the camera through _D3_AddViewAngles, so disable the
     // engine's own pointer-lock mouse path.
     "+set", "in_mouse", "0",
@@ -969,7 +994,7 @@ function buildAutoexecConfig(config) {
     "seta image_downSize \"1\"",
     "seta image_useCompression \"1\"",
     `seta g_skill "${getNumericConfig(config.skill, 0)}"`,
-    `seta com_fixedTic "${config.inputMode === "wearable" ? "1" : "0"}"`,
+    `seta com_fixedTic "${computeFixedTic(config)}"`,
     "seta in_mouse \"0\"",
     "seta in_alwaysRun \"0\"",
     // r_gammaInShader is set in buildArguments (default 1), intentionally NOT pinned
