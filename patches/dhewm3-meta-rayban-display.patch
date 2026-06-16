@@ -4033,10 +4033,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..502d7ee
+index 0000000..18d3cdc
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,4345 @@
+@@ -0,0 +1,4388 @@
 +/*
 +================================================================================
 +
@@ -6074,6 +6074,15 @@ index 0000000..502d7ee
 +            recordBindGroups[i] = wgpuDeviceCreateBindGroup(device, &bgd);
 +            bgd.layout = bglDepth;
 +            recordDepthBindGroups[i] = wgpuDeviceCreateBindGroup(device, &bgd);
++            // Iter 81: same depth layout but over passUBuf (the pass records'
++            // uniforms). MVP is at offset 0 in both UBOs, which is all the
++            // shared interaction vs_main reads for clip position — so this
++            // fills correct depth for opaque material pass records.
++            WGPUBindGroupEntry pe = {};
++            pe.binding = 0; pe.buffer = passUBuf; pe.offset = (uint64_t)i * kUBStride; pe.size = 224;
++            WGPUBindGroupDescriptor pbgd = {};
++            pbgd.entryCount = 1; pbgd.entries = &pe; pbgd.layout = bglDepth;
++            passDepthBindGroups[i] = wgpuDeviceCreateBindGroup(device, &pbgd);
 +        }
 +        wgpuBindGroupLayoutRelease(bglInteraction);
 +        wgpuBindGroupLayoutRelease(bglDepth);
@@ -7011,7 +7020,15 @@ index 0000000..502d7ee
 +            static uint32_t lastDropReport = 0;
 +            if (detFrameCounter - lastDropReport > 600 || lastDropReport == 0) {
 +                lastDropReport = detFrameCounter ? detFrameCounter : 1;
-+                EM_ASM_({ console.info("[d3] WebGPU records dropped this frame (cap hit): " + $0); }, g_capDropped);
++                // Iter 81: per-cap breakdown so we know WHICH cap bit without
++                // guessing. Caps: pass/shadow record COUNT 32768, blend/fog 64,
++                // haze 16; the index (20MB) + vert (56MB) byte accumulators are
++                // SHARED by pass+shadow+blend+fog — a value near its cap is the
++                // limiter. (e.g. idxKB≈20480 ⇒ shadows starved surfaces.)
++                extern uint32_t g_passRecordCount, g_shadowRecordCount, g_blendRecordCount, g_fogRecordCount, g_hazeRecordCount;
++                EM_ASM_({ console.info("[d3] cap-drop " + $0 + " | pass=" + $1 + "/32768 shadow=" + $2 + " blend=" + $3 + "/64 fog=" + $4 + "/64 haze=" + $5 + "/16 | idxKB=" + $6 + "/20480 vertKB=" + $7 + "/57344"); },
++                    g_capDropped, g_passRecordCount, g_shadowRecordCount, g_blendRecordCount, g_fogRecordCount, g_hazeRecordCount,
++                    g_capIndexBytes / 1024u, g_capVertBytes / 1024u);
 +            }
 +            g_capDropped = 0;
 +        }
@@ -7136,6 +7153,29 @@ index 0000000..502d7ee
 +                wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
 +                wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
 +                wgpuRenderPassEncoderDrawIndexed(rp, r.indexCount, 1, 0, 0, 0);
++            }
++            // Iter 81 (sky-leak fix): ALSO fill depth from opaque MATERIAL pass
++            // records (pad3==0). The interaction fill above only covers LIT
++            // pixels; an UNLIT opaque wall is a pass record with no interaction,
++            // so without this its depth stays at the cleared far value (1.0) and
++            // the sky — drawn in the final pass at its real depth with LessEqual
++            // — passes the depth test and paints THROUGH the wall (the peach
++            // "skybox leak"). This mirrors GL's RB_STD_FillDepthBuffer, which
++            // fills depth for every opaque surface regardless of lighting. Skip
++            // 2D/sky/reflect (pad3 1/2/3 — sky+reflect already self-write depth)
++            // and translucent (sPad2); main view only.
++            {
++                const uint32_t mvPrepass = lastRecordCount > 0
++                    ? lastRecords[lastRecordCount - 1].pad0 : 0u;
++                for (uint32_t i = 0; i < lastPassCount; ++i) {
++                    const Rec& r = lastPassRecords[i];
++                    if (r.pad3 != 0u || r.sPad2 || r.pad0 != mvPrepass) continue;
++                    if (!passDepthBindGroups[i]) continue;
++                    wgpuRenderPassEncoderSetBindGroup(rp, 0, passDepthBindGroups[i], 0, nullptr);
++                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
++                    wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
++                    wgpuRenderPassEncoderDrawIndexed(rp, r.indexCount, 1, 0, 0, 0);
++                }
 +            }
 +            wgpuRenderPassEncoderEnd(rp);
 +            wgpuRenderPassEncoderRelease(rp);
@@ -8160,7 +8200,7 @@ index 0000000..502d7ee
 +    // buffers + per-slot group(0) bind groups (one set for the interaction
 +    // pipeline layout, one for the depth pipeline layout). Material
 +    // textures live in group(1), cached per unique 5-image tuple.
-+    static constexpr uint32_t kMaxRecordSlots = 24576;   // iter 69: mirrors kWGPUMaxRecords (896→24576)
++    static constexpr uint32_t kMaxRecordSlots = 32768;   // iter 69/81: mirrors kWGPUMaxRecords (896→24576→32768)
 +    WGPUBuffer              recordVertexBuf = nullptr;
 +    WGPUBuffer              recordIndexBuf  = nullptr;
 +    uint32_t                recordVertexCap = 0;   // bytes
@@ -8184,6 +8224,9 @@ index 0000000..502d7ee
 +    uint32_t                shadowUBHigh = 0;
 +    WGPUBindGroup           recordBindGroups[kMaxRecordSlots]  = {nullptr};
 +    WGPUBindGroup           recordDepthBindGroups[kMaxRecordSlots] = {nullptr};
++    // Iter 81: depth bind groups over passUBuf — lets opaque MATERIAL pass
++    // records fill the z-prepass so the sky stops leaking through unlit walls.
++    WGPUBindGroup           passDepthBindGroups[kMaxRecordSlots] = {nullptr};
 +    bool                    recordSlotsReady = false;
 +    uint32_t                lastUploadedCapFrameId = 0;
 +    // Iter 6.6: backend-local copy of the last consumed records — the draw
@@ -9988,7 +10031,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..52a33bb 100644
+index c83ebb5..825a829 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -10014,7 +10057,7 @@ index c83ebb5..52a33bb 100644
  
  /*
  
-@@ -38,6 +50,961 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,970 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -10039,9 +10082,18 @@ index c83ebb5..52a33bb 100644
 +    // 24576 = 1.5x the observed spawn peak (~16448) for deeper/busier-area headroom;
 +    // vert accumulator 48MB matches (24576 rec x 28 verts x 60B ~= 41MB). +~50MB RAM
 +    // (growth is on, MAXIMUM_MEMORY=2GB, so this just lifts the baseline).
-+    kWGPUMaxRecords      = 24576,               // hard cap on per-frame draws
-+    kWGPUVertAccumBytes  = 48 * 1024 * 1024,    // vertex accumulator
-+    kWGPUIndexAccumBytes = 12 * 1024 * 1024,    // u16 index accumulator
++    // Iter 81: 24576 / 12MB-index STILL hit in heavy reactor-area views (~308
++    // stencil shadow volumes share the index/vert byte accumulators with world
++    // surfaces, so a busy frame STARVES later SURFACE records → the dropped
++    // surface vanishes and the orange squarelight1-lit wall / sky behind it
++    // leaks through; live-confirmed: a 22-record drop at the orange view + r_shadows
++    // 0 → 0 drops). Overflow was marginal so raised moderately: records 24576→32768,
++    // vert accum 48→56MB (32768 × ~28 verts × 60B ≈ 55MB), index accum 12→20MB.
++    // The per-cap drop log (RenderBackend "[d3] cap-drop ...") reports WHICH cap
++    // bit so this can be tuned precisely on-device without guessing.
++    kWGPUMaxRecords      = 32768,               // hard cap on per-frame draws
++    kWGPUVertAccumBytes  = 56 * 1024 * 1024,    // vertex accumulator
++    kWGPUIndexAccumBytes = 20 * 1024 * 1024,    // u16 index accumulator
 +};
 +struct WGPUInteractionRecord {
 +    uint32_t vertOffset;
@@ -10976,7 +11028,7 @@ index c83ebb5..52a33bb 100644
  
  /*
  =================
-@@ -49,6 +1016,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +1025,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -10992,7 +11044,7 @@ index c83ebb5..52a33bb 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +1054,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +1063,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -11008,7 +11060,7 @@ index c83ebb5..52a33bb 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1101,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1110,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -11025,7 +11077,7 @@ index c83ebb5..52a33bb 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1161,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1170,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -11033,7 +11085,7 @@ index c83ebb5..52a33bb 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1388,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1397,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -11046,7 +11098,7 @@ index c83ebb5..52a33bb 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1557,72 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1566,72 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
