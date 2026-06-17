@@ -830,15 +830,12 @@ function buildArguments(config) {
     ...(wantWebGPU(typeof window !== "undefined" ? window.location.search : "")
         ? ["+set", "r_useVertexBuffers", "0"] : []),
     // iter-121: the SOFT-PARTICLE branch of RB_T_RenderShaderPasses
-    // (draw_common.cpp) has NO WebGPU capture hook — so under WebGPU-primary
-    // every softened additive/alpha particle (machinegun muzzle smoke, imp
-    // fireball trail, enemy death/despawn burst) gets no record and renders
-    // invisible/black. r_useSoftParticles 0 routes particles back through the
-    // captured old-stage path. Cost: no depth soft-fade where particles meet
-    // geometry (cosmetic, near-imperceptible on the glasses). ?softparticles=1
-    // restores soft particles for an A/B.
-    ...(wantWebGPU(typeof window !== "undefined" ? window.location.search : "")
-        && !/[?&]softparticles=1\b/.test(typeof window !== "undefined" ? window.location.search : "")
+    // (draw_common.cpp) has no WebGPU capture hook, but r_useSoftParticles 0
+    // did NOT fix the black particles (live-confirmed) — the soft_particle gate
+    // is per-surface dsFlags, not this cvar, so routing didn't happen. REVERTED
+    // (the change had no benefit and lost soft-fade). ?softparticles=0 lets us
+    // re-test it manually if needed; default leaves soft particles ON (stock).
+    ...(/[?&]softparticles=0\b/.test(typeof window !== "undefined" ? window.location.search : "")
         ? ["+set", "r_useSoftParticles", "0"] : []),
     // iter-121 DIAGNOSTIC toggles (URL params — A/B the depth changes vs the
     // combat-effect regressions on the glasses, where the console is hard):

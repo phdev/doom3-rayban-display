@@ -4033,7 +4033,7 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..d8ebe6c
+index 0000000..df5c277
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
 @@ -0,0 +1,4461 @@
@@ -6680,7 +6680,7 @@ index 0000000..d8ebe6c
 +                        ? nullptr   // iter-120 depth-fill record: prepass-only, no color group (would be a null-image bind)
 +                        : (r.sPad3 > 0)
 +                        ? getCinPassBindGroup(pn, r.sPad3 - 1u)
-+                        : getPassBindGroup(pn, g_passImagePtrs[i], r.pad3 == 1u);
++                        : getPassBindGroup(pn, g_passImagePtrs[i], false);   // iter-121 Bug C REVERTED: back to white fallback (transparent fallback didn't fix the white flash + suspected in ammo-counter regression)
 +                    if (lastPassGroups[pn]) wgpuBindGroupAddRef(lastPassGroups[pn]);
 +                    if (r.sPad3 > 0) {
 +                        static bool cinAnnounced = false;
@@ -8531,7 +8531,7 @@ index 0000000..0f9c8e6
 +    return nullptr;
 +}
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
-index 7914093..4145170 100644
+index 7914093..7256514 100644
 --- a/neo/renderer/RenderSystem_init.cpp
 +++ b/neo/renderer/RenderSystem_init.cpp
 @@ -39,6 +39,11 @@ If you have questions concerning this license or the applicable additional terms
@@ -8563,7 +8563,7 @@ index 7914093..4145170 100644
 +idCVar r_wgpuSingleLight( "r_wgpuSingleLight", "-1", CVAR_RENDERER | CVAR_INTEGER, "debug: draw only the WebGPU capture lightId N (per-frame vLight order)" );
 +// iter-121 DIAGNOSTIC toggles — live A/B the depth changes against combat-effect regressions.
 +idCVar r_wgpuDepthFill( "r_wgpuDepthFill", "1", CVAR_RENDERER | CVAR_BOOL, "iter-120: write pre-pass depth for opaque no-stage walls so they occlude the sky. 0 = off (LIVE; brings back holes but A/Bs whether depth-fill breaks translucent effects)" );
-+idCVar r_wgpuDecalBias( "r_wgpuDecalBias", "-600", CVAR_RENDERER | CVAR_INTEGER, "iter-121: depthBias applied to translucent/decal pass pipelines vs the iter-120 wall depth. Read at pipeline build — set via boot arg + reload" );
++idCVar r_wgpuDecalBias( "r_wgpuDecalBias", "0", CVAR_RENDERER | CVAR_INTEGER, "iter-121: depthBias on translucent/decal pass pipelines vs iter-120 wall depth. Default 0 (REVERTED — -600 did not fix decals). Set e.g. -600 via boot arg + reload to re-test" );
 +idCVar r_shadowDarken( "r_shadowDarken", "1.0", CVAR_RENDERER | CVAR_FLOAT, "WebGPU: multiply shadowed pixels by this factor (1 = off; Quest-style visible shadows)" );
 +idCVar r_bloomThreshold( "r_bloomThreshold", "0.5", CVAR_RENDERER | CVAR_FLOAT, "bloom bright-pass threshold (0..1)" );
 +idCVar r_bloomScale( "r_bloomScale", "1.25", CVAR_RENDERER | CVAR_FLOAT, "bloom intensity" );
