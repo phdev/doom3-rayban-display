@@ -4045,10 +4045,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..df5c277
+index 0000000..da363f9
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,4461 @@
+@@ -0,0 +1,4475 @@
 +/*
 +================================================================================
 +
@@ -6617,9 +6617,13 @@ index 0000000..df5c277
 +                    float ub[32];
 +                    memcpy(ub + 0, r.modelMatrix, 64);
 +                    memcpy(ub + 16, r.diffuseColor, 16);
-+                    const float svcMod = (r.pad2 == 1u) ? 1.0f : (r.pad2 == 2u) ? -1.0f : 0.0f;
-+                    const float svcAdd = (r.pad2 == 1u) ? 0.0f : 1.0f;
-+                    ub[20] = svcMod; ub[21] = svcAdd; ub[22] = 0.0f; ub[23] = 0.0f;
++                    // iter 123: svc is the low byte of pad2; bit 8 = filter-decal
++                    // white-lift flag (params.z) — see texture.wgsl.
++                    const uint32_t svc2 = r.pad2 & 0xFFu;
++                    const float svcMod = (svc2 == 1u) ? 1.0f : (svc2 == 2u) ? -1.0f : 0.0f;
++                    const float svcAdd = (svc2 == 1u) ? 0.0f : 1.0f;
++                    const float decalLift = (r.pad2 & 0x100u) ? 1.0f : 0.0f;
++                    ub[20] = svcMod; ub[21] = svcAdd; ub[22] = decalLift; ub[23] = 0.0f;
 +                    memcpy(ub + 24, r.lightProjS, 16);   // stage texture matrix S
 +                    memcpy(ub + 28, r.lightProjT, 16);   // stage texture matrix T
 +                    {
@@ -6634,7 +6638,17 @@ index 0000000..df5c277
 +                    }
 +                    // pass-record probe (d3cmd r_wgpuSingleLight 998): name +
 +                    // stage color + blend kind for every drawn pass record.
-+                    if (g_capWgpuSingleLight == 998 && pn < 24) {
++                    // The 24-record cap keeps the normal dump readable, but the
++                    // HUD/GUI + projected decals saturate it and push the combat
++                    // PARTICLE sprites out of view — so ALSO dump any particle /
++                    // decal / muzzle-flash / sfx record regardless of position,
++                    // to pin the "black quad" effect (debug instrument).
++                    const char* probeNm998 = D3_WebGPU_ImageName(g_passImagePtrs[i]);
++                    const bool probeFx998 = probeNm998 && (
++                        strstr(probeNm998, "particles/") || strstr(probeNm998, "decals/") ||
++                        strstr(probeNm998, "mflash") || strstr(probeNm998, "sfx/") ||
++                        strstr(probeNm998, "_dis"));
++                    if (g_capWgpuSingleLight == 998 && (pn < 24 || probeFx998)) {
 +                        // iter 45: geometry bounds from the staged verts —
 +                        // catches wrong-vertex-range associations.
 +                        extern uint8_t g_capVertsAccum[];
@@ -10168,7 +10182,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..4487699 100644
+index c83ebb5..6888f93 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -10194,7 +10208,7 @@ index c83ebb5..4487699 100644
  
  /*
  
-@@ -38,6 +50,1085 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,1098 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -11086,6 +11100,19 @@ index c83ebb5..4487699 100644
 +	else                                                                             r.pad1 = 2;
 +	if ( alphaPrime ) r.pad1 = 6;   // iter 48: alpha-prime (maskcolor) — overrides blend kind
 +	r.pad2 = (uint32_t)pStage->vertexColor;
++	// iter 123: filter-blend scorch/wound decals (sort SS_DECAL, e.g.
++	// textures/decals/hurt02) are mostly-near-white "multiply" textures whose
++	// near-white surround is the transparent part (dst * ~0.92). A SINGLE one is
++	// invisible, but mag-dumping an enemy stacks ~8 overlapping projections and
++	// the filter blend MULTIPLIES — the surround compounds (0.92^8 ~ 0.5) and the
++	// dark wound center to ~0, turning the whole decal box into an opaque BLACK
++	// rotated quad. Flag these so texture.wgsl lifts the near-white "transparent"
++	// texels back to 1.0 (no compounding) while preserving the dark wound center.
++	// Scoped to filter (pad1==4) DECALs only, so the iter-16 glass filter tints
++	// are untouched. The flag rides pad2 bit 8 (svc is the low byte).
++	if ( r.pad1 == 4u && surf->material && surf->material->GetSort() == SS_DECAL ) {
++		r.pad2 |= 0x100u;
++	}
 +	r.pad3 = is2D ? 1u : 0u;
 +	r.sPad3 = cinSlot;   // iter 17: 1-based dynamic-frame slot, 0 = static image
 +	if ( skyStash ) {
@@ -11280,7 +11307,7 @@ index c83ebb5..4487699 100644
  
  /*
  =================
-@@ -49,6 +1140,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +1153,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -11296,7 +11323,7 @@ index c83ebb5..4487699 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +1178,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +1191,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -11312,7 +11339,7 @@ index c83ebb5..4487699 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1225,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1238,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -11329,7 +11356,7 @@ index c83ebb5..4487699 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1285,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1298,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -11337,7 +11364,7 @@ index c83ebb5..4487699 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1512,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1525,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -11350,7 +11377,7 @@ index c83ebb5..4487699 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1681,73 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1694,73 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
@@ -11436,10 +11463,10 @@ index c83ebb5..4487699 100644
  	// ensures that depth writes are enabled for the depth clear
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..28ccbc9
+index 0000000..ea66c28
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,929 @@
+@@ -0,0 +1,949 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -12365,7 +12392,27 @@ index 0000000..28ccbc9
 +"@fragment\n"
 +"fn fs_main(in: VSOut) -> @location(0) vec4<f32> {\n"
 +"    let vc = in.vertex_color * u.params.x + vec4<f32>(u.params.y);\n"
-+"    return textureSample(tex, samp, in.uv) * u.tint * vc;\n"
++"    var texColor = textureSample(tex, samp, in.uv);\n"
++"    // iter 123: filter-blend scorch/wound decal cap (params.z, set only for\n"
++"    // SS_DECAL filter records — textures/decals/hurt02 etc). These are mostly\n"
++"    // near-white \"multiply\" textures (white == transparent) with a dark wound\n"
++"    // body. Two failure modes turn them into opaque BLACK quads under WebGPU-\n"
++"    // primary: (a) the ~0.92 white surround multiplies down to black when many\n"
++"    // overlapping wound projections stack, and (b) when the material covers a\n"
++"    // whole damaged model the dark wound body (~0.18) multiplies the surface to\n"
++"    // ~black. Fix both: lift the near-white surround to pure 1.0 (truly\n"
++"    // transparent, no compounding), then FLOOR the result so the multiply can\n"
++"    // never drive the surface below ~0.4 (a wound darkens, but never to black).\n"
++"    if (u.params.z > 0.5) {\n"
++"        // Lift the near-white \"transparent\" surround to pure 1.0 (no multiply\n"
++"        // compounding), then FLOOR the result high enough that the dark wound\n"
++"        // body can only darken the surface to ~0.75 — a visible damage flash,\n"
++"        // never a black-out. (0.4 was too dark on a dim display.)\n"
++"        let mx = max(texColor.r, max(texColor.g, texColor.b));\n"
++"        let lifted = mix(texColor.rgb, vec3<f32>(1.0), smoothstep(0.55, 0.9, mx));\n"
++"        texColor = vec4<f32>(max(lifted, vec3<f32>(0.75)), texColor.a);\n"
++"    }\n"
++"    return texColor * u.tint * vc;\n"
 +"}\n"
 +"";
 +

@@ -57,5 +57,25 @@ fn vs_main(in: VSIn) -> VSOut {
 @fragment
 fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let vc = in.vertex_color * u.params.x + vec4<f32>(u.params.y);
-    return textureSample(tex, samp, in.uv) * u.tint * vc;
+    var texColor = textureSample(tex, samp, in.uv);
+    // iter 123: filter-blend scorch/wound decal cap (params.z, set only for
+    // SS_DECAL filter records — textures/decals/hurt02 etc). These are mostly
+    // near-white "multiply" textures (white == transparent) with a dark wound
+    // body. Two failure modes turn them into opaque BLACK quads under WebGPU-
+    // primary: (a) the ~0.92 white surround multiplies down to black when many
+    // overlapping wound projections stack, and (b) when the material covers a
+    // whole damaged model the dark wound body (~0.18) multiplies the surface to
+    // ~black. Fix both: lift the near-white surround to pure 1.0 (truly
+    // transparent, no compounding), then FLOOR the result so the multiply can
+    // never drive the surface below ~0.4 (a wound darkens, but never to black).
+    if (u.params.z > 0.5) {
+        // Lift the near-white "transparent" surround to pure 1.0 (no multiply
+        // compounding), then FLOOR the result high enough that the dark wound
+        // body can only darken the surface to ~0.75 — a visible damage flash,
+        // never a black-out. (0.4 was too dark on a dim display.)
+        let mx = max(texColor.r, max(texColor.g, texColor.b));
+        let lifted = mix(texColor.rgb, vec3<f32>(1.0), smoothstep(0.55, 0.9, mx));
+        texColor = vec4<f32>(max(lifted, vec3<f32>(0.75)), texColor.a);
+    }
+    return texColor * u.tint * vc;
 }
