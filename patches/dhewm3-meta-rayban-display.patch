@@ -4033,10 +4033,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..1c6d3af
+index 0000000..61db6ef
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,4442 @@
+@@ -0,0 +1,4460 @@
 +/*
 +================================================================================
 +
@@ -4775,6 +4775,16 @@ index 0000000..1c6d3af
 +            dss.format = WGPUTextureFormat_Depth24PlusStencil8;
 +            dss.depthWriteEnabled = depthWrite ? WGPUOptionalBool_True : WGPUOptionalBool_False;
 +            dss.depthCompare = depthCmp;
++            // iter-121 Bug B: translucent material/decal stages (depthWrite off,
++            // LessEqual) get a small negative polygon-offset so they don't z-fight
++            // the OPAQUE wall depth iter-120 now writes for unlit no-stage walls —
++            // that z-fight is the blood/light-decal FLICKER + black-background (losing
++            // fragments show the unlit black wall through). Mirrors GL's
++            // glPolygonOffset(0, -600) which the WebGPU port never had. Excludes the
++            // opaque pass (depthWrite) and the 2D GUI pipelines (Always compare).
++            if (!depthWrite && depthCmp == WGPUCompareFunction_LessEqual) {
++                dss.depthBias = -600;   // slopeScale/clamp stay 0 via zero-init (GL used factor=0)
++            }
 +            dss.stencilFront.compare = WGPUCompareFunction_Always;
 +            dss.stencilBack.compare  = WGPUCompareFunction_Always;
 +            dss.stencilFront.failOp = dss.stencilFront.depthFailOp = dss.stencilFront.passOp = WGPUStencilOperation_Keep;
@@ -5571,13 +5581,19 @@ index 0000000..1c6d3af
 +
 +    // Iter 8c: bind group for a shader-pass record slot — texture.wgsl
 +    // group(0) = uniform + sampler + texture. Cached per (slot, image).
-+    WGPUBindGroup getPassBindGroup(uint32_t slot, const void* imgPtr) {
++    WGPUBindGroup getPassBindGroup(uint32_t slot, const void* imgPtr, bool clearFallback = false) {
 +        for (uint32_t i = 0; i < passBGCacheCount; ++i) {
 +            if (passBGCache[i].slot == slot && passBGCache[i].img == imgPtr) {
 +                return passBGCache[i].group;
 +            }
 +        }
-+        WGPUTextureView view = getEngineTextureView(imgPtr, fbWhiteView);
++        // iter-121 Bug C: a 2D overlay whose image MISSES the cache (e.g. the
++        // PlayerView damage-blob's _scratch — a CaptureRenderToImage target the
++        // port never echoes) falls back to TRANSPARENT, not white, so a missing
++        // dynamic overlay draws NOTHING instead of a full-screen WHITE block.
++        // Scoped to 2D records: cached static images (incl. _white) never miss,
++        // so a legitimate white HUD element still binds its real texture.
++        WGPUTextureView view = getEngineTextureView(imgPtr, clearFallback ? fbClearView : fbWhiteView);
 +        WGPUBindGroupEntry e[3] = {};
 +        e[0].binding = 0; e[0].buffer = passUBuf; e[0].offset = (uint64_t)slot * kUBStride; e[0].size = 128;
 +        e[1].binding = 1; e[1].sampler = demoSampler;
@@ -6034,6 +6050,7 @@ index 0000000..1c6d3af
 +        // Little-endian RGBA8 bytes R=0x80 G=0x80 B=0xFF A=0xFF.
 +        fbFlatNormalView = makeFillTex(0xffff8080u, "fbFlatNormal");
 +        fbWhiteView      = makeFillTex(0xffffffffu, "fbWhite");
++        fbClearView      = makeFillTex(0x00000000u, "fbClear");   // iter-121 Bug C: transparent fallback for missing 2D dynamic overlays
 +        fbCheckerView    = makeFillTex(0xff80c080u, "fbChecker");
 +
 +        WGPUBindGroupLayout bglInteraction = wgpuRenderPipelineGetBindGroupLayout(interactionPipeline, 0);
@@ -6662,7 +6679,7 @@ index 0000000..1c6d3af
 +                        ? nullptr   // iter-120 depth-fill record: prepass-only, no color group (would be a null-image bind)
 +                        : (r.sPad3 > 0)
 +                        ? getCinPassBindGroup(pn, r.sPad3 - 1u)
-+                        : getPassBindGroup(pn, g_passImagePtrs[i]);
++                        : getPassBindGroup(pn, g_passImagePtrs[i], r.pad3 == 1u);
 +                    if (lastPassGroups[pn]) wgpuBindGroupAddRef(lastPassGroups[pn]);
 +                    if (r.sPad3 > 0) {
 +                        static bool cinAnnounced = false;
@@ -8308,6 +8325,7 @@ index 0000000..1c6d3af
 +    uint32_t                matEvictCursor = 0;      // iter 42: round-robin eviction
 +    WGPUTextureView         fbFlatNormalView = nullptr;
 +    WGPUTextureView         fbWhiteView      = nullptr;
++    WGPUTextureView         fbClearView      = nullptr;   // iter-121 Bug C: transparent (0,0,0,0) fallback for missing 2D dynamic overlays
 +    WGPUTextureView         fbCheckerView    = nullptr;
 +    WGPUBindGroup           fbMatGroup       = nullptr;
 +    // Iter 8c: shader-pass (emissive/decal) echo. Records share the Rec
