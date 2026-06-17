@@ -4045,10 +4045,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..feb0b41
+index 0000000..883450d
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,4498 @@
+@@ -0,0 +1,4486 @@
 +/*
 +================================================================================
 +
@@ -4238,13 +4238,7 @@ index 0000000..feb0b41
 +            // CopySrc: iter 16's heat haze copies the canvas into its
 +            // _currentRender substitute between the final-pass halves.
 +            cfg.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc;
-+            // iter-124: force OPAQUE compositing (was _Auto). The dst-alpha gating fix
-+            // (iter-124) makes the framebuffer alpha a working MASK channel left at ~0
-+            // across most of the frame; under Auto a browser (notably Safari/WebKit) may
-+            // resolve to premultiplied compositing, where a ~0 alpha would blank the whole
-+            // canvas. Opaque guarantees the compositor IGNORES alpha on every browser, so
-+            // the alpha channel is purely internal — matching the GL backend (alpha:false).
-+            cfg.alphaMode = WGPUCompositeAlphaMode_Opaque;
++            cfg.alphaMode = WGPUCompositeAlphaMode_Auto;
 +            cfg.width = (uint32_t)w;
 +            cfg.height = (uint32_t)h;
 +            cfg.presentMode = WGPUPresentMode_Fifo;
@@ -4520,9 +4514,7 @@ index 0000000..feb0b41
 +
 +        WGPUColorTargetState target = {};
 +        target.format = surfaceFormat;
-+        // iter-124: RGB-only — main-view opaque/ambient pass must not write framebuffer
-+        // alpha (alpha is the maskcolor-only dst-alpha gate channel; see makeVariant).
-+        target.writeMask = (WGPUColorWriteMask)(WGPUColorWriteMask_Red | WGPUColorWriteMask_Green | WGPUColorWriteMask_Blue);
++        target.writeMask = WGPUColorWriteMask_All;
 +        WGPUBlendState blend = {};
 +        blend.color.srcFactor = WGPUBlendFactor_One; blend.color.dstFactor = WGPUBlendFactor_Zero;
 +        blend.alpha.srcFactor = WGPUBlendFactor_One; blend.alpha.dstFactor = WGPUBlendFactor_Zero;
@@ -4679,10 +4671,7 @@ index 0000000..feb0b41
 +
 +        WGPUColorTargetState target = {};
 +        target.format = surfaceFormat;
-+        // iter-124: RGB-only — the lit/interaction pass accumulates light additively and
-+        // must not write framebuffer alpha (else lit surfaces behind monitor GUIs leave
-+        // high alpha and the dst-alpha glass overlay reads it -> checkerboard).
-+        target.writeMask = (WGPUColorWriteMask)(WGPUColorWriteMask_Red | WGPUColorWriteMask_Green | WGPUColorWriteMask_Blue);
++        target.writeMask = WGPUColorWriteMask_All;
 +        WGPUBlendState blend = {};
 +        blend.color.srcFactor = WGPUBlendFactor_One; blend.color.dstFactor = WGPUBlendFactor_One;
 +        blend.alpha.srcFactor = WGPUBlendFactor_One; blend.alpha.dstFactor = WGPUBlendFactor_One;
@@ -4791,15 +4780,7 @@ index 0000000..feb0b41
 +        auto makeVariant = [&](WGPUBlendFactor src, WGPUBlendFactor dst,
 +                               bool depthWrite, WGPUCompareFunction depthCmp,
 +                               const char* label,
-+                               // iter-124: default to RGB-ONLY. Framebuffer alpha is a
-+                               // DEDICATED MASK CHANNEL written ONLY by passAlphaPrime
-+                               // (maskcolor, line ~791, WGPUColorWriteMask_Alpha). Every
-+                               // other pass must NOT touch alpha or it pollutes the
-+                               // dst-alpha gate (pad1=7/9) that monitor_glass2 + the weapon
-+                               // ammo grid read — that pollution is the console checkerboard
-+                               // + ammo grid-outside-mask + additive-flash black surround.
-+                               WGPUColorWriteMask writeMask =
-+                                   (WGPUColorWriteMask)(WGPUColorWriteMask_Red | WGPUColorWriteMask_Green | WGPUColorWriteMask_Blue)) -> WGPURenderPipeline {
++                               WGPUColorWriteMask writeMask = WGPUColorWriteMask_All) -> WGPURenderPipeline {
 +            WGPUDepthStencilState dss = {};
 +            dss.stencilReadMask = 0xFFu;   // zero-init = mask 0 = inert stencil (emdawnwebgpu passes masks verbatim); 0xFF not 0xFFFFFFFF — iOS WebKit rejects out-of-format mask bits
 +            dss.stencilWriteMask = 0xFFu;
@@ -7132,10 +7113,6 @@ index 0000000..feb0b41
 +    // haze (it then simply doesn't draw).
 +    void encodeRecordsPass(WGPUCommandEncoder enc, WGPUTextureView color, WGPUTextureView depth,
 +                           WGPUTexture colorTex = nullptr) {
-+        // iter-124: framebuffer-alpha clear value (default 0.0 = the dst-alpha gating fix;
-+        // set r_wgpuAlphaClear 1 to A/B the old polluted behaviour — the console
-+        // checkerboard returns). Mirror of r_wgpuAlphaClear (this file has no idCVar).
-+        extern float g_capWgpuAlphaClear;
 +        // Iter 14: render linked subviews (mirrors/monitors) into their
 +        // offscreen targets FIRST — the main view samples them.
 +        for (uint32_t g = 0; g < subGroupCount; ++g) {
@@ -7190,7 +7167,7 @@ index 0000000..feb0b41
 +                ca.view = subviewView[g];
 +                ca.loadOp = WGPULoadOp_Clear;
 +                ca.storeOp = WGPUStoreOp_Store;
-+                ca.clearValue = { 0.0, 0.0, 0.0, g_capWgpuAlphaClear };   // iter-124: alpha=0 gate baseline
++                ca.clearValue = { 0.0, 0.0, 0.0, 1.0 };
 +                ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
 +                WGPURenderPassDepthStencilAttachment da = {};
 +                da.view = subviewDepthView[g];
@@ -7277,7 +7254,18 @@ index 0000000..feb0b41
 +                uint32_t dfDrawn = 0;
 +                for (uint32_t i = 0; i < lastPassCount; ++i) {
 +                    const Rec& r = lastPassRecords[i];
-+                    if ((r.pad3 != 0u && r.pad3 != 4u) || r.sPad2 || r.pad0 != mvPrepass) continue;
++                    // iter-125: the pad3==0 prepass depth-fill is OPAQUE-only (pad1==1),
++                    // mirroring GL's RB_T_FillDepthBuffer which returns early on
++                    // MC_TRANSLUCENT. iter-81 filled EVERY pad3==0 pass record (sPad2 is
++                    // never set on pass records), so an in-world monitor's ~8 stacked
++                    // COPLANAR TRANSLUCENT GUI fills (bgwhite4/adminbg/circle2/fonts, pad1==3)
++                    // each wrote near-identical prepass depth; in the color pass (LessEqual,
++                    // depthWrite off) per-fragment float jitter then made some quads fail the
++                    // depth test and drop out -> solid BLACK BLOCKS over the GUI content +
++                    // a z-fight HATCH over the teal. View-dependent; GL never does this.
++                    // pad3==4 (iter-120 no-stage walls) + opaque pad1==1 material passes
++                    // still fill depth, so the iter-81/120 sky-leak fix is preserved.
++                    if (!((r.pad3 == 0u && r.pad1 == 1u) || r.pad3 == 4u) || r.sPad2 || r.pad0 != mvPrepass) continue;
 +                    if (!passDepthBindGroups[i]) continue;
 +                    if (r.pad3 == 4u) dfDrawn++;
 +                    wgpuRenderPassEncoderSetBindGroup(rp, 0, passDepthBindGroups[i], 0, nullptr);
@@ -7332,7 +7320,7 @@ index 0000000..feb0b41
 +            ca.view = color;
 +            ca.loadOp = WGPULoadOp_Clear;
 +            ca.storeOp = WGPUStoreOp_Store;
-+            ca.clearValue = { 0.0, 0.0, 0.0, g_capWgpuAlphaClear };   // iter-124: alpha=0 establishes the dst-alpha gate baseline on the swapchain
++            ca.clearValue = { 0.0, 0.0, 0.0, 1.0 };
 +            ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
 +            colorCleared = true;
 +            WGPURenderPassDepthStencilAttachment da = {};
@@ -7485,7 +7473,7 @@ index 0000000..feb0b41
 +            ca.view = color;
 +            ca.loadOp = colorCleared ? WGPULoadOp_Load : WGPULoadOp_Clear;
 +            ca.storeOp = WGPUStoreOp_Store;
-+            ca.clearValue = { 0.0, 0.0, 0.0, g_capWgpuAlphaClear };   // iter-124: cold-path alpha=0 gate baseline
++            ca.clearValue = { 0.0, 0.0, 0.0, 1.0 };
 +            ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
 +            WGPURenderPassDepthStencilAttachment da = {};
 +            da.view = depth;
@@ -7668,7 +7656,7 @@ index 0000000..feb0b41
 +                        fca.view = target;
 +                        fca.loadOp = load;
 +                        fca.storeOp = WGPUStoreOp_Store;
-+                        fca.clearValue = { 0.0, 0.0, 0.0, 0.0 };   // iter-124: offscreen bloom buffer, alpha irrelevant (samples .rgb)
++                        fca.clearValue = { 0.0, 0.0, 0.0, 1.0 };
 +                        fca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
 +                        WGPURenderPassDescriptor frpd = {};
 +                        frpd.colorAttachmentCount = 1;
@@ -8580,7 +8568,7 @@ index 0000000..0f9c8e6
 +    return nullptr;
 +}
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
-index 7914093..448dd99 100644
+index 7914093..7256514 100644
 --- a/neo/renderer/RenderSystem_init.cpp
 +++ b/neo/renderer/RenderSystem_init.cpp
 @@ -39,6 +39,11 @@ If you have questions concerning this license or the applicable additional terms
@@ -8595,7 +8583,7 @@ index 7914093..448dd99 100644
  
  #include "framework/GameCallbacks_local.h"
  #include "framework/Game.h"
-@@ -102,6 +107,37 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
+@@ -102,6 +107,36 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
  
  idCVar r_skipSuppress( "r_skipSuppress", "0", CVAR_RENDERER | CVAR_BOOL, "ignore the per-view suppressions" );
  idCVar r_skipPostProcess( "r_skipPostProcess", "0", CVAR_RENDERER | CVAR_BOOL, "skip all post-process renderings" );
@@ -8613,7 +8601,6 @@ index 7914093..448dd99 100644
 +// iter-121 DIAGNOSTIC toggles — live A/B the depth changes against combat-effect regressions.
 +idCVar r_wgpuDepthFill( "r_wgpuDepthFill", "1", CVAR_RENDERER | CVAR_BOOL, "iter-120: write pre-pass depth for opaque no-stage walls so they occlude the sky. 0 = off (LIVE; brings back holes but A/Bs whether depth-fill breaks translucent effects)" );
 +idCVar r_wgpuDecalBias( "r_wgpuDecalBias", "0", CVAR_RENDERER | CVAR_INTEGER, "iter-121: depthBias on translucent/decal pass pipelines vs iter-120 wall depth. Default 0 (REVERTED — -600 did not fix decals). Set e.g. -600 via boot arg + reload to re-test" );
-+idCVar r_wgpuAlphaClear( "r_wgpuAlphaClear", "0", CVAR_RENDERER | CVAR_FLOAT, "iter-124: framebuffer-alpha clear value. 0 = dst-alpha gating fix (monitor glass faint, ammo grid masked, additive-flash bg transparent). 1 = old polluted behaviour (console checkerboard) for live A/B" );
 +idCVar r_shadowDarken( "r_shadowDarken", "1.0", CVAR_RENDERER | CVAR_FLOAT, "WebGPU: multiply shadowed pixels by this factor (1 = off; Quest-style visible shadows)" );
 +idCVar r_bloomThreshold( "r_bloomThreshold", "0.5", CVAR_RENDERER | CVAR_FLOAT, "bloom bright-pass threshold (0..1)" );
 +idCVar r_bloomScale( "r_bloomScale", "1.25", CVAR_RENDERER | CVAR_FLOAT, "bloom intensity" );
@@ -8633,7 +8620,7 @@ index 7914093..448dd99 100644
  idCVar r_skipLightScale( "r_skipLightScale", "0", CVAR_RENDERER | CVAR_BOOL, "don't do any post-interaction light scaling, makes things dim on low-dynamic range cards" );
  idCVar r_skipInteractions( "r_skipInteractions", "0", CVAR_RENDERER | CVAR_BOOL, "skip all light/surface interaction drawing" );
  idCVar r_skipDynamicTextures( "r_skipDynamicTextures", "0", CVAR_RENDERER | CVAR_BOOL, "don't dynamically create textures" );
-@@ -158,6 +194,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
+@@ -158,6 +193,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
  idCVar r_useExternalShadows( "r_useExternalShadows", "1", CVAR_RENDERER | CVAR_INTEGER, "1 = skip drawing caps when outside the light volume, 2 = force to no caps for testing", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
  idCVar r_useOptimizedShadows( "r_useOptimizedShadows", "1", CVAR_RENDERER | CVAR_BOOL, "use the dmap generated static shadow volumes" );
  idCVar r_useScissor( "r_useScissor", "1", CVAR_RENDERER | CVAR_BOOL, "scissor clip as portals and lights are processed" );
@@ -8641,7 +8628,7 @@ index 7914093..448dd99 100644
  idCVar r_useCombinerDisplayLists( "r_useCombinerDisplayLists", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "put all nvidia register combiner programming in display lists" );
  idCVar r_useDepthBoundsTest( "r_useDepthBoundsTest", "1", CVAR_RENDERER | CVAR_BOOL, "use depth bounds test to reduce shadow fill" );
  
-@@ -819,11 +856,63 @@ void R_InitOpenGL( void ) {
+@@ -819,11 +855,63 @@ void R_InitOpenGL( void ) {
  		r_multiSamples.SetInteger( 0 );
  	}
  
@@ -8705,7 +8692,7 @@ index 7914093..448dd99 100644
  
  #include "renderer/qgl_proc.h"
  
-@@ -2505,6 +2594,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
+@@ -2505,6 +2593,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
  	// is destroyed (relevant when starting a mod which also recreates window)
  	Sys_ShutdownInput();
  
@@ -10206,7 +10193,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..dc87e39 100644
+index c83ebb5..6888f93 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -10232,7 +10219,7 @@ index c83ebb5..dc87e39 100644
  
  /*
  
-@@ -38,6 +50,1099 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,1098 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -10431,7 +10418,6 @@ index c83ebb5..dc87e39 100644
 +    int      g_capWgpuSingleLight = -1;   // debug: backend draws only this lightId
 +    float    g_capShadowDarken = 0.6f;    // Quest-style shadow darkening factor (1 = off)
 +    int      g_capWgpuDecalBias = -600;   // iter-121: plain mirror of r_wgpuDecalBias (backend has no idCVar)
-+    float    g_capWgpuAlphaClear = 0.0f;  // iter-124: framebuffer-alpha clear value mirror of r_wgpuAlphaClear (0 = dst-alpha gating fix; 1 = old polluted/checkerboard)
 +    // Iter 28: WebGPU GPU-memory diet (iOS Safari kills the tab on total GPU
 +    // memory). Budget/dim-cap for the backend's texture cache + det-test gate.
 +    int      g_capTexBudgetMB = 0;        // 0 = unlimited
@@ -11332,7 +11318,7 @@ index c83ebb5..dc87e39 100644
  
  /*
  =================
-@@ -49,6 +1154,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +1153,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -11348,7 +11334,7 @@ index c83ebb5..dc87e39 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +1192,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +1191,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -11364,7 +11350,7 @@ index c83ebb5..dc87e39 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1239,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1238,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -11381,7 +11367,7 @@ index c83ebb5..dc87e39 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1299,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1298,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -11389,7 +11375,7 @@ index c83ebb5..dc87e39 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1526,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1525,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -11402,7 +11388,7 @@ index c83ebb5..dc87e39 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1695,74 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1694,73 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
@@ -11418,7 +11404,6 @@ index c83ebb5..dc87e39 100644
 +		g_capBloomScale = r_bloomScale.GetFloat();
 +		g_capWgpuSingleLight = r_wgpuSingleLight.GetInteger();
 +		{ extern idCVar r_wgpuDecalBias; g_capWgpuDecalBias = r_wgpuDecalBias.GetInteger(); }
-+		{ extern idCVar r_wgpuAlphaClear; g_capWgpuAlphaClear = r_wgpuAlphaClear.GetFloat(); }
 +	// Iter 49: publish the view position/angles for the diag UI — user
 +	// screenshots then carry teleportable coordinates (setviewpos x y z yaw).
 +	{
