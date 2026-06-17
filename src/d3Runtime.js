@@ -840,6 +840,14 @@ function buildArguments(config) {
     ...(wantWebGPU(typeof window !== "undefined" ? window.location.search : "")
         && !/[?&]softparticles=1\b/.test(typeof window !== "undefined" ? window.location.search : "")
         ? ["+set", "r_useSoftParticles", "0"] : []),
+    // iter-121 DIAGNOSTIC toggles (URL params — A/B the depth changes vs the
+    // combat-effect regressions on the glasses, where the console is hard):
+    //   ?nodepthfill        → r_wgpuDepthFill 0  (disable iter-120 wall depth-fill)
+    //   ?decalbias=<n>      → r_wgpuDecalBias n  (e.g. 0 = no decal bias)
+    ...(/[?&]nodepthfill\b/.test(typeof window !== "undefined" ? window.location.search : "")
+        ? ["+set", "r_wgpuDepthFill", "0"] : []),
+    ...(((m) => m ? ["+set", "r_wgpuDecalBias", m[1]] : [])(
+        /[?&]decalbias=(-?\d+)\b/.exec(typeof window !== "undefined" ? window.location.search : ""))),
     // Iter 28: WebGPU GPU-memory diet. iOS Safari kills the whole TAB when
     // total GPU memory tips over (the "82% Starting DOOM 3" crash: WebGL
     // context lost + GPUDevice.createBindGroup InvalidStateError during the
