@@ -1628,7 +1628,16 @@ async function start() {
     wireFxPanel();
     // Show the on-screen movement pad on the touch/wearable profile (desktop has a
     // keyboard). It lives on the left so the right stays clear for head-aiming.
-    if (runtimeConfig.inputMode === "wearable" && refs.moveControls && !onGlasses) {
+    // iter-126: iPhone/iPad NEED the D-pad — wearable inputMode unbinds the
+    // keyboard/mouse, and unlike the Ray-Ban glasses (head-tracked movement) iOS
+    // has no gesture movement, so without the pad the player literally can't walk.
+    // The ≤640px `onGlasses` heuristic (main.js) wrongly classed iPhone as glasses
+    // and hid it. Show it on iOS regardless; the real glasses (Android wv) stay
+    // clean with no on-screen pad. The debug UI stays hidden on iPhone (unchanged).
+    const isIOSTouch = /iPad|iPhone|iPod/.test(navigator.userAgent)
+      || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1); // iPadOS desktop-mode
+    if (refs.moveControls &&
+        (isIOSTouch || (runtimeConfig.inputMode === "wearable" && !onGlasses))) {
       refs.moveControls.hidden = false;
     }
     startEnemyIndicatorPolling();
