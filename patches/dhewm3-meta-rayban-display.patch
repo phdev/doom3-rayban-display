@@ -1830,10 +1830,10 @@ index 0000000..4b45b72
 +#endif // __D3_WEARABLE_H__
 diff --git a/neo/game/D3Wearable.cpp b/neo/game/D3Wearable.cpp
 new file mode 100644
-index 0000000..c0957e5
+index 0000000..d9e252e
 --- /dev/null
 +++ b/neo/game/D3Wearable.cpp
-@@ -0,0 +1,296 @@
+@@ -0,0 +1,308 @@
 +/*
 +===========================================================================
 +
@@ -1884,6 +1884,18 @@ index 0000000..c0957e5
 +	}
 +
 +	if ( !candidate->IsType( idAI::Type ) )
++	{
++		return false;
++	}
++
++	// A monster that has not been revealed yet must never be auto-targeted.
++	// enpro spawns most of its monsters HIDDEN (spawnArgs "hide" "1") and
++	// trigger-shows them later; idAI::Hide() also makes them non-solid, so the
++	// D3_WearableCanSee trace passes straight through to the hidden actor's
++	// origin and reports it "visible" — which made the gun auto-fire at an imp
++	// that is not on screen yet. Skip hidden actors so auto-fire only engages
++	// monsters the player can actually see.
++	if ( candidate->IsHidden() )
 +	{
 +		return false;
 +	}
@@ -9696,7 +9708,7 @@ index c1d0d3e..b24e36d 100644
  ==================
  R_ReloadARBPrograms_f
 diff --git a/neo/renderer/draw_common.cpp b/neo/renderer/draw_common.cpp
-index 0cabbfd..439ed4d 100644
+index 0cabbfd..b09ba70 100644
 --- a/neo/renderer/draw_common.cpp
 +++ b/neo/renderer/draw_common.cpp
 @@ -30,10 +30,29 @@ If you have questions concerning this license or the applicable additional terms
@@ -9785,7 +9797,34 @@ index 0cabbfd..439ed4d 100644
  			// draw it
  			RB_DrawElementsWithCounters( tri );
  
-@@ -1175,6 +1219,12 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
+@@ -1095,6 +1139,26 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
+ 			if ( pStage->vertexColor != SVC_IGNORE ) {
+ 				qglDisableClientState( GL_COLOR_ARRAY );
+ 			}
++
++			// WebGPU echo: the soft-particle GL path above has no capture
++			// equivalent, so under r_skipGLDraw 1 (WebGPU-primary) these
++			// particles — the imp fireball body (impfireball2.prt), its
++			// explosion (imp_explosion.prt) and other soft .prt models —
++			// drew nothing and were invisible/black. Replay them through the
++			// captured pass path: the blend bits classify to the right pipeline
++			// (alpha -> passAlpha, additive -> passAdd) and pStage->vertexColor
++			// (SVC_MODULATE) applies the per-particle fade that
++			// idParticleStage::ParticleColors baked into the vertex colors.
++			// The stage rgb tint comes from the registers, exactly like the old
++			// stages below. Only the depth soft-fade at intersections is lost
++			// (cosmetic). GLS_DEPTHFUNC_ALWAYS above only changes depth-compare,
++			// not the blend bits, so the classifier is unaffected.
++			color[0] = regs[pStage->color.registers[0]];
++			color[1] = regs[pStage->color.registers[1]];
++			color[2] = regs[pStage->color.registers[2]];
++			color[3] = regs[pStage->color.registers[3]];
++			D3_WebGPU_CapturePassStage( surf, tri, pStage, color );
++
+ 			continue;
+ 		}
+ 
+@@ -1175,6 +1239,12 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
  
  		RB_PrepareStageTexturing( pStage, surf, ac );
  
@@ -9798,7 +9837,7 @@ index 0cabbfd..439ed4d 100644
  		// draw it
  		RB_DrawElementsWithCounters( tri );
  
-@@ -1305,7 +1355,9 @@ static void RB_T_Shadow( const drawSurf_t *surf ) {
+@@ -1305,7 +1375,9 @@ static void RB_T_Shadow( const drawSurf_t *surf ) {
  
  	tri = surf->geo;
  
@@ -9808,7 +9847,7 @@ index 0cabbfd..439ed4d 100644
  		return;
  	}
  
-@@ -1345,6 +1397,16 @@ static void RB_T_Shadow( const drawSurf_t *surf ) {
+@@ -1345,6 +1417,16 @@ static void RB_T_Shadow( const drawSurf_t *surf ) {
  		qglDepthBoundsEXT( surf->scissorRect.zmin, surf->scissorRect.zmax );
  	}
  
@@ -9825,7 +9864,7 @@ index 0cabbfd..439ed4d 100644
  	// debug visualization
  	if ( r_showShadows.GetInteger() ) {
  		if ( r_showShadows.GetInteger() == 3 ) {
-@@ -1568,6 +1630,18 @@ static void RB_T_BlendLight( const drawSurf_t *surf ) {
+@@ -1568,6 +1650,18 @@ static void RB_T_BlendLight( const drawSurf_t *surf ) {
  		qglTexGenfv( GL_S, GL_OBJECT_PLANE, lightProject[3].ToFloatPtr() );
  	}
  
@@ -9844,7 +9883,7 @@ index 0cabbfd..439ed4d 100644
  	// this gets used for both blend lights and shadow draws
  	if ( tri->ambientCache ) {
  		idDrawVert	*ac = (idDrawVert *)vertexCache.Position( tri->ambientCache );
-@@ -1630,6 +1704,11 @@ static void RB_BlendLight( const drawSurf_t *drawSurfs,  const drawSurf_t *drawS
+@@ -1630,6 +1724,11 @@ static void RB_BlendLight( const drawSurf_t *drawSurfs,  const drawSurf_t *drawS
  
  		GL_SelectTexture( 0 );
  		stage->texture.image->Bind();
@@ -9856,7 +9895,7 @@ index 0cabbfd..439ed4d 100644
  
  		if ( stage->texture.hasMatrix ) {
  			RB_LoadShaderTextureMatrix( regs, &stage->texture );
-@@ -1700,6 +1779,28 @@ local[0] = local[1] = local[2] = 0; local[3] = 0.5;
+@@ -1700,6 +1799,28 @@ local[0] = local[1] = local[2] = 0; local[3] = 0.5;
  		qglTexGenfv( GL_S, GL_OBJECT_PLANE, local.ToFloatPtr() );
  	}
  
@@ -9885,7 +9924,7 @@ index 0cabbfd..439ed4d 100644
  	RB_T_RenderTriangleSurface( surf );
  }
  
-@@ -1758,6 +1859,8 @@ static void RB_FogPass( const drawSurf_t *drawSurfs,  const drawSurf_t *drawSurf
+@@ -1758,6 +1879,8 @@ static void RB_FogPass( const drawSurf_t *drawSurfs,  const drawSurf_t *drawSurf
  	// texture 0 is the falloff image
  	GL_SelectTexture( 0 );
  	globalImages->fogImage->Bind();
@@ -9894,7 +9933,7 @@ index 0cabbfd..439ed4d 100644
  	//GL_Bind( tr.whiteImage );
  	qglDisableClientState( GL_TEXTURE_COORD_ARRAY );
  	qglEnable( GL_TEXTURE_GEN_S );
-@@ -1851,10 +1954,15 @@ void RB_STD_FogAllLights( void ) {
+@@ -1851,10 +1974,15 @@ void RB_STD_FogAllLights( void ) {
  			// units from the origin
  			backEnd.currentScissor = vLight->scissorRect;
  			if ( r_useScissor.GetBool() ) {
@@ -9914,7 +9953,7 @@ index 0cabbfd..439ed4d 100644
  			}
  			qglClear( GL_STENCIL_BUFFER_BIT );
  
-@@ -1903,10 +2011,15 @@ void RB_STD_LightScale( void ) {
+@@ -1903,10 +2031,15 @@ void RB_STD_LightScale( void ) {
  
  	// the scissor may be smaller than the viewport for subviews
  	if ( r_useScissor.GetBool() ) {
@@ -10129,7 +10168,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..2c6588d 100644
+index c83ebb5..4487699 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -10155,7 +10194,7 @@ index c83ebb5..2c6588d 100644
  
  /*
  
-@@ -38,6 +50,1068 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,1085 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -10913,6 +10952,23 @@ index c83ebb5..2c6588d 100644
 +	}
 +	if ( tri->numVerts <= 0 || tri->numIndexes <= 0 ) { WGPU_PASS_REJECT("empty-tri"); return; }
 +	if ( tri->numVerts > kWGPUMaxCaptureVerts || tri->numIndexes > kWGPUMaxCaptureIndexes ) { WGPU_PASS_REJECT("too-big"); return; }
++	// Vertex-color probe (d3cmd r_wgpuSingleLight 995): dump the captured
++	// per-vertex color of each pass stage. Used to diagnose the black-opaque
++	// smoke (mechanism 2): a particle's fade lives in its vertex color, so if
++	// these bytes read near-black with high alpha the fade isn't surviving
++	// capture; if they vary plausibly the issue is GPU-side, not the data.
++	if ( g_capWgpuSingleLight == 995 ) {
++		const byte* c0 = capVerts[0].color;
++		const byte* cm = capVerts[tri->numVerts / 2].color;
++		char vbuf[256];
++		idStr::snPrintf( vbuf, sizeof(vbuf),
++			"[d3] vcProbe mat=%s nv=%d svc=%d v0=(%d,%d,%d,%d) vmid=(%d,%d,%d,%d)",
++			surf && surf->material ? surf->material->GetName() : "?",
++			tri->numVerts, (int)pStage->vertexColor,
++			(int)c0[0], (int)c0[1], (int)c0[2], (int)c0[3],
++			(int)cm[0], (int)cm[1], (int)cm[2], (int)cm[3] );
++		EM_ASM_({ console.info( UTF8ToString($0) ); }, vbuf);
++	}
 +	// Iter 13b: sky cube stages — capture with the stashed per-vertex dirs.
 +	const WGPUSkyStash* skyStash = nullptr;
 +	if ( pStage->texture.texgen == TG_SKYBOX_CUBE || pStage->texture.texgen == TG_WOBBLESKY_CUBE ) {
@@ -11224,7 +11280,7 @@ index c83ebb5..2c6588d 100644
  
  /*
  =================
-@@ -49,6 +1123,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +1140,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -11240,7 +11296,7 @@ index c83ebb5..2c6588d 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +1161,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +1178,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -11256,7 +11312,7 @@ index c83ebb5..2c6588d 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1208,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1225,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -11273,7 +11329,7 @@ index c83ebb5..2c6588d 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1268,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1285,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -11281,7 +11337,7 @@ index c83ebb5..2c6588d 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1495,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1512,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -11294,7 +11350,7 @@ index c83ebb5..2c6588d 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1664,73 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1681,73 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
