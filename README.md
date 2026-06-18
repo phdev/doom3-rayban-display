@@ -1,10 +1,8 @@
 # DOOM 3 — Meta Ray-Ban Display
 
-<p align="center">
-  <video src="https://github.com/phdev/doom3-rayban-display/raw/main/docs/doom3-rayban-display-demo.mp4" controls muted playsinline width="640"></video>
-</p>
+[![DOOM 3 — Meta Ray-Ban Display gameplay preview](public/media/demo-preview.gif)](https://phdev.github.io/doom3-rayban-display/media/doom3-rayban-display-demo.mp4)
 
-> ▶ If the inline player doesn't load, [watch the demo here](https://github.com/phdev/doom3-rayban-display/raw/main/docs/doom3-rayban-display-demo.mp4).
+[Watch the MP4 demo](https://phdev.github.io/doom3-rayban-display/media/doom3-rayban-display-demo.mp4)
 
 **Runs on iOS Safari and mobile Chrome** (via WebGPU) — as well as desktop
 Chrome / Safari and the Meta Ray-Ban Display.
@@ -16,6 +14,8 @@ Neural Band pinch gestures + W3C `DeviceOrientationEvent` head-turning for input
 and streams a reduced first-level (`maps/game/enpro`, the Enpro Plant) so it
 loads fast on a wearable.
 
+📺 **[Full development breakdown on X →](https://x.com/peterhowell/status/2067729471852212437?s=20)**
+
 **It is not glasses-only.** It's a standard web app that runs in any modern
 browser with WebGPU — **mobile Safari (iOS) and mobile Chrome (Android)** on
 phones, and desktop Chrome / Safari — and falls back to WebGL2 (GL4ES) where
@@ -25,8 +25,7 @@ It is the DOOM 3 sibling of
 [glquake2-rayban-display](https://github.com/phdev/glquake2-rayban-display) and
 follows the same architecture: a Vite web shell, an engine source **patch**, and
 a local packaging workflow. It boots into the level and renders the 3D world —
-industrial geometry, per-pixel lighting, stencil shadows — at ~50–60 fps on real
-GPU hardware.
+industrial geometry, per-pixel lighting, stencil shadows.
 
 ---
 
@@ -182,7 +181,8 @@ the browser. Highlights of what this fork adds on top of stock dhewm3:
 - A **reduced display pak** contains only the assets `maps/game/enpro` references
   (built by `scripts/reduce-d3-map-pk4.py` — a decl-aware closure over the map).
 - Unused monsters that never spawn in enpro (cacodemon/spectre/skeleton) are
-  stripped. Current download: **~17.7 MB boot + ~2.7 MB streamed geometry**.
+  stripped. Current download: **~13 MB boot pak + ~2.7 MB streamed geometry**
+  (the monolith `?noareastream` fallback is ~23 MB).
 
 ### Wearable / glasses build
 - **Clean UI on the glasses**: the debug readout, log/copy buttons, fx panel, and
@@ -209,6 +209,7 @@ the browser. Highlights of what this fork adds on top of stock dhewm3:
 | Param | Effect |
 |---|---|
 | `?pak=<url>` | Base URL for the paks (required when hosting externally). |
+| `?cb=<n>` | Cache-bust: force a fresh download of the engine + paks (use a new value each time — for a WebView that caches aggressively). |
 | `?backend=gl` | Force the GL4ES (WebGL2) renderer instead of WebGPU. |
 | `?echo` | Render GL + WebGPU side-by-side (debug). |
 | `?noareastream` / `?nostream` | Load the monolith (everything at boot, no geometry streaming). |
@@ -245,8 +246,9 @@ CI (`.github/workflows/deploy-pages.yml`) rebuilds it from the patch and bundles
 - `scripts/bake-area-stream.sh` + `scripts/pack-area-stream.py` — split the
   binary render geometry into the boot region + the per-area stream blob.
 - `scripts/chunk-pk4.py` — chunk a pak for HTTP-friendly fetching.
-- `scripts/upload-paks-to-r2.sh` — push `public/wasm/{base,base-stream,base256}`
-  to a Cloudflare R2 bucket.
+- `scripts/upload-paks-to-pages.sh` — deploy `public/wasm/{base,base-stream}`
+  (+ CORS `_headers`) to Cloudflare Pages (what the reference deploy uses).
+  `scripts/upload-paks-to-r2.sh` is the R2 equivalent.
 
 You must own DOOM 3 and supply your own PK4s; this repo ships no game data.
 
