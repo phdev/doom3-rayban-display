@@ -4126,10 +4126,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..883450d
+index 0000000..c95ddd9
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,4486 @@
+@@ -0,0 +1,4496 @@
 +/*
 +================================================================================
 +
@@ -4692,6 +4692,14 @@ index 0000000..883450d
 +        sd.addressModeW = WGPUAddressMode_Repeat;
 +        sd.maxAnisotropy = 16;   // iter 45b: GL parity (image_anisotropy 16; aniso-1 fattened oblique detail)
 +        demoSampler = wgpuDeviceCreateSampler(device, &sd);
++        // iter-130: ClampToEdge variant for CLAMP pass textures (idImage::repeat
++        // != TR_REPEAT — GUI panels/glows, decals). Same Linear/aniso settings;
++        // only the address mode differs. Without it those textures wrap under the
++        // REPEAT demoSampler and smear past their quad (weapon ammo-glow ghosting).
++        sd.addressModeU = WGPUAddressMode_ClampToEdge;
++        sd.addressModeV = WGPUAddressMode_ClampToEdge;
++        sd.addressModeW = WGPUAddressMode_ClampToEdge;
++        clampSampler = wgpuDeviceCreateSampler(device, &sd);
 +
 +        // Bind group — texture.wgsl expects uniform@0 sampler@1 texture@2
 +        WGPUBindGroupLayout bgl = wgpuRenderPipelineGetBindGroupLayout(demoPipeline, 0);
@@ -5675,7 +5683,7 @@ index 0000000..883450d
 +
 +    // Iter 8c: bind group for a shader-pass record slot — texture.wgsl
 +    // group(0) = uniform + sampler + texture. Cached per (slot, image).
-+    WGPUBindGroup getPassBindGroup(uint32_t slot, const void* imgPtr, bool clearFallback = false) {
++    WGPUBindGroup getPassBindGroup(uint32_t slot, const void* imgPtr, bool clearFallback = false, bool clamp = false) {
 +        for (uint32_t i = 0; i < passBGCacheCount; ++i) {
 +            if (passBGCache[i].slot == slot && passBGCache[i].img == imgPtr) {
 +                return passBGCache[i].group;
@@ -5690,7 +5698,7 @@ index 0000000..883450d
 +        WGPUTextureView view = getEngineTextureView(imgPtr, clearFallback ? fbClearView : fbWhiteView);
 +        WGPUBindGroupEntry e[3] = {};
 +        e[0].binding = 0; e[0].buffer = passUBuf; e[0].offset = (uint64_t)slot * kUBStride; e[0].size = 128;
-+        e[1].binding = 1; e[1].sampler = demoSampler;
++        e[1].binding = 1; e[1].sampler = ( clamp && clampSampler ) ? clampSampler : demoSampler;   // iter-130
 +        e[2].binding = 2; e[2].textureView = view;
 +        WGPUBindGroupDescriptor bgd = {};
 +        bgd.layout = passBGL;
@@ -6575,6 +6583,7 @@ index 0000000..883450d
 +        {
 +            extern Rec      g_passRecords[];
 +            extern void*    g_passImagePtrs[];
++            extern unsigned char g_passImageClamp[];   // iter-130: 1 = bind ClampToEdge
 +            extern uint32_t g_passRecordCount;
 +            uint32_t pTotal = (g_passRecordCount < kMaxRecordSlots) ? g_passRecordCount : kMaxRecordSlots;
 +            uint32_t pn = 0;
@@ -6787,7 +6796,7 @@ index 0000000..883450d
 +                        ? nullptr   // iter-120 depth-fill record: prepass-only, no color group (would be a null-image bind)
 +                        : (r.sPad3 > 0)
 +                        ? getCinPassBindGroup(pn, r.sPad3 - 1u)
-+                        : getPassBindGroup(pn, g_passImagePtrs[i], false);   // iter-121 Bug C REVERTED: back to white fallback (transparent fallback didn't fix the white flash + suspected in ammo-counter regression)
++                        : getPassBindGroup(pn, g_passImagePtrs[i], false, g_passImageClamp[i] != 0u);   // iter-130: bind ClampToEdge for CLAMP textures (weapon ammo-glow ghosting); iter-121 Bug C REVERTED: white fallback
 +                    if (lastPassGroups[pn]) wgpuBindGroupAddRef(lastPassGroups[pn]);
 +                    if (r.sPad3 > 0) {
 +                        static bool cinAnnounced = false;
@@ -8367,6 +8376,7 @@ index 0000000..883450d
 +    WGPUBuffer              demoUniformBuf   = nullptr;
 +    WGPUTexture             demoTexture      = nullptr;
 +    WGPUSampler             demoSampler      = nullptr;
++    WGPUSampler             clampSampler     = nullptr;   // iter-130: ClampToEdge for clamp pass textures
 +    WGPUBindGroup           demoBindGroup    = nullptr;
 +    // Iter 4/7b: interaction.wgsl pipeline (DOOM 3 lit pass, additive)
 +    WGPURenderPipeline      interactionPipeline = nullptr;
@@ -10274,7 +10284,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..6888f93 100644
+index c83ebb5..3e1143c 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -10300,7 +10310,7 @@ index c83ebb5..6888f93 100644
  
  /*
  
-@@ -38,6 +50,1098 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,1108 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -10390,6 +10400,13 @@ index c83ebb5..6888f93 100644
 +    // vert/index accumulators below.
 +    WGPUInteractionRecord g_passRecords[kWGPUMaxRecords];
 +    void*    g_passImagePtrs[kWGPUMaxRecords];
++    // iter-130: per-record texture clamp flag. 1 = the stage image is a CLAMP
++    // texture (idImage::repeat != TR_REPEAT — GUI panels/glows, decals, etc.), so
++    // the WebGPU backend must bind a ClampToEdge sampler instead of the default
++    // REPEAT one. Without it, a clamp GUI texture (e.g. the weapon ammo-display
++    // glow) WRAPS under the REPEAT sampler and tiles/smears past its quad = white
++    // ghosting on the outside of the panel. World walls stay TR_REPEAT -> 0 -> tile.
++    unsigned char g_passImageClamp[kWGPUMaxRecords];
 +    uint32_t g_passRecordCount = 0;
 +    // Iter 6: multi-surface accumulator. draw_arb2.cpp appends here.
 +    WGPUInteractionRecord g_capRecords[kWGPUMaxRecords];
@@ -11231,6 +11248,8 @@ index c83ebb5..6888f93 100644
 +		r.lightFalloffS[3] = (float)( surf->scissorRect.y2 + 1 - surf->scissorRect.y1 );
 +	}
 +	g_passImagePtrs[g_passRecordCount] = (void*)img;
++	// iter-130: flag CLAMP textures so the backend binds ClampToEdge, not REPEAT.
++	g_passImageClamp[g_passRecordCount] = ( img && img->repeat != TR_REPEAT ) ? 1u : 0u;
 +	g_capVertBytes  += vR;
 +	g_capIndexBytes += iR;
 +	g_passRecordCount++;
@@ -11319,6 +11338,7 @@ index c83ebb5..6888f93 100644
 +	r.pad3  = 4u;     // depth-fill sentinel: prepass-only, never drawn as color
 +	r.sPad2 = 0u;     // opaque (writes depth)
 +	g_passImagePtrs[g_passRecordCount] = NULL;
++	g_passImageClamp[g_passRecordCount] = 0u;   // iter-130: no image -> default REPEAT path
 +	g_passRecordCount++;
 +}
 +
@@ -11399,7 +11419,7 @@ index c83ebb5..6888f93 100644
  
  /*
  =================
-@@ -49,6 +1153,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +1163,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -11415,7 +11435,7 @@ index c83ebb5..6888f93 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +1191,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +1201,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -11431,7 +11451,7 @@ index c83ebb5..6888f93 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1238,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1248,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -11448,7 +11468,7 @@ index c83ebb5..6888f93 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1298,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1308,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -11456,7 +11476,7 @@ index c83ebb5..6888f93 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1525,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1535,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -11469,7 +11489,7 @@ index c83ebb5..6888f93 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1694,73 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1704,73 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  

@@ -30,7 +30,45 @@ const PAK_BASE = resolvePakBase();
 // which iOS Safari otherwise caches across deploys (so engine rebuilds never load).
 // Injected by Vite (define); falls back to a constant in dev.
 const ENGINE_VER = (typeof __ENGINE_VER__ !== "undefined") ? __ENGINE_VER__ : "dev";
-const bustCache = (url) => `${url}${url.includes("?") ? "&" : "?"}v=${ENGINE_VER}`;
+// User-facing cache-buster: a ?cb=<anything> on the PAGE url flows through to the
+// fixed-name engine fetches (dhewm3.js/.wasm/.data) so a stale glasses/WebView
+// cache can be force-busted from the URL alone. The page URL being unique busts
+// the cached HTML; this then busts the engine artifacts the new HTML loads. The
+// pak is intentionally NOT busted here (it rarely changes and is ~16MB). Use a
+// DIFFERENT cb each visit (e.g. ?cb=2, ?cb=3) to defeat an aggressive cache.
+const URL_CB = (typeof window !== "undefined")
+  ? (new URLSearchParams(window.location.search).get("cb") || "") : "";
+const bustCache = (url) =>
+  `${url}${url.includes("?") ? "&" : "?"}v=${ENGINE_VER}${URL_CB ? `&cb=${encodeURIComponent(URL_CB)}` : ""}`;
+
+// iter-131: when ?cb=<x> is on the page URL, force the LEVEL DATA (pak / stream /
+// area-stream / chunk manifests + chunks) to re-download too — a stale or
+// partial glasses/WebView cache otherwise serves old (or no) levels. The pak
+// lives on its own host (Cloudflare); the engine artifacts use bustCache above.
+// Done via a scoped fetch wrapper so every pak fetch path is covered without
+// threading cb through each call site, and ONLY when cb is set (normal loads
+// keep the ~16MB pak cached). The pak is large, so use cb only to force-refresh.
+if (URL_CB && typeof window !== "undefined" && typeof window.fetch === "function") {
+  let pakOrigin = null;
+  try { pakOrigin = new URL(PAK_BASE, window.location.href).origin; } catch { /* relative base */ }
+  const _origFetch = window.fetch.bind(window);
+  window.fetch = (input, init) => {
+    try {
+      const raw = (typeof input === "string") ? input : (input && input.url);
+      if (raw) {
+        const u = new URL(raw, window.location.href);
+        // Bust pak-host requests AND any same-origin /wasm-or-base-style pak path
+        // (covers the localhost ?pak=.../wasm/ dev case too).
+        if ((pakOrigin && u.origin === pakOrigin) || /\.(pk4|stream|manifest\.json)(\?|$)/.test(u.pathname) || /\/base(-stream|256)?\//.test(u.pathname)) {
+          u.searchParams.set("cb", URL_CB);
+          const busted = u.toString();
+          input = (typeof input === "string") ? busted : new Request(busted, input);
+        }
+      }
+    } catch { /* fall through to original */ }
+    return _origFetch(input, init);
+  };
+}
 
 // iOS detection (iPhone/iPad/iPod, incl. iPadOS desktop-mode which reports
 // MacIntel + touch points). Used by the com_fixedTic policy below.
