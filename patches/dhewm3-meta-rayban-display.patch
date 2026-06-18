@@ -1830,10 +1830,10 @@ index 0000000..4b45b72
 +#endif // __D3_WEARABLE_H__
 diff --git a/neo/game/D3Wearable.cpp b/neo/game/D3Wearable.cpp
 new file mode 100644
-index 0000000..d9e252e
+index 0000000..82b468f
 --- /dev/null
 +++ b/neo/game/D3Wearable.cpp
-@@ -0,0 +1,308 @@
+@@ -0,0 +1,338 @@
 +/*
 +===========================================================================
 +
@@ -1867,6 +1867,13 @@ index 0000000..d9e252e
 +#define D3_WEARABLE_AUTOFIRE_DOT		0.9063078f	// cos(25 degrees)
 +#define D3_WEARABLE_VIEW_HALF_ANGLE		35.0f
 +#define D3_WEARABLE_REAR_BOTH_ANGLE		160.0f
++// iter-127: close-range auto-fire robustness. A monster in the player's face
++// FILLS the view, so its center can sit well outside the tight 25-degree cone
++// (a small positional offset is a large ANGULAR one at point-blank). Treat any
++// hostile within CLOSE_RANGE that is in the front-ish hemisphere (>= CLOSE_DOT)
++// and visible as a valid auto-fire target regardless of the precise cone.
++#define D3_WEARABLE_CLOSE_RANGE			160.0f		// "in your face" / melee-lunge distance
++#define D3_WEARABLE_CLOSE_DOT			0.5f		// cos(60 degrees): front-ish hemisphere
 +
 +static float
 +D3_Normalize180( float angle )
@@ -1942,8 +1949,18 @@ index 0000000..d9e252e
 +static idEntity *
 +D3_WearableFindCenterEnemy( idPlayer *player, const idVec3 &eye, const idVec3 &forward )
 +{
++	// Far targets: precise 25-degree cone, pick the most-centered.
 +	idEntity *best = NULL;
 +	float best_dot = D3_WEARABLE_AUTOFIRE_DOT;
++
++	// iter-127: close targets get priority. A hostile inside CLOSE_RANGE that is
++	// roughly in front (>= CLOSE_DOT) and visible is the imminent threat even if
++	// it falls outside the tight cone, so track the NEAREST one and prefer it.
++	// Firing only presses BUTTON_ATTACK along `forward`, so any non-NULL return
++	// means "fire" — keeping the gun shooting when something lunges into the
++	// player's face instead of going silent because the monster left the cone.
++	idEntity *close_best = NULL;
++	float close_best_dist = D3_WEARABLE_CLOSE_RANGE + 1.0f;
 +
 +	for ( int i = 0; i < MAX_GENTITIES; i++ )
 +	{
@@ -1958,13 +1975,26 @@ index 0000000..d9e252e
 +		idVec3 dir = target - eye;
 +		float dist = dir.Normalize();
 +
-+		if ( ( dist <= 1.0f ) || ( dist > D3_WEARABLE_ENEMY_RANGE ) )
++		if ( ( dist <= 0.5f ) || ( dist > D3_WEARABLE_ENEMY_RANGE ) )
 +		{
 +			continue;
 +		}
 +
 +		float dot = dir * forward;
 +
++		// Close-range threat: front-ish hemisphere + visible -> valid target
++		// regardless of the tight aim cone. Nearest wins.
++		if ( ( dist < D3_WEARABLE_CLOSE_RANGE ) && ( dot >= D3_WEARABLE_CLOSE_DOT ) )
++		{
++			if ( ( dist < close_best_dist ) && D3_WearableCanSee( player, candidate, eye, target ) )
++			{
++				close_best = candidate;
++				close_best_dist = dist;
++			}
++			continue;
++		}
++
++		// Far-range: precise cone, most-centered.
 +		if ( dot < best_dot )
 +		{
 +			continue;
@@ -1979,7 +2009,7 @@ index 0000000..d9e252e
 +		best_dot = dot;
 +	}
 +
-+	return best;
++	return close_best ? close_best : best;
 +}
 +
 +static idEntity *
@@ -2175,6 +2205,22 @@ index 0000000..bd37bff
 +#endif // __EMSCRIPTEN__
 +
 +#endif // __D3_WEARABLE_GAME_H__
+diff --git a/neo/game/Entity.cpp b/neo/game/Entity.cpp
+index 451aaa8..8211e36 100644
+--- a/neo/game/Entity.cpp
++++ b/neo/game/Entity.cpp
+@@ -5206,7 +5206,10 @@ void idAnimatedEntity::AddLocalDamageEffect( jointHandle_t jointNum, const idVec
+ 	if ( *splat == '\0' ) {
+ 		splat = def->dict.RandomPrefix( key, gameLocal.random );
+ 	}
+-	if ( *splat != '\0' ) {
++	// iter-127: g_bloodSplats gates blood thrown onto the WORLD (walls/floor).
++	// Off by default in this build — the on-actor wound overlay + blood spurt
++	// below still play, so enemies still bleed; the environment just stays clean.
++	if ( *splat != '\0' && g_bloodSplats.GetBool() ) {
+ 		gameLocal.BloodSplat( origin, dir, 64.0f, splat );
+ 	}
+ 
 diff --git a/neo/game/Game_local.cpp b/neo/game/Game_local.cpp
 index 1fca78f..f69d1a1 100644
 --- a/neo/game/Game_local.cpp
@@ -2924,10 +2970,10 @@ index 105ff57..e4b3f00 100644
  	cmdSystem->AddCommand( "sayTeam",				Cmd_SayTeam_f,				CMD_FL_GAME,				"team text chat" );
  	cmdSystem->AddCommand( "addChatLine",			Cmd_AddChatLine_f,			CMD_FL_GAME,				"internal use - core to game chat lines" );
 diff --git a/neo/game/gamesys/SysCvar.cpp b/neo/game/gamesys/SysCvar.cpp
-index 824d9c2..42c0adc 100644
+index 824d9c2..0659543 100644
 --- a/neo/game/gamesys/SysCvar.cpp
 +++ b/neo/game/gamesys/SysCvar.cpp
-@@ -97,6 +97,7 @@ idCVar r_aspectRatio(				"r_aspectRatio",			"-1",			CVAR_RENDERER | CVAR_INTEGER
+@@ -97,10 +97,12 @@ idCVar r_aspectRatio(				"r_aspectRatio",			"-1",			CVAR_RENDERER | CVAR_INTEGER
  
  idCVar g_cinematic(					"g_cinematic",				"1",			CVAR_GAME | CVAR_BOOL, "skips updating entities that aren't marked 'cinematic' '1' during cinematics" );
  idCVar g_cinematicMaxSkipTime(		"g_cinematicMaxSkipTime",	"600",			CVAR_GAME | CVAR_FLOAT, "# of seconds to allow game to run when skipping cinematic.  prevents lock-up when cinematic doesn't end.", 0, 3600 );
@@ -2935,8 +2981,13 @@ index 824d9c2..42c0adc 100644
  
  idCVar g_muzzleFlash(				"g_muzzleFlash",			"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "show muzzle flashes" );
  idCVar g_projectileLights(			"g_projectileLights",		"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "show dynamic lights on projectiles" );
+ idCVar g_bloodEffects(				"g_bloodEffects",			"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "show blood splats, sprays and gibs" );
++idCVar g_bloodSplats(				"g_bloodSplats",			"0",			CVAR_GAME | CVAR_BOOL, "iter-127: throw blood-splat decals onto environment surfaces (walls/floor) when an actor is hit. 0 (default in this build) keeps blood off the world; on-actor wound overlays, sprays/gibs (g_bloodEffects) and bullet-hole decals (g_decals) are unaffected" );
+ idCVar g_doubleVision(				"g_doubleVision",			"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "show double vision when taking damage" );
+ idCVar g_hitEffect(					"g_hitEffect",				"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "mess up player camera when taking damage" );
+ idCVar g_monsters(					"g_monsters",				"1",			CVAR_GAME | CVAR_BOOL, "" );
 diff --git a/neo/game/gamesys/SysCvar.h b/neo/game/gamesys/SysCvar.h
-index a4883b5..095506b 100644
+index a4883b5..233abca 100644
 --- a/neo/game/gamesys/SysCvar.h
 +++ b/neo/game/gamesys/SysCvar.h
 @@ -35,6 +35,7 @@ extern idCVar	developer;
@@ -2947,6 +2998,14 @@ index a4883b5..095506b 100644
  
  extern idCVar	r_aspectRatio;
  
+@@ -46,6 +47,7 @@ extern idCVar	g_gravity;
+ extern idCVar	g_skipFX;
+ extern idCVar	g_skipParticles;
+ extern idCVar	g_bloodEffects;
++extern idCVar	g_bloodSplats;
+ extern idCVar	g_projectileLights;
+ extern idCVar	g_doubleVision;
+ extern idCVar	g_hitEffect;
 diff --git a/neo/idlib/MapFile.cpp b/neo/idlib/MapFile.cpp
 index afbfa1d..cf83f9d 100644
 --- a/neo/idlib/MapFile.cpp
