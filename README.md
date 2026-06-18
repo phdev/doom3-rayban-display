@@ -1,5 +1,14 @@
 # DOOM 3 — Meta Ray-Ban Display
 
+<p align="center">
+  <video src="https://github.com/phdev/doom3-rayban-display/raw/main/docs/doom3-rayban-display-demo.mp4" controls muted playsinline width="640"></video>
+</p>
+
+> ▶ If the inline player doesn't load, [watch the demo here](https://github.com/phdev/doom3-rayban-display/raw/main/docs/doom3-rayban-display-demo.mp4).
+
+**Runs on iOS Safari and mobile Chrome** (via WebGPU) — as well as desktop
+Chrome / Safari and the Meta Ray-Ban Display.
+
 An open-source [dhewm3](https://github.com/dhewm/dhewm3) (DOOM 3, GPL idTech4)
 build compiled to WebAssembly and rendered with a **custom WebGPU backend**,
 packaged as a web app shell for the **Meta Ray-Ban Display**. It uses Meta
