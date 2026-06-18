@@ -2222,7 +2222,7 @@ index 451aaa8..8211e36 100644
  	}
  
 diff --git a/neo/game/Game_local.cpp b/neo/game/Game_local.cpp
-index 1fca78f..f69d1a1 100644
+index 1fca78f..5935183 100644
 --- a/neo/game/Game_local.cpp
 +++ b/neo/game/Game_local.cpp
 @@ -27,6 +27,10 @@ If you have questions concerning this license or the applicable additional terms
@@ -2585,7 +2585,24 @@ index 1fca78f..f69d1a1 100644
  void idGameLocal::SpawnMapEntities( void ) {
  	int			i;
  	int			num;
-@@ -3960,9 +4265,30 @@ void idGameLocal::SetCamera( idCamera *cam ) {
+@@ -3878,6 +4183,16 @@ void idGameLocal::ProjectDecal( const idVec3 &origin, const idVec3 &dir, float d
+ 	idFixedWinding winding;
+ 	idVec3 windingOrigin, projectionOrigin;
+ 
++	// iter-128: honor g_decals for ALL projected world decals (bullet holes /
++	// mtr_detonate impacts, scorch, etc.). Stock dhewm3 gates only the
++	// AddDamageEffect overlay on g_decals; the projectile-impact decals went
++	// straight to ProjectDecal ungated, so g_decals 0 never cleared bullet holes.
++	// Default g_decals is 0 in this build (clean environment); set g_decals 1 to
++	// restore. On-actor wound overlays + blood spurts are separate and unaffected.
++	if ( !g_decals.GetBool() ) {
++		return;
++	}
++
+ 	static idVec3 decalWinding[4] = {
+ 		idVec3(  1.0f,  1.0f, 0.0f ),
+ 		idVec3( -1.0f,  1.0f, 0.0f ),
+@@ -3960,9 +4275,30 @@ void idGameLocal::SetCamera( idCamera *cam ) {
  	}
  
  	camera = cam;
@@ -2970,10 +2987,10 @@ index 105ff57..e4b3f00 100644
  	cmdSystem->AddCommand( "sayTeam",				Cmd_SayTeam_f,				CMD_FL_GAME,				"team text chat" );
  	cmdSystem->AddCommand( "addChatLine",			Cmd_AddChatLine_f,			CMD_FL_GAME,				"internal use - core to game chat lines" );
 diff --git a/neo/game/gamesys/SysCvar.cpp b/neo/game/gamesys/SysCvar.cpp
-index 824d9c2..0659543 100644
+index 824d9c2..510f360 100644
 --- a/neo/game/gamesys/SysCvar.cpp
 +++ b/neo/game/gamesys/SysCvar.cpp
-@@ -97,10 +97,12 @@ idCVar r_aspectRatio(				"r_aspectRatio",			"-1",			CVAR_RENDERER | CVAR_INTEGER
+@@ -97,14 +97,16 @@ idCVar r_aspectRatio(				"r_aspectRatio",			"-1",			CVAR_RENDERER | CVAR_INTEGER
  
  idCVar g_cinematic(					"g_cinematic",				"1",			CVAR_GAME | CVAR_BOOL, "skips updating entities that aren't marked 'cinematic' '1' during cinematics" );
  idCVar g_cinematicMaxSkipTime(		"g_cinematicMaxSkipTime",	"600",			CVAR_GAME | CVAR_FLOAT, "# of seconds to allow game to run when skipping cinematic.  prevents lock-up when cinematic doesn't end.", 0, 3600 );
@@ -2986,6 +3003,11 @@ index 824d9c2..0659543 100644
  idCVar g_doubleVision(				"g_doubleVision",			"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "show double vision when taking damage" );
  idCVar g_hitEffect(					"g_hitEffect",				"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "mess up player camera when taking damage" );
  idCVar g_monsters(					"g_monsters",				"1",			CVAR_GAME | CVAR_BOOL, "" );
+-idCVar g_decals(					"g_decals",					"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "show decals such as bullet holes" );
++idCVar g_decals(					"g_decals",					"0",			CVAR_GAME | CVAR_BOOL, "iter-128: show world decals such as bullet holes / mtr_detonate impacts + scorch. DEFAULT 0 in this build = clean environment (no bullet holes on walls); set g_decals 1 to restore. ARCHIVE removed so it is deterministic per boot. On-actor wounds + blood spurts are separate" );
+ idCVar g_knockback(					"g_knockback",				"1000",			CVAR_GAME | CVAR_INTEGER, "" );
+ idCVar g_skill(						"g_skill",					"1",			CVAR_GAME | CVAR_INTEGER, "" );
+ idCVar g_nightmare(					"g_nightmare",				"0",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "if nightmare mode is allowed" );
 diff --git a/neo/game/gamesys/SysCvar.h b/neo/game/gamesys/SysCvar.h
 index a4883b5..233abca 100644
 --- a/neo/game/gamesys/SysCvar.h

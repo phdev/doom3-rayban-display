@@ -997,6 +997,12 @@ function buildAutoexecConfig(config) {
     `seta r_gamma "${getNumericConfig(config.rGamma, 1.1)}"`,
     `seta r_brightness "${getNumericConfig(config.rBrightness, 1)}"`,
     `seta r_lightScale "${getNumericConfig(config.rLightScale, 2)}"`,
+    // iter-128: clean environment — no blood splats and no bullet-hole / impact
+    // decals on the world. Pinned in autoexec (execs last) so a persisted
+    // DoomConfig.cfg can never re-enable them. Set g_decals 1 / g_bloodSplats 1
+    // in the console to restore. On-actor wounds + blood spurts are unaffected.
+    "seta g_bloodSplats \"0\"",
+    "seta g_decals \"0\"",
     // Iter 31: PIN shadows here, not just in the +set args. r_shadows is
     // CVAR_ARCHIVE, and the engine's first-run sysDetect path (which fires
     // EVERY boot — /save is MEMFS, so the _spec.cfg marker never persists)
