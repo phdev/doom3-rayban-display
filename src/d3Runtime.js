@@ -100,6 +100,24 @@ const computeFixedTic = (config) => {
 // on desktop). Both ship as same-origin 4MB chunk sets (GitHub release
 // assets send no CORS headers, so cross-origin hosting is a dead end).
 const HD_TIER = (typeof window !== "undefined") && /[?&]hd\b/.test(window.location.search);
+// iter-132: throttled background GPU-texture pre-warm budget (images/frame).
+// With image_preload 0 the wearable CPU-decodes the level at load but creates
+// each GPU texture lazily on first DRAW (unthrottled) — a multi-second per-view
+// stall that reads black on the weak glasses GPU. A small per-frame budget
+// pre-creates the off-screen textures in the background (no new CPU decode; GPU
+// residency stays under the 80MB budget), so the level fully textures in ~1-3s
+// smoothly. On for the wearable 96px tier only — NOT ?hd (its 256px set nears
+// the budget where the no-LRU cap would drop to black) and not desktop (it has
+// the headroom + everything-at-boot). ?preload=N overrides anywhere (0 = off).
+const computePreloadPerFrame = (config) => {
+  const m = /[?&]preload=(\d+)\b/.exec(typeof window !== "undefined" ? window.location.search : "");
+  if (m) return m[1];
+  return (config.inputMode === "wearable" && !HD_TIER) ? "16" : "0";
+};
+const computePreloadMs = (config) => {
+  const m = /[?&]preloadms=(\d+)\b/.exec(typeof window !== "undefined" ? window.location.search : "");
+  return m ? m[1] : "6";
+};
 // Iter 55/56: progressive texture streaming is now the DEFAULT. The deferred
 // BOOT pak (structural + HUD/light textures, ~35MB) loads first; the bulk world/
 // model textures (~13MB gzip) stream in after boot, popping from gray-lit to
@@ -899,6 +917,15 @@ function buildArguments(config) {
         String((() => { const m = /[?&]texdim=(\d+)\b/.exec(typeof window !== "undefined" ? window.location.search : "");
                         return m ? Number(m[1]) : (config.inputMode === "wearable" ? 128 : 0); })()),
     "+set", "r_wgpuDetTest", config.inputMode === "wearable" ? "0" : "1",
+    // iter-132: throttled background GPU-texture pre-warm. With image_preload 0
+    // the wearable creates each GPU texture lazily on first DRAW — an unthrottled
+    // per-view burst that reads black on the weak glasses GPU until it finishes.
+    // r_wgpuPreloadPerFrame>0 pre-creates the off-screen textures N/frame in the
+    // background (no new CPU decode; GPU residency stays under r_wgpuTexBudgetMB),
+    // so the level fully textures in ~1-3s smoothly. On for the wearable 96px
+    // tier only. ?preload=N / ?preloadms=N override (0 disables for A/B).
+    "+set", "r_wgpuPreloadPerFrame", computePreloadPerFrame(config),
+    "+set", "r_wgpuPreloadMsPerFrame", computePreloadMs(config),
     // Skip ROQ cinematic decoding. The RoQ decoder calls a null function pointer
     // in this WASM build (idCinematicLocal::ImageForTime, reached from
     // RB_BindVariableStageImage when a surface has a video texture), which traps

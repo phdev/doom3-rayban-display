@@ -4126,10 +4126,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..c95ddd9
+index 0000000..4afb71e
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,4496 @@
+@@ -0,0 +1,4567 @@
 +/*
 +================================================================================
 +
@@ -4271,6 +4271,13 @@ index 0000000..c95ddd9
 +// evicts these from its GPU caches at the next drain so the real texture
 +// replaces the stale gray _default.
 +extern "C" { extern const void* g_capReuploadPtrs[]; extern int g_capReuploadCount; extern int g_capReuploadAll; }
++// iter-132: throttled background GPU-texture pre-warm (see preloadSweep). The
++// budget mirrors r_wgpuPreloadPerFrame; the by-index accessors enumerate the
++// CPU image cache (the backend otherwise has only by-ptr lookup).
++extern "C" int g_capPreloadPerFrame;
++extern "C" int g_capPreloadMsPerFrame;
++extern "C" int D3_WebGPU_CachedImageCount( void );
++extern "C" const void* D3_WebGPU_CachedImagePtr( int i );
 +
 +// ─── Backend class ──────────────────────────────────────────────────────────
 +
@@ -4420,6 +4427,10 @@ index 0000000..c95ddd9
 +                return;
 +            }
 +        }
++        // iter-132: background GPU-texture pre-warm — runs only on frames we're
++        // about to present (past the iter-30 submit-skip), so each warmed batch
++        // is flushed by this frame's QueueSubmit. No-op unless r_wgpuPreloadPerFrame>0.
++        preloadSweep();
 +        if (surface && demoPipeline) {
 +            WGPUSurfaceTexture st;
 +            wgpuSurfaceGetCurrentTexture(surface, &st);
@@ -6033,6 +6044,62 @@ index 0000000..c95ddd9
 +            }, slot->name, slot->w, slot->h, p[0], p[1], p[2], p[3]);
 +        }
 +        return view;
++    }
++
++    // iter-132: throttled background GPU-texture pre-warm. With image_preload 0
++    // (the wearable/glasses profile) the level's textures are CPU-decoded at
++    // EndLevelLoad but each GPU texture is created lazily on first DRAW in
++    // getEngineTextureView above — an unthrottled per-view burst (box-filter mip
++    // chain + writeTexture) that reads black-until-decoded on the weak glasses
++    // GPU. This sweep pre-creates them N/frame over the ALREADY-decoded CPU image
++    // cache, so the level fully textures in ~1-3s smoothly. It calls only
++    // getEngineTextureView — NO new CPU decode (the cache is already populated),
++    // so it cannot re-trigger the iter-79 decode flood; the full enpro set is
++    // ~62.5MB < the 80MB budget at the 96px tier, so the no-LRU budget never
++    // trips. Visible textures keep priority (the lazy-on-Bind path is unchanged;
++    // this only fills the off-screen remainder so looking around no longer
++    // stalls). Off unless r_wgpuPreloadPerFrame > 0. Placed after the iter-30
++    // submit-skip so each warmed batch is flushed by this frame's QueueSubmit.
++    void preloadSweep() {
++        if ( g_capPreloadPerFrame <= 0 ) return;
++        const int total = D3_WebGPU_CachedImageCount();
++        if ( preloadCursor >= total ) {
++            if ( total <= preloadSeenCount ) return;   // caught up; nothing new decoded
++            preloadCursor = preloadSeenCount;          // warm only the freshly-decoded tail
++        }
++        // Soft cap: never spend the last of the GPU budget pre-warming off-screen
++        // images — a visible texture must still be able to allocate. (Won't
++        // trigger at the 96px tier; defends ?hd / a mis-estimate against the
++        // no-LRU budget's permanent fallback-to-black.)
++        const size_t softCap = ( g_capTexBudgetMB > 0 )
++            ? ( ( (size_t)g_capTexBudgetMB << 20 ) / 10u ) * 9u
++            : (size_t)-1;
++        const double t0 = emscripten_get_now();
++        int made = 0;
++        while ( preloadCursor < total && made < g_capPreloadPerFrame ) {
++            if ( gpuTexBytes >= softCap ) { preloadCursor = total; break; }
++            const void* ptr = D3_WebGPU_CachedImagePtr( preloadCursor++ );
++            if ( !ptr ) continue;
++            const int before = texCacheCount;
++            getEngineTextureView( ptr, fbWhiteView );  // creates+caches if decodable; self-skips cached/defaulted
++            if ( texCacheCount > before ) {
++                ++made;
++                if ( g_capPreloadMsPerFrame > 0 &&
++                     emscripten_get_now() - t0 >= (double)g_capPreloadMsPerFrame ) break;
++            }
++        }
++        if ( preloadCursor >= total ) preloadSeenCount = total;
++        if ( made > 0 ) {
++            EM_ASM_({ window.__d3PreloadWarm = $0; window.__d3PreloadTotal = $1; }, texCacheCount, total);
++            // Log "complete" each time the cursor catches up to a LARGER cache than
++            // last reported — the boot-HUD images cache first (tiny total) and
++            // EndLevelLoad fills the cache to the full set moments later, so a plain
++            // once-only flag would report the premature boot total, not the real one.
++            if ( preloadCursor >= total && total > preloadLoggedTotal ) {
++                EM_ASM_({ console.info("[d3] WebGPU texture pre-warm complete: " + $0 + " of " + $1 + " GPU textures cached"); }, texCacheCount, total);
++                preloadLoggedTotal = total;
++            }
++        }
 +    }
 +
 +    // Iter 7b: material bind group (@group(1)) per unique 5-image tuple.
@@ -8441,6 +8508,10 @@ index 0000000..c95ddd9
 +    int                     matCacheCount = 0;
 +    size_t                  gpuTexBytes = 0;     // iter 28: bytes resident in texCache (incl. mips)
 +    int                     gpuTexDropped = 0;   // iter 28: images denied by r_wgpuTexBudgetMB
++    // iter-132: background GPU-texture pre-warm cursor (see preloadSweep).
++    int                     preloadCursor = 0;       // next CPU-cache index to consider
++    int                     preloadSeenCount = 0;    // cache count already fully covered
++    int                     preloadLoggedTotal = 0;  // last cache size we logged "complete" for
 +    uint32_t                lastPublishedShadowVols = 0xFFFFFFFFu;   // iter 31: diag shadow state
 +    // Iter 30: delta-upload mirrors (CPU copy of last-uploaded accumulator
 +    // contents; uploads send only changed 256KB chunks).
@@ -8659,7 +8730,7 @@ index 0000000..0f9c8e6
 +    return nullptr;
 +}
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
-index 7914093..7256514 100644
+index 7914093..14dc1af 100644
 --- a/neo/renderer/RenderSystem_init.cpp
 +++ b/neo/renderer/RenderSystem_init.cpp
 @@ -39,6 +39,11 @@ If you have questions concerning this license or the applicable additional terms
@@ -8674,7 +8745,7 @@ index 7914093..7256514 100644
  
  #include "framework/GameCallbacks_local.h"
  #include "framework/Game.h"
-@@ -102,6 +107,36 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
+@@ -102,6 +107,46 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
  
  idCVar r_skipSuppress( "r_skipSuppress", "0", CVAR_RENDERER | CVAR_BOOL, "ignore the per-view suppressions" );
  idCVar r_skipPostProcess( "r_skipPostProcess", "0", CVAR_RENDERER | CVAR_BOOL, "skip all post-process renderings" );
@@ -8700,6 +8771,16 @@ index 7914093..7256514 100644
 +idCVar r_wgpuTexBudgetMB( "r_wgpuTexBudgetMB", "0", CVAR_RENDERER | CVAR_INTEGER, "WebGPU texture-cache GPU byte budget in MB (0 = unlimited); over-budget images bind a fallback instead of crashing the device" );
 +idCVar r_wgpuTexMaxDim( "r_wgpuTexMaxDim", "0", CVAR_RENDERER | CVAR_INTEGER, "WebGPU texture-cache max dimension (0 = uncapped); larger cached images are box-reduced before GPU upload" );
 +idCVar r_wgpuDetTest( "r_wgpuDetTest", "1", CVAR_RENDERER | CVAR_BOOL, "run the WebGPU determinism self-test (extra offscreen targets + readback buffers; disable on memory-tight devices)" );
++// iter-132: throttled background GPU-texture pre-warm. With image_preload 0
++// (wearable) the level's textures are CPU-decoded at load but each GPU texture
++// is created lazily on first DRAW (getEngineTextureView) — an unthrottled
++// per-view burst (box-filter mip chain + writeTexture) that reads black on the
++// weak glasses GPU. This budget pre-creates up to N already-decoded images'
++// GPU textures per frame in the background (NO new CPU decode; full enpro set
++// ~62.5MB < the 80MB budget at the 96px tier), so the level fully textures in
++// ~1-3s smoothly instead of stalling per look. 0 = off (desktop / ?hd 256px).
++idCVar r_wgpuPreloadPerFrame( "r_wgpuPreloadPerFrame", "0", CVAR_RENDERER | CVAR_INTEGER, "WebGPU: background-pre-warm up to N already-decoded images' GPU textures per frame (0 = off; the wearable 96px profile sets it)" );
++idCVar r_wgpuPreloadMsPerFrame( "r_wgpuPreloadMsPerFrame", "6", CVAR_RENDERER | CVAR_INTEGER, "WebGPU: per-frame wall-time cap (ms) for the background texture pre-warm sweep" );
 +// Iter 29: BFG-presentation specular. Verified against the id-Software
 +// DOOM-3-BFG source: BFG replaced the 2004 specular table (zero below
 +// N·H 0.75, then (4(x-.75))²) with analytic pow(N·H, 10) — broader, always-
@@ -8711,7 +8792,7 @@ index 7914093..7256514 100644
  idCVar r_skipLightScale( "r_skipLightScale", "0", CVAR_RENDERER | CVAR_BOOL, "don't do any post-interaction light scaling, makes things dim on low-dynamic range cards" );
  idCVar r_skipInteractions( "r_skipInteractions", "0", CVAR_RENDERER | CVAR_BOOL, "skip all light/surface interaction drawing" );
  idCVar r_skipDynamicTextures( "r_skipDynamicTextures", "0", CVAR_RENDERER | CVAR_BOOL, "don't dynamically create textures" );
-@@ -158,6 +193,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
+@@ -158,6 +203,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
  idCVar r_useExternalShadows( "r_useExternalShadows", "1", CVAR_RENDERER | CVAR_INTEGER, "1 = skip drawing caps when outside the light volume, 2 = force to no caps for testing", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
  idCVar r_useOptimizedShadows( "r_useOptimizedShadows", "1", CVAR_RENDERER | CVAR_BOOL, "use the dmap generated static shadow volumes" );
  idCVar r_useScissor( "r_useScissor", "1", CVAR_RENDERER | CVAR_BOOL, "scissor clip as portals and lights are processed" );
@@ -8719,7 +8800,7 @@ index 7914093..7256514 100644
  idCVar r_useCombinerDisplayLists( "r_useCombinerDisplayLists", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "put all nvidia register combiner programming in display lists" );
  idCVar r_useDepthBoundsTest( "r_useDepthBoundsTest", "1", CVAR_RENDERER | CVAR_BOOL, "use depth bounds test to reduce shadow fill" );
  
-@@ -819,11 +855,63 @@ void R_InitOpenGL( void ) {
+@@ -819,11 +865,63 @@ void R_InitOpenGL( void ) {
  		r_multiSamples.SetInteger( 0 );
  	}
  
@@ -8783,7 +8864,7 @@ index 7914093..7256514 100644
  
  #include "renderer/qgl_proc.h"
  
-@@ -2505,6 +2593,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
+@@ -2505,6 +2603,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
  	// is destroyed (relevant when starting a mod which also recreates window)
  	Sys_ShutdownInput();
  
@@ -10284,7 +10365,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..3e1143c 100644
+index c83ebb5..3876abb 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -10310,7 +10391,7 @@ index c83ebb5..3e1143c 100644
  
  /*
  
-@@ -38,6 +50,1108 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,1123 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -10525,6 +10606,11 @@ index c83ebb5..3e1143c 100644
 +    // classic specular LUT (zero below N·H 0.75) with analytic pow(N·H,10),
 +    // which is most of its visible floor/wall sheen.
 +    float    g_capBfgSpec = 1.0f;
++    // iter-132: throttled background GPU-texture pre-warm budget (plain mirror of
++    // r_wgpuPreloadPerFrame / r_wgpuPreloadMsPerFrame — the backend has no idCVar
++    // access). 0 = off.
++    int      g_capPreloadPerFrame = 0;
++    int      g_capPreloadMsPerFrame = 6;
 +}
 +
 +// Boot-speed: route a labelled millisecond timing to the browser console
@@ -10785,6 +10871,16 @@ index c83ebb5..3e1143c 100644
 +        if ( g_imgCache[i].ptr == img ) return &g_imgCache[i];
 +    }
 +    return nullptr;
++}
++
++// iter-132: by-index enumeration of the CPU image cache so the WebGPU backend's
++// background pre-warm sweep (preloadSweep) can walk the already-decoded images
++// and pre-create their GPU textures N/frame — it otherwise has only by-ptr
++// lookup. Returns the opaque idImage* the backend feeds back to
++// getEngineTextureView; null past the end.
++extern "C" int D3_WebGPU_CachedImageCount( void ) { return g_imgCacheCount; }
++extern "C" const void* D3_WebGPU_CachedImagePtr( int i ) {
++    return ( i >= 0 && i < g_imgCacheCount ) ? g_imgCache[i].ptr : nullptr;
 +}
 +
 +// Iter 8c: capture a plain textured shader-pass stage (emissive lamp,
@@ -11419,7 +11515,7 @@ index c83ebb5..3e1143c 100644
  
  /*
  =================
-@@ -49,6 +1163,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +1178,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -11435,7 +11531,7 @@ index c83ebb5..3e1143c 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +1201,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +1216,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -11451,7 +11547,7 @@ index c83ebb5..3e1143c 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1248,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1263,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -11468,7 +11564,7 @@ index c83ebb5..3e1143c 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1308,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1323,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -11476,7 +11572,7 @@ index c83ebb5..3e1143c 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1535,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1550,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -11489,7 +11585,7 @@ index c83ebb5..3e1143c 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1704,73 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1719,76 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
@@ -11528,6 +11624,9 @@ index c83ebb5..3e1143c 100644
 +		g_capDetTest = r_wgpuDetTest.GetBool() ? 1u : 0u;
 +		extern idCVar r_bfgSpecular;
 +		g_capBfgSpec = r_bfgSpecular.GetBool() ? 1.0f : 0.0f;
++		extern idCVar r_wgpuPreloadPerFrame, r_wgpuPreloadMsPerFrame;
++		g_capPreloadPerFrame = r_wgpuPreloadPerFrame.GetInteger();
++		g_capPreloadMsPerFrame = r_wgpuPreloadMsPerFrame.GetInteger();
 +	}
 +	// Iter 6.6: the multi-surface accumulator is intentionally NOT reset
 +	// here. RB_BeginDrawingView runs once per VIEW (main view, lightgem,
