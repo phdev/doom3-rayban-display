@@ -1003,6 +1003,13 @@ function buildAutoexecConfig(config) {
     // in the console to restore. On-actor wounds + blood spurts are unaffected.
     "seta g_bloodSplats \"0\"",
     "seta g_decals \"0\"",
+    // iter-129: no on-screen damage overlay. g_hitEffect gates ALL of
+    // idPlayerView::DamageImpulse — the full-screen double-vision flash (samples
+    // the _scratch capture target, which the WebGPU port renders as an opaque
+    // WHITE quad), the mtr_blob damage splat, AND the view-kick. Off = clean view
+    // on hit (the HUD health still shows damage); the view-shake removal is a plus
+    // on a head-mounted display. g_hitEffect 1 restores all of it.
+    "seta g_hitEffect \"0\"",
     // Iter 31: PIN shadows here, not just in the +set args. r_shadows is
     // CVAR_ARCHIVE, and the engine's first-run sysDetect path (which fires
     // EVERY boot — /save is MEMFS, so the _spec.cfg marker never persists)
