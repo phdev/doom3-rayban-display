@@ -181,8 +181,8 @@ the browser. Highlights of what this fork adds on top of stock dhewm3:
 - A **reduced display pak** contains only the assets `maps/game/enpro` references
   (built by `scripts/reduce-d3-map-pk4.py` — a decl-aware closure over the map).
 - Unused monsters that never spawn in enpro (cacodemon/spectre/skeleton) are
-  stripped. Current download: **~13 MB boot pak + ~2.7 MB streamed geometry**
-  (the monolith `?noareastream` fallback is ~23 MB).
+  stripped. Current download: **~17.7 MB boot pak + ~2.7 MB streamed geometry**
+  (~20 MB to first-playable; the monolith `?noareastream` fallback is ~23 MB).
 
 ### Wearable / glasses build
 - **Clean UI on the glasses**: the debug readout, log/copy buttons, fx panel, and
