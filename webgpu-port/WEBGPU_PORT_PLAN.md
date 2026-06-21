@@ -1,155 +1,174 @@
-# DOOM 3 → WebGPU port plan
+# DOOM 3 → WebGPU port — status
 
-## Why this exists
+> **STATUS (2026-06): SHIPPED. WebGPU is the PRIMARY renderer.**
+> The bare app URL renders the 3D world entirely through the hand-written WebGPU
+> backend; GL4ES (WebGL2) is now only the fallback for browsers without WebGPU.
+> The original chunky-tile problem this port set out to solve is **fixed and
+> proven** on a physical iPhone. The phased "abstraction-migration" plan below
+> (Phases 4–8, the ~6-month estimate) was **superseded** by a capture/replay
+> approach that turned out far more tractable — see "What actually got built."
 
-iOS Safari WebGL's chunky-tile artifact (whole-scene per-pixel intensity drift in the additive lit pass + visible tile corruption on specific surfaces) survived every shader-level / cvar / context-attribute / texture-cap fix we tried over a multi-hour session. The Web Inspector recording proved the engine's WebGL command stream is deterministic — the bug lives in Apple's WebGL→Metal translation layer, below WebGL. The Phase 3 WebGPU validation (commit `4df6580`, `wall.html`) rendered a clean lit brick wall via WebGPU on the same iPhone with NO chunky-tile artifact, confirming that going around the WebGL→Metal path via WebGPU is a real solution.
+## Why this exists (still accurate)
 
-## Where we are right now
+iOS Safari WebGL's chunky-tile artifact (whole-scene per-pixel intensity drift in
+the additive lit pass + tile corruption on specific surfaces) survived every
+shader-level / cvar / context-attribute / texture-cap fix over a multi-hour
+session. The bug lives in Apple's WebGL→Metal translation layer, below WebGL.
+WebGPU goes around that layer. **This was confirmed conclusively** (see the
+determinism self-test below): on a physical iPhone, the WebGPU path produces
+byte-identical frames where the GL path flickers — so the chunky-tile bug is a
+GL→GL4ES→WebGL→Metal stack defect, and the WebGPU port is the production fix.
 
-| Phase | Status | Output |
+## What actually got built (architecture)
+
+The shipped port is **NOT** the planned `RenderBackend` abstraction that migrates
+all 809 GL call sites one-by-one. Instead it is a **capture / replay ("echo")**
+architecture, which let WebGPU be built and validated *alongside* the working GL
+path without rewriting every draw call:
+
+- **Capture (CPU side, `tr_render.cpp` + `draw_arb2.cpp` + `draw_common.cpp`):**
+  the existing engine render loop runs, and a set of `D3_WebGPU_Capture*` hooks
+  record each frame's draw data into CPU-side accumulators — lit-pass
+  interactions (geometry + per-light/material uniforms + image pointers), stencil
+  shadow volumes, emissive/shader-stage passes, fog, blend lights, sky cube dirs,
+  subview links, heat-haze stages, 2D GUI records, and a per-`idImage` pixel cache.
+- **Replay (GPU side, `RenderBackend_WebGPU.cpp`, ~4k lines):** at `EndFrame` the
+  backend drains the accumulators, uploads geometry/uniforms/textures, and replays
+  everything through WGSL pipelines (`webgpu-port/shaders/*.wgsl`, embedded into
+  the wasm by `scripts/embed_wgsl.py`).
+- **Cutover:** `?backend=webgpu` (now the **default** for the bare URL, iter 70)
+  promotes the WebGPU canvas to the fullscreen game view and sets `r_skipGLDraw 1`
+  so the GL `RB_DrawElements*` calls early-return (the capture hooks have already
+  run). The engine still *computes* the GL path's vertex data (the capture reads
+  it) but no longer *draws* it.
+- **`?echo`** keeps both canvases side-by-side — the permanent A/B harness that
+  was used to verify parity throughout, and **`?backend=gl`** forces the pure
+  GL4ES path.
+
+Shaders are **hand-written WGSL** matching the engine's ARB programs (not the
+planned 60-shader RBDOOM-3-BFG HLSL→SPIR-V→WGSL port).
+
+## Renderer feature coverage (current)
+
+| Feature | Status | Notes |
 |---|---|---|
-| 1 | ✅ done | `--use-port=emdawnwebgpu` Emscripten port building, Dawn snapshot cached |
-| 2 | ✅ done | `webgpu-test/triangle.cpp` — colored triangle renders via WebGPU |
-| 3 | ✅ done | `webgpu-test/wall.cpp` — DOOM-3-style lit brick wall renders, validated on iPhone |
-| **4a** | ✅ done | RenderBackend abstraction wired into engine; r_backend cvar; Init/Shutdown |
-| **4b** | 🟡 partial | tr_backend.cpp frame-boundary ops (4/97 sites). GL backend impls BeginRenderPass etc. |
-| **4c** | 🟡 partial | draw_common.cpp + tr_render.cpp viewport/scissor (6/310 sites combined) |
-| **GL backend** | ✅ done | Pipeline/Buffer/Texture/Sampler/BindGroup all genuinely implemented (~450 lines). Phase 4b/4c continuation is now unblocked. |
-| 4d, 4e | pending | Texture upload migration; remaining files. Ready to proceed. |
-| **5 prep** | ✅ done | emdawnwebgpu linked into engine build; D3_WEBGPU_BACKEND flag wired |
-| **5a** | ✅ done | JS pre-acquires WGPU device; backend Init grabs via emscripten_webgpu_get_device |
-| **5a (resources)** | ✅ done | CreateBuffer/Texture/Sampler + Update + Destroy against Dawn API |
-| **5b** | ✅ done | Command encoder + render pass lifecycle; SetViewport/Scissor/StencilRef; Draw/DrawIndexed |
-| **5c** | ✅ done | CreatePipeline (idDrawVert layout + WGSL compile); CreateBindGroup; all bind ops |
-| 5d | pending | Surface/swapchain creation. Blocker: canvas already owned by GL context |
-| **6 setup** | ✅ done | HLSL→SPIR-V→WGSL toolchain validated end-to-end (`webgpu-port/shader-tools/hlsl2wgsl.sh`) |
-| 6 (full) | pending | Port 60 RBDOOM-3-BFG shaders. Needs `register(tN/sN/bN)` → `vk::binding(N,M)` preprocessor + include resolver. |
-| 7 | pending | Integration + iOS perf tuning + chunky-tile validation |
-| 8 | pending | Cutover; remove GL backend |
+| Z pre-pass + additive lit (interaction) pass | ✅ | shared-VS clip-z invariance; 512+ records/frame |
+| Real game textures (per-`idImage` GPU cache) | ✅ | mip chains, aniso, clamp/repeat/zeroClamp modes |
+| Point / projected / ambient lights | ✅ | exact specular LUT **and** BFG analytic `pow(N·H,10)` (`?bfg`) |
+| Stencil shadow volumes | ✅ | single-pass mark→draw→unmark (iter 39); player-shadow + Quest-style darken (`r_shadowDarken`) |
+| Fog lights / blend lights | ✅ | iter 12b / 13a — full light-type coverage |
+| Sky / wobblesky cubemaps | ✅ | iter 13b (6-face CPU cube cache) |
+| Subviews (mirrors / monitors) | ✅ | iter 14 render-to-texture |
+| Heat-haze / `_currentRender` post-process | ✅ | iter 16 (WebGPU-native; GL had to skip it) |
+| Cinematic (ROQ) dynamic textures | ✅ | iter 17 (4-slot ring; ROQ null-ptr crash also fixed) |
+| Bloom | ✅ | iter 19 — WebGPU-native (vanilla/stock DOOM 3 has none); default OFF, `?bloom` |
+| 2D HUD / GUI overlay | ✅ | iter 8d |
+| Determinism self-test | ✅ | iter 6.8 — byte-compares two offscreen renders in-engine |
+| Surface / swapchain | ✅ | `#webgpuCanvas` surface; Phase-5d "canvas conflict" was resolved by using a separate canvas |
+| Reflect / screen texgens, heat-haze new-stages beyond the above | ⚠️ niche | unsupported; rare in the shipped level |
+| Lightgem | ↪ GL4ES | still renders through the GL path by design (gameplay reads its pixels) |
 
-## What the WebGPU backend has, post-session
+## Verification
 
-The `RenderBackend_WebGPU.cpp` is ~600 lines of working Dawn code covering EVERY method in the abstraction except surface/swapchain (Phase 5d). Specifically:
+- **Determinism self-test (iter 6.8, the decisive instrument):** the backend
+  periodically renders the identical record set twice into offscreen textures and
+  byte-compares. On a **physical iPhone** it logged `IDENTICAL` while the GL view on
+  the same device showed the chunky-tile flicker — the conclusive proof.
+- **On-device:** real iPhone Safari WebGPU runs the game (iter 42 — first
+  successful iOS WebGPU play session, after the memory/GPU-process fixes).
+- **Local loop:** headed Chrome (Dawn) screenshots + the determinism self-test +
+  real **Mac Safari** via `safaridriver` (the WebKit-WebGPU proxy for iOS). Note:
+  WebGPU canvas readback / headless screenshots come back **black**, so honest
+  verification is headed-browser screenshots, the in-engine byte-compare, or the
+  device.
 
-| Operation | Status | Maps to |
-|---|---|---|
-| Init / Shutdown | ✅ | emscripten_webgpu_get_device → JS pre-acquired WGPUDevice |
-| Buffer create/update/destroy | ✅ | wgpuDeviceCreateBuffer + wgpuQueueWriteBuffer + wgpuBufferRelease |
-| Texture create/upload/destroy | ✅ | wgpuDeviceCreateTexture + wgpuQueueWriteTexture + wgpuTextureRelease |
-| Sampler create/destroy | ✅ | wgpuDeviceCreateSampler + wgpuSamplerRelease |
-| Pipeline create/destroy/bind | ✅ | wgpuDeviceCreateRenderPipeline (idDrawVert vertex layout + WGSL + blend/depth/stencil) |
-| BindGroup create/destroy/bind | ✅ | wgpuDeviceCreateBindGroup (auto layout from pipeline) |
-| BindVertexBuffer / BindIndexBuffer | ✅ | wgpuRenderPassEncoderSet*Buffer |
-| BeginFrame / EndFrame | ✅ | wgpuDeviceCreateCommandEncoder + Finish + QueueSubmit |
-| BeginRenderPass / EndRenderPass | ✅ | wgpuCommandEncoderBeginRenderPass + clear/load/store + depth-stencil attachment |
-| Draw / DrawIndexed | ✅ | wgpuRenderPassEncoderDraw[Indexed] |
-| SetViewport / SetScissor / SetStencilRef | ✅ | wgpuRenderPassEncoder* dynamic state |
-| Surface / swapchain | ❌ | Phase 5d — canvas conflict needs resolving |
+## Why it didn't take the estimated 6 months
 
-## Files committed in this Phase 4 starting commit
+The capture/replay approach sidestepped the plan's core cost (migrating 809 GL
+call sites through a new abstraction while keeping GL bit-identical at every step).
+By recording the existing GL path's draw data and replaying it, the WebGPU backend
+could be grown feature-by-feature against a live A/B (`?echo`) with the GL path as
+the reference, and cut over by simply skipping the GL draws. The bulk of the work
+became renderer-feature parity + the **iOS memory/perf hardening** (the genuinely
+hard part — see below), not a mechanical call-site rewrite.
 
-```
-webgpu-port/
-├── WEBGPU_PORT_PLAN.md            ← this file
-└── engine/
-    ├── RenderBackend.h            ← abstraction interface
-    ├── RenderBackend_factory.cpp  ← runtime backend selection
-    ├── RenderBackend_GL.cpp       ← current-behavior wrapper (pass-through)
-    └── RenderBackend_WebGPU.cpp   ← skeleton; all methods fail-loud
-```
+## Hard-won iOS/WebKit work (the real difficulty)
 
-These files are NOT yet wired into the engine build. They're committed as the framework that subsequent phases will integrate.
+- **Tab-kill / memory (iters 26–30, 42):** 256 MB initial heap + growth; skip
+  redundant GL texture uploads under WebGPU-primary; per-image GPU texture budget;
+  consolidated uniform buffers (one per family vs ~2,688 tiny `GPUBuffer`s — WebKit
+  page-pads each); **delta vertex upload**, **redundant-submit skip**, **per-light
+  pass merge** to stop the WebKit GPU-process from ballooning past ~1.7 GB; and
+  round-robin **bind-group eviction** (it was leaking transient bind groups until
+  the iOS GPU process died).
+- **Perf (iter 24):** ~45% of CPU was busy-wait clock reads; forcing `vsynced60`
+  under Emscripten removed it; `-O3 -msimd128`.
+- **WebKit-only shader bugs (iters 47b, 71):** near-plane attribute interpolation
+  produces inf/NaN on WebKit (not Dawn) → clamp + NaN-safe `select()` on every
+  interpolated light cookie / falloff / haze offset.
 
-## Concrete refactor surface (measured)
+## Known open / not-done (WebGPU-specific)
 
-- **94 distinct GL functions** across `.build/dhewm3/neo/renderer/`
-- **809 GL call sites** total
-- Top files by call density:
-  - `draw_common.cpp` — 243 calls (the lit pass; highest priority)
-  - `tr_rendertools.cpp` — 221 calls (debug renderer; lowest priority)
-  - `tr_backend.cpp` — 97 calls (frame loop; second priority)
-  - `Image_load.cpp` — 80 calls (texture upload; third priority)
-  - `tr_render.cpp` — 67 calls
-  - `draw_arb2.cpp` — 43 calls (ARB shader binding; replaced by WGSL)
-  - `RenderSystem_init.cpp` — 22 calls
-  - `VertexCache.cpp` — 15 calls
+- **iPhone "orange panel" (iter 71/72b):** two spawn-area panels render bright
+  orange on iPhone WebKit-WebGPU; correct on Chrome/Dawn **and Mac Safari** (does
+  not reproduce on the Mac GPU). NaN-safe guards were added per the near-plane
+  pathology, but the actual iPhone-GPU mechanism is likely a *finite* precision
+  error the NaN guard can't catch — **unresolved on the real device**.
+- **Reflect / screen texgens** and a few new-stage ARB effects beyond heat-haze
+  are unsupported (rare in the shipped enpro level).
+- **GL4ES is retained, by decision** — it's the non-WebGPU fallback, the `?echo`
+  A/B harness, and renders the lightgem. "Remove the GL backend" (old Phase 8) is
+  **not** going to happen.
 
-## Migration sequence (Phase 4 → 8)
+(Separate, non-renderer threads tracked elsewhere: glasses texture-load *time*,
+and the per-level-pak + iOS level-picker effort — these are content/delivery, not
+WebGPU-backend, work.)
 
-### Phase 4a — wire the interface (~3 days)
-1. Add `RenderBackend.h` + the three .cpp files to `neo/renderer/CMakeLists.txt`
-2. Add cvar `r_backend` (default `"gl"`) in `RenderSystem_init.cpp`
-3. Instantiate `renderBackend` after `GLimp_Init` succeeds
-4. Build, verify zero behavior change (still uses qgl* everywhere)
+---
 
-### Phase 4b — migrate frame loop (~1 week)
-- Target: `tr_backend.cpp` (97 sites)
-- Replace `RB_*` frame-level functions with `renderBackend->BeginFrame()` / `EndFrame()` / `BeginRenderPass()` / `EndRenderPass()`
-- Each migrated function: GL backend still calls qgl* under the hood, so behavior is bit-identical
+# Appendix — original plan (2026-06-08, SUPERSEDED)
 
-### Phase 4c — migrate the lit (interaction) pass (~2 weeks)
-- Target: `draw_common.cpp` (243 sites) — the heaviest file, the lit pass that contains our chunky-tile bug
-- This is where bind groups + pipeline state become first-class
-- After this phase, the lit pass is fully abstracted; flipping to WebGPU backend would render the lit pass via WebGPU exclusively
+> Kept for history. The phased abstraction-migration below was the initial plan;
+> the actual port used capture/replay instead (above), so the call-site counts,
+> phase breakdown, and 6-month/2-FTE estimate did not play out as written. The
+> **kill criteria were all met** — notably "full DOOM 3 scene boots and renders via
+> WebGPU on iPhone with NO chunky-tile artifact," which is the shipped state.
 
-### Phase 4d — migrate texture upload (~1 week)
-- Target: `Image_load.cpp` (80 sites)
-- DDS / S3TC / BPTC decompression maps to WebGPU's CompressedTexture sub-image upload
+## Concrete refactor surface (measured, original)
 
-### Phase 4e — everything else (~1 week)
-- `tr_render.cpp`, `VertexCache.cpp`, `RenderSystem_init.cpp`, smaller files
-- Leave `tr_rendertools.cpp` last (debug code; not user-facing)
+- **94 distinct GL functions**, **809 GL call sites** across `neo/renderer/`.
+- Top files: `draw_common.cpp` 243, `tr_rendertools.cpp` 221, `tr_backend.cpp` 97,
+  `Image_load.cpp` 80, `tr_render.cpp` 67, `draw_arb2.cpp` 43,
+  `RenderSystem_init.cpp` 22, `VertexCache.cpp` 15.
 
-### Phase 5 — WebGPU backend implementation (~6 weeks)
-- Fill in `RenderBackend_WebGPU.cpp` stubs
-- Each abstraction method gets a real implementation
-- Async init (adapter/device request) integrated into engine boot
-- Surface creation tied to existing `#gameCanvas`
+## Phased migration (original, not the path taken)
 
-### Phase 6 — shader port (~4 weeks, parallelizable with Phase 5)
-- Set up DXC for RBDOOM-3-BFG HLSL → SPIR-V → WGSL pipeline (tooling work, ~3 days)
-- Port shaders one at a time in priority order:
-  1. `interaction.ps.hlsl` (we already validated WGSL feasibility in Phase 3)
-  2. `interactionAmbient.ps.hlsl`
-  3. `texture.ps.hlsl` (GUI)
-  4. `depth.ps.hlsl` (zfill)
-  5. shadow / blendlight / fog / postprocess
+- **4a** wire `RenderBackend.h` + factory + GL/WebGPU .cpp (cvar `r_backend`).
+- **4b** migrate the frame loop (`tr_backend.cpp`).
+- **4c** migrate the lit pass (`draw_common.cpp`).
+- **4d** texture upload (`Image_load.cpp`).
+- **4e** everything else; `tr_rendertools.cpp` last.
+- **5** fill in the WebGPU backend; async device init; surface on `#gameCanvas`.
+- **6** port 60 RBDOOM-3-BFG HLSL shaders via DXC → SPIR-V → WGSL.
+- **7** integration + iOS perf tuning + chunky-tile validation.
+- **8** flip `r_backend` default to `webgpu`; remove GL backend + GL4ES.
 
-### Phase 7 — integration + perf tuning (~3 weeks)
-- Wire the WebGPU backend up; runtime-switchable via `r_backend "webgpu"`
-- Bug-bash on iPhone Safari WebGPU; address the iOS-specific gotchas surfaced in research (64-cmdbuf jetsam limit, mesh-shader translation bugs, surface format quirks)
-- Benchmark against GL backend; tune for the 3-shader-bind-group iOS limit
+Original estimate: 6 months at 2 FTE / 7–9 months solo. (Did not materialize as
+stated — the capture/replay shortcut + the real cost being iOS hardening, not
+call-site migration, changed the shape entirely.)
 
-### Phase 8 — cutover + cleanup (~2 weeks)
-- Flip `r_backend` default from `"gl"` to `"webgpu"` once stable
-- Remove the GL backend code path (or leave behind a `?backend=gl` URL flag as a fallback)
-- Remove GL4ES from the dependency tree
-- Strip our extensive `src/main.js` JS-side WebGL workarounds (pow strip, falloff fix, etc.) — they all become moot
+## Original kill criteria (all met)
 
-## Realistic total: 6 months at 2 FTE, 7–9 months solo
-
-(per the Exa-validated case studies: Bevy 4–8 person-months, Godot 6–9 months solo, NAP framework 7 person-months for OpenGL→Vulkan)
-
-## Kill criteria along the way
-
-- **End of Phase 4a**: build doesn't regress. If GL behavior changes, the wrapper has a bug.
-- **End of Phase 5**: triangle renders via WebGPU backend through the abstraction layer (not just standalone like Phase 2 already does).
-- **End of Phase 6**: at least the interaction shader renders one DOOM 3 surface correctly via the new WGSL.
-- **End of Phase 7**: full DOOM 3 scene boots and renders via WebGPU on iPhone, with NO chunky-tile artifact. ← The Real Test.
-
-If any of these fail, we re-evaluate whether to continue.
-
-## Open design questions
-
-- **Vertex layout**: DOOM 3's `idDrawVert` is fixed (position + normal + tangent + bitangent + texcoord + color). Should the abstraction assume this layout (simpler), or be generic (more flexible, more overhead)?
-  - Lean: assume idDrawVert. The engine never deviates.
-- **Render bundles**: WebGPU supports replayable command bundles. The engine's draws within one render pass are highly repetitive — should we generate bundles to reduce per-cmdbuf overhead?
-  - Lean: yes, in Phase 7 perf-tuning. Skip during initial port.
-- **Threading**: emdawnwebgpu objects can't cross threads. dhewm3 is mostly single-threaded but does `com_smp` multithreading. Disable `com_smp` for WebGPU backend, or solve threading?
-  - Lean: disable `com_smp` for WebGPU (matches our current mobile profile anyway).
+- End of 4a: build doesn't regress. ✅
+- End of 5: triangle renders via the backend. ✅ (the full scene does)
+- End of 6: interaction shader renders one surface via new WGSL. ✅
+- End of 7: full scene boots + renders via WebGPU on iPhone, no chunky-tile. ✅ **← the real test, passed**
 
 ## Update log
 
-| Date | Phase | Note |
-|---|---|---|
-| 2026-06-08 | 4 | Framework files committed; not yet wired into engine build |
+| Date | Note |
+|---|---|
+| 2026-06-08 | Original framework files committed; phased plan written (this doc's first version). |
+| 2026-06-09 → 06 | Capture/replay backend built feature-by-feature (lit, textures, emissive, GUI, shadows, fog, blend, sky, subviews, haze, cinematics, bloom); determinism self-test proved IDENTICAL on iPhone where GL flickers. |
+| 2026-06 | iOS memory/GPU-process hardening; WebGPU made the bare-URL default (iter 70); GL4ES retained as fallback + echo + lightgem. **Port shipped as the primary renderer.** |
+| 2026-06-21 | This doc rewritten to reflect shipped status (was stale at the 2026-06-08 plan). |
