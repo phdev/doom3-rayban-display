@@ -30,3 +30,6 @@ areadump-out/
 public/wasm/base/
 public/wasm/base-stream/
 public/wasm/base256/
+
+# R-GLTF spike test fixtures (regenerable from content-forge)
+public/wasm/*.glb

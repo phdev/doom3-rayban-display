@@ -233,6 +233,323 @@ index f9ae002..9430a1e 100644
  			Mem_Free( junk );
  
  			qglCopyTexSubImage2D( GL_TEXTURE_2D, 0, 0, 0, x, y, imageWidth, imageHeight );
+diff --git a/neo/renderer/Model.cpp b/neo/renderer/Model.cpp
+index 3016bf2..b81d829 100644
+--- a/neo/renderer/Model.cpp
++++ b/neo/renderer/Model.cpp
+@@ -35,6 +35,9 @@ If you have questions concerning this license or the applicable additional terms
+ #include "renderer/Model_lwo.h"
+ #include "renderer/Model_ma.h"
+ #include "renderer/VertexCache.h"
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++#endif
+ 
+ #include "renderer/Model.h"
+ 
+@@ -262,6 +265,266 @@ void idRenderModelStatic::MakeDefaultModel() {
+ 	FinishSurfaces();
+ }
+ 
++/*
++================================================================================
++R-GLTF SPIKE-A — minimal static glTF / GLB loader (RENDER track).
++
++De-risks the content-forge GLB -> engine path: parse the binary GLB container +
++the glTF JSON (stock idLexer), decode the first mesh's float POSITION/NORMAL/
++TEXCOORD_0 + indices into the engine's 60-byte idDrawVert layout, and build
++idRenderModelStatic surfaces the WebGPU capture-replay backend replays with ZERO
++backend change. STATIC only — skinning/anim is Spike-B + the idMD5Anim bridge,
++which touches neo/anim and needs SPINE patch-split coordination. Material =
++default for now (the ORM/.mtr contract is content-forge's half). Lives in
++Model.cpp on purpose: a new .cpp would touch neo/CMakeLists.txt (SPINE's
++rayban-base.patch) — this keeps spike-A 100% in rayban-renderer.patch.
++================================================================================
++*/
++struct gltfAccessor_t { int bufferView; int byteOffset; int componentType; int count; int numComp; };
++struct gltfBufferView_t { int byteOffset; int byteLength; int byteStride; };
++struct gltfPrim_t { int pos; int normal; int uv; int indices; int material; };
++
++static int GLTF_NumComp( const idStr &type ) {
++	if ( type == "SCALAR" ) return 1;
++	if ( type == "VEC2" ) return 2;
++	if ( type == "VEC3" ) return 3;
++	if ( type == "VEC4" ) return 4;
++	if ( type == "MAT4" ) return 16;
++	return 1;
++}
++
++// skip one balanced JSON value (object / array / scalar)
++static void GLTF_SkipValue( idLexer &lex ) {
++	idToken tok;
++	if ( !lex.ReadToken( &tok ) ) return;
++	if ( tok == "{" || tok == "[" ) {
++		int depth = 1;
++		while ( depth > 0 && lex.ReadToken( &tok ) ) {
++			if ( tok == "{" || tok == "[" ) depth++;
++			else if ( tok == "}" || tok == "]" ) depth--;
++		}
++	}
++}
++
++bool idRenderModelStatic::LoadGLTF( const char *fileName ) {
++#ifdef __EMSCRIPTEN__
++	EM_ASM({ window.__d3GltfCalled = (window.__d3GltfCalled||0)+1; });   // JS-visible signal (Printf doesn't reach JS)
++#endif
++	void *fileBuf = NULL;
++	int fileLen = fileSystem->ReadFile( fileName, &fileBuf, NULL );
++	if ( fileLen <= 20 || !fileBuf ) {
++		if ( fileBuf ) fileSystem->FreeFile( fileBuf );
++		return false;
++	}
++	const byte *p = (const byte *)fileBuf;
++	// GLB header: magic 'glTF' (0x46546C67), version, length
++	if ( *(const unsigned int *)( p + 0 ) != 0x46546C67u ) {
++		common->Warning( "LoadGLTF: '%s' is not a binary GLB (only GLB supported in spike-A)", fileName );
++		fileSystem->FreeFile( fileBuf );
++		return false;
++	}
++	unsigned int jsonLen  = *(const unsigned int *)( p + 12 );
++	unsigned int jsonType = *(const unsigned int *)( p + 16 );
++	if ( jsonType != 0x4E4F534Au || 20 + jsonLen > (unsigned)fileLen ) {	// 'JSON'
++		fileSystem->FreeFile( fileBuf );
++		return false;
++	}
++	const char *json = (const char *)( p + 20 );
++	// chunk 1 = BIN, right after the JSON chunk
++	unsigned int binOff = 20 + jsonLen;
++	const byte *bin = NULL;
++	if ( binOff + 8 <= (unsigned)fileLen && *(const unsigned int *)( p + binOff + 4 ) == 0x004E4942u ) {	// 'BIN\0'
++		bin = p + binOff + 8;
++	}
++	if ( !bin ) {
++		common->Warning( "LoadGLTF: '%s' has no BIN chunk", fileName );
++		fileSystem->FreeFile( fileBuf );
++		return false;
++	}
++
++	idList<gltfAccessor_t> accessors;
++	idList<gltfBufferView_t> bufferViews;
++	idList<gltfPrim_t> prims;
++	bool gotMesh0 = false;
++
++	idLexer lex;
++	lex.LoadMemory( json, (int)jsonLen, fileName );
++	lex.SetFlags( LEXFL_NOERRORS | LEXFL_NOWARNINGS | LEXFL_NOFATALERRORS );
++
++	idToken tok;
++	if ( !lex.ExpectTokenString( "{" ) ) { lex.FreeSource(); fileSystem->FreeFile( fileBuf ); return false; }
++	while ( lex.ReadToken( &tok ) ) {
++		if ( tok == "}" ) break;
++		if ( tok == "," ) continue;
++		idStr key = tok;
++		lex.ExpectTokenString( ":" );
++		if ( key == "accessors" ) {
++			lex.ExpectTokenString( "[" );
++			while ( lex.ReadToken( &tok ) ) {
++				if ( tok == "]" ) break;
++				if ( tok == "," ) continue;	// tok == "{"
++				gltfAccessor_t a; a.bufferView = -1; a.byteOffset = 0; a.componentType = 5126; a.count = 0; a.numComp = 1;
++				while ( lex.ReadToken( &tok ) ) {
++					if ( tok == "}" ) break;
++					if ( tok == "," ) continue;
++					idStr k = tok; lex.ExpectTokenString( ":" );
++					if ( k == "bufferView" ) a.bufferView = lex.ParseInt();
++					else if ( k == "byteOffset" ) a.byteOffset = lex.ParseInt();
++					else if ( k == "componentType" ) a.componentType = lex.ParseInt();
++					else if ( k == "count" ) a.count = lex.ParseInt();
++					else if ( k == "type" ) { idToken t2; lex.ReadToken( &t2 ); a.numComp = GLTF_NumComp( t2 ); }
++					else GLTF_SkipValue( lex );
++				}
++				accessors.Append( a );
++			}
++		} else if ( key == "bufferViews" ) {
++			lex.ExpectTokenString( "[" );
++			while ( lex.ReadToken( &tok ) ) {
++				if ( tok == "]" ) break;
++				if ( tok == "," ) continue;
++				gltfBufferView_t bv; bv.byteOffset = 0; bv.byteLength = 0; bv.byteStride = 0;
++				while ( lex.ReadToken( &tok ) ) {
++					if ( tok == "}" ) break;
++					if ( tok == "," ) continue;
++					idStr k = tok; lex.ExpectTokenString( ":" );
++					if ( k == "byteOffset" ) bv.byteOffset = lex.ParseInt();
++					else if ( k == "byteLength" ) bv.byteLength = lex.ParseInt();
++					else if ( k == "byteStride" ) bv.byteStride = lex.ParseInt();
++					else GLTF_SkipValue( lex );
++				}
++				bufferViews.Append( bv );
++			}
++		} else if ( key == "meshes" ) {
++			lex.ExpectTokenString( "[" );
++			int meshIdx = 0;
++			while ( lex.ReadToken( &tok ) ) {
++				if ( tok == "]" ) break;
++				if ( tok == "," ) continue;
++				bool firstMesh = ( meshIdx == 0 );
++				meshIdx++;
++				while ( lex.ReadToken( &tok ) ) {
++					if ( tok == "}" ) break;
++					if ( tok == "," ) continue;
++					idStr k = tok; lex.ExpectTokenString( ":" );
++					if ( k == "primitives" && firstMesh ) {
++						lex.ExpectTokenString( "[" );
++						while ( lex.ReadToken( &tok ) ) {
++							if ( tok == "]" ) break;
++							if ( tok == "," ) continue;
++							gltfPrim_t pr; pr.pos = -1; pr.normal = -1; pr.uv = -1; pr.indices = -1; pr.material = -1;
++							while ( lex.ReadToken( &tok ) ) {
++								if ( tok == "}" ) break;
++								if ( tok == "," ) continue;
++								idStr k2 = tok; lex.ExpectTokenString( ":" );
++								if ( k2 == "attributes" ) {
++									lex.ExpectTokenString( "{" );
++									while ( lex.ReadToken( &tok ) ) {
++										if ( tok == "}" ) break;
++										if ( tok == "," ) continue;
++										idStr ak = tok; lex.ExpectTokenString( ":" );
++										int av = lex.ParseInt();
++										if ( ak == "POSITION" ) pr.pos = av;
++										else if ( ak == "NORMAL" ) pr.normal = av;
++										else if ( ak == "TEXCOORD_0" ) pr.uv = av;
++									}
++								} else if ( k2 == "indices" ) pr.indices = lex.ParseInt();
++								else if ( k2 == "material" ) pr.material = lex.ParseInt();
++								else GLTF_SkipValue( lex );
++							}
++							prims.Append( pr );
++						}
++						gotMesh0 = true;
++					} else {
++						GLTF_SkipValue( lex );
++					}
++				}
++			}
++		} else {
++			GLTF_SkipValue( lex );
++		}
++	}
++	lex.FreeSource();
++
++	if ( !gotMesh0 || prims.Num() == 0 ) {
++		common->Warning( "LoadGLTF: '%s' parsed no primitives", fileName );
++		fileSystem->FreeFile( fileBuf );
++		return false;
++	}
++
++	const float scale = 24.0f;	// glTF meters -> visible D3 units (spike-tunable)
++	for ( int pi = 0; pi < prims.Num(); pi++ ) {
++		const gltfPrim_t &pr = prims[pi];
++		if ( pr.pos < 0 || pr.pos >= accessors.Num() || pr.indices < 0 || pr.indices >= accessors.Num() ) continue;
++		const gltfAccessor_t &pa = accessors[pr.pos];
++		const gltfAccessor_t &ia = accessors[pr.indices];
++		if ( pa.bufferView < 0 || pa.bufferView >= bufferViews.Num() ) continue;
++		if ( ia.bufferView < 0 || ia.bufferView >= bufferViews.Num() ) continue;
++		int numVerts = pa.count, numIndexes = ia.count;
++		if ( numVerts <= 0 || numIndexes <= 0 ) continue;
++
++		srfTriangles_t *tri = R_AllocStaticTriSurf();
++		R_AllocStaticTriSurfVerts( tri, numVerts );
++		R_AllocStaticTriSurfIndexes( tri, numIndexes );
++
++		const gltfBufferView_t &pbv = bufferViews[pa.bufferView];
++		int pstride = pbv.byteStride ? pbv.byteStride : 12;
++		const byte *pbase = bin + pbv.byteOffset + pa.byteOffset;
++		const gltfAccessor_t *na = ( pr.normal >= 0 && pr.normal < accessors.Num() ) ? &accessors[pr.normal] : NULL;
++		const byte *nbase = NULL; int nstride = 12;
++		if ( na && na->bufferView >= 0 && na->bufferView < bufferViews.Num() ) {
++			const gltfBufferView_t &nbv = bufferViews[na->bufferView];
++			nstride = nbv.byteStride ? nbv.byteStride : 12;
++			nbase = bin + nbv.byteOffset + na->byteOffset;
++		}
++		const gltfAccessor_t *ua = ( pr.uv >= 0 && pr.uv < accessors.Num() ) ? &accessors[pr.uv] : NULL;
++		const byte *ubase = NULL; int ustride = 8;
++		if ( ua && ua->bufferView >= 0 && ua->bufferView < bufferViews.Num() ) {
++			const gltfBufferView_t &ubv = bufferViews[ua->bufferView];
++			ustride = ubv.byteStride ? ubv.byteStride : 8;
++			ubase = bin + ubv.byteOffset + ua->byteOffset;
++		}
++		for ( int v = 0; v < numVerts; v++ ) {
++			tri->verts[v].Clear();
++			const float *fp = (const float *)( pbase + v * pstride );
++			// glTF Y-up right-handed -> idTech4 Z-up: (x, -z, y)
++			tri->verts[v].xyz.Set( fp[0] * scale, -fp[2] * scale, fp[1] * scale );
++			if ( nbase ) {
++				const float *fn = (const float *)( nbase + v * nstride );
++				tri->verts[v].normal.Set( fn[0], -fn[2], fn[1] );
++			}
++			if ( ubase ) {
++				const float *fu = (const float *)( ubase + v * ustride );
++				tri->verts[v].st[0] = fu[0];
++				tri->verts[v].st[1] = fu[1];
++			}
++		}
++		tri->numVerts = numVerts;
++
++		const gltfBufferView_t &ibv = bufferViews[ia.bufferView];
++		const byte *ibase = bin + ibv.byteOffset + ia.byteOffset;
++		for ( int t = 0; t < numIndexes; t++ ) {
++			if ( ia.componentType == 5125 )       tri->indexes[t] = (glIndex_t)( (const unsigned int *)ibase )[t];	// UINT
++			else if ( ia.componentType == 5121 )  tri->indexes[t] = (glIndex_t)( (const unsigned char *)ibase )[t];	// UBYTE
++			else                                  tri->indexes[t] = (glIndex_t)( (const unsigned short *)ibase )[t];	// USHORT
++		}
++		tri->numIndexes = numIndexes;
++		if ( !nbase ) tri->generateNormals = true;
++
++		modelSurface_t surf;
++		surf.id = pi;
++		surf.shader = tr.defaultMaterial;	// SPIKE: real ORM/.mtr is content-forge's half
++		surf.geometry = tri;
++		AddSurface( surf );
++	}
++
++	fileSystem->FreeFile( fileBuf );
++	common->Printf( "LoadGLTF: '%s' -> %d surfaces\n", fileName, surfaces.Num() );
++#ifdef __EMSCRIPTEN__
++	EM_ASM({ window.__d3GltfSurfaces = $0; window.__d3GltfLoaded = ($0 > 0); }, surfaces.Num());
++#endif
++	return surfaces.Num() > 0;
++}
++
+ /*
+ ================
+ idRenderModelStatic::PartialInitFromFile
+@@ -299,6 +562,9 @@ void idRenderModelStatic::InitFromFile( const char *fileName ) {
+ 	} else if ( extension.Icmp( "ma" ) == 0 ) {
+ 		loaded		= LoadMA( name );
+ 		reloadable	= true;
++	} else if ( extension.Icmp( "glb" ) == 0 || extension.Icmp( "gltf" ) == 0 ) {
++		loaded		= LoadGLTF( name );	// R-GLTF spike-A
++		reloadable	= true;
+ 	} else {
+ 		common->Warning( "idRenderModelStatic::InitFromFile: unknown type for model: \'%s\'", name.c_str() );
+ 		loaded		= false;
+diff --git a/neo/renderer/ModelManager.cpp b/neo/renderer/ModelManager.cpp
+index ddbff1c..16a3b0e 100644
+--- a/neo/renderer/ModelManager.cpp
++++ b/neo/renderer/ModelManager.cpp
+@@ -291,7 +291,8 @@ idRenderModel *idRenderModelManagerLocal::GetModel( const char *modelName, bool
+ 
+ 	canonical.ExtractFileExtension( extension );
+ 
+-	if ( ( extension.Icmp( "ase" ) == 0 ) || ( extension.Icmp( "lwo" ) == 0 ) || ( extension.Icmp( "flt" ) == 0 ) ) {
++	if ( ( extension.Icmp( "ase" ) == 0 ) || ( extension.Icmp( "lwo" ) == 0 ) || ( extension.Icmp( "flt" ) == 0 )
++			|| ( extension.Icmp( "glb" ) == 0 ) || ( extension.Icmp( "gltf" ) == 0 ) ) {	// R-GLTF spike-A
+ 		model = new idRenderModelStatic;
+ 		model->InitFromFile( modelName );
+ 	} else if ( extension.Icmp( "ma" ) == 0 ) {
+diff --git a/neo/renderer/Model_local.h b/neo/renderer/Model_local.h
+index a56c999..e769579 100644
+--- a/neo/renderer/Model_local.h
++++ b/neo/renderer/Model_local.h
+@@ -94,6 +94,7 @@ public:
+ 	bool						LoadLWO( const char *fileName );
+ 	bool						LoadFLT( const char *fileName );
+ 	bool						LoadMA( const char *filename );
++	bool						LoadGLTF( const char *fileName );	// R-GLTF spike-A: static glTF/GLB
+ 
+ 	bool						ConvertASEToModelSurfaces( const struct aseModel_s *ase );
+ 	bool						ConvertLWOToModelSurfaces( const struct st_lwObject *lwo );
 diff --git a/neo/renderer/RenderBackend.h b/neo/renderer/RenderBackend.h
 new file mode 100644
 index 0000000..c123b24
