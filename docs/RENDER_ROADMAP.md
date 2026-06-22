@@ -88,3 +88,74 @@ ships a falsifiable `metrics{}` gate proven red + default-OFF until on-device-ve
 PBR (M6) needs a content-track hand-off for metallic-roughness authoring before it can start.
 Recon caveat: 6/7 per-feature recon agents were rate-limited; synthesis + the 4 adversarial lenses
 source-grounded the plan directly; individual milestone specs can be deepened on request.
+
+---
+
+## 7. FORMAT CONTRACT — LOCKED with CONTENT + SPINE (2026-06-22)
+
+Content-forge + SPINE reviewed the program; owner locked the contract. **Both PBR and IBL ride
+mechanisms the engine already has → minimal render-side surface, ZERO base-patch (SPINE) edits.**
+
+- **PBR → ORM-packed into the existing specularmap slot.** Content emits one ORM texture
+  (**R=AO, G=roughness, B=metallic, LINEAR**) placed in the material's specularmap slot; render
+  reinterprets it as PBR via an **`isPBR` flag in the unused `specular_color.w`**. **No new engine
+  keyword, no new binding, no base-patch edit — only render's GGX shader math.** (Separate _mr/_rmo
+  maps would need a `Material.cpp` keyword = SPINE base-patch = a much larger v2; rejected for v1.)
+  Content-forge ALREADY emits `metallic.png`+`roughness.png` (the Meshy gun) → P0 unblocked now.
+- **PBR scope:** **new content-forge assets only** (MR-native). Legacy DOOM 3 has no MR data; deriving
+  it is the rejected spec-gloss "slop". (Matches §6.)
+- **IBL → 6 face PNGs** (`_px.._nz`, RGBA8, square, **32px**) + a tiny `cameraCubeMap` `.mtr` per probe
+  → loads through the **unchanged cube path**. **Per-area centroid placement, per-area selection,
+  ≤32-probe budget. CPU-hemisphere bake (v1).**
+- **CONTENT owns:** the ORM pack + `.mtr` auto-gen, the probe-baker (sibling of `bake_lighting.mjs`),
+  and the falsifiable gates (`pbr_orm_packed_ok`, `mr_channels_in_range`, `pbr_material_has_orm`,
+  `mtr_pbr_roundtrip`; `probe_energy_nonzero`, `probe_directional`, `probe_cube_format_ok` — each
+  mutation-proven RED). Sequencing: **IBL (Phase B) before PBR (Phase C)**; PBR P0 ships now (maps exist).
+- **RENDER must add (the §F list):** the per-area **centroid dump field** (probe placement), the
+  **cube-cache cap** raise (≤32), the **ORM + irradiance WGSL** (GGX reading ORM; `irradiance(world_N)`
+  ambient using F2's world-normal), and the **`isPBR` flag** plumbing (`specular_color.w`).
+
+## 8. NEW MILESTONE — R-GLTF: glTF model loader + skinned-anim bridge (RENDER-owned, SPIKE-GATED)
+
+SPINE surfaced this as the **cross-track unblocker** and squarely RENDER's lane (it intersects the PBR
+contract — a glTF loader that auto-gens a `.mtr` per material *is* the render↔content asset bridge).
+Content-forge emits **GLB**; the engine loads MD5/LWO/ASE but **not glTF** — so nothing content-forge
+generates can enter the engine until this lands. **Content is HOLDING its MD5 writer until a spike passes.**
+
+- **Wire contract is format-blind (SPINE-verified):** combat replication is two 12-bit `animNum` fields
+  → `CycleAnim(ch, animNum)`, a symbolic 1-indexed token into `idDeclModelDef::anims[]` — says nothing
+  about MD5 vs glTF. **glTF enemies "just work" with shipped combat, zero netcode/anim-drive change** —
+  *condition:* glTF anims register into the same `.def` anim-list in the same 1-indexed order (pipeline,
+  not netcode). M8/M9 combat untouched.
+- **The one hard gap (the spike's kill-criterion):** dhewm3's `idMD5Anim` is text-`.md5anim`-only.
+  Build `idMD5Anim`/`idJointQuat` frame arrays **in-memory** from glTF clips (cleaner than a disk
+  round-trip for WASM) so the resolved object is an `idMD5Anim`. **⚠ this touches `neo/anim` — coordinate
+  the patch split with SPINE** (renderer owns `idRenderModelGLTF` in `neo/renderer`; the anim bridge may
+  cross into base-patch files).
+- Otherwise clean: ModelManager dispatch = one else-if (extension→subclass); the WebGPU backend consumes
+  abstract 60-byte CPU-skinned `idDrawVert` → a glTF loader that CPU-skins into that layout (mirroring
+  `idMD5Mesh::TransformVerts`) needs **zero backend changes**; the glTF parser uses stock idlib (JSON via
+  `idLexer`); materials = auto-gen `.mtr` + the ORM contract above.
+- **SPIKE (recommended NEXT, ~3–5 pd):** load + render + **animate** one rigged glTF in WebGPU **on a
+  phone** (re-export an imp, or content's `forge_blaster_v1.glb` static first). Bonus: spawn it as a
+  replicated enemy → confirm the same 12-bit `animNum` drives it with the unmodified combat patch.
+  **PASS → content ships glTF-emit + deletes the MD5 writer. FAIL on the anim bridge → fallback = glTF
+  for static props (kill LWO), keep MD5 for rigged enemies.** **Do NOT delete any converter until the
+  spike passes.** Full milestone ~21–30 pd.
+
+## 9. Revised sequencing (post-alignment)
+
+1. **R-GLTF spike** — RECOMMENDED NEXT. Cross-track unblocker (content + SPINE both gated on it) + the
+   PBR-contract foundation. De-risks the entire content→engine pipeline before anyone deletes converters.
+2. **PBR P0 shader math** (ORM-in-specular-slot + `isPBR`) — can ride alongside R-GLTF (the maps exist
+   now; needs glTF-loaded assets to be useful).
+3. **M4 soft shadows + F2 world-normal** — pure-render polish, no cross-track dependency; slot around the
+   spike.
+4. **Phase B:** F1 HDR foundation (desktop-only) + M1 HDR bloom + M2 baked IBL (render adds centroid-dump
+   field + cube-cache cap; content builds the probe-baker).
+5. **Phase C:** full PBR (GGX on glTF assets) + specular IBL.
+
+## Status (updated 2026-06-22)
+Format contract LOCKED; glTF loader added as R-GLTF (RENDER-owned, spike-gated). **Recommended next =
+the R-GLTF spike** (cross-track unblocker). M4/F2/PBR-P0 ready to slot around it. Coordinate the
+anim-bridge patch split with SPINE before touching `neo/anim`.
