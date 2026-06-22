@@ -289,6 +289,10 @@ def main(argv=None):
                              "sentry' to cut those enemies). The def TEXT still ships, so pair "
                              "with --cut-map-entities to also remove their map instances (else "
                              "they spawn as default box models).")
+    parser.add_argument("--keep-defs", default="",
+                        help="comma-list of entityDef names to FORCE into the asset closure (so "
+                             "their full model/anim/texture/skin deps ship). Use for PvE monsters "
+                             "a DM map never references (e.g. 'monster_demon_imp'). Arco COMBAT.")
     parser.add_argument("--cut-map-entities", action="store_true",
                         help="with --cut-defs, also delete matching entity blocks from the .map "
                              "so the cut enemies don't spawn at all (no box models).")
@@ -490,6 +494,14 @@ def main(argv=None):
         }
         seed_names |= ESSENTIAL_DEFS
         used |= ESSENTIAL_DEFS
+
+        # Arco COMBAT milestone: force PvE monster defs into the closure so their FULL
+        # model/anim/texture/skin deps ship (a DM map names no monsters, so the def graph
+        # never reaches them otherwise — only def/* text ships, and idAI::Spawn then fatally
+        # fails its mesh/anim lookup). Comma-separated via --keep-defs.
+        keep_defs = set(d.strip().lower() for d in getattr(args, "keep_defs", "").split(",") if d.strip())
+        seed_names |= keep_defs
+        used |= keep_defs
         # Transitive closure through the entityDef/model def graph: a map entity
         # names an AI/character def, which names a model def, which lists the
         # md5mesh + every md5anim. A single pass stops at the first hop and drops

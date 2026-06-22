@@ -1,5 +1,5 @@
 diff --git a/neo/CMakeLists.txt b/neo/CMakeLists.txt
-index 69f1892..9912f89 100644
+index 69f1892..e100b55 100644
 --- a/neo/CMakeLists.txt
 +++ b/neo/CMakeLists.txt
 @@ -194,29 +194,46 @@ if(CMAKE_MAJOR_VERSION LESS 3 OR ( CMAKE_MAJOR_VERSION EQUAL 3 AND CMAKE_MINOR_V
@@ -98,7 +98,7 @@ index 69f1892..9912f89 100644
 +		set(D3_EMSCRIPTEN_EMBED "${CMAKE_SOURCE_DIR}/sys/wasm/embed")
 +	endif()
 +
-+	set(d3_wasm_exports "[\"_main\",\"_D3_AddViewAngles\",\"_D3_SetViewYaw\",\"_D3_SetWearableAction\",\"_D3_ExecCommand\",\"_D3_ReloadStreamedImages\",\"_D3_AppendArea\",\"_D3_GetEnemyIndicators\",\"_D3_GetEnemyYaw\",\"_D3_RequestEnemyTurn\",\"_D3_SetEnemyIndicators\",\"_D3_SetEnemyIndicatorYaw\",\"_D3_ConsumeEnemyTurn\"]")
++	set(d3_wasm_exports "[\"_main\",\"_D3_AddViewAngles\",\"_D3_SetViewYaw\",\"_D3_SetWearableAction\",\"_D3_ExecCommand\",\"_D3_ReloadStreamedImages\",\"_D3_AppendArea\",\"_D3_GetEnemyIndicators\",\"_D3_GetEnemyYaw\",\"_D3_RequestEnemyTurn\",\"_D3_SetEnemyIndicators\",\"_D3_SetEnemyIndicatorYaw\",\"_D3_ConsumeEnemyTurn\",\"_D3_Arco_SetCamera\",\"_D3_Arco_FrameCount\",\"_D3_Arco_Readback\"]")
 +
 +	# The game module is hard-linked (HARDLINK_GAME), so no dynamic linking /
 +	# MAIN_MODULE is required. SDL2 comes from Emscripten's built-in port, GL
@@ -156,15 +156,16 @@ index 69f1892..9912f89 100644
  	renderer/RenderEntity.cpp
  	renderer/RenderSystem.cpp
  	renderer/RenderSystem_init.cpp
-@@ -699,6 +782,7 @@ set(src_framework
+@@ -699,6 +782,8 @@ set(src_framework
  	framework/FileSystem.cpp
  	framework/KeyInput.cpp
  	framework/UsercmdGen.cpp
 +	framework/d3_wearable.cpp
++	framework/d3_arco.cpp
  	framework/Session_menu.cpp
  	framework/Session.cpp
  	framework/async/AsyncClient.cpp
-@@ -909,6 +993,7 @@ set(src_game
+@@ -909,6 +994,7 @@ set(src_game
  	game/AF.cpp
  	game/AFEntity.cpp
  	game/Actor.cpp
@@ -172,7 +173,7 @@ index 69f1892..9912f89 100644
  	game/Camera.cpp
  	game/Entity.cpp
  	game/BrittleFracture.cpp
-@@ -1280,7 +1365,7 @@ include_directories(${CMAKE_BINARY_DIR})
+@@ -1280,7 +1366,7 @@ include_directories(${CMAKE_BINARY_DIR})
  include_directories(${CMAKE_SOURCE_DIR})
  
  add_library(idlib STATIC ${src_idlib})
@@ -1292,10 +1293,18 @@ index 7edeb4d..adae33e 100644
  		Sys_CreateThread( BackgroundDownloadThread, &backgroundThread_exit, backgroundThread, "backgroundDownload" );
  	} else {
 diff --git a/neo/framework/Session.cpp b/neo/framework/Session.cpp
-index 29745c6..9fe2198 100644
+index 29745c6..d416439 100644
 --- a/neo/framework/Session.cpp
 +++ b/neo/framework/Session.cpp
-@@ -126,6 +126,12 @@ static void Session_Map_f( const idCmdArgs &args ) {
+@@ -36,6 +36,7 @@ If you have questions concerning this license or the applicable additional terms
+ #include "renderer/ModelManager.h"
+ 
+ #include "framework/Session_local.h"
++#include "framework/d3_arco.h"
+ 
+ #if defined(__AROS__)
+ #define CDKEY_FILEPATH CDKEY_FILE
+@@ -126,6 +127,12 @@ static void Session_Map_f( const idCmdArgs &args ) {
  	// handle addon packs through reloadEngine
  	sprintf( string, "maps/%s.map", map.c_str() );
  	ff = fileSystem->FindFile( string, true );
@@ -1308,7 +1317,7 @@ index 29745c6..9fe2198 100644
  	switch ( ff ) {
  	case FIND_NO:
  		common->Printf( "Can't find map %s\n", string.c_str() );
-@@ -167,6 +173,12 @@ static void Session_DevMap_f( const idCmdArgs &args ) {
+@@ -167,6 +174,12 @@ static void Session_DevMap_f( const idCmdArgs &args ) {
  	// handle addon packs through reloadEngine
  	sprintf( string, "maps/%s.map", map.c_str() );
  	ff = fileSystem->FindFile( string, true );
@@ -1321,7 +1330,7 @@ index 29745c6..9fe2198 100644
  	switch ( ff ) {
  	case FIND_NO:
  		common->Printf( "Can't find map %s\n", string.c_str() );
-@@ -548,8 +560,16 @@ void idSessionLocal::ShowLoadingGui() {
+@@ -548,8 +561,16 @@ void idSessionLocal::ShowLoadingGui() {
  	// introduced in D3XP code. don't think it actually fixes anything, but doesn't hurt either
  #if 1
  	// Try and prevent the while loop from being skipped over (long hitch on the main thread?)
@@ -1338,7 +1347,7 @@ index 29745c6..9fe2198 100644
  	while ( Sys_Milliseconds() < stop || force-- > 0 ) {
  		Com_UpdateFrameTime(); // DG: put updating com_frameTime into a function
  		session->Frame();
-@@ -1544,6 +1564,7 @@ create a game at all.
+@@ -1544,6 +1565,7 @@ create a game at all.
  Exits with mapSpawned = true
  ===============
  */
@@ -1346,7 +1355,7 @@ index 29745c6..9fe2198 100644
  void idSessionLocal::ExecuteMapChange( bool noFadeWipe ) {
  	int		i;
  	bool	reloadingSameMap;
-@@ -1604,7 +1625,17 @@ void idSessionLocal::ExecuteMapChange( bool noFadeWipe ) {
+@@ -1604,7 +1626,17 @@ void idSessionLocal::ExecuteMapChange( bool noFadeWipe ) {
  	}
  
  	uiManager->BeginLevelLoad();
@@ -1364,7 +1373,168 @@ index 29745c6..9fe2198 100644
  
  	// set the loading gui that we will wipe to
  	LoadLoadingGui( mapString );
-@@ -3024,6 +3055,14 @@ void idSessionLocal::Init() {
+@@ -2646,9 +2678,160 @@ idSessionLocal::Frame
+ */
+ extern bool CheckOpenALDeviceAndRecoverIfNeeded();
+ extern int g_screenshotFormat;
++
++// ---- B1 SPIKE (Arco) ------------------------------------------------------
++// Falsification test for "drive idRenderWorld as a pure renderer fed externally,
++// WITHOUT idGameLocal". Set r_b1map "maps/game/mp/d3dm3" (autoexec) and the
++// session Frame() below allocates a render world, InitFromMap, and RenderScene
++// from a free camera EVERY frame — the game is never spawned and the menu never
++// draws. Proves the renderer + render world are separable from the game in THIS
++// WebGPU build. Captures one TGA after warm-up. Inert when r_b1map is empty.
++idCVar r_b1map( "r_b1map", "", CVAR_SYSTEM, "B1 spike: render this map's render-world with NO game (e.g. maps/game/mp/d3dm3)" );
++// FFI-seam test: an externally-driven proxy entity ("networked player"). r_b1ent enables it;
++// r_b1yaw / r_b1lat are set FROM JS every frame (window.d3cmd) and fed straight into the
++// render world via UpdateEntityDef — proving external code controls render state per frame.
++idCVar r_b1ent( "r_b1ent", "0", CVAR_SYSTEM | CVAR_BOOL, "B1 FFI test: render a JS-driven proxy entity" );
++idCVar r_b1yaw( "r_b1yaw", "0", CVAR_SYSTEM | CVAR_FLOAT, "B1 FFI: proxy entity yaw (deg), set from JS" );
++idCVar r_b1lat( "r_b1lat", "0", CVAR_SYSTEM | CVAR_FLOAT, "B1 FFI: proxy entity lateral offset, set from JS" );
++// ---------------------------------------------------------------------------
++
+ void idSessionLocal::Frame() {
+ 	D3P_ScopedCPUSample(Session_Frame);
+ 
++	// ---- B1 SPIKE: render-world-without-game bypass ----
++	if ( r_b1map.GetString()[0] ) {
++		static idRenderWorld *b1rw = NULL;
++		static int b1frame = 0;
++		static bool b1captured = false;
++		if ( b1rw == NULL ) {
++			common->Printf( "[B1] AllocRenderWorld + InitFromMap '%s' (idGameLocal NOT spawned)\n", r_b1map.GetString() );
++			b1rw = renderSystem->AllocRenderWorld();
++			renderSystem->BeginLevelLoad();
++			bool ok = b1rw->InitFromMap( r_b1map.GetString() );
++			renderSystem->EndLevelLoad();
++			if ( !ok ) {
++				common->Printf( "[B1] InitFromMap FAILED for '%s'\n", r_b1map.GetString() );
++				r_b1map.SetString( "" );
++				return;
++			}
++			common->Printf( "[B1] InitFromMap OK — render world built with NO game module\n" );
++			// LIGHTING TEST: dhewm3 lights the world via light ENTITIES the game spawns; render-only
++			// mode has none → black. Add one big bright point light at a d3dm3 spawn to confirm.
++			renderLight_t tl;
++			memset( (void *)&tl, 0, sizeof( tl ) );
++			tl.origin = idVec3( 16.0f, 460.0f, 360.0f ); // d3dm3 spawn area (inches)
++			tl.axis = mat3_identity;
++			tl.pointLight = true;
++			tl.noShadows = true;
++			tl.lightRadius = idVec3( 700.0f, 700.0f, 700.0f );
++			tl.shaderParms[0] = tl.shaderParms[1] = tl.shaderParms[2] = tl.shaderParms[3] = 1.0f;
++			b1rw->AddLightDef( &tl );
++			common->Printf( "[B1] test light added\n" );
++			// DIAG: did the world area models load with geometry?
++			idRenderModel *a0 = renderModelManager->CheckModel( "_area0" );
++			idStr wd = va( "[B1-WORLD] NumAreas=%d _area0=%s surfs=%d default=%d\n",
++				b1rw->NumAreas(),
++				a0 ? a0->Name() : "NULL",
++				a0 ? a0->NumSurfaces() : -1,
++				a0 ? (int)a0->IsDefaultModel() : -1 );
++			fileSystem->WriteFile( "b1world.txt", wd.c_str(), wd.Length(), "fs_savepath" );
++			common->Printf( "%s", wd.c_str() );
++		}
++
++		// ---- FFI SEAM: externally-driven proxy entity ("networked player") ----
++		static qhandle_t b1entH = -1;
++		static idVec3 b1cam( 16.0f, 300.0f, 240.0f );
++		static bool b1entReady = false;
++		if ( r_b1ent.GetBool() && !b1entReady ) {
++			// Find a point that's actually inside a loaded area (boot chunk only, no player streaming).
++			int area = b1rw->PointInArea( b1cam );
++			if ( area < 0 ) {
++				idVec3 seed = b1cam; float best = 1e9f;
++				for ( int dx = -512; dx <= 512; dx += 64 )
++				for ( int dy = -512; dy <= 512; dy += 64 )
++				for ( int dz = -128; dz <= 192; dz += 64 ) {
++					idVec3 p( seed.x + dx, seed.y + dy, seed.z + dz );
++					if ( b1rw->PointInArea( p ) >= 0 ) { float d = ( p - seed ).LengthSqr(); if ( d < best ) { best = d; b1cam = p; } }
++				}
++				area = b1rw->PointInArea( b1cam );
++			}
++			idStr diag = va( "[B1-FFI] area_cam=%d cam=(%.0f %.0f %.0f) — camera driven from JS, no entity\n",
++				area, b1cam.x, b1cam.y, b1cam.z );
++			fileSystem->WriteFile( "b1diag.txt", diag.c_str(), diag.Length(), "fs_savepath" );
++			b1entReady = true;
++		}
++
++		int sw = renderSystem->GetScreenWidth();
++		int sh = renderSystem->GetScreenHeight();
++
++		// ---- B1 production path: Arco client drives the camera via D3_Arco_SetCamera ----
++		if ( D3Arco_Active() ) {
++			renderSystem->BeginFrame( sw, sh );
++			renderView_t av;
++			D3Arco_BuildView( av );
++			static int diagN = 0;
++			if ( diagN < 4 ) {
++				diagN++;
++				int a = b1rw->PointInArea( av.vieworg );
++				idStr d = va( "[B1-ARCO] vieworg=(%.1f %.1f %.1f) area=%d fovx=%.1f fwd=(%.2f %.2f %.2f)\n",
++					av.vieworg.x, av.vieworg.y, av.vieworg.z, a, av.fov_x,
++					av.viewaxis[0].x, av.viewaxis[0].y, av.viewaxis[0].z );
++				fileSystem->WriteFile( "b1arco.txt", d.c_str(), d.Length(), "fs_savepath" );
++			}
++			b1rw->RenderScene( &av );
++			renderSystem->EndFrame( NULL, NULL );
++			D3Arco_AfterFrame();
++			return;
++		}
++		// ---- end B1 production path; below is the standalone spike sweep ----
++
++		renderSystem->BeginFrame( sw, sh );
++		renderView_t v;
++		memset( (void *)&v, 0, sizeof( v ) );
++		v.x = 0; v.y = 0;
++		v.width = sw; v.height = sh;           // match the ACTUAL render target (was 640x480 vs 640x640 → ringed)
++		v.fov_x = 90.0f;
++		v.fov_y = 2.0f * RAD2DEG( idMath::ATan( idMath::Tan( DEG2RAD( v.fov_x ) * 0.5f ) * (float)sh / (float)sw ) );
++
++		if ( r_b1ent.GetBool() && b1entReady ) {
++			// FFI SEAM: the camera pose is pulled FROM JS-set cvars every frame and fed to RenderScene —
++			// r_b1yaw pans the view, r_b1lat dollies forward. Each JS command visibly changes the frame.
++			float jsYaw = r_b1yaw.GetFloat();
++			float jsLat = r_b1lat.GetFloat();
++			idAngles ca( 0.0f, jsYaw, 0.0f );
++			v.vieworg = b1cam + ca.ToForward() * jsLat;
++			v.viewaxis = ca.ToMat3();
++			v.time = Sys_Milliseconds();
++			b1rw->RenderScene( &v );
++			renderSystem->EndFrame( NULL, NULL );
++			b1frame++;
++			if ( b1frame % 12 == 0 ) { // capture continuously; filename encodes the JS-commanded pose
++				idStr fn = va( "screenshots/ent_y%03d_l%+04d.tga", (int)jsYaw, (int)jsLat );
++				renderSystem->CaptureRenderToFile( fn.c_str(), false );
++			}
++			return;
++		}
++
++		// Default B1 mode: sweep a free camera over the loaded world (render-without-game proof).
++		int shot = b1frame / 25; // 0..7, one capture per 25 frames
++		float yaw = (float)( shot * 45 );
++		v.vieworg = idVec3( 16.0f, 460.0f, 340.0f ); // a d3dm3 info_player spawn (eye height)
++		idAngles ang( 0.0f, yaw, 0.0f );
++		v.viewaxis = ang.ToMat3();
++		v.time = Sys_Milliseconds();
++		b1rw->RenderScene( &v );
++		renderSystem->EndFrame( NULL, NULL );
++		b1frame++;
++		if ( b1frame % 25 == 0 && shot < 8 ) {
++			idStr fn = va( "screenshots/b1_%03d.tga", (int)yaw );
++			renderSystem->CaptureRenderToFile( fn.c_str(), false );
++			common->Printf( "[B1] CAPTURED %s (yaw=%d) — RENDER-WITHOUT-GAME OK\n", fn.c_str(), (int)yaw );
++			if ( shot >= 7 ) b1captured = true;
++		}
++		return; // bypass game tic + menu draw entirely
++	}
++	// ---- end B1 SPIKE ----
++
+ 	if ( com_asyncSound.GetInteger() == 0 ) {
+ 		soundSystem->AsyncUpdateWrite( Sys_Milliseconds() );
+ 	}
+@@ -3024,6 +3207,14 @@ void idSessionLocal::Init() {
  	menuSoundWorld = soundSystem->AllocSoundWorld( rw );
  
  	// we have a single instance of the main menu
@@ -1379,7 +1549,7 @@ index 29745c6..9fe2198 100644
  	guiMainMenu = uiManager->FindGui( "guis/mainmenu.gui", true, false, true );
  	if (!guiMainMenu) {
  		guiMainMenu = uiManager->FindGui( "guis/demo_mainmenu.gui", true, false, true );
-@@ -3032,6 +3071,7 @@ void idSessionLocal::Init() {
+@@ -3032,6 +3223,7 @@ void idSessionLocal::Init() {
  	guiMainMenu_MapList = uiManager->AllocListGUI();
  	guiMainMenu_MapList->Config( guiMainMenu, "mapList" );
  	idAsyncNetwork::client.serverList.GUIConfig( guiMainMenu, "serverList" );
@@ -1439,12 +1609,117 @@ index 6bba28f..9f732b9 100644
  		// check to make sure the angles haven't wrapped
  		if ( viewangles[PITCH] - oldAngles[PITCH] > 90 ) {
  			viewangles[PITCH] = oldAngles[PITCH] + 90;
+diff --git a/neo/framework/d3_arco.cpp b/neo/framework/d3_arco.cpp
+new file mode 100644
+index 0000000..2c2ac24
+--- /dev/null
++++ b/neo/framework/d3_arco.cpp
+@@ -0,0 +1,76 @@
++// B1 (Arco) render-state bridge.
++//
++// Feeds dhewm3's idRenderWorld from Arco's authoritative server, run as a PURE
++// renderer (idGameLocal tic never runs). This file is the ONLY Arco FFI surface.
++//
++// HARD INVARIANT (enforced in review): no write to usercmd_t, no
++// cmdSystem->BufferCommandText of gameplay/impulse commands, no idGameLocal /
++// game-> access. Pure render-state setters only. (Replaces the doom3-rayban
++// wearable bridge d3_wearable.cpp, which writes BUTTON_ATTACK/usercmd and is
++// out of scope for Arco — CLAUDE.md #1.)
++
++#include <string.h>
++#include "sys/platform.h"
++#include "idlib/math/Vector.h"
++#include "idlib/math/Angles.h"
++#include "idlib/math/Math.h"
++#include "idlib/Lib.h"
++#include "renderer/RenderWorld.h"
++#include "renderer/RenderSystem.h"
++#include "framework/d3_arco.h"
++
++#ifdef __EMSCRIPTEN__
++#include <emscripten/emscripten.h>
++#else
++#define EMSCRIPTEN_KEEPALIVE
++#endif
++
++// Arco wire pose: METERS, RADIANS, Z-up (yaw about +Z, pitch tilts up/down).
++static float s_camX = 0.0f, s_camY = 0.0f, s_camZ = 0.0f;
++static float s_yaw = 0.0f, s_pitch = 0.0f;
++static float s_fovDeg = 90.0f;
++static bool  s_active = false;
++static int   s_frameCount = 0;
++
++extern "C" {
++
++// Called from Arco's JS client every frame with the predicted self pose.
++EMSCRIPTEN_KEEPALIVE void D3_Arco_SetCamera( float x, float y, float z, float yaw, float pitch, float fovDeg ) {
++	s_camX = x; s_camY = y; s_camZ = z;
++	s_yaw = yaw; s_pitch = pitch;
++	if ( fovDeg > 1.0f ) s_fovDeg = fovDeg;
++	s_active = true;
++}
++
++// Readiness/liveness signal for the JS loader (replaces _arco_frame_count).
++EMSCRIPTEN_KEEPALIVE int D3_Arco_FrameCount( void ) { return s_frameCount; }
++
++// Offscreen capture for the render-regression gate (P1). Writes a TGA into
++// fs_savepath/screenshots that the headless harness reads via Module.FS.
++EMSCRIPTEN_KEEPALIVE void D3_Arco_Readback( void ) {
++	renderSystem->CaptureRenderToFile( "screenshots/d3arco.tga", false );
++}
++
++} // extern "C"
++
++bool D3Arco_Active( void ) { return s_active; }
++
++void D3Arco_BuildView( renderView_t &v ) {
++	// meters -> idTech4 inches (1 / 0.0254). The Arco wire z is ALREADY the eye
++	// (feetZ*0.0254 + EYE_HEIGHT at emit), so no extra eye-height offset here.
++	const float M2I = 39.37007874f;
++	memset( (void *)&v, 0, sizeof( v ) );
++	const int sw = renderSystem->GetScreenWidth();
++	const int sh = renderSystem->GetScreenHeight();
++	v.x = 0; v.y = 0; v.width = sw; v.height = sh;
++	v.fov_x = s_fovDeg;
++	v.fov_y = 2.0f * RAD2DEG( idMath::ATan( idMath::Tan( DEG2RAD( v.fov_x ) * 0.5f ) * (float)sh / (float)sw ) );
++	v.vieworg = idVec3( s_camX * M2I, s_camY * M2I, s_camZ * M2I );
++	// dhewm3 renderView "looks down +X"; idAngles is (pitch,yaw,roll) in degrees.
++	// idTech4 pitch is DOWN-positive, Arco pitch is UP-positive → negate. (P3 verifies signs.)
++	idAngles ang( -RAD2DEG( s_pitch ), RAD2DEG( s_yaw ), 0.0f );
++	v.viewaxis = ang.ToMat3();
++	v.time = Sys_Milliseconds();
++}
++
++void D3Arco_AfterFrame( void ) { s_frameCount++; }
+diff --git a/neo/framework/d3_arco.h b/neo/framework/d3_arco.h
+new file mode 100644
+index 0000000..eecb62d
+--- /dev/null
++++ b/neo/framework/d3_arco.h
+@@ -0,0 +1,17 @@
++// B1 (Arco) render-state bridge — declarations.
++// Pure render-state ONLY. INVARIANT: no usercmd_t writes, no cmdSystem gameplay/
++// impulse commands, no idGameLocal/game-> access anywhere in d3_arco.cpp.
++#ifndef __D3_ARCO_H__
++#define __D3_ARCO_H__
++
++struct renderView_s;
++
++// True once Arco's client has pushed a camera via D3_Arco_SetCamera().
++bool D3Arco_Active( void );
++// Fill a renderView from the last Arco pose (meters->inches, radians->degrees,
++// Z-up yaw/pitch -> dhewm3 "+X forward" viewaxis).
++void D3Arco_BuildView( renderView_s &v );
++// Post-render bookkeeping (frame counter for the JS readiness signal).
++void D3Arco_AfterFrame( void );
++
++#endif
 diff --git a/neo/framework/d3_wearable.cpp b/neo/framework/d3_wearable.cpp
 new file mode 100644
-index 0000000..e9aafa2
+index 0000000..5627533
 --- /dev/null
 +++ b/neo/framework/d3_wearable.cpp
-@@ -0,0 +1,302 @@
+@@ -0,0 +1,318 @@
 +/*
 +===========================================================================
 +
@@ -1723,6 +1998,22 @@ index 0000000..e9aafa2
 +		cmd.forwardmove = 100;
 +	}
 +
++	// Arco touch movement: back + strafe.
++	if ( d3_wearable_actions[D3_WEARABLE_BACK] && ( cmd.forwardmove > -100 ) )
++	{
++		cmd.forwardmove = -100;
++	}
++
++	if ( d3_wearable_actions[D3_WEARABLE_MOVELEFT] && ( cmd.rightmove > -100 ) )
++	{
++		cmd.rightmove = -100;
++	}
++
++	if ( d3_wearable_actions[D3_WEARABLE_MOVERIGHT] && ( cmd.rightmove < 100 ) )
++	{
++		cmd.rightmove = 100;
++	}
++
 +	if ( d3_wearable_actions[D3_WEARABLE_JUMP] && ( cmd.upmove < 127 ) )
 +	{
 +		cmd.upmove = 127;
@@ -1749,10 +2040,10 @@ index 0000000..e9aafa2
 +#endif // __EMSCRIPTEN__
 diff --git a/neo/framework/d3_wearable.h b/neo/framework/d3_wearable.h
 new file mode 100644
-index 0000000..4b45b72
+index 0000000..f49ecf8
 --- /dev/null
 +++ b/neo/framework/d3_wearable.h
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,79 @@
 +/*
 +===========================================================================
 +
@@ -1782,6 +2073,10 @@ index 0000000..4b45b72
 +	D3_WEARABLE_CROUCH,
 +	D3_WEARABLE_USE,
 +	D3_WEARABLE_FLASHLIGHT,
++	// Arco touch movement (appended so existing action ids don't shift):
++	D3_WEARABLE_BACK,
++	D3_WEARABLE_MOVELEFT,
++	D3_WEARABLE_MOVERIGHT,
 +	D3_WEARABLE_ACTION_COUNT
 +};
 +
@@ -2941,6 +3236,38 @@ index 36a0cbe..58d9a22 100644
  	}
  
  	GetPhysics()->SetContents( CONTENTS_SOLID );
+diff --git a/neo/game/ai/AI.cpp b/neo/game/ai/AI.cpp
+index 2ac9948..252bde1 100644
+--- a/neo/game/ai/AI.cpp
++++ b/neo/game/ai/AI.cpp
+@@ -925,6 +925,10 @@ void idAI::Spawn( void ) {
+ 
+ 	BecomeActive( TH_THINK );
+ 
++	// Arco COMBAT milestone P0: replicate this monster to clients. Without networkSync the
++	// server's ServerWriteSnapshot skips it (Game_network.cpp:610) and no client ever sees it.
++	fl.networkSync = true;
++
+ 	if ( af_push_moveables ) {
+ 		af.SetupPose( this, gameLocal.time );
+ 		af.GetPhysics()->EnableClip();
+@@ -1049,6 +1053,16 @@ idAI::Think
+ =====================
+ */
+ void idAI::Think( void ) {
++	// Arco COMBAT milestone P0: a replicated idAI on the CLIENT must NOT run the server-only
++	// scripted brain (it has no enemy / AAS / script-thread context and would mis-sim or assert).
++	// Route to the animated-entity client path (physics interp + animation + present) so the client
++	// renders a server-driven actor only. The dedicated server (isClient == false) runs the real
++	// brain below as normal. This is the load-bearing guard for monster replication.
++	if ( gameLocal.isClient ) {
++		idAnimatedEntity::ClientPredictionThink();
++		return;
++	}
++
+ 	// if we are completely closed off from the player, don't do anything at all
+ 	if ( CheckDormant() ) {
+ 		return;
 diff --git a/neo/game/gamesys/SysCmds.cpp b/neo/game/gamesys/SysCmds.cpp
 index 105ff57..e4b3f00 100644
 --- a/neo/game/gamesys/SysCmds.cpp
@@ -12924,10 +13251,77 @@ index bb0232b..7975128 100644
  
  // ----------- lots of signal handling stuff ------------
 diff --git a/neo/sys/posix/posix_net.cpp b/neo/sys/posix/posix_net.cpp
-index 746a945..315c675 100644
+index 746a945..269a19f 100644
 --- a/neo/sys/posix/posix_net.cpp
 +++ b/neo/sys/posix/posix_net.cpp
-@@ -277,6 +277,13 @@ void Sys_InitNetworking(void)
+@@ -49,6 +49,44 @@ If you have questions concerning this license or the applicable additional terms
+ 
+ #include "sys/posix/posix_public.h"
+ 
++#ifdef __EMSCRIPTEN__
++// Arco F0 #2b: WASM idPort over a JS WebSocket to the ws-udp-bridge (browsers can't
++// do UDP). One WebSocket = the client's link to the server (via the bridge). The
++// async client's UDP idPort calls below early-return to these JS-backed paths.
++#include <emscripten.h>
++EM_JS( void, arco_ws_open, (), {
++	if ( Module.__arcoWs ) return;
++	var url = Module.ARCO_BRIDGE_URL ||
++		( (location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.hostname + ':27667' );
++	Module.__arcoWsQueue = [];
++	Module.__arcoWsOpen = 0;
++	try {
++		var ws = new WebSocket( url ); ws.binaryType = 'arraybuffer';
++		ws.onopen = function(){ Module.__arcoWsOpen = 1; out('[arco-net] ws open ' + url); };
++		ws.onmessage = function(e){ Module.__arcoWsQueue.push( new Uint8Array( e.data ) ); };
++		ws.onclose = function(){ Module.__arcoWsOpen = 0; };
++		ws.onerror = function(){ out('[arco-net] ws error'); };
++		Module.__arcoWs = ws;
++	} catch (e) { out('[arco-net] ws open failed: ' + e); }
++});
++EM_JS( int, arco_ws_send, (int ptr, int len), {
++	var ws = Module.__arcoWs; if ( !ws || ws.readyState !== 1 ) return 0;
++	ws.send( HEAPU8.slice( ptr, ptr + len ) ); return len;
++});
++EM_JS( int, arco_ws_recv, (int ptr, int max), {
++	var q = Module.__arcoWsQueue; if ( !q || !q.length ) return -1;
++	var msg = q.shift(); var n = Math.min( msg.length, max );
++	HEAPU8.set( msg.subarray( 0, n ), ptr ); return n;
++});
++EM_JS( void, arco_ws_close, (), {
++	if ( Module.__arcoWs ) { try { Module.__arcoWs.close(); } catch(e){} Module.__arcoWs = null; }
++});
++// Synthetic server address the bridge fronts (must match the +connect target).
++static void Arco_ServerAdr( netadr_t &a ) {
++	a.type = NA_IP; a.ip[0]=127; a.ip[1]=0; a.ip[2]=0; a.ip[3]=1; a.port = 27666;
++}
++#endif
++
+ idPort clientPort, serverPort;
+ 
+ idCVar net_ip( "net_ip", "localhost", CVAR_SYSTEM, "local IP address" );
+@@ -171,6 +209,13 @@ Sys_StringToAdr
+ =============
+ */
+ bool Sys_StringToNetAdr( const char *s, netadr_t * a, bool doDNSResolve ) {
++#ifdef __EMSCRIPTEN__
++	// No DNS/sockets in the browser; the bridge fronts the server. Resolve to the
++	// synthetic loopback adr (optionally honoring an explicit :port).
++	Arco_ServerAdr( *a );
++	{ const char *col = strchr( s, ':' ); if ( col ) a->port = (unsigned short)atoi( col + 1 ); }
++	return true;
++#else
+ 	struct sockaddr_in sadr;
+ 
+ 	if ( !StringToSockaddr( s, &sadr, doDNSResolve ) ) {
+@@ -179,6 +224,7 @@ bool Sys_StringToNetAdr( const char *s, netadr_t * a, bool doDNSResolve ) {
+ 
+ 	SockadrToNetadr( &sadr, a );
+ 	return true;
++#endif
+ }
+ 
+ /*
+@@ -277,6 +323,13 @@ void Sys_InitNetworking(void)
  
  	num_interfaces = 0;
  
@@ -12941,6 +13335,82 @@ index 746a945..315c675 100644
  	if( getifaddrs( &ifap ) < 0 ) {
  		common->FatalError( "InitNetworking: SIOCGIFCONF error - %s\n", strerror( errno ) );
  		return;
+@@ -412,6 +465,9 @@ idPort::Close
+ ==================
+ */
+ void idPort::Close() {
++#ifdef __EMSCRIPTEN__
++	arco_ws_close(); netSocket = 0; return;
++#endif
+ 	if ( netSocket ) {
+ 		close(netSocket);
+ 		netSocket = 0;
+@@ -425,6 +481,13 @@ idPort::GetPacket
+ ==================
+ */
+ bool idPort::GetPacket( netadr_t &net_from, void *data, int &size, int maxSize ) {
++#ifdef __EMSCRIPTEN__
++	int n = arco_ws_recv( (int)(uintptr_t)data, maxSize );
++	if ( n <= 0 ) return false;
++	Arco_ServerAdr( net_from );
++	size = n;
++	return true;
++#else
+ 	int ret;
+ 	struct sockaddr_in from;
+ 	int fromlen;
+@@ -450,6 +513,7 @@ bool idPort::GetPacket( netadr_t &net_from, void *data, int &size, int maxSize )
+ 	SockadrToNetadr( &from, &net_from );
+ 	size = ret;
+ 	return true;
++#endif
+ }
+ 
+ /*
+@@ -458,6 +522,10 @@ idPort::GetPacketBlocking
+ ==================
+ */
+ bool idPort::GetPacketBlocking( netadr_t &net_from, void *data, int &size, int maxSize, int timeout ) {
++#ifdef __EMSCRIPTEN__
++	// No select() blocking in the browser — single poll; callers retry across frames.
++	return GetPacket( net_from, data, size, maxSize );
++#else
+ 	fd_set				set;
+ 	struct timeval		tv;
+ 	int					ret;
+@@ -502,6 +570,7 @@ bool idPort::GetPacketBlocking( netadr_t &net_from, void *data, int &size, int m
+ 	SockadrToNetadr( &from, &net_from );
+ 	size = ret;
+ 	return true;
++#endif
+ }
+ 
+ /*
+@@ -510,6 +579,10 @@ idPort::SendPacket
+ ==================
+ */
+ void idPort::SendPacket( const netadr_t to, const void *data, int size ) {
++#ifdef __EMSCRIPTEN__
++	arco_ws_send( (int)(uintptr_t)data, size );
++	return;
++#endif
+ 	int ret;
+ 	struct sockaddr_in addr;
+ 
+@@ -536,6 +609,13 @@ idPort::InitForPort
+ ==================
+ */
+ bool idPort::InitForPort( int portNumber ) {
++#ifdef __EMSCRIPTEN__
++	arco_ws_open();
++	bound_to.type = NA_IP; bound_to.ip[0]=127; bound_to.ip[1]=0; bound_to.ip[2]=0; bound_to.ip[3]=1;
++	bound_to.port = (unsigned short)( portNumber ? portNumber : 1 );
++	netSocket = 1; // non-zero so the port reads as "open"
++	return true;
++#endif
+ 	netSocket = IPSocket( net_ip.GetString(), portNumber, &bound_to );
+ 	if ( netSocket <= 0 ) {
+ 		netSocket = 0;
 diff --git a/neo/sys/wasm/d3_runtime_exports.js b/neo/sys/wasm/d3_runtime_exports.js
 new file mode 100644
 index 0000000..2e7755b
