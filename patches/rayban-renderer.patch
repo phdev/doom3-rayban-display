@@ -958,10 +958,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..4afb71e
+index 0000000..e7e764e
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,4567 @@
+@@ -0,0 +1,4769 @@
 +/*
 +================================================================================
 +
@@ -1108,6 +1108,10 @@ index 0000000..4afb71e
 +// CPU image cache (the backend otherwise has only by-ptr lookup).
 +extern "C" int g_capPreloadPerFrame;
 +extern "C" int g_capPreloadMsPerFrame;
++// R0: ACES filmic tonemap grade (opt-in ?tonemap). Mirrors of r_tonemap*.
++extern "C" uint32_t g_capTonemapOn;
++extern "C" float    g_capTonemapExposure;
++extern "C" uint32_t g_capTonemapDither;
 +extern "C" int D3_WebGPU_CachedImageCount( void );
 +extern "C" const void* D3_WebGPU_CachedImagePtr( int i );
 +
@@ -1347,6 +1351,11 @@ index 0000000..4afb71e
 +                    if (g_capDetTest && detMapsPending == 0 && detRoundsDone < kDetMaxRounds &&
 +                        detFrameCounter >= 90 && (detFrameCounter - 90) % 240 == 0) {
 +                        runDeterminismRound();
++                    }
++                    // R0 operator gate: run the LUT self-test once (independent of
++                    // r_tonemap / the scene) so window.__d3TonemapLut is always set.
++                    if (!tmLutDone && tonemapPipeline && tonemapUB && detFrameCounter >= 30) {
++                        runTonemapLutSelfTest();
 +                    }
 +                }
 +            }
@@ -2164,6 +2173,9 @@ index 0000000..4afb71e
 +        bloomBrightPipeline    = makeBloom("fs_bright", false, "bloomBright");
 +        bloomBlurPipeline      = makeBloom("fs_blur", false, "bloomBlur");
 +        bloomCompositePipeline = makeBloom("fs_composite", true, "bloomComposite");
++        // R0: tonemap grade — REPLACE blend (additive=false → src One / dst Zero),
++        // same bloomBGL layout + fullscreen vs_main. Color-only pass (no depth).
++        tonemapPipeline        = makeBloom("fs_tonemap", false, "tonemap");
 +
 +        // Iter 23: shadow-darkening fullscreen multiply — stencil-gated
 +        // (NotEqual 128 = inside the union of shadow volumes), blend
@@ -2227,6 +2239,12 @@ index 0000000..4afb71e
 +            d.size = 32;
 +            d.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
 +            bloomUB[i] = wgpuDeviceCreateBuffer(device, &d);
++        }
++        {   // R0: one 32B UB for the tonemap grade (allocated once, like bloomUB)
++            WGPUBufferDescriptor d = {};
++            d.size = 32;
++            d.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
++            tonemapUB = wgpuDeviceCreateBuffer(device, &d);
 +        }
 +    }
 +
@@ -4457,7 +4475,10 @@ index 0000000..4afb71e
 +                                    currentRenderW == (uint32_t)depthW &&
 +                                    currentRenderH == (uint32_t)depthH;
 +            const bool bloomActive = bloomCompositePipeline && bloomBGL && colorTex && g_capBloomOn;
-+            const bool splitGUI = hazeActive || bloomActive;   // GUI draws after post-FX
++            // R0: tonemap grade — loose active flag (mirrors bloomActive); the
++            // ensureCurrentRenderTarget + size-match guard live inside the block.
++            const bool tonemapActive = g_capTonemapOn && tonemapPipeline && tonemapUB && bloomBGL && colorTex;
++            const bool splitGUI = hazeActive || bloomActive || tonemapActive;   // GUI draws after post-FX (incl. the grade — HUD must not be tone-crushed)
 +            WGPURenderPassColorAttachment ca = {};
 +            ca.view = color;
 +            ca.loadOp = colorCleared ? WGPULoadOp_Load : WGPULoadOp_Clear;
@@ -4664,6 +4685,62 @@ index 0000000..4afb71e
 +                }
 +            }
 +
++            // R0: ACES filmic tonemap — copy the (post-bloom) frame into
++            // currentRenderTex and grade it back into `color` with ONE REPLACE
++            // fullscreen draw. After shadow-darken/haze/bloom, before the GUI.
++            // Reuses currentRenderTex + bloomBGL (no new render target).
++            if (tonemapActive) {
++                ensureCurrentRenderTarget((uint32_t)depthW, (uint32_t)depthH);
++                if (currentRenderTex && currentRenderView &&
++                    currentRenderW == (uint32_t)depthW && currentRenderH == (uint32_t)depthH) {
++                    WGPUTexelCopyTextureInfo src = {};
++                    src.texture = colorTex;
++                    WGPUTexelCopyTextureInfo dst = {};
++                    dst.texture = currentRenderTex;
++                    WGPUExtent3D ext = { currentRenderW, currentRenderH, 1 };
++                    wgpuCommandEncoderCopyTextureToTexture(enc, &src, &dst, &ext);
++
++                    // params.x = exposure, params.y = enable, params.z = dither
++                    float ub[8] = { g_capTonemapExposure, 1.0f, g_capTonemapDither ? 1.0f : 0.0f, 0,  0, 0, 0, 0 };
++                    wgpuQueueWriteBuffer(queue, tonemapUB, 0, ub, 32);
++
++                    // bind group samples currentRenderView (the copy) → rebuilt
++                    // only when the copy target was recreated. Shared across the
++                    // live view AND both det passes (they sample the same view).
++                    if (tonemapBGGen != currentRenderGen || !tonemapBG) {
++                        if (tonemapBG) { wgpuBindGroupRelease(tonemapBG); tonemapBG = nullptr; }
++                        WGPUBindGroupEntry e[3] = {};
++                        e[0].binding = 0; e[0].buffer = tonemapUB; e[0].size = 32;
++                        e[1].binding = 1; e[1].sampler = interactionLightSampler;
++                        e[2].binding = 2; e[2].textureView = currentRenderView;
++                        WGPUBindGroupDescriptor bgd = {};
++                        bgd.layout = bloomBGL;
++                        bgd.entryCount = 3;
++                        bgd.entries = e;
++                        tonemapBG = wgpuDeviceCreateBindGroup(device, &bgd);
++                        tonemapBGGen = currentRenderGen;
++                    }
++                    if (tonemapBG) {
++                        WGPURenderPassColorAttachment fca = {};
++                        fca.view = color;
++                        fca.loadOp = WGPULoadOp_Load;
++                        fca.storeOp = WGPUStoreOp_Store;
++                        fca.clearValue = { 0.0, 0.0, 0.0, 1.0 };
++                        fca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
++                        WGPURenderPassDescriptor frpd = {};
++                        frpd.colorAttachmentCount = 1;
++                        frpd.colorAttachments = &fca;
++                        WGPURenderPassEncoder frp = wgpuCommandEncoderBeginRenderPass(enc, &frpd);
++                        wgpuRenderPassEncoderSetPipeline(frp, tonemapPipeline);
++                        wgpuRenderPassEncoderSetBindGroup(frp, 0, tonemapBG, 0, nullptr);
++                        wgpuRenderPassEncoderDraw(frp, 3, 1, 0, 0);
++                        wgpuRenderPassEncoderEnd(frp);
++                        wgpuRenderPassEncoderRelease(frp);
++                        tonemapDrawCount++;   // gate: must advance inside det rounds
++                    }
++                }
++            }
++
 +            // GUI overlay last (post-FX must not bloom/warp the HUD).
 +            if (splitGUI) {
 +                ca.loadOp = WGPULoadOp_Load;
@@ -4675,7 +4752,7 @@ index 0000000..4afb71e
 +                    WGPURenderPipeline p = (r.pad1 == 2u) ? guiAddPipeline
 +                                          : (r.pad1 == 5u) ? guiAddAlphaPipeline
 +                                          : guiAlphaPipeline;
-+                    setRecordScissor(rp, r);   // iter 45
++                    setRecordScissor(rp3, r);   // iter 45 (was the part-A encoder `rp`, ended+released above — a latent use-after-release the R0 tonemap split exposed)
 +                    if (!p || !lastPassGroups[i]) continue;
 +                    wgpuRenderPassEncoderSetPipeline(rp3, p);
 +                    wgpuRenderPassEncoderSetBindGroup(rp3, 0, lastPassGroups[i], 0, nullptr);
@@ -4744,6 +4821,98 @@ index 0000000..4afb71e
 +        // detMapsPending == 0 → idle; next round arms on the frame cadence.
 +    }
 +
++    // R0 OPERATOR GATE — one-shot, capture-independent. Feed a known 256-step
++    // gray gradient through fs_tonemap and read it back; the callback compares
++    // each output to the CPU Narkowicz ACES. An identity / wrong / no-op curve
++    // → large maxErr → the gate goes red. Immune to the scene/camera/load-fade
++    // screenshot pollution (iter-25/125). Exposure 1.0, dither OFF (clean curve).
++    static void tmLutMapCallback(WGPUMapAsyncStatus status, WGPUStringView /*msg*/, void* ud1, void* /*ud2*/) {
++        idRenderBackend_WebGPU* self = (idRenderBackend_WebGPU*)ud1;
++        if (status != WGPUMapAsyncStatus_Success) {
++            EM_ASM({ console.warn("[d3] tonemap LUT self-test: buffer map FAILED"); });
++            return;
++        }
++        const uint32_t N = 256;
++        const uint8_t* p = (const uint8_t*)wgpuBufferGetConstMappedRange(self->tmLutBuf, 0, (size_t)N * 4u);
++        int maxErr = 0; int worstI = -1;
++        if (p) {
++            for (uint32_t i = 0; i < N; ++i) {
++                double x = (double)i / 255.0;   // input gray level (exposure 1)
++                const double a=2.51,b=0.03,c=2.43,d=0.59,e=0.14;   // matches bloom.wgsl aces_narkowicz
++                double y = (x*(a*x+b)) / (x*(c*x+d)+e);
++                if (y < 0.0) y = 0.0; if (y > 1.0) y = 1.0;
++                int expv = (int)(y * 255.0 + 0.5);
++                int got = (int)p[i*4+0];   // gray → any channel equals the graded value
++                int err = got - expv; if (err < 0) err = -err;
++                if (err > maxErr) { maxErr = err; worstI = (int)i; }
++            }
++        }
++        wgpuBufferUnmap(self->tmLutBuf);
++        const int pass = (p && maxErr <= 2) ? 1 : 0;   // ±2 LSB tolerance (8-bit round)
++        // NB: no top-level comma inside the EM_ASM body (the macro splits args on it).
++        EM_ASM({
++            window.__d3TonemapLutMaxErr = $0;
++            window.__d3TonemapLut = ($2 ? true : false);
++            console.info("[d3] tonemap LUT operator self-test: maxErr=" + $0 + " worstI=" + $1 + " -> " + ($2 ? "PASS (curve is ACES)" : "FAIL (no-op/wrong curve?)"));
++        }, maxErr, worstI, pass);
++    }
++
++    void runTonemapLutSelfTest() {
++        if (tmLutDone) return;
++        if (!device || !queue || !tonemapPipeline || !tonemapUB || !bloomBGL || !interactionLightSampler) return;
++        tmLutDone = true;   // attempt exactly once (no retry storm)
++        const uint32_t N = 256;
++        WGPUTextureDescriptor itd = {};
++        itd.size = { N, 1, 1 }; itd.mipLevelCount = 1; itd.sampleCount = 1;
++        itd.dimension = WGPUTextureDimension_2D; itd.format = surfaceFormat;
++        itd.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
++        tmLutIn = wgpuDeviceCreateTexture(device, &itd);
++        uint8_t grad[256*4];
++        for (uint32_t i = 0; i < N; ++i) { grad[i*4+0]=(uint8_t)i; grad[i*4+1]=(uint8_t)i; grad[i*4+2]=(uint8_t)i; grad[i*4+3]=255; }
++        WGPUTexelCopyTextureInfo dstT = {}; dstT.texture = tmLutIn;
++        WGPUTexelCopyBufferLayout lay = {}; lay.bytesPerRow = N*4; lay.rowsPerImage = 1;
++        WGPUExtent3D ext1 = { N, 1, 1 };
++        wgpuQueueWriteTexture(queue, &dstT, grad, sizeof(grad), &lay, &ext1);
++        tmLutInView = wgpuTextureCreateView(tmLutIn, nullptr);
++        WGPUTextureDescriptor otd = itd;
++        otd.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc;
++        tmLutOut = wgpuDeviceCreateTexture(device, &otd);
++        tmLutOutView = wgpuTextureCreateView(tmLutOut, nullptr);
++        WGPUBufferDescriptor bd = {}; bd.size = (uint64_t)N*4; bd.usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst;
++        tmLutBuf = wgpuDeviceCreateBuffer(device, &bd);
++        float ub[8] = { 1.0f, 1.0f, 0.0f, 0, 0, 0, 0, 0 };   // exposure 1, enable, dither off
++        wgpuQueueWriteBuffer(queue, tonemapUB, 0, ub, 32);
++        WGPUBindGroupEntry e[3] = {};
++        e[0].binding = 0; e[0].buffer = tonemapUB; e[0].size = 32;
++        e[1].binding = 1; e[1].sampler = interactionLightSampler;
++        e[2].binding = 2; e[2].textureView = tmLutInView;
++        WGPUBindGroupDescriptor bgd = {}; bgd.layout = bloomBGL; bgd.entryCount = 3; bgd.entries = e;
++        tmLutBG = wgpuDeviceCreateBindGroup(device, &bgd);
++        WGPUCommandEncoderDescriptor cdsc = {};
++        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(device, &cdsc);
++        WGPURenderPassColorAttachment ca = {};
++        ca.view = tmLutOutView; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
++        ca.clearValue = { 0.0, 0.0, 0.0, 1.0 }; ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
++        WGPURenderPassDescriptor rpd = {}; rpd.colorAttachmentCount = 1; rpd.colorAttachments = &ca;
++        WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
++        wgpuRenderPassEncoderSetPipeline(rp, tonemapPipeline);
++        wgpuRenderPassEncoderSetBindGroup(rp, 0, tmLutBG, 0, nullptr);
++        wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
++        wgpuRenderPassEncoderEnd(rp); wgpuRenderPassEncoderRelease(rp);
++        WGPUTexelCopyTextureInfo srcT = {}; srcT.texture = tmLutOut;
++        WGPUTexelCopyBufferInfo dstB = {}; dstB.buffer = tmLutBuf;
++        dstB.layout.bytesPerRow = N*4; dstB.layout.rowsPerImage = 1;
++        wgpuCommandEncoderCopyTextureToBuffer(enc, &srcT, &dstB, &ext1);
++        WGPUCommandBuffer cb = wgpuCommandEncoderFinish(enc, nullptr);
++        wgpuCommandEncoderRelease(enc);
++        wgpuQueueSubmit(queue, 1, &cb); wgpuCommandBufferRelease(cb);
++        WGPUBufferMapCallbackInfo cbi = {};
++        cbi.mode = WGPUCallbackMode_AllowSpontaneous;
++        cbi.callback = &idRenderBackend_WebGPU::tmLutMapCallback;
++        cbi.userdata1 = this;
++        wgpuBufferMapAsync(tmLutBuf, WGPUMapMode_Read, 0, (size_t)N*4, cbi);
++    }
++
 +    // Run one self-test round: two identical passes → two readback buffers
 +    // → async compare. Called from EndFrame on a frame cadence.
 +    void runDeterminismRound() {
@@ -4777,8 +4946,27 @@ index 0000000..4afb71e
 +
 +        WGPUCommandEncoderDescriptor cd = {};
 +        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(device, &cd);
++        const uint32_t tmBefore = tonemapDrawCount;
 +        encodeRecordsPass(enc, detViewA, detDepthView, detTexA);
 +        encodeRecordsPass(enc, detViewB, detDepthView, detTexB);
++        // R0 false-green guard: the IDENTICAL verdict is only meaningful for the
++        // grade if the tonemap pass actually FIRED in BOTH det encodes (it would
++        // be silently skipped if currentRenderTex size != det target size). Both
++        // det targets are created at depthW/depthH, so this must advance by 2;
++        // surface it (a one-shot WARNING if it didn't) so the gate can't pass vacuously.
++        {
++            const uint32_t fired = tonemapDrawCount - tmBefore;
++            // NB: no top-level comma inside EM_ASM braces — the macro splits args on it.
++            EM_ASM({ window.__d3TonemapOn = $0; window.__d3TonemapDet = ($1 >= 2); }, g_capTonemapOn, fired);
++            static bool warnedVacuous = false;
++            if (g_capTonemapOn && fired < 2u && !warnedVacuous) {
++                warnedVacuous = true;
++                EM_ASM({ console.warn('[d3] WARNING: det round did NOT exercise tonemap (fired ' + $0 + '/2) — IDENTICAL is vacuous for the grade'); }, fired);
++            } else if (g_capTonemapOn && fired >= 2u) {
++                static bool loggedOk = false;
++                if (!loggedOk) { loggedOk = true; EM_ASM({ console.log('[d3] tonemap exercised in det round (' + $0 + '/2) — IDENTICAL verdict covers the grade'); }, fired); }
++            }
++        }
 +        WGPUTexelCopyTextureInfo srcA = {}; srcA.texture = detTexA;
 +        WGPUTexelCopyTextureInfo srcB = {}; srcB.texture = detTexB;
 +        WGPUTexelCopyBufferInfo dstA = {};
@@ -5501,6 +5689,20 @@ index 0000000..4afb71e
 +    WGPUBuffer              bloomUB[4] = {nullptr};      // bright, blurH, blurV, composite
 +    WGPUBindGroup           bloomBG[4] = {nullptr};
 +    uint32_t                bloomBGGen = 0, bloomBGCurGen = 0;
++    // R0: ACES filmic tonemap grade (one REPLACE fullscreen pass over the
++    // composited frame; reuses currentRenderTex + bloomBGL).
++    WGPURenderPipeline      tonemapPipeline = nullptr;
++    WGPUBuffer              tonemapUB = nullptr;
++    WGPUBindGroup           tonemapBG = nullptr;
++    uint32_t                tonemapBGGen = 0xffffffffu;
++    uint32_t                tonemapDrawCount = 0;   // false-green guard: must advance inside det rounds
++    // R0 operator gate: one-shot LUT self-test (gradient → fs_tonemap → readback,
++    // compared to CPU ACES). Capture-independent → the falsifiable operator check.
++    bool                    tmLutDone = false;
++    WGPUTexture             tmLutIn = nullptr, tmLutOut = nullptr;
++    WGPUTextureView         tmLutInView = nullptr, tmLutOutView = nullptr;
++    WGPUBuffer              tmLutBuf = nullptr;
++    WGPUBindGroup           tmLutBG = nullptr;
 +    // Iter 23: Quest-style shadow darkening (union-of-volumes multiply).
 +    WGPURenderPipeline      shadowDarkenPipeline = nullptr;
 +    WGPURenderPipeline      shadowDarkenEqPipeline = nullptr;   // iter 38: -992/-991 stencil readout
@@ -5562,7 +5764,7 @@ index 0000000..0f9c8e6
 +    return nullptr;
 +}
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
-index 7914093..14dc1af 100644
+index 7914093..8e462ac 100644
 --- a/neo/renderer/RenderSystem_init.cpp
 +++ b/neo/renderer/RenderSystem_init.cpp
 @@ -39,6 +39,11 @@ If you have questions concerning this license or the applicable additional terms
@@ -5577,7 +5779,7 @@ index 7914093..14dc1af 100644
  
  #include "framework/GameCallbacks_local.h"
  #include "framework/Game.h"
-@@ -102,6 +107,46 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
+@@ -102,6 +107,51 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
  
  idCVar r_skipSuppress( "r_skipSuppress", "0", CVAR_RENDERER | CVAR_BOOL, "ignore the per-view suppressions" );
  idCVar r_skipPostProcess( "r_skipPostProcess", "0", CVAR_RENDERER | CVAR_BOOL, "skip all post-process renderings" );
@@ -5618,13 +5820,18 @@ index 7914093..14dc1af 100644
 +// N·H 0.75, then (4(x-.75))²) with analytic pow(N·H, 10) — broader, always-
 +// visible highlights (the floor sheen in BFG screenshots).
 +idCVar r_bfgSpecular( "r_bfgSpecular", "0", CVAR_RENDERER | CVAR_BOOL, "WebGPU: BFG-style analytic pow(N·H,10) specular falloff (0 = classic LUT ramp)" );
++// R0: HDR filmic tonemap grade (opt-in via ?tonemap; default OFF on every tier
++// until on-device-verified — keeps the native-parity default untouched).
++idCVar r_tonemap( "r_tonemap", "0", CVAR_RENDERER | CVAR_BOOL, "WebGPU R0: ACES filmic tonemap grade (deep blacks + highlight rolloff; replaces the gamma wash)" );
++idCVar r_tonemapExposure( "r_tonemapExposure", "1.0", CVAR_RENDERER | CVAR_FLOAT, "WebGPU R0: tonemap linear exposure pre-scale (look call; live-tunable on the fx panel)" );
++idCVar r_tonemapDither( "r_tonemapDither", "1", CVAR_RENDERER | CVAR_BOOL, "WebGPU R0: ordered dither folded into the tonemap pass (breaks 8-bit banding in crushed blacks)" );
 +idCVar r_skipGLDraw( "r_skipGLDraw", "0", CVAR_RENDERER | CVAR_BOOL,
 +	"skip GL draw calls (WebGPU-primary cutover; the WebGPU echo renders instead). "
 +	"Tiny views (lightgem) keep drawing so gameplay light readback works." );
  idCVar r_skipLightScale( "r_skipLightScale", "0", CVAR_RENDERER | CVAR_BOOL, "don't do any post-interaction light scaling, makes things dim on low-dynamic range cards" );
  idCVar r_skipInteractions( "r_skipInteractions", "0", CVAR_RENDERER | CVAR_BOOL, "skip all light/surface interaction drawing" );
  idCVar r_skipDynamicTextures( "r_skipDynamicTextures", "0", CVAR_RENDERER | CVAR_BOOL, "don't dynamically create textures" );
-@@ -158,6 +203,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
+@@ -158,6 +208,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
  idCVar r_useExternalShadows( "r_useExternalShadows", "1", CVAR_RENDERER | CVAR_INTEGER, "1 = skip drawing caps when outside the light volume, 2 = force to no caps for testing", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
  idCVar r_useOptimizedShadows( "r_useOptimizedShadows", "1", CVAR_RENDERER | CVAR_BOOL, "use the dmap generated static shadow volumes" );
  idCVar r_useScissor( "r_useScissor", "1", CVAR_RENDERER | CVAR_BOOL, "scissor clip as portals and lights are processed" );
@@ -5632,7 +5839,7 @@ index 7914093..14dc1af 100644
  idCVar r_useCombinerDisplayLists( "r_useCombinerDisplayLists", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "put all nvidia register combiner programming in display lists" );
  idCVar r_useDepthBoundsTest( "r_useDepthBoundsTest", "1", CVAR_RENDERER | CVAR_BOOL, "use depth bounds test to reduce shadow fill" );
  
-@@ -819,11 +865,63 @@ void R_InitOpenGL( void ) {
+@@ -819,11 +870,63 @@ void R_InitOpenGL( void ) {
  		r_multiSamples.SetInteger( 0 );
  	}
  
@@ -5696,7 +5903,7 @@ index 7914093..14dc1af 100644
  
  #include "renderer/qgl_proc.h"
  
-@@ -2505,6 +2603,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
+@@ -2505,6 +2608,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
  	// is destroyed (relevant when starting a mod which also recreates window)
  	Sys_ShutdownInput();
  
@@ -7197,7 +7404,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..3876abb 100644
+index c83ebb5..cca6606 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -7223,7 +7430,7 @@ index c83ebb5..3876abb 100644
  
  /*
  
-@@ -38,6 +50,1123 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,1128 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -7443,6 +7650,11 @@ index c83ebb5..3876abb 100644
 +    // access). 0 = off.
 +    int      g_capPreloadPerFrame = 0;
 +    int      g_capPreloadMsPerFrame = 6;
++    // R0: ACES filmic tonemap grade (opt-in ?tonemap; default OFF all tiers).
++    // Mirrors r_tonemap / r_tonemapExposure / r_tonemapDither (backend has no idCVar).
++    uint32_t g_capTonemapOn = 0;
++    float    g_capTonemapExposure = 1.0f;
++    uint32_t g_capTonemapDither = 1;
 +}
 +
 +// Boot-speed: route a labelled millisecond timing to the browser console
@@ -8347,7 +8559,7 @@ index c83ebb5..3876abb 100644
  
  /*
  =================
-@@ -49,6 +1178,15 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +1183,15 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -8363,7 +8575,7 @@ index c83ebb5..3876abb 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +1216,15 @@ RB_DrawElementsWithCounters
+@@ -78,6 +1221,15 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -8379,7 +8591,7 @@ index c83ebb5..3876abb 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1263,16 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1268,16 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -8396,7 +8608,7 @@ index c83ebb5..3876abb 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1323,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1328,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -8404,7 +8616,7 @@ index c83ebb5..3876abb 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1550,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1555,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -8417,7 +8629,7 @@ index c83ebb5..3876abb 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1719,76 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1724,80 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
@@ -8459,6 +8671,10 @@ index c83ebb5..3876abb 100644
 +		extern idCVar r_wgpuPreloadPerFrame, r_wgpuPreloadMsPerFrame;
 +		g_capPreloadPerFrame = r_wgpuPreloadPerFrame.GetInteger();
 +		g_capPreloadMsPerFrame = r_wgpuPreloadMsPerFrame.GetInteger();
++		extern idCVar r_tonemap, r_tonemapExposure, r_tonemapDither;
++		g_capTonemapOn = r_tonemap.GetBool() ? 1u : 0u;
++		g_capTonemapExposure = r_tonemapExposure.GetFloat();
++		g_capTonemapDither = r_tonemapDither.GetBool() ? 1u : 0u;
 +	}
 +	// Iter 6.6: the multi-surface accumulator is intentionally NOT reset
 +	// here. RB_BeginDrawingView runs once per VIEW (main view, lightgem,
@@ -8506,10 +8722,10 @@ index c83ebb5..3876abb 100644
  	// ensures that depth writes are enabled for the depth clear
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..ea66c28
+index 0000000..722dfa9
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,949 @@
+@@ -0,0 +1,997 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -8741,6 +8957,54 @@ index 0000000..ea66c28
 +"fn fs_darken(in: VSOut) -> @location(0) vec4<f32> {\n"
 +"    let k = u.params.x;\n"
 +"    return vec4<f32>(k, k, k, 1.0);   // pipeline blend: dst * src\n"
++"}\n"
++"\n"
++"// R0 — HDR filmic tonemap (RBDOOM-3-BFG-class), the principled replacement\n"
++"// for the per-fragment gamma \"lift\" the iter-29 BFG-look research found was the\n"
++"// wash (\"the BFG look needs deep blacks, not more lift\"). A single fullscreen\n"
++"// grade of the already-composited 8-bit frame (LDR-on-LDR, exactly like the\n"
++"// bloom/shadow-darken passes above), bound through the SAME bloomBGL.\n"
++"//\n"
++"// params.x = exposure (linear pre-scale), params.z = dither enable (1=on).\n"
++"// The pipeline blend is REPLACE (non-additive, like fs_bright) — it overwrites\n"
++"// the canvas with the graded result.\n"
++"//\n"
++"// DETERMINISM: the curve is a pure function of the sampled bytes + constant\n"
++"// uniforms; the dither is a pure function of @builtin(position). No time, no\n"
++"// frame counter, no RNG, no cross-frame feedback — so the two encodeRecordsPass\n"
++"// runs of the __d3WgpuDet self-test are byte-identical (like fs_darken, which\n"
++"// CLAUDE.md confirms \"runs in det rounds too\" and stays IDENTICAL).\n"
++"\n"
++"// Narkowicz ACES filmic fit — self-normalizing (no separate white-point scale).\n"
++"// Crushes the toe (deep blacks) and rolls off the shoulder (no blown highlights).\n"
++"fn aces_narkowicz(x: vec3<f32>) -> vec3<f32> {\n"
++"    let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;\n"
++"    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));\n"
++"}\n"
++"\n"
++"// 8x8 ordered (Bayer-class) threshold in [0,1), keyed by integer pixel position\n"
++"// — STATIC (no frame term), so it stays det-IDENTICAL. NOT RBDOOM's temporal\n"
++"// golden-ratio dither (that is frame-dependent and would break the self-test).\n"
++"fn ordered8(p: vec2<u32>) -> f32 {\n"
++"    let x = p.x & 7u; let y = p.y & 7u;\n"
++"    var v = 0u;                                  // interleave the low 3 bits of x,y\n"
++"    v = (v << 1u) | ((y >> 2u) & 1u); v = (v << 1u) | ((x >> 2u) & 1u);\n"
++"    v = (v << 1u) | ((y >> 1u) & 1u); v = (v << 1u) | ((x >> 1u) & 1u);\n"
++"    v = (v << 1u) | ((y      ) & 1u); v = (v << 1u) | ((x      ) & 1u);\n"
++"    return f32(v) / 64.0;\n"
++"}\n"
++"\n"
++"@fragment\n"
++"fn fs_tonemap(in: VSOut) -> @location(0) vec4<f32> {\n"
++"    let src = textureSampleLevel(tex, samp, in.uv, 0.0).rgb;\n"
++"    var c = aces_narkowicz(max(src, vec3<f32>(0.0)) * u.params.x);\n"
++"    if (u.params.z > 0.5) {\n"
++"        // break up 8-bit contour banding the deep-blacks curve exposes: a\n"
++"        // ±0.5-LSB offset distributed across pixels (sub-quantum, deterministic).\n"
++"        let off = (ordered8(vec2<u32>(u32(in.pos.x), u32(in.pos.y))) - 0.5) / 255.0;\n"
++"        c = c + vec3<f32>(off);\n"
++"    }\n"
++"    return vec4<f32>(c, 1.0);\n"
 +"}\n"
 +"";
 +
