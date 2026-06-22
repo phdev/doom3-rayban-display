@@ -18,8 +18,11 @@ reduced `base/pak-display.pk4` (or `?pk4=<url>`).
 - `src/` — Vite web app shell. `d3Runtime.js` boots the engine, mounts the PK4,
   builds the cvar/autoexec config; `main.js` wires the canvas (`#gameCanvas`),
   overlays, and input; `headTracking.js` / `wearableInput.js` feed the camera.
-- `patches/dhewm3-meta-rayban-display.patch` — the Emscripten/wearable patch,
-  generated against the pinned `DHEWM3_COMMIT` in `scripts/build-dhewm3.sh`.
+- `patches/rayban-base.patch` (game/combat/sys/framework/cm/CMakeLists) + `patches/rayban-renderer.patch`
+  (neo/renderer WebGPU backend) — the Emscripten/wearable patch, SPLIT by file (disjoint: neo/renderer
+  vs the rest) so the renderer (Session D) and game/combat (Session A) regenerate independently without
+  clobbering one shared file. Both generated against the pinned `DHEWM3_COMMIT` in `scripts/build-dhewm3.sh`;
+  together they == the old single `dhewm3-meta-rayban-display.patch` (proven by a git tree-hash compare).
 - `scripts/` — `build-gl4es.sh`, `build-dhewm3.sh` (clone → apply patch →
   emcmake → stage `public/wasm/dhewm3.{js,wasm,data}`), `reduce-d3-map-pk4.py`
   (heuristic single-map PK4 reducer), `install-demo-data.sh`.
@@ -46,7 +49,9 @@ the patch comes out ~half size:
 
 ```bash
 git -C .build/dhewm3 add -A -N
-git -C .build/dhewm3 diff <DHEWM3_COMMIT> > patches/dhewm3-meta-rayban-display.patch
+# regenerate ONLY your half (the patches are split by file; together they == the old single patch):
+git -C .build/dhewm3 diff <DHEWM3_COMMIT> -- neo/renderer        > patches/rayban-renderer.patch  # Session D
+git -C .build/dhewm3 diff <DHEWM3_COMMIT> -- . ':!neo/renderer'  > patches/rayban-base.patch       # Session A
 ```
 
 **Build-script trap (fixed 2026-06):** the patch *adds* files; those survive
@@ -420,8 +425,8 @@ selects which `idRenderBackend` instance the engine drives, gated by the
 `?backend=webgpu` URL flag. The WebGPU backend renders into a separate
 `#webgpuCanvas` so the existing `#gameCanvas` GL path keeps working
 unchanged — eventually `#gameCanvas` goes away. The whole port lives in
-`patches/dhewm3-meta-rayban-display.patch` + `webgpu-port/shaders/*.wgsl`
-(`scripts/embed_wgsl.py` bakes them into the wasm at build time).
+`patches/rayban-renderer.patch` (neo/renderer) + `patches/rayban-base.patch` (the rest) +
+`webgpu-port/shaders/*.wgsl` (`scripts/embed_wgsl.py` bakes them into the wasm at build time).
 
 JS bootstraps via `navigator.gpu.requestAdapter()` →
 `requestDevice()` → `Module.preinitializedWebGPUDevice` in

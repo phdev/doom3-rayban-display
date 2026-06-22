@@ -234,8 +234,9 @@ npm install && npm run dev      # local dev server (serves public/wasm paks loca
 npm run build                   # dist/ for deploy
 ```
 
-Engine source lives in `patches/dhewm3-meta-rayban-display.patch` (applied onto a
-pinned dhewm3 commit). The WebGPU shaders are in `webgpu-port/shaders/*.wgsl`
+Engine source lives in `patches/rayban-base.patch` + `patches/rayban-renderer.patch` (applied onto a
+pinned dhewm3 commit; split by file — neo/renderer vs the rest — so the renderer and game/combat
+regenerate independently). The WebGPU shaders are in `webgpu-port/shaders/*.wgsl`
 (embedded into the build by `scripts/embed_wgsl.py`). `dhewm3.wasm` is gitignored;
 CI (`.github/workflows/deploy-pages.yml`) rebuilds it from the patch and bundles
 `src` → `dist` with Vite.

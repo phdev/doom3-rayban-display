@@ -1,0 +1,4411 @@
+diff --git a/neo/CMakeLists.txt b/neo/CMakeLists.txt
+index 69f1892..e100b55 100644
+--- a/neo/CMakeLists.txt
++++ b/neo/CMakeLists.txt
+@@ -194,29 +194,46 @@ if(CMAKE_MAJOR_VERSION LESS 3 OR ( CMAKE_MAJOR_VERSION EQUAL 3 AND CMAKE_MINOR_V
+ endif()
+ 
+ # libs
+-find_package(OpenAL REQUIRED)
+-include_directories(${OPENAL_INCLUDE_DIR})
++if(EMSCRIPTEN)
++	# Emscripten ships OpenAL as a built-in port (-lopenal); there is no CMake
++	# package to find and the AL/ headers live in the sysroot.
++	set(OPENAL_LIBRARY "-lopenal")
++	set(OPENAL_INCLUDE_DIR "")
++else()
++	find_package(OpenAL REQUIRED)
++	include_directories(${OPENAL_INCLUDE_DIR})
++endif()
+ 
+ if (SDL3)
+ 	if(SDL2)
+ 		message(WARNING "You enabled both SDL2 and SDL3. Only one can be used at a time, disabling SDL2")
+ 		set(SDL2 OFF CACHE BOOL "Use SDL2 (make sure SDL3 is disabled!)" FORCE)
+ 	endif()
+-	# 1. Look for a SDL3 package,
+-	# 2. look for the SDL3-shared component, and
+-	# 3. fail if the shared component cannot be found.
+-	find_package(SDL3 REQUIRED CONFIG REQUIRED COMPONENTS SDL3-shared)
+-	# TODO: include dirs?
+-	set(SDLx_LIBRARY SDL3::SDL3)
++	if(EMSCRIPTEN)
++		# Emscripten's built-in SDL3 port (enabled via -sUSE_SDL=3 in flags).
++		set(SDLx_LIBRARY "")
++	else()
++		# 1. Look for a SDL3 package,
++		# 2. look for the SDL3-shared component, and
++		# 3. fail if the shared component cannot be found.
++		find_package(SDL3 REQUIRED CONFIG REQUIRED COMPONENTS SDL3-shared)
++		# TODO: include dirs?
++		set(SDLx_LIBRARY SDL3::SDL3)
++	endif()
+ 	add_definitions(-DD3_SDL3=1)
+ elseif (SDL2)
+ 	# skip SDL2main
+ 	if(APPLE OR WIN32)
+ 		set(SDL2_BUILDING_LIBRARY TRUE)
+ 	endif()
+-	find_package(SDL2 REQUIRED)
+-	include_directories(${SDL2_INCLUDE_DIR})
+-	set(SDLx_LIBRARY ${SDL2_LIBRARY})
++	if(EMSCRIPTEN)
++		# Emscripten's built-in SDL2 port (enabled via -sUSE_SDL=3 in flags).
++		set(SDLx_LIBRARY "")
++	else()
++		find_package(SDL2 REQUIRED)
++		include_directories(${SDL2_INCLUDE_DIR})
++		set(SDLx_LIBRARY ${SDL2_LIBRARY})
++	endif()
+ else()
+ 	# skip SDLmain
+ 	if(APPLE OR WIN32)
+@@ -360,7 +377,9 @@ if(D3_COMPILER_IS_GCC_OR_CLANG)
+ 	add_compile_options(-pipe)
+ 	add_compile_options(-Wall)
+ 
+-	if(NOT CMAKE_CROSSCOMPILING AND ONATIVE)
++	if(EMSCRIPTEN)
++		# wasm32 has no -march; skip CPU arch flags entirely.
++	elseif(NOT CMAKE_CROSSCOMPILING AND ONATIVE)
+ 		add_compile_options(-march=native)
+ 	elseif(NOT APPLE AND cpu STREQUAL "x86")
+ 		add_compile_options(-march=pentium3)
+@@ -377,6 +396,11 @@ if(D3_COMPILER_IS_GCC_OR_CLANG)
+ 	if(cpu STREQUAL "e2k" AND CMAKE_COMPILER_IS_GNUCC)
+ 		# O3 on E2K mcst-lcc approximately equal to O2 at X86/ARM gcc
+ 		set(OPT_LEVEL "-O3")
++	elseif(EMSCRIPTEN)
++		# WASM: take every optimization we can get — the iPhone runs the
++		# game loop ~8x slower than desktop. -msimd128 (wasm SIMD, Safari
++		# 16.4+) enables autovectorization across idLib/renderer math.
++		set(OPT_LEVEL "-O3 -msimd128")
+ 	else()
+ 		set(OPT_LEVEL "-O2")
+ 	endif()
+@@ -535,6 +559,62 @@ set(CMAKE_CXX_FLAGS_RELWITHDEBINFO ${CMAKE_C_FLAGS_RELWITHDEBINFO})
+ set(CMAKE_CXX_FLAGS_RELEASE "-DNDEBUG ${CMAKE_C_FLAGS_RELEASE}")
+ set(CMAKE_CXX_FLAGS_MINSIZEREL "-DNDEBUG ${CMAKE_C_FLAGS_MINSIZEREL}")
+ 
++# Meta Ray-Ban Display: Emscripten / WebAssembly target (experimental).
++# Produces dhewm3.js / dhewm3.wasm / dhewm3.data and exposes the D3_* wearable
++# bridge to JavaScript. The runtime is driven by the web app shell in
++# https://github.com/phdev/doom3-rayban-display .
++if(EMSCRIPTEN)
++	# D3_EMSCRIPTEN_EMBED may point at a directory whose contents are baked into
++	# dhewm3.data (e.g. base/autoexec.cfg and an optional reduced pak-display.pk4).
++	if(NOT DEFINED D3_EMSCRIPTEN_EMBED)
++		set(D3_EMSCRIPTEN_EMBED "${CMAKE_SOURCE_DIR}/sys/wasm/embed")
++	endif()
++
++	set(d3_wasm_exports "[\"_main\",\"_D3_AddViewAngles\",\"_D3_SetViewYaw\",\"_D3_SetWearableAction\",\"_D3_ExecCommand\",\"_D3_ReloadStreamedImages\",\"_D3_AppendArea\",\"_D3_GetEnemyIndicators\",\"_D3_GetEnemyYaw\",\"_D3_RequestEnemyTurn\",\"_D3_SetEnemyIndicators\",\"_D3_SetEnemyIndicatorYaw\",\"_D3_ConsumeEnemyTurn\",\"_D3_Arco_SetCamera\",\"_D3_Arco_FrameCount\",\"_D3_Arco_Readback\"]")
++
++	# The game module is hard-linked (HARDLINK_GAME), so no dynamic linking /
++	# MAIN_MODULE is required. SDL2 comes from Emscripten's built-in port, GL
++	# from GL4ES translated to WebGL2.
++	set(d3_wasm_ldflags
++		"-sUSE_SDL=3"
++		"-fexceptions"
++		"-sFULL_ES2=1 -sFULL_ES3=1 -sMIN_WEBGL_VERSION=1 -sMAX_WEBGL_VERSION=2"
++		# SDL3 creates the WebGL context directly on the "#gameCanvas" element
++		# (selected via SDL_HINT_EMSCRIPTEN_CANVAS_SELECTOR in GLimp_Init) and
++		# presents it with SDL_GL_SwapWindow, matching the proven Qwasm2 GL4ES path.
++		# 256MB initial (was 512): iOS Safari jetsam-kills tabs on total memory —
++		# committing 512MB before the pak even loads ate half the budget up
++		# front. Growth covers actual demand (~400MB peak with the 66MB pak).
++		# Iter 28: default geometric growth is +20% (one grow past 256MB
++		# commits 307MB even if the peak was 260MB) — grow in small steps so
++		# committed wasm pages track the real peak, not the overshoot.
++		"-sINITIAL_MEMORY=256MB -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2GB -sSTACK_SIZE=8MB"
++		"-sMEMORY_GROWTH_GEOMETRIC_STEP=0.05 -sMEMORY_GROWTH_GEOMETRIC_CAP=16MB"
++		"-sEXPORTED_FUNCTIONS=${d3_wasm_exports}"
++		"-sEXPORTED_RUNTIME_METHODS=[\"ccall\",\"cwrap\",\"FS\",\"callMain\",\"HEAP8\"]"
++		"-sEXIT_RUNTIME=0 -sINVOKE_RUN=0 -sERROR_ON_UNDEFINED_SYMBOLS=0"
++		"--post-js ${CMAKE_SOURCE_DIR}/sys/wasm/d3_runtime_exports.js"
++		"--preload-file ${D3_EMSCRIPTEN_EMBED}@/"
++		"-lidbfs.js -lopenal"
++	)
++
++	# Debug aid: -DD3_PROFILING_FUNCS=ON relinks with function names kept in
++	# the wasm so traps ("null function or function signature mismatch")
++	# produce NAMED stack traces. Adds ~1-2MB; never ship it.
++	option(D3_PROFILING_FUNCS "Keep wasm function names for stack traces" OFF)
++	if(D3_PROFILING_FUNCS)
++		list(APPEND d3_wasm_ldflags "--profiling-funcs")
++	endif()
++	string(REPLACE ";" " " d3_wasm_ldflags "${d3_wasm_ldflags}")
++	set(ldflags "${ldflags} ${d3_wasm_ldflags}")
++
++	# SDL2 headers come from the Emscripten port at compile time; GL headers
++	# come from GL4ES (added via -I in the build script). -fexceptions makes
++	# C++ try/catch work (Emscripten disables it by default), so dhewm3's
++	# recoverable idException errors drop to the console instead of aborting.
++	add_compile_options(-sUSE_SDL=3 -fPIC -fexceptions)
++endif()
++
+ # mingw and msvc
+ if(WIN32)
+ 	add_definitions(-DWINVER=0x0501)
+@@ -633,6 +713,9 @@ set(src_renderer
+ 	renderer/Model_md5.cpp
+ 	renderer/Model_prt.cpp
+ 	renderer/Model_sprite.cpp
++	renderer/RenderBackend_factory.cpp
++	renderer/RenderBackend_GL.cpp
++	renderer/RenderBackend_WebGPU.cpp
+ 	renderer/RenderEntity.cpp
+ 	renderer/RenderSystem.cpp
+ 	renderer/RenderSystem_init.cpp
+@@ -699,6 +782,8 @@ set(src_framework
+ 	framework/FileSystem.cpp
+ 	framework/KeyInput.cpp
+ 	framework/UsercmdGen.cpp
++	framework/d3_wearable.cpp
++	framework/d3_arco.cpp
+ 	framework/Session_menu.cpp
+ 	framework/Session.cpp
+ 	framework/async/AsyncClient.cpp
+@@ -909,6 +994,7 @@ set(src_game
+ 	game/AF.cpp
+ 	game/AFEntity.cpp
+ 	game/Actor.cpp
++	game/D3Wearable.cpp
+ 	game/Camera.cpp
+ 	game/Entity.cpp
+ 	game/BrittleFracture.cpp
+@@ -1280,7 +1366,7 @@ include_directories(${CMAKE_BINARY_DIR})
+ include_directories(${CMAKE_SOURCE_DIR})
+ 
+ add_library(idlib STATIC ${src_idlib})
+-if(SDL3)
++if(SDL3 AND NOT EMSCRIPTEN)
+ 	target_link_libraries(idlib SDL3::Headers) # so it can use SDL_Endian.h
+ endif()
+ if (AROS)
+diff --git a/neo/cm/CollisionModel.h b/neo/cm/CollisionModel.h
+index edb0365..30876a5 100644
+--- a/neo/cm/CollisionModel.h
++++ b/neo/cm/CollisionModel.h
+@@ -92,6 +92,11 @@ typedef int cmHandle_t;
+ #define CM_BOX_EPSILON		1.0f			// should always be larger than clip epsilon
+ #define CM_MAX_TRACE_DIST	4096.0f			// maximum distance a trace model may be traced, point traces are unlimited
+ 
++// Phase 0 (area-streaming): caller-supplied "which render area is this point in"
++// lookup, so cm/ can bucket world collision geometry by area without depending
++// on the renderer. The game passes a thunk over gameRenderWorld->PointInArea.
++typedef int (*cmAreaForPointFn)( void *ctx, const idVec3 &point );
++
+ class idCollisionModelManager {
+ public:
+ 	virtual					~idCollisionModelManager( void ) {}
+@@ -149,6 +154,25 @@ public:
+ 	virtual void			ListModels( void ) = 0;
+ 	// Writes a collision model file for the given map entity.
+ 	virtual bool			WriteCollisionModelForMapEntity( const idMapEntity *mapEnt, const char *filename, const bool testTraceModel = true ) = 0;
++
++	// Phase 0 (area-streaming bake): walk the world collision model (model 0),
++	// bucket every polygon/brush by render area (via the supplied PointInArea
++	// thunk on each primitive's centroid), and write <dir>/collision.json with
++	// per-area counts + cross-area-straddler + void totals (the go/no-go metric).
++	// Non-pure so only idCollisionModelManagerLocal implements it. Read-only.
++	virtual void			DumpAreaCollisionStats( const char *dir, int numAreas, cmAreaForPointFn fn, void *ctx ) {}
++
++	// Phase 2 (area-streaming bake): serialize the world collision model split by
++	// render area. Writes <dir>/enpro.boot.bcm (full vert/edge/node skeleton +
++	// only the resident polys/brushes: cross-area, void, and boot-region areas)
++	// and <dir>/_areaN.bcm.part (each non-boot area's polys/brushes). isBootArea
++	// is a numAreas-sized array marking which areas stay resident. Read-only.
++	virtual void			DumpAreaCollision( const char *dir, int numAreas, const bool *isBootArea, unsigned int mapCRC, cmAreaForPointFn fn, void *ctx ) {}
++
++	// Phase 2 (runtime): append one area's collision polys/brushes (from a
++	// _areaN.bcm.part) into the world model's existing BSP. Returns false if the
++	// part is missing/corrupt. Safe mid-game; never rebuilds the tree.
++	virtual bool			AppendAreaCollision( int areaNum ) { return false; }
+ };
+ 
+ extern idCollisionModelManager *		collisionModelManager;
+diff --git a/neo/cm/CollisionModel_files.cpp b/neo/cm/CollisionModel_files.cpp
+index 9240b06..51d867a 100644
+--- a/neo/cm/CollisionModel_files.cpp
++++ b/neo/cm/CollisionModel_files.cpp
+@@ -45,6 +45,16 @@ If you have questions concerning this license or the applicable additional terms
+ #define CM_FILEID			"CM"
+ #define CM_FILEVERSION		"1.00"
+ 
++// Boot-speed: binary collision cache. A byte-for-byte mirror of the ASCII
++// .cm parse that skips the idLexer tokenize + number-conversion entirely
++// (~946ms ASCII -> tens of ms on repeat boots). Falls back to the ASCII path
++// on any mismatch (bad magic, version bump, CRC mismatch, short read), so a
++// stale/corrupt cache is always safe. Toggle off with cm_binaryCache 0.
++#define BCM_FILE_EXT		"bcm"
++#define BCM_MAGIC			(('B'<<0)|('C'<<8)|('M'<<16)|('1'<<24))
++#define BCM_VERSION			1
++idCVar cm_binaryCache( "cm_binaryCache", "1", CVAR_SYSTEM | CVAR_BOOL, "use the binary .bcm collision cache (0 = ASCII .cm only)" );
++
+ /*
+ ===============================================================================
+ 
+@@ -261,6 +271,447 @@ void idCollisionModelManagerLocal::WriteCollisionModelsToFile( const char *filen
+ 	fileSystem->CloseFile( fp );
+ }
+ 
++/*
++================
++idCollisionModelManagerLocal::DumpAreaCollisionStats
++
++Phase 0 (area-streaming bake): census the world collision model (model 0) by
++render area. For every polygon/brush in the BSP (deduped via checkcount), the
++centroid is classified with the caller's PointInArea thunk; a primitive whose 8
++bound corners map to more than one area is a "straddler" that Phase 2 will keep
++in the always-boot _shared bucket. Writes <dir>/collision.json. Read-only.
++================
++*/
++void idCollisionModelManagerLocal::DumpAreaCollisionStats( const char *dir, int numAreas, cmAreaForPointFn fn, void *ctx ) {
++	if ( numModels < 1 || models[0] == NULL || fn == NULL ) {
++		return;
++	}
++	cm_model_t *model = models[0];
++
++	int *areaPolys = (int *)Mem_ClearedAlloc( numAreas * sizeof( int ) );
++	int *areaBrushes = (int *)Mem_ClearedAlloc( numAreas * sizeof( int ) );
++	int totalPolys = 0, crossPolys = 0, voidPolys = 0;
++	int totalBrushes = 0, crossBrushes = 0, voidBrushes = 0;
++
++	// explicit-stack BSP walk (avoids recursion-helper churn)
++	idList<cm_node_t *> stack;
++	stack.Append( model->node );
++
++	// --- polygons ---
++	checkCount++;
++	while ( stack.Num() ) {
++		cm_node_t *node = stack[ stack.Num() - 1 ];
++		stack.RemoveIndex( stack.Num() - 1 );
++		for ( cm_polygonRef_t *pref = node->polygons; pref; pref = pref->next ) {
++			cm_polygon_t *p = pref->p;
++			if ( p->checkcount == checkCount ) {
++				continue;
++			}
++			p->checkcount = checkCount;
++			totalPolys++;
++			idVec3 centroid = ( p->bounds[0] + p->bounds[1] ) * 0.5f;
++			int a = fn( ctx, centroid );
++			if ( a < 0 || a >= numAreas ) {
++				voidPolys++;
++			} else {
++				// straddle test: do the 8 bound corners agree on the area?
++				bool cross = false;
++				for ( int c = 0; c < 8 && !cross; c++ ) {
++					idVec3 corner( p->bounds[(c>>0)&1][0], p->bounds[(c>>1)&1][1], p->bounds[(c>>2)&1][2] );
++					int ca = fn( ctx, corner );
++					if ( ca >= 0 && ca != a ) {
++						cross = true;
++					}
++				}
++				if ( cross ) {
++					crossPolys++;
++				} else {
++					areaPolys[a]++;
++				}
++			}
++		}
++		if ( node->planeType != -1 ) {
++			stack.Append( node->children[0] );
++			stack.Append( node->children[1] );
++		}
++	}
++
++	// --- brushes ---
++	checkCount++;
++	stack.Clear();
++	stack.Append( model->node );
++	while ( stack.Num() ) {
++		cm_node_t *node = stack[ stack.Num() - 1 ];
++		stack.RemoveIndex( stack.Num() - 1 );
++		for ( cm_brushRef_t *bref = node->brushes; bref; bref = bref->next ) {
++			cm_brush_t *b = bref->b;
++			if ( b->checkcount == checkCount ) {
++				continue;
++			}
++			b->checkcount = checkCount;
++			totalBrushes++;
++			idVec3 centroid = ( b->bounds[0] + b->bounds[1] ) * 0.5f;
++			int a = fn( ctx, centroid );
++			if ( a < 0 || a >= numAreas ) {
++				voidBrushes++;
++			} else {
++				bool cross = false;
++				for ( int c = 0; c < 8 && !cross; c++ ) {
++					idVec3 corner( b->bounds[(c>>0)&1][0], b->bounds[(c>>1)&1][1], b->bounds[(c>>2)&1][2] );
++					int ca = fn( ctx, corner );
++					if ( ca >= 0 && ca != a ) {
++						cross = true;
++					}
++				}
++				if ( cross ) {
++					crossBrushes++;
++				} else {
++					areaBrushes[a]++;
++				}
++			}
++		}
++		if ( node->planeType != -1 ) {
++			stack.Append( node->children[0] );
++			stack.Append( node->children[1] );
++		}
++	}
++
++	// write json fragment
++	idStr path = idStr( dir ) + "/collision.json";
++	idFile *json = fileSystem->OpenFileWrite( path );
++	if ( json ) {
++		json->WriteFloatString( "{\n  \"numAreas\": %d,\n", numAreas );
++		json->WriteFloatString( "  \"totalPolys\": %d, \"crossAreaPolys\": %d, \"voidPolys\": %d,\n", totalPolys, crossPolys, voidPolys );
++		json->WriteFloatString( "  \"totalBrushes\": %d, \"crossAreaBrushes\": %d, \"voidBrushes\": %d,\n", totalBrushes, crossBrushes, voidBrushes );
++		json->WriteFloatString( "  \"perArea\": [\n" );
++		for ( int i = 0; i < numAreas; i++ ) {
++			json->WriteFloatString( "%s    { \"area\": %d, \"polys\": %d, \"brushes\": %d }",
++				i ? ",\n" : "", i, areaPolys[i], areaBrushes[i] );
++		}
++		json->WriteFloatString( "\n  ]\n}\n" );
++		fileSystem->CloseFile( json );
++	}
++	common->Printf( "DumpAreaCollisionStats: %d polys (%d cross-area, %d void), %d brushes (%d cross, %d void)\n",
++		totalPolys, crossPolys, voidPolys, totalBrushes, crossBrushes, voidBrushes );
++
++	Mem_Free( areaPolys );
++	Mem_Free( areaBrushes );
++}
++
++/*
++================
++Phase 2 collision serialization helpers
++================
++*/
++static int CM_PolySize( cm_polygon_t *p ) {
++	return sizeof( cm_polygon_t ) + ( p->numEdges - 1 ) * sizeof( p->edges[0] );
++}
++static int CM_BrushSize( cm_brush_t *b ) {
++	return sizeof( cm_brush_t ) + ( b->numPlanes - 1 ) * sizeof( b->planes[0] );
++}
++static void CM_WritePoly( idFile *fp, cm_polygon_t *p ) {
++	fp->WriteInt( p->numEdges );
++	for ( int i = 0; i < p->numEdges; i++ ) {
++		fp->WriteInt( p->edges[i] );
++	}
++	fp->WriteVec3( p->plane.Normal() );
++	fp->WriteFloat( p->plane.Dist() );
++	fp->WriteVec3( p->bounds[0] );
++	fp->WriteVec3( p->bounds[1] );
++	fp->WriteString( p->material->GetName() );
++}
++static void CM_WriteBrush( idFile *fp, cm_brush_t *b ) {
++	fp->WriteInt( b->numPlanes );
++	for ( int i = 0; i < b->numPlanes; i++ ) {
++		fp->WriteVec3( b->planes[i].Normal() );
++		fp->WriteFloat( b->planes[i].Dist() );
++	}
++	fp->WriteVec3( b->bounds[0] );
++	fp->WriteVec3( b->bounds[1] );
++	fp->WriteInt( b->contents );
++}
++
++// Returns the bucket for a polygon: -2 = resident (boot .bcm) for void /
++// cross-area straddler / boot-region; else the area number (-> _areaN.bcm.part).
++int idCollisionModelManagerLocal::PolyAreaBucket( cm_polygon_t *p, int numAreas, const bool *isBootArea, cmAreaForPointFn fn, void *ctx ) {
++	idVec3 centroid = ( p->bounds[0] + p->bounds[1] ) * 0.5f;
++	int a = fn( ctx, centroid );
++	if ( a < 0 || a >= numAreas ) {
++		return -2;
++	}
++	for ( int c = 0; c < 8; c++ ) {
++		idVec3 corner( p->bounds[(c>>0)&1][0], p->bounds[(c>>1)&1][1], p->bounds[(c>>2)&1][2] );
++		int ca = fn( ctx, corner );
++		if ( ca >= 0 && ca != a ) {
++			return -2;	// straddles an area boundary -> always-boot
++		}
++	}
++	if ( isBootArea && isBootArea[a] ) {
++		return -2;
++	}
++	return a;
++}
++
++int idCollisionModelManagerLocal::BrushAreaBucket( cm_brush_t *b, int numAreas, const bool *isBootArea, cmAreaForPointFn fn, void *ctx ) {
++	idVec3 centroid = ( b->bounds[0] + b->bounds[1] ) * 0.5f;
++	int a = fn( ctx, centroid );
++	if ( a < 0 || a >= numAreas ) {
++		return -2;
++	}
++	for ( int c = 0; c < 8; c++ ) {
++		idVec3 corner( b->bounds[(c>>0)&1][0], b->bounds[(c>>1)&1][1], b->bounds[(c>>2)&1][2] );
++		int ca = fn( ctx, corner );
++		if ( ca >= 0 && ca != a ) {
++			return -2;
++		}
++	}
++	if ( isBootArea && isBootArea[a] ) {
++		return -2;
++	}
++	return a;
++}
++
++/*
++================
++idCollisionModelManagerLocal::DumpAreaCollision
++
++Phase 2 bake: serialize the world collision model (model 0) split by render area.
++Boot .bcm = full vert/edge/node skeleton + resident polys/brushes (void, straddler,
++boot-region). Per-area parts = each non-boot area's polys/brushes (poly/brush
++sub-stream only; they reference the global edge array which lives in the boot
++.bcm). The append reader (AppendAreaCollision) filters them into the existing
++tree at runtime. mapCRC must be the live map's geometry CRC so the reduced boot
++.bcm passes LoadBinaryCollisionModelFile's freshness check. Read-only.
++================
++*/
++void idCollisionModelManagerLocal::DumpAreaCollision( const char *dir, int numAreas, const bool *isBootArea, unsigned int mapCRC, cmAreaForPointFn fn, void *ctx ) {
++	if ( numModels < 1 || models[0] == NULL || fn == NULL ) {
++		return;
++	}
++	cm_model_t *model = models[0];
++
++	// collect deduped polys + brushes with their bucket
++	idList<cm_polygon_t *> polys;
++	idList<int> polyBkt;
++	idList<cm_brush_t *> brushes;
++	idList<int> brushBkt;
++	idList<cm_node_t *> stack;
++
++	checkCount++;
++	stack.Append( model->node );
++	while ( stack.Num() ) {
++		cm_node_t *node = stack[ stack.Num() - 1 ];
++		stack.RemoveIndex( stack.Num() - 1 );
++		for ( cm_polygonRef_t *pr = node->polygons; pr; pr = pr->next ) {
++			if ( pr->p->checkcount == checkCount ) {
++				continue;
++			}
++			pr->p->checkcount = checkCount;
++			polys.Append( pr->p );
++			polyBkt.Append( PolyAreaBucket( pr->p, numAreas, isBootArea, fn, ctx ) );
++		}
++		if ( node->planeType != -1 ) {
++			stack.Append( node->children[0] );
++			stack.Append( node->children[1] );
++		}
++	}
++	checkCount++;
++	stack.Clear();
++	stack.Append( model->node );
++	while ( stack.Num() ) {
++		cm_node_t *node = stack[ stack.Num() - 1 ];
++		stack.RemoveIndex( stack.Num() - 1 );
++		for ( cm_brushRef_t *br = node->brushes; br; br = br->next ) {
++			if ( br->b->checkcount == checkCount ) {
++				continue;
++			}
++			br->b->checkcount = checkCount;
++			brushes.Append( br->b );
++			brushBkt.Append( BrushAreaBucket( br->b, numAreas, isBootArea, fn, ctx ) );
++		}
++		if ( node->planeType != -1 ) {
++			stack.Append( node->children[0] );
++			stack.Append( node->children[1] );
++		}
++	}
++
++	// --- boot .bcm: header + skeleton + resident (bucket == -2) polys/brushes ---
++	idStr bootPath = idStr( dir ) + "/enpro.boot.bcm";
++	idFile *fp = fileSystem->OpenFileWrite( bootPath );
++	int residentPolys = 0, residentBrushes = 0;
++	if ( fp ) {
++		fp->WriteInt( BCM_MAGIC );
++		fp->WriteInt( BCM_VERSION );
++		fp->WriteInt( (int)mapCRC );
++		// MAP collision models only: model 0 (the world) is reduced/split per-area;
++		// the inline brush models 1..numMapModels-1 (func_door, movers, func_static)
++		// stay WHOLE and boot-resident — dropping them breaks every door/mover's
++		// collision. numMapModels (not numModels) excludes runtime trm/moveable
++		// models loaded after the map (else the boot .bcm carries stale junk).
++		int nMap = ( numMapModels > 0 ) ? numMapModels : numModels;
++		fp->WriteInt( nMap );
++		fp->WriteString( model->name.c_str() );
++		fp->WriteInt( model->numVertices );
++		for ( int i = 0; i < model->numVertices; i++ ) {
++			fp->WriteVec3( model->vertices[i].p );
++		}
++		fp->WriteInt( model->numEdges );
++		for ( int i = 0; i < model->numEdges; i++ ) {
++			fp->WriteInt( model->edges[i].vertexNum[0] );
++			fp->WriteInt( model->edges[i].vertexNum[1] );
++			fp->WriteInt( model->edges[i].internal );
++			fp->WriteInt( model->edges[i].numUsers );
++		}
++		WriteBinaryNodes( fp, model->node );
++		// resident polygons
++		int pm = 0;
++		for ( int i = 0; i < polys.Num(); i++ ) {
++			if ( polyBkt[i] == -2 ) { pm += CM_PolySize( polys[i] ); residentPolys++; }
++		}
++		fp->WriteInt( pm );
++		fp->WriteInt( residentPolys );
++		for ( int i = 0; i < polys.Num(); i++ ) {
++			if ( polyBkt[i] == -2 ) CM_WritePoly( fp, polys[i] );
++		}
++		// resident brushes
++		int bm = 0;
++		for ( int i = 0; i < brushes.Num(); i++ ) {
++			if ( brushBkt[i] == -2 ) { bm += CM_BrushSize( brushes[i] ); residentBrushes++; }
++		}
++		fp->WriteInt( bm );
++		fp->WriteInt( residentBrushes );
++		for ( int i = 0; i < brushes.Num(); i++ ) {
++			if ( brushBkt[i] == -2 ) CM_WriteBrush( fp, brushes[i] );
++		}
++		// inline brush models (doors/movers/func_static) — whole, boot-resident.
++		for ( int mi = 1; mi < nMap; mi++ ) {
++			if ( models[mi] ) {
++				WriteBinaryCollisionModel( fp, models[mi] );
++			}
++		}
++		fileSystem->CloseFile( fp );
++	}
++
++	// --- per-area parts (non-boot areas only) ---
++	int streamedAreas = 0;
++	for ( int area = 0; area < numAreas; area++ ) {
++		if ( isBootArea && isBootArea[area] ) {
++			continue;
++		}
++		int pm = 0, pc = 0, bm = 0, bc = 0;
++		for ( int i = 0; i < polys.Num(); i++ ) {
++			if ( polyBkt[i] == area ) { pm += CM_PolySize( polys[i] ); pc++; }
++		}
++		for ( int i = 0; i < brushes.Num(); i++ ) {
++			if ( brushBkt[i] == area ) { bm += CM_BrushSize( brushes[i] ); bc++; }
++		}
++		if ( pc == 0 && bc == 0 ) {
++			continue;
++		}
++		idStr partPath = idStr( dir ) + "/_area" + area + ".bcm.part";
++		idFile *pf = fileSystem->OpenFileWrite( partPath );
++		if ( !pf ) {
++			continue;
++		}
++		pf->WriteInt( pm );
++		pf->WriteInt( pc );
++		for ( int i = 0; i < polys.Num(); i++ ) {
++			if ( polyBkt[i] == area ) CM_WritePoly( pf, polys[i] );
++		}
++		pf->WriteInt( bm );
++		pf->WriteInt( bc );
++		for ( int i = 0; i < brushes.Num(); i++ ) {
++			if ( brushBkt[i] == area ) CM_WriteBrush( pf, brushes[i] );
++		}
++		fileSystem->CloseFile( pf );
++		streamedAreas++;
++	}
++
++	common->Printf( "DumpAreaCollision: boot .bcm = %d/%d polys + %d/%d brushes resident; %d areas streamed\n",
++		residentPolys, polys.Num(), residentBrushes, brushes.Num(), streamedAreas );
++}
++
++/*
++================
++idCollisionModelManagerLocal::AppendAreaCollision
++
++Phase 2 runtime: append one area's polys/brushes (from areadump/_areaN.bcm.part)
++into the world model's existing BSP. Mirrors ParseBinaryPolygons/Brushes but does
++NOT reallocate polygonBlock — AllocPolygon/AllocBrush overflow to Mem_Alloc, so
++appended primitives just malloc individually. Edge normals are recomputed once
++(rotation traces need them). Never rebuilds the tree, so traces stay stable.
++================
++*/
++bool idCollisionModelManagerLocal::AppendAreaCollision( int areaNum ) {
++	if ( numModels < 1 || models[0] == NULL ) {
++		return false;
++	}
++	cm_model_t *model = models[0];
++	idStr path = va( "areadump/_area%i.bcm.part", areaNum );
++	idFile *fp = fileSystem->OpenFileRead( path );
++	if ( fp == NULL ) {
++		return false;
++	}
++
++	int pm = 0, numPolys = 0;
++	fp->ReadInt( pm );			// polygonMemory — intentionally ignored (no block realloc)
++	fp->ReadInt( numPolys );
++	for ( int n = 0; n < numPolys; n++ ) {
++		int numEdges = 0;
++		fp->ReadInt( numEdges );
++		cm_polygon_t *p = AllocPolygon( model, numEdges );
++		p->numEdges = numEdges;
++		for ( int i = 0; i < numEdges; i++ ) {
++			fp->ReadInt( p->edges[i] );
++		}
++		idVec3 normal;
++		fp->ReadVec3( normal );
++		p->plane.SetNormal( normal );
++		float dist;
++		fp->ReadFloat( dist );
++		p->plane.SetDist( dist );
++		fp->ReadVec3( p->bounds[0] );
++		fp->ReadVec3( p->bounds[1] );
++		idStr matName;
++		fp->ReadString( matName );
++		p->material = declManager->FindMaterial( matName );
++		p->contents = p->material->GetContentFlags();
++		p->checkcount = 0;
++		R_FilterPolygonIntoTree( model, model->node, NULL, p );
++		model->contents |= p->contents;
++	}
++
++	int bm = 0, numBrushes = 0;
++	fp->ReadInt( bm );
++	fp->ReadInt( numBrushes );
++	for ( int n = 0; n < numBrushes; n++ ) {
++		int numPlanes = 0;
++		fp->ReadInt( numPlanes );
++		cm_brush_t *b = AllocBrush( model, numPlanes );
++		b->numPlanes = numPlanes;
++		for ( int i = 0; i < numPlanes; i++ ) {
++			idVec3 normal;
++			fp->ReadVec3( normal );
++			b->planes[i].SetNormal( normal );
++			float dist;
++			fp->ReadFloat( dist );
++			b->planes[i].SetDist( dist );
++		}
++		fp->ReadVec3( b->bounds[0] );
++		fp->ReadVec3( b->bounds[1] );
++		fp->ReadInt( b->contents );
++		b->checkcount = 0;
++		b->primitiveNum = 0;
++		R_FilterBrushIntoTree( model, model->node, NULL, b );
++		model->contents |= b->contents;
++	}
++	fileSystem->CloseFile( fp );
++
++	// rotation traces need edge normals; recompute once for the whole tree.
++	CalculateEdgeNormals( model, model->node );
++	return true;
++}
++
+ /*
+ ================
+ idCollisionModelManagerLocal::WriteCollisionModelForMapEntity
+@@ -615,3 +1066,329 @@ bool idCollisionModelManagerLocal::LoadCollisionModelFile( const char *name, uns
+ 
+ 	return true;
+ }
++
++/*
++===============================================================================
++
++	Binary collision model cache (.bcm) — byte-for-byte mirror of the ASCII
++	Write and Parse path above, via idFile binary ops. Skips the idLexer
++	tokenize + number-conversion (the measured ~946ms .cm cost on this map).
++	Any failure (bad magic/version, CRC mismatch, truncated read) returns
++	false so BuildModels falls through to the ASCII path.
++
++===============================================================================
++*/
++
++void idCollisionModelManagerLocal::WriteBinaryNodes( idFile *fp, cm_node_t *node ) {
++	fp->WriteInt( node->planeType );
++	fp->WriteFloat( node->planeDist );
++	if ( node->planeType != -1 ) {
++		WriteBinaryNodes( fp, node->children[0] );
++		WriteBinaryNodes( fp, node->children[1] );
++	}
++}
++
++void idCollisionModelManagerLocal::WriteBinaryPolygons( idFile *fp, cm_node_t *node ) {
++	cm_polygonRef_t *pref;
++	cm_polygon_t *p;
++	int i;
++
++	for ( pref = node->polygons; pref; pref = pref->next ) {
++		p = pref->p;
++		if ( p->checkcount == checkCount ) {
++			continue;
++		}
++		p->checkcount = checkCount;
++		fp->WriteInt( p->numEdges );
++		for ( i = 0; i < p->numEdges; i++ ) {
++			fp->WriteInt( p->edges[i] );
++		}
++		fp->WriteVec3( p->plane.Normal() );
++		fp->WriteFloat( p->plane.Dist() );
++		fp->WriteVec3( p->bounds[0] );
++		fp->WriteVec3( p->bounds[1] );
++		fp->WriteString( p->material->GetName() );
++	}
++	if ( node->planeType != -1 ) {
++		WriteBinaryPolygons( fp, node->children[0] );
++		WriteBinaryPolygons( fp, node->children[1] );
++	}
++}
++
++void idCollisionModelManagerLocal::WriteBinaryBrushes( idFile *fp, cm_node_t *node ) {
++	cm_brushRef_t *bref;
++	cm_brush_t *b;
++	int i;
++
++	for ( bref = node->brushes; bref; bref = bref->next ) {
++		b = bref->b;
++		if ( b->checkcount == checkCount ) {
++			continue;
++		}
++		b->checkcount = checkCount;
++		fp->WriteInt( b->numPlanes );
++		for ( i = 0; i < b->numPlanes; i++ ) {
++			fp->WriteVec3( b->planes[i].Normal() );
++			fp->WriteFloat( b->planes[i].Dist() );
++		}
++		fp->WriteVec3( b->bounds[0] );
++		fp->WriteVec3( b->bounds[1] );
++		fp->WriteInt( b->contents );
++	}
++	if ( node->planeType != -1 ) {
++		WriteBinaryBrushes( fp, node->children[0] );
++		WriteBinaryBrushes( fp, node->children[1] );
++	}
++}
++
++void idCollisionModelManagerLocal::WriteBinaryCollisionModel( idFile *fp, cm_model_t *model ) {
++	int i, polygonMemory, brushMemory;
++
++	fp->WriteString( model->name.c_str() );
++	// vertices
++	fp->WriteInt( model->numVertices );
++	for ( i = 0; i < model->numVertices; i++ ) {
++		fp->WriteVec3( model->vertices[i].p );
++	}
++	// edges
++	fp->WriteInt( model->numEdges );
++	for ( i = 0; i < model->numEdges; i++ ) {
++		fp->WriteInt( model->edges[i].vertexNum[0] );
++		fp->WriteInt( model->edges[i].vertexNum[1] );
++		fp->WriteInt( model->edges[i].internal );
++		fp->WriteInt( model->edges[i].numUsers );
++	}
++	// nodes
++	WriteBinaryNodes( fp, model->node );
++	// polygons (checkCount++ once for CountPolygonMemory, once for the write — each dedups)
++	checkCount++;
++	polygonMemory = CountPolygonMemory( model->node );
++	fp->WriteInt( polygonMemory );
++	fp->WriteInt( model->numPolygons );
++	checkCount++;
++	WriteBinaryPolygons( fp, model->node );
++	// brushes
++	checkCount++;
++	brushMemory = CountBrushMemory( model->node );
++	fp->WriteInt( brushMemory );
++	fp->WriteInt( model->numBrushes );
++	checkCount++;
++	WriteBinaryBrushes( fp, model->node );
++}
++
++void idCollisionModelManagerLocal::WriteBinaryCollisionModelsToFile( const char *filename, int firstModel, int lastModel, unsigned int mapFileCRC ) {
++	int i;
++	idFile *fp;
++	idStr name;
++
++	name = filename;
++	name.SetFileExtension( BCM_FILE_EXT );
++
++	fp = fileSystem->OpenFileWrite( name, "fs_devpath" );
++	if ( !fp ) {
++		common->Warning( "WriteBinaryCollisionModelsToFile: Error opening file %s\n", name.c_str() );
++		return;
++	}
++	fp->WriteInt( BCM_MAGIC );
++	fp->WriteInt( BCM_VERSION );
++	fp->WriteInt( (int)mapFileCRC );
++	fp->WriteInt( lastModel - firstModel );
++	for ( i = firstModel; i < lastModel; i++ ) {
++		WriteBinaryCollisionModel( fp, models[ i ] );
++	}
++	fileSystem->CloseFile( fp );
++	common->Printf( "wrote binary collision cache %s\n", name.c_str() );
++}
++
++cm_node_t *idCollisionModelManagerLocal::ParseBinaryNodes( idFile *fp, cm_model_t *model, cm_node_t *parent ) {
++	cm_node_t *node;
++
++	model->numNodes++;
++	node = AllocNode( model, model->numNodes < NODE_BLOCK_SIZE_SMALL ? NODE_BLOCK_SIZE_SMALL : NODE_BLOCK_SIZE_LARGE );
++	node->brushes = NULL;
++	node->polygons = NULL;
++	node->parent = parent;
++	fp->ReadInt( node->planeType );
++	fp->ReadFloat( node->planeDist );
++	if ( node->planeType != -1 ) {
++		node->children[0] = ParseBinaryNodes( fp, model, node );
++		node->children[1] = ParseBinaryNodes( fp, model, node );
++	}
++	return node;
++}
++
++void idCollisionModelManagerLocal::ParseBinaryVertices( idFile *fp, cm_model_t *model ) {
++	int i;
++
++	fp->ReadInt( model->numVertices );
++	model->maxVertices = model->numVertices;
++	model->vertices = (cm_vertex_t *) Mem_Alloc( model->maxVertices * sizeof( cm_vertex_t ) );
++	for ( i = 0; i < model->numVertices; i++ ) {
++		fp->ReadVec3( model->vertices[i].p );
++		model->vertices[i].side = 0;
++		model->vertices[i].sideSet = 0;
++		model->vertices[i].checkcount = 0;
++	}
++}
++
++void idCollisionModelManagerLocal::ParseBinaryEdges( idFile *fp, cm_model_t *model ) {
++	int i, tmp;
++
++	fp->ReadInt( model->numEdges );
++	model->maxEdges = model->numEdges;
++	model->edges = (cm_edge_t *) Mem_Alloc( model->maxEdges * sizeof( cm_edge_t ) );
++	for ( i = 0; i < model->numEdges; i++ ) {
++		fp->ReadInt( model->edges[i].vertexNum[0] );
++		fp->ReadInt( model->edges[i].vertexNum[1] );
++		model->edges[i].side = 0;
++		model->edges[i].sideSet = 0;
++		fp->ReadInt( tmp ); model->edges[i].internal = (unsigned short)tmp;
++		fp->ReadInt( tmp ); model->edges[i].numUsers = (unsigned short)tmp;
++		model->edges[i].normal = vec3_origin;
++		model->edges[i].checkcount = 0;
++		model->numInternalEdges += model->edges[i].internal;
++	}
++}
++
++void idCollisionModelManagerLocal::ParseBinaryPolygons( idFile *fp, cm_model_t *model ) {
++	cm_polygon_t *p;
++	int i, n, numEdges, numPolys, polygonMemory;
++	idVec3 normal;
++	float dist;
++	idStr matName;
++
++	fp->ReadInt( polygonMemory );
++	if ( polygonMemory > 0 ) {
++		model->polygonBlock = (cm_polygonBlock_t *) Mem_Alloc( sizeof( cm_polygonBlock_t ) + polygonMemory );
++		model->polygonBlock->bytesRemaining = polygonMemory;
++		model->polygonBlock->next = ( (byte *) model->polygonBlock ) + sizeof( cm_polygonBlock_t );
++	}
++	fp->ReadInt( numPolys );
++	for ( n = 0; n < numPolys; n++ ) {
++		fp->ReadInt( numEdges );
++		p = AllocPolygon( model, numEdges );
++		p->numEdges = numEdges;
++		for ( i = 0; i < numEdges; i++ ) {
++			fp->ReadInt( p->edges[i] );
++		}
++		fp->ReadVec3( normal );
++		p->plane.SetNormal( normal );
++		fp->ReadFloat( dist );
++		p->plane.SetDist( dist );
++		fp->ReadVec3( p->bounds[0] );
++		fp->ReadVec3( p->bounds[1] );
++		fp->ReadString( matName );
++		p->material = declManager->FindMaterial( matName );
++		p->contents = p->material->GetContentFlags();
++		p->checkcount = 0;
++		R_FilterPolygonIntoTree( model, model->node, NULL, p );
++	}
++}
++
++void idCollisionModelManagerLocal::ParseBinaryBrushes( idFile *fp, cm_model_t *model ) {
++	cm_brush_t *b;
++	int i, n, numPlanes, numBrushes, brushMemory;
++	idVec3 normal;
++	float dist;
++
++	fp->ReadInt( brushMemory );
++	if ( brushMemory > 0 ) {
++		model->brushBlock = (cm_brushBlock_t *) Mem_Alloc( sizeof( cm_brushBlock_t ) + brushMemory );
++		model->brushBlock->bytesRemaining = brushMemory;
++		model->brushBlock->next = ( (byte *) model->brushBlock ) + sizeof( cm_brushBlock_t );
++	}
++	fp->ReadInt( numBrushes );
++	for ( n = 0; n < numBrushes; n++ ) {
++		fp->ReadInt( numPlanes );
++		b = AllocBrush( model, numPlanes );
++		b->numPlanes = numPlanes;
++		for ( i = 0; i < numPlanes; i++ ) {
++			fp->ReadVec3( normal );
++			b->planes[i].SetNormal( normal );
++			fp->ReadFloat( dist );
++			b->planes[i].SetDist( dist );
++		}
++		fp->ReadVec3( b->bounds[0] );
++		fp->ReadVec3( b->bounds[1] );
++		fp->ReadInt( b->contents );
++		b->checkcount = 0;
++		b->primitiveNum = 0;
++		R_FilterBrushIntoTree( model, model->node, NULL, b );
++	}
++}
++
++bool idCollisionModelManagerLocal::ParseBinaryCollisionModel( idFile *fp ) {
++	cm_model_t *model;
++	idStr name;
++
++	if ( numModels >= MAX_SUBMODELS ) {
++		common->Error( "LoadBinaryCollisionModelFile: no free slots" );
++		return false;
++	}
++	model = AllocModel();
++	models[numModels] = model;
++	numModels++;
++
++	fp->ReadString( name );
++	model->name = name;
++	ParseBinaryVertices( fp, model );
++	ParseBinaryEdges( fp, model );
++	model->node = ParseBinaryNodes( fp, model, NULL );
++	ParseBinaryPolygons( fp, model );
++	ParseBinaryBrushes( fp, model );
++
++	// calculate edge normals
++	checkCount++;
++	CalculateEdgeNormals( model, model->node );
++	// get model bounds from brush and polygon bounds
++	CM_GetNodeBounds( &model->bounds, model->node );
++	// get model contents
++	model->contents = CM_GetNodeContents( model->node );
++	// total memory used by this model
++	model->usedMemory = model->numVertices * sizeof(cm_vertex_t) +
++						model->numEdges * sizeof(cm_edge_t) +
++						model->polygonMemory +
++						model->brushMemory +
++						model->numNodes * sizeof(cm_node_t) +
++						model->numPolygonRefs * sizeof(cm_polygonRef_t) +
++						model->numBrushRefs * sizeof(cm_brushRef_t);
++	return true;
++}
++
++bool idCollisionModelManagerLocal::LoadBinaryCollisionModelFile( const char *name, unsigned int mapFileCRC ) {
++	idStr fileName;
++	idFile *fp;
++	int magic, version, numModelsInFile, crcInt, i;
++
++	fileName = name;
++	fileName.SetFileExtension( BCM_FILE_EXT );
++	fp = fileSystem->OpenFileRead( fileName );
++	if ( !fp ) {
++		return false;
++	}
++	magic = version = 0;
++	fp->ReadInt( magic );
++	fp->ReadInt( version );
++	if ( magic != BCM_MAGIC || version != BCM_VERSION ) {
++		fileSystem->CloseFile( fp );
++		return false;
++	}
++	crcInt = 0;
++	fp->ReadInt( crcInt );
++	if ( mapFileCRC && (unsigned int)crcInt != mapFileCRC ) {
++		common->Printf( "%s is out of date\n", fileName.c_str() );
++		fileSystem->CloseFile( fp );
++		return false;
++	}
++	numModelsInFile = 0;
++	fp->ReadInt( numModelsInFile );
++	for ( i = 0; i < numModelsInFile; i++ ) {
++		if ( !ParseBinaryCollisionModel( fp ) ) {
++			fileSystem->CloseFile( fp );
++			return false;
++		}
++	}
++	fileSystem->CloseFile( fp );
++	common->Printf( "loaded binary collision cache %s\n", fileName.c_str() );
++	return true;
++}
+diff --git a/neo/cm/CollisionModel_load.cpp b/neo/cm/CollisionModel_load.cpp
+index 199484c..5ce82c0 100644
+--- a/neo/cm/CollisionModel_load.cpp
++++ b/neo/cm/CollisionModel_load.cpp
+@@ -184,6 +184,7 @@ void idCollisionModelManagerLocal::Clear( void ) {
+ 	checkCount = 0;
+ 	maxModels = 0;
+ 	numModels = 0;
++	numMapModels = 0;
+ 	models = NULL;
+ 	memset( trmPolygons, 0, sizeof( trmPolygons ) );
+ 	trmBrushes[0] = NULL;
+@@ -3391,14 +3392,25 @@ void idCollisionModelManagerLocal::ListModels( void ) {
+ idCollisionModelManagerLocal::BuildModels
+ ================
+ */
++// Boot-speed: parse-phase timer (logs [parse-time] via D3_ParseTimeLog)
++extern "C" void D3_ParseTimeLog(const char*, int);
++namespace { struct D3ParseTimer { const char* n; unsigned int t0; D3ParseTimer(const char* nm):n(nm),t0(Sys_Milliseconds()){} ~D3ParseTimer(){ D3_ParseTimeLog(n,(int)(Sys_Milliseconds()-t0)); } }; }
++
+ void idCollisionModelManagerLocal::BuildModels( const idMapFile *mapFile ) {
++	D3ParseTimer _pt("BuildModels(.cm)");
+ 	int i;
+ 	const idMapEntity *mapEnt;
+ 
+ 	idTimer timer;
+ 	timer.Start();
+ 
+-	if ( !LoadCollisionModelFile( mapFile->GetName(), mapFile->GetGeometryCRC() ) ) {
++	// Boot-speed: try the binary .bcm cache first (skips the ~946ms ASCII
++	// .cm lex). Any failure (no file, bad magic/version, CRC mismatch)
++	// falls through to the ASCII path below, which then writes a fresh .bcm.
++	extern idCVar cm_binaryCache;
++	bool binLoaded = cm_binaryCache.GetBool() && LoadBinaryCollisionModelFile( mapFile->GetName(), mapFile->GetGeometryCRC() );
++
++	if ( !binLoaded && !LoadCollisionModelFile( mapFile->GetName(), mapFile->GetGeometryCRC() ) ) {
+ 
+ 		if ( !mapFile->GetNumEntities() ) {
+ 			return;
+@@ -3429,6 +3441,12 @@ void idCollisionModelManagerLocal::BuildModels( const idMapFile *mapFile ) {
+ 		WriteCollisionModelsToFile( mapFile->GetName(), 0, numModels, mapFile->GetGeometryCRC() );
+ 	}
+ 
++	// Boot-speed: if the models came from the ASCII path (or a fresh build),
++	// write the binary cache so the next boot takes the fast path.
++	if ( !binLoaded && cm_binaryCache.GetBool() && numModels > 0 ) {
++		WriteBinaryCollisionModelsToFile( mapFile->GetName(), 0, numModels, mapFile->GetGeometryCRC() );
++	}
++
+ 	timer.Stop();
+ 
+ 	// print statistics on collision data
+@@ -3481,6 +3499,11 @@ void idCollisionModelManagerLocal::LoadMap( const idMapFile *mapFile ) {
+ 	// build collision models
+ 	BuildModels( mapFile );
+ 
++	// remember how many models came from the map (.bcm). Runtime trace models
++	// (SetupTrmModel) and moveable .lwo collisions (LoadModel) append after this;
++	// the area-streaming bake must serialize only these map models.
++	numMapModels = numModels;
++
+ 	// save name and time stamp
+ 	mapName = mapFile->GetName();
+ 	mapFileTime = mapFile->GetFileTime();
+diff --git a/neo/cm/CollisionModel_local.h b/neo/cm/CollisionModel_local.h
+index 562344f..107f5cb 100644
+--- a/neo/cm/CollisionModel_local.h
++++ b/neo/cm/CollisionModel_local.h
+@@ -345,6 +345,13 @@ public:
+ 	void			ListModels( void );
+ 	// write a collision model file for the map entity
+ 	bool			WriteCollisionModelForMapEntity( const idMapEntity *mapEnt, const char *filename, const bool testTraceModel = true );
++	// Phase 0 (area-streaming bake): per-area collision poly/brush census
++	void			DumpAreaCollisionStats( const char *dir, int numAreas, cmAreaForPointFn fn, void *ctx );
++	// Phase 2: per-area collision serialization + runtime append
++	void			DumpAreaCollision( const char *dir, int numAreas, const bool *isBootArea, unsigned int mapCRC, cmAreaForPointFn fn, void *ctx );
++	bool			AppendAreaCollision( int areaNum );
++	int				PolyAreaBucket( cm_polygon_t *p, int numAreas, const bool *isBootArea, cmAreaForPointFn fn, void *ctx );
++	int				BrushAreaBucket( cm_brush_t *b, int numAreas, const bool *isBootArea, cmAreaForPointFn fn, void *ctx );
+ 
+ private:			// CollisionMap_translate.cpp
+ 	int				TranslateEdgeThroughEdge( idVec3 &cross, idPluecker &l1, idPluecker &l2, float *fraction );
+@@ -490,6 +497,20 @@ private:			// CollisionMap_files.cpp
+ 	void			ParseBrushes( idLexer *src, cm_model_t *model );
+ 	bool			ParseCollisionModel( idLexer *src );
+ 	bool			LoadCollisionModelFile( const char *name, unsigned int mapFileCRC );
++					// Boot-speed: binary .bcm cache (byte-for-byte mirror of the ASCII
++					// Write*/Parse* above; skips tokenize+number-conversion on repeat boots)
++	void			WriteBinaryNodes( idFile *fp, cm_node_t *node );
++	void			WriteBinaryPolygons( idFile *fp, cm_node_t *node );
++	void			WriteBinaryBrushes( idFile *fp, cm_node_t *node );
++	void			WriteBinaryCollisionModel( idFile *fp, cm_model_t *model );
++	void			WriteBinaryCollisionModelsToFile( const char *filename, int firstModel, int lastModel, unsigned int mapFileCRC );
++	cm_node_t *		ParseBinaryNodes( idFile *fp, cm_model_t *model, cm_node_t *parent );
++	void			ParseBinaryVertices( idFile *fp, cm_model_t *model );
++	void			ParseBinaryEdges( idFile *fp, cm_model_t *model );
++	void			ParseBinaryPolygons( idFile *fp, cm_model_t *model );
++	void			ParseBinaryBrushes( idFile *fp, cm_model_t *model );
++	bool			ParseBinaryCollisionModel( idFile *fp );
++	bool			LoadBinaryCollisionModelFile( const char *name, unsigned int mapFileCRC );
+ 
+ private:			// CollisionMap_debug
+ 	int				ContentsFromString( const char *string ) const;
+@@ -509,6 +530,7 @@ private:			// collision map data
+ 					// models
+ 	int				maxModels;
+ 	int				numModels;
++	int				numMapModels;		// models loaded from the map (.bcm) only; runtime trm/moveable models append after
+ 	cm_model_t **	models;
+ 					// polygons and brush for trm model
+ 	cm_polygonRef_t*trmPolygons[MAX_TRACEMODEL_POLYS];
+diff --git a/neo/framework/Common.cpp b/neo/framework/Common.cpp
+index dbf6c54..cecbc33 100644
+--- a/neo/framework/Common.cpp
++++ b/neo/framework/Common.cpp
+@@ -26,6 +26,7 @@ If you have questions concerning this license or the applicable additional terms
+ ===========================================================================
+ */
+ 
++
+ #include "sys/sys_sdl.h"
+ 
+ #if SDL_VERSION_ATLEAST(3, 0, 0)
+@@ -108,6 +109,13 @@ idCVar com_timescale( "timescale", "1", CVAR_SYSTEM | CVAR_FLOAT, "scales the ti
+ idCVar com_makingBuild( "com_makingBuild", "0", CVAR_BOOL | CVAR_SYSTEM, "1 when making a build" );
+ idCVar com_updateLoadSize( "com_updateLoadSize", "0", CVAR_BOOL | CVAR_SYSTEM | CVAR_NOCHEAT, "update the load size after loading a map" );
+ 
++// Area-streaming (experimental, default OFF => monolithic load path unchanged).
++// com_streamAreas gates the per-area deferred render/collision/entity load.
++// com_streamDump is the bake helper: dumpAreaSplit writes per-area .part files
++// + json fragments under /save/areadump for scripts/pack-area-stream.py.
++idCVar com_streamAreas( "com_streamAreas", "0", CVAR_BOOL | CVAR_SYSTEM, "experimental: stream level geometry/entities per render-area (0 = monolithic)" );
++idCVar com_streamDump( "com_streamDump", "0", CVAR_BOOL | CVAR_SYSTEM, "bake helper: enables the dumpAreaSplit per-area dump command" );
++
+ idCVar com_enableDebuggerServer( "com_enableDebuggerServer", "0", CVAR_BOOL | CVAR_SYSTEM, "toggle debugger server and try to connect to com_dbgClientAdr" );
+ idCVar com_dbgClientAdr( "com_dbgClientAdr", "localhost", CVAR_SYSTEM | CVAR_ARCHIVE, "debuggerApp client address" );
+ idCVar com_dbgServerAdr( "com_dbgServerAdr", "localhost", CVAR_SYSTEM | CVAR_ARCHIVE, "debugger server address" );
+@@ -874,7 +882,7 @@ doom set test blah + map test
+ ============================================================================
+ */
+ 
+-#define		MAX_CONSOLE_LINES	32
++#define		MAX_CONSOLE_LINES	64
+ int			com_numConsoleLines;
+ idCmdArgs	com_consoleLines[MAX_CONSOLE_LINES];
+ 
+@@ -885,14 +893,31 @@ idCommonLocal::ParseCommandLine
+ */
+ void idCommonLocal::ParseCommandLine( int argc, char **argv ) {
+ 	int i;
++	bool ignoring = false;
+ 
+ 	com_numConsoleLines = 0;
+ 	// API says no program path
+ 	for ( i = 0; i < argc; i++ ) {
+ 		if ( argv[ i ][ 0 ] == '+' ) {
++			// Original id code had no bounds check: the 33rd "+command"
++			// silently wrote past com_consoleLines[], corrupting adjacent
++			// globals (first symptom: the console object's vtable → a
++			// "null function" trap on the very first Printf). Found on the
++			// Emscripten port, where the web shell passes ~32 "+set" args.
++			if ( com_numConsoleLines >= MAX_CONSOLE_LINES ) {
++				Sys_Printf( "WARNING: ParseCommandLine: more than %d console lines, ignoring '%s'\n",
++							MAX_CONSOLE_LINES, argv[ i ] );
++				ignoring = true;
++				continue;
++			}
++			ignoring = false;
+ 			com_numConsoleLines++;
+ 			com_consoleLines[ com_numConsoleLines-1 ].AppendArg( argv[ i ] + 1 );
+ 		} else {
++			// arguments of a dropped command must be dropped with it
++			if ( ignoring ) {
++				continue;
++			}
+ 			if ( !com_numConsoleLines ) {
+ 				com_numConsoleLines++;
+ 			}
+@@ -2531,7 +2556,6 @@ void idCommonLocal::Frame( void ) {
+ 			}
+ 		} else {
+ 			session->Frame();
+-
+ 			// normal, in-sequence screen update
+ 			session->UpdateScreen( false );
+ 		}
+@@ -2560,8 +2584,17 @@ void idCommonLocal::Frame( void ) {
+ 		if ( com_editors == 0 )
+ #endif
+ 		{
+-			if ( com_timescale.GetFloat() == 1.0f && GLimp_GetSwapInterval() != 0
+-				&& fabsf(60.0f - GLimp_GetDisplayRefresh()) < 1.0f ) {
++			bool vsynced60 = ( GLimp_GetSwapInterval() != 0
++				&& fabsf(60.0f - GLimp_GetDisplayRefresh()) < 1.0f );
++#ifdef __EMSCRIPTEN__
++			// The browser main loop IS vsync: requestAnimationFrame paces
++			// frames at display rate. The GLimp swap/refresh queries don't
++			// report that here, so the code fell into Com_WaitForNextTicStart,
++			// which on WASM cannot sleep and BUSY-SPINS on the clock until
++			// the next 60Hz tic boundary (~35-45% of ALL CPU in profiles).
++			vsynced60 = true;
++#endif
++			if ( com_timescale.GetFloat() == 1.0f && vsynced60 ) {
+ 				// if we're using vsync and the display is running at about 60Hz, start next tic
+ 				// immediately so our internal tic time and vsync don't drift apart
+ 				double now = Sys_MillisecondsPrecise();
+@@ -3175,8 +3208,14 @@ void idCommonLocal::Init( int argc, char **argv ) {
+ 		Sys_Error( "Error during initialization" );
+ 	}
+ 
++#ifdef __EMSCRIPTEN__
++	// No worker threads in the single-threaded browser build; the async game /
++	// sound tic is driven from idCommonLocal::Frame() instead.
++	runAsyncThread = false;
++#else
+ 	runAsyncThread = true;
+ 	Sys_CreateThread( AsyncThread, this, asyncThread, "AsyncThread" );
++#endif
+ }
+ 
+ 
+@@ -3245,6 +3284,7 @@ void idCommonLocal::Shutdown( void ) {
+ idCommonLocal::InitGame
+ =================
+ */
++
+ void idCommonLocal::InitGame( void ) {
+ 	// initialize the file system
+ 	fileSystem->Init();
+@@ -3357,6 +3397,14 @@ void idCommonLocal::InitGame( void ) {
+ 	// have to do this twice.. first one sets the correct r_mode for the renderer init
+ 	// this time around the backend is all setup correct.. a bit fugly but do not want
+ 	// to mess with all the gl init at this point.. an old vid card will never qualify for
++#ifdef __EMSCRIPTEN__
++	// Boot-speed (iter 61): /save is MEMFS so sysDetect is ALWAYS true here, making
++	// this run EVERY boot — and the redundant s_restart re-inits sound HW for nothing
++	// on the muted default boot. Our machine-spec cvars (r_mode/render-size/image_*)
++	// are pinned by +set args + autoexec (StartupVariable runs last, iter 31), so the
++	// engine's auto-detect is inert. Skip the whole second pass.
++	(void)sysDetect;
++#else
+ 	if ( sysDetect ) {
+ 		SetMachineSpec();
+ 		Com_ExecMachineSpec_f( args );
+@@ -3364,6 +3412,7 @@ void idCommonLocal::InitGame( void ) {
+ 		cmdSystem->BufferCommandText( CMD_EXEC_NOW, "s_restart\n" );
+ 		cmdSystem->ExecuteCommandBuffer();
+ 	}
++#endif
+ }
+ 
+ /*
+diff --git a/neo/framework/FileSystem.cpp b/neo/framework/FileSystem.cpp
+index 7edeb4d..adae33e 100644
+--- a/neo/framework/FileSystem.cpp
++++ b/neo/framework/FileSystem.cpp
+@@ -3555,6 +3555,12 @@ idFileSystemLocal::StartBackgroundReadThread
+ =================
+ */
+ void idFileSystemLocal::StartBackgroundDownloadThread() {
++#ifdef __EMSCRIPTEN__
++	// No worker threads in the single-threaded browser build; networked
++	// background downloads are unused. Background reads fall back to the
++	// synchronous path.
++	return;
++#endif
+ 	if ( !backgroundThread.threadHandle ) {
+ 		Sys_CreateThread( BackgroundDownloadThread, &backgroundThread_exit, backgroundThread, "backgroundDownload" );
+ 	} else {
+diff --git a/neo/framework/Session.cpp b/neo/framework/Session.cpp
+index 29745c6..d416439 100644
+--- a/neo/framework/Session.cpp
++++ b/neo/framework/Session.cpp
+@@ -36,6 +36,7 @@ If you have questions concerning this license or the applicable additional terms
+ #include "renderer/ModelManager.h"
+ 
+ #include "framework/Session_local.h"
++#include "framework/d3_arco.h"
+ 
+ #if defined(__AROS__)
+ #define CDKEY_FILEPATH CDKEY_FILE
+@@ -126,6 +127,12 @@ static void Session_Map_f( const idCmdArgs &args ) {
+ 	// handle addon packs through reloadEngine
+ 	sprintf( string, "maps/%s.map", map.c_str() );
+ 	ff = fileSystem->FindFile( string, true );
++	if ( ff == FIND_NO ) {
++		// Boot-speed: a binary entities cache (.bmap) may ship in place of the
++		// ASCII .map (the geometry parse is baked to .bcm/.bmap/.bproc).
++		sprintf( string, "maps/%s.bmap", map.c_str() );
++		ff = fileSystem->FindFile( string, true );
++	}
+ 	switch ( ff ) {
+ 	case FIND_NO:
+ 		common->Printf( "Can't find map %s\n", string.c_str() );
+@@ -167,6 +174,12 @@ static void Session_DevMap_f( const idCmdArgs &args ) {
+ 	// handle addon packs through reloadEngine
+ 	sprintf( string, "maps/%s.map", map.c_str() );
+ 	ff = fileSystem->FindFile( string, true );
++	if ( ff == FIND_NO ) {
++		// Boot-speed: a binary entities cache (.bmap) may ship in place of the
++		// ASCII .map (the geometry parse is baked to .bcm/.bmap/.bproc).
++		sprintf( string, "maps/%s.bmap", map.c_str() );
++		ff = fileSystem->FindFile( string, true );
++	}
+ 	switch ( ff ) {
+ 	case FIND_NO:
+ 		common->Printf( "Can't find map %s\n", string.c_str() );
+@@ -548,8 +561,16 @@ void idSessionLocal::ShowLoadingGui() {
+ 	// introduced in D3XP code. don't think it actually fixes anything, but doesn't hurt either
+ #if 1
+ 	// Try and prevent the while loop from being skipped over (long hitch on the main thread?)
++#ifdef __EMSCRIPTEN__
++	// Boot-speed: the 1s "animate out the loading gui" spin is pure cosmetic
++	// delay on every map load. On web/wearable just run a few frames so the
++	// loading gui appears, then proceed — saves ~1s off "Starting map".
++	int stop = Sys_Milliseconds();
++	int force = 3;
++#else
+ 	int stop = Sys_Milliseconds() + 1000;
+ 	int force = 10;
++#endif
+ 	while ( Sys_Milliseconds() < stop || force-- > 0 ) {
+ 		Com_UpdateFrameTime(); // DG: put updating com_frameTime into a function
+ 		session->Frame();
+@@ -1544,6 +1565,7 @@ create a game at all.
+ Exits with mapSpawned = true
+ ===============
+ */
++
+ void idSessionLocal::ExecuteMapChange( bool noFadeWipe ) {
+ 	int		i;
+ 	bool	reloadingSameMap;
+@@ -1604,7 +1626,17 @@ void idSessionLocal::ExecuteMapChange( bool noFadeWipe ) {
+ 	}
+ 
+ 	uiManager->BeginLevelLoad();
++#ifdef __EMSCRIPTEN__
++	// Boot-speed: Reload(true) FORCE-reparses every registered GUI ignoring file
++	// timestamps — a dev-workflow rebuild for live-edited .gui files. The web pak
++	// is an immutable MEMFS, so .gui timestamps never advance; Reload(false) does
++	// the timestamp check and skips every (just-loaded, unchanged) GUI. Measured
++	// the force reparse at ~9.5s on Chromium headless — it was the dominant
++	// "pre-load" cost (the decl/render/sound BeginLevelLoad are all ~0ms).
++	uiManager->Reload( false );
++#else
+ 	uiManager->Reload( true );
++#endif
+ 
+ 	// set the loading gui that we will wipe to
+ 	LoadLoadingGui( mapString );
+@@ -2646,9 +2678,160 @@ idSessionLocal::Frame
+ */
+ extern bool CheckOpenALDeviceAndRecoverIfNeeded();
+ extern int g_screenshotFormat;
++
++// ---- B1 SPIKE (Arco) ------------------------------------------------------
++// Falsification test for "drive idRenderWorld as a pure renderer fed externally,
++// WITHOUT idGameLocal". Set r_b1map "maps/game/mp/d3dm3" (autoexec) and the
++// session Frame() below allocates a render world, InitFromMap, and RenderScene
++// from a free camera EVERY frame — the game is never spawned and the menu never
++// draws. Proves the renderer + render world are separable from the game in THIS
++// WebGPU build. Captures one TGA after warm-up. Inert when r_b1map is empty.
++idCVar r_b1map( "r_b1map", "", CVAR_SYSTEM, "B1 spike: render this map's render-world with NO game (e.g. maps/game/mp/d3dm3)" );
++// FFI-seam test: an externally-driven proxy entity ("networked player"). r_b1ent enables it;
++// r_b1yaw / r_b1lat are set FROM JS every frame (window.d3cmd) and fed straight into the
++// render world via UpdateEntityDef — proving external code controls render state per frame.
++idCVar r_b1ent( "r_b1ent", "0", CVAR_SYSTEM | CVAR_BOOL, "B1 FFI test: render a JS-driven proxy entity" );
++idCVar r_b1yaw( "r_b1yaw", "0", CVAR_SYSTEM | CVAR_FLOAT, "B1 FFI: proxy entity yaw (deg), set from JS" );
++idCVar r_b1lat( "r_b1lat", "0", CVAR_SYSTEM | CVAR_FLOAT, "B1 FFI: proxy entity lateral offset, set from JS" );
++// ---------------------------------------------------------------------------
++
+ void idSessionLocal::Frame() {
+ 	D3P_ScopedCPUSample(Session_Frame);
+ 
++	// ---- B1 SPIKE: render-world-without-game bypass ----
++	if ( r_b1map.GetString()[0] ) {
++		static idRenderWorld *b1rw = NULL;
++		static int b1frame = 0;
++		static bool b1captured = false;
++		if ( b1rw == NULL ) {
++			common->Printf( "[B1] AllocRenderWorld + InitFromMap '%s' (idGameLocal NOT spawned)\n", r_b1map.GetString() );
++			b1rw = renderSystem->AllocRenderWorld();
++			renderSystem->BeginLevelLoad();
++			bool ok = b1rw->InitFromMap( r_b1map.GetString() );
++			renderSystem->EndLevelLoad();
++			if ( !ok ) {
++				common->Printf( "[B1] InitFromMap FAILED for '%s'\n", r_b1map.GetString() );
++				r_b1map.SetString( "" );
++				return;
++			}
++			common->Printf( "[B1] InitFromMap OK — render world built with NO game module\n" );
++			// LIGHTING TEST: dhewm3 lights the world via light ENTITIES the game spawns; render-only
++			// mode has none → black. Add one big bright point light at a d3dm3 spawn to confirm.
++			renderLight_t tl;
++			memset( (void *)&tl, 0, sizeof( tl ) );
++			tl.origin = idVec3( 16.0f, 460.0f, 360.0f ); // d3dm3 spawn area (inches)
++			tl.axis = mat3_identity;
++			tl.pointLight = true;
++			tl.noShadows = true;
++			tl.lightRadius = idVec3( 700.0f, 700.0f, 700.0f );
++			tl.shaderParms[0] = tl.shaderParms[1] = tl.shaderParms[2] = tl.shaderParms[3] = 1.0f;
++			b1rw->AddLightDef( &tl );
++			common->Printf( "[B1] test light added\n" );
++			// DIAG: did the world area models load with geometry?
++			idRenderModel *a0 = renderModelManager->CheckModel( "_area0" );
++			idStr wd = va( "[B1-WORLD] NumAreas=%d _area0=%s surfs=%d default=%d\n",
++				b1rw->NumAreas(),
++				a0 ? a0->Name() : "NULL",
++				a0 ? a0->NumSurfaces() : -1,
++				a0 ? (int)a0->IsDefaultModel() : -1 );
++			fileSystem->WriteFile( "b1world.txt", wd.c_str(), wd.Length(), "fs_savepath" );
++			common->Printf( "%s", wd.c_str() );
++		}
++
++		// ---- FFI SEAM: externally-driven proxy entity ("networked player") ----
++		static qhandle_t b1entH = -1;
++		static idVec3 b1cam( 16.0f, 300.0f, 240.0f );
++		static bool b1entReady = false;
++		if ( r_b1ent.GetBool() && !b1entReady ) {
++			// Find a point that's actually inside a loaded area (boot chunk only, no player streaming).
++			int area = b1rw->PointInArea( b1cam );
++			if ( area < 0 ) {
++				idVec3 seed = b1cam; float best = 1e9f;
++				for ( int dx = -512; dx <= 512; dx += 64 )
++				for ( int dy = -512; dy <= 512; dy += 64 )
++				for ( int dz = -128; dz <= 192; dz += 64 ) {
++					idVec3 p( seed.x + dx, seed.y + dy, seed.z + dz );
++					if ( b1rw->PointInArea( p ) >= 0 ) { float d = ( p - seed ).LengthSqr(); if ( d < best ) { best = d; b1cam = p; } }
++				}
++				area = b1rw->PointInArea( b1cam );
++			}
++			idStr diag = va( "[B1-FFI] area_cam=%d cam=(%.0f %.0f %.0f) — camera driven from JS, no entity\n",
++				area, b1cam.x, b1cam.y, b1cam.z );
++			fileSystem->WriteFile( "b1diag.txt", diag.c_str(), diag.Length(), "fs_savepath" );
++			b1entReady = true;
++		}
++
++		int sw = renderSystem->GetScreenWidth();
++		int sh = renderSystem->GetScreenHeight();
++
++		// ---- B1 production path: Arco client drives the camera via D3_Arco_SetCamera ----
++		if ( D3Arco_Active() ) {
++			renderSystem->BeginFrame( sw, sh );
++			renderView_t av;
++			D3Arco_BuildView( av );
++			static int diagN = 0;
++			if ( diagN < 4 ) {
++				diagN++;
++				int a = b1rw->PointInArea( av.vieworg );
++				idStr d = va( "[B1-ARCO] vieworg=(%.1f %.1f %.1f) area=%d fovx=%.1f fwd=(%.2f %.2f %.2f)\n",
++					av.vieworg.x, av.vieworg.y, av.vieworg.z, a, av.fov_x,
++					av.viewaxis[0].x, av.viewaxis[0].y, av.viewaxis[0].z );
++				fileSystem->WriteFile( "b1arco.txt", d.c_str(), d.Length(), "fs_savepath" );
++			}
++			b1rw->RenderScene( &av );
++			renderSystem->EndFrame( NULL, NULL );
++			D3Arco_AfterFrame();
++			return;
++		}
++		// ---- end B1 production path; below is the standalone spike sweep ----
++
++		renderSystem->BeginFrame( sw, sh );
++		renderView_t v;
++		memset( (void *)&v, 0, sizeof( v ) );
++		v.x = 0; v.y = 0;
++		v.width = sw; v.height = sh;           // match the ACTUAL render target (was 640x480 vs 640x640 → ringed)
++		v.fov_x = 90.0f;
++		v.fov_y = 2.0f * RAD2DEG( idMath::ATan( idMath::Tan( DEG2RAD( v.fov_x ) * 0.5f ) * (float)sh / (float)sw ) );
++
++		if ( r_b1ent.GetBool() && b1entReady ) {
++			// FFI SEAM: the camera pose is pulled FROM JS-set cvars every frame and fed to RenderScene —
++			// r_b1yaw pans the view, r_b1lat dollies forward. Each JS command visibly changes the frame.
++			float jsYaw = r_b1yaw.GetFloat();
++			float jsLat = r_b1lat.GetFloat();
++			idAngles ca( 0.0f, jsYaw, 0.0f );
++			v.vieworg = b1cam + ca.ToForward() * jsLat;
++			v.viewaxis = ca.ToMat3();
++			v.time = Sys_Milliseconds();
++			b1rw->RenderScene( &v );
++			renderSystem->EndFrame( NULL, NULL );
++			b1frame++;
++			if ( b1frame % 12 == 0 ) { // capture continuously; filename encodes the JS-commanded pose
++				idStr fn = va( "screenshots/ent_y%03d_l%+04d.tga", (int)jsYaw, (int)jsLat );
++				renderSystem->CaptureRenderToFile( fn.c_str(), false );
++			}
++			return;
++		}
++
++		// Default B1 mode: sweep a free camera over the loaded world (render-without-game proof).
++		int shot = b1frame / 25; // 0..7, one capture per 25 frames
++		float yaw = (float)( shot * 45 );
++		v.vieworg = idVec3( 16.0f, 460.0f, 340.0f ); // a d3dm3 info_player spawn (eye height)
++		idAngles ang( 0.0f, yaw, 0.0f );
++		v.viewaxis = ang.ToMat3();
++		v.time = Sys_Milliseconds();
++		b1rw->RenderScene( &v );
++		renderSystem->EndFrame( NULL, NULL );
++		b1frame++;
++		if ( b1frame % 25 == 0 && shot < 8 ) {
++			idStr fn = va( "screenshots/b1_%03d.tga", (int)yaw );
++			renderSystem->CaptureRenderToFile( fn.c_str(), false );
++			common->Printf( "[B1] CAPTURED %s (yaw=%d) — RENDER-WITHOUT-GAME OK\n", fn.c_str(), (int)yaw );
++			if ( shot >= 7 ) b1captured = true;
++		}
++		return; // bypass game tic + menu draw entirely
++	}
++	// ---- end B1 SPIKE ----
++
+ 	if ( com_asyncSound.GetInteger() == 0 ) {
+ 		soundSystem->AsyncUpdateWrite( Sys_Milliseconds() );
+ 	}
+@@ -3024,6 +3207,14 @@ void idSessionLocal::Init() {
+ 	menuSoundWorld = soundSystem->AllocSoundWorld( rw );
+ 
+ 	// we have a single instance of the main menu
++#ifdef __EMSCRIPTEN__
++	// Boot-speed: mainmenu.gui is 680KB (2861 windowDefs + ROQ cinematics) and
++	// costs ~8.6s to parse — the single biggest "Configuring" cost — but the web
++	// build auto-boots into the map and never shows the menu. Defer the load to
++	// StartMenu (first menu open); if the menu is never opened it's never parsed.
++	guiMainMenu = NULL;
++	guiMainMenu_MapList = NULL;
++#else
+ 	guiMainMenu = uiManager->FindGui( "guis/mainmenu.gui", true, false, true );
+ 	if (!guiMainMenu) {
+ 		guiMainMenu = uiManager->FindGui( "guis/demo_mainmenu.gui", true, false, true );
+@@ -3032,6 +3223,7 @@ void idSessionLocal::Init() {
+ 	guiMainMenu_MapList = uiManager->AllocListGUI();
+ 	guiMainMenu_MapList->Config( guiMainMenu, "mapList" );
+ 	idAsyncNetwork::client.serverList.GUIConfig( guiMainMenu, "serverList" );
++#endif
+ 	guiRestartMenu = uiManager->FindGui( "guis/restart.gui", true, false, true );
+ 	guiGameOver = uiManager->FindGui( "guis/gameover.gui", true, false, true );
+ 	guiMsg = uiManager->FindGui( "guis/msg.gui", true, false, true );
+diff --git a/neo/framework/Session_menu.cpp b/neo/framework/Session_menu.cpp
+index 73b58db..d2f748d 100644
+--- a/neo/framework/Session_menu.cpp
++++ b/neo/framework/Session_menu.cpp
+@@ -58,6 +58,21 @@ idSessionLocal::StartMainMenu
+ ==============
+ */
+ void idSessionLocal::StartMenu( bool playIntro ) {
++#ifdef __EMSCRIPTEN__
++	// Boot-speed: mainmenu.gui is loaded lazily (deferred from session->Init, which
++	// saves ~8.6s of boot parse since the web build auto-boots into the map). Load
++	// it now on first menu open.
++	if ( !guiMainMenu ) {
++		guiMainMenu = uiManager->FindGui( "guis/mainmenu.gui", true, false, true );
++		if ( !guiMainMenu ) {
++			guiMainMenu = uiManager->FindGui( "guis/demo_mainmenu.gui", true, false, true );
++			demoversion = (guiMainMenu != NULL);
++		}
++		guiMainMenu_MapList = uiManager->AllocListGUI();
++		guiMainMenu_MapList->Config( guiMainMenu, "mapList" );
++		idAsyncNetwork::client.serverList.GUIConfig( guiMainMenu, "serverList" );
++	}
++#endif
+ 	if ( guiActive == guiMainMenu ) {
+ 		return;
+ 	}
+diff --git a/neo/framework/UsercmdGen.cpp b/neo/framework/UsercmdGen.cpp
+index 6bba28f..9f732b9 100644
+--- a/neo/framework/UsercmdGen.cpp
++++ b/neo/framework/UsercmdGen.cpp
+@@ -34,6 +34,7 @@ If you have questions concerning this license or the applicable additional terms
+ #include "framework/async/AsyncNetwork.h"
+ 
+ #include "framework/UsercmdGen.h"
++#include "framework/d3_wearable.h"
+ 
+ /*
+ ================
+@@ -1056,6 +1057,13 @@ void idUsercmdGenLocal::MakeCurrent( void ) {
+ 		// get basic movement from mouse
+ 		MouseMove();
+ 
++#ifdef __EMSCRIPTEN__
++		// Meta Ray-Ban Display: fold in head-tracking yaw/pitch and latched
++		// wearable actions before the angles are committed to the usercmd.
++		D3_ApplyWearableView( viewangles );
++		D3_ApplyWearableButtons( cmd );
++#endif
++
+ 		// check to make sure the angles haven't wrapped
+ 		if ( viewangles[PITCH] - oldAngles[PITCH] > 90 ) {
+ 			viewangles[PITCH] = oldAngles[PITCH] + 90;
+diff --git a/neo/framework/d3_arco.cpp b/neo/framework/d3_arco.cpp
+new file mode 100644
+index 0000000..2c2ac24
+--- /dev/null
++++ b/neo/framework/d3_arco.cpp
+@@ -0,0 +1,76 @@
++// B1 (Arco) render-state bridge.
++//
++// Feeds dhewm3's idRenderWorld from Arco's authoritative server, run as a PURE
++// renderer (idGameLocal tic never runs). This file is the ONLY Arco FFI surface.
++//
++// HARD INVARIANT (enforced in review): no write to usercmd_t, no
++// cmdSystem->BufferCommandText of gameplay/impulse commands, no idGameLocal /
++// game-> access. Pure render-state setters only. (Replaces the doom3-rayban
++// wearable bridge d3_wearable.cpp, which writes BUTTON_ATTACK/usercmd and is
++// out of scope for Arco — CLAUDE.md #1.)
++
++#include <string.h>
++#include "sys/platform.h"
++#include "idlib/math/Vector.h"
++#include "idlib/math/Angles.h"
++#include "idlib/math/Math.h"
++#include "idlib/Lib.h"
++#include "renderer/RenderWorld.h"
++#include "renderer/RenderSystem.h"
++#include "framework/d3_arco.h"
++
++#ifdef __EMSCRIPTEN__
++#include <emscripten/emscripten.h>
++#else
++#define EMSCRIPTEN_KEEPALIVE
++#endif
++
++// Arco wire pose: METERS, RADIANS, Z-up (yaw about +Z, pitch tilts up/down).
++static float s_camX = 0.0f, s_camY = 0.0f, s_camZ = 0.0f;
++static float s_yaw = 0.0f, s_pitch = 0.0f;
++static float s_fovDeg = 90.0f;
++static bool  s_active = false;
++static int   s_frameCount = 0;
++
++extern "C" {
++
++// Called from Arco's JS client every frame with the predicted self pose.
++EMSCRIPTEN_KEEPALIVE void D3_Arco_SetCamera( float x, float y, float z, float yaw, float pitch, float fovDeg ) {
++	s_camX = x; s_camY = y; s_camZ = z;
++	s_yaw = yaw; s_pitch = pitch;
++	if ( fovDeg > 1.0f ) s_fovDeg = fovDeg;
++	s_active = true;
++}
++
++// Readiness/liveness signal for the JS loader (replaces _arco_frame_count).
++EMSCRIPTEN_KEEPALIVE int D3_Arco_FrameCount( void ) { return s_frameCount; }
++
++// Offscreen capture for the render-regression gate (P1). Writes a TGA into
++// fs_savepath/screenshots that the headless harness reads via Module.FS.
++EMSCRIPTEN_KEEPALIVE void D3_Arco_Readback( void ) {
++	renderSystem->CaptureRenderToFile( "screenshots/d3arco.tga", false );
++}
++
++} // extern "C"
++
++bool D3Arco_Active( void ) { return s_active; }
++
++void D3Arco_BuildView( renderView_t &v ) {
++	// meters -> idTech4 inches (1 / 0.0254). The Arco wire z is ALREADY the eye
++	// (feetZ*0.0254 + EYE_HEIGHT at emit), so no extra eye-height offset here.
++	const float M2I = 39.37007874f;
++	memset( (void *)&v, 0, sizeof( v ) );
++	const int sw = renderSystem->GetScreenWidth();
++	const int sh = renderSystem->GetScreenHeight();
++	v.x = 0; v.y = 0; v.width = sw; v.height = sh;
++	v.fov_x = s_fovDeg;
++	v.fov_y = 2.0f * RAD2DEG( idMath::ATan( idMath::Tan( DEG2RAD( v.fov_x ) * 0.5f ) * (float)sh / (float)sw ) );
++	v.vieworg = idVec3( s_camX * M2I, s_camY * M2I, s_camZ * M2I );
++	// dhewm3 renderView "looks down +X"; idAngles is (pitch,yaw,roll) in degrees.
++	// idTech4 pitch is DOWN-positive, Arco pitch is UP-positive → negate. (P3 verifies signs.)
++	idAngles ang( -RAD2DEG( s_pitch ), RAD2DEG( s_yaw ), 0.0f );
++	v.viewaxis = ang.ToMat3();
++	v.time = Sys_Milliseconds();
++}
++
++void D3Arco_AfterFrame( void ) { s_frameCount++; }
+diff --git a/neo/framework/d3_arco.h b/neo/framework/d3_arco.h
+new file mode 100644
+index 0000000..eecb62d
+--- /dev/null
++++ b/neo/framework/d3_arco.h
+@@ -0,0 +1,17 @@
++// B1 (Arco) render-state bridge — declarations.
++// Pure render-state ONLY. INVARIANT: no usercmd_t writes, no cmdSystem gameplay/
++// impulse commands, no idGameLocal/game-> access anywhere in d3_arco.cpp.
++#ifndef __D3_ARCO_H__
++#define __D3_ARCO_H__
++
++struct renderView_s;
++
++// True once Arco's client has pushed a camera via D3_Arco_SetCamera().
++bool D3Arco_Active( void );
++// Fill a renderView from the last Arco pose (meters->inches, radians->degrees,
++// Z-up yaw/pitch -> dhewm3 "+X forward" viewaxis).
++void D3Arco_BuildView( renderView_s &v );
++// Post-render bookkeeping (frame counter for the JS readiness signal).
++void D3Arco_AfterFrame( void );
++
++#endif
+diff --git a/neo/framework/d3_wearable.cpp b/neo/framework/d3_wearable.cpp
+new file mode 100644
+index 0000000..5627533
+--- /dev/null
++++ b/neo/framework/d3_wearable.cpp
+@@ -0,0 +1,318 @@
++/*
++===========================================================================
++
++Meta Ray-Ban Display wearable bridge for dhewm3 (DOOM 3).
++
++Engine-side implementation of the wearable bridge. Only compiled for the
++Emscripten/WebAssembly target. Mirrors the GLQuake II Display patch:
++
++  - JavaScript head tracking calls D3_AddViewAngles() to nudge the camera.
++  - JavaScript gestures call D3_SetWearableAction() to latch forward / jump /
++    attack / crouch / use / flashlight.
++  - The game module writes enemy indicator state and reads turn requests.
++
++===========================================================================
++*/
++
++#include "sys/platform.h"
++#include "idlib/math/Vector.h"
++#include "idlib/math/Angles.h"
++#include "idlib/Lib.h"
++#include "framework/UsercmdGen.h"
++#include "framework/CmdSystem.h"
++#include "framework/d3_wearable.h"
++
++#ifdef __EMSCRIPTEN__
++
++#include <emscripten/emscripten.h>
++
++// The flashlight is selected as a weapon in classic DOOM 3; this impulse
++// matches the "f" bind written into base/autoexec.cfg.
++#define D3_FLASHLIGHT_IMPULSE	11
++
++static bool		d3_wearable_actions[D3_WEARABLE_ACTION_COUNT];
++static float	d3_wearable_pending_yaw;
++static float	d3_wearable_pending_pitch;
++static int		d3_wearable_enemy_indicators;
++static int		d3_wearable_enemy_turn_request;
++static float	d3_wearable_enemy_yaws[2];
++static bool		d3_wearable_flashlight_edge;
++
++static float
++D3_Normalize360( float angle )
++{
++	while ( angle >= 360.0f )
++	{
++		angle -= 360.0f;
++	}
++
++	while ( angle < 0.0f )
++	{
++		angle += 360.0f;
++	}
++
++	return angle;
++}
++
++extern "C" {
++
++EMSCRIPTEN_KEEPALIVE
++void
++D3_AddViewAngles( float dyaw, float dpitch )
++{
++	d3_wearable_pending_yaw += dyaw;
++	d3_wearable_pending_pitch += dpitch;
++}
++
++EMSCRIPTEN_KEEPALIVE
++void
++D3_SetViewYaw( float yaw )
++{
++	// Absolute yaw is applied on the next ApplyWearableView() by zeroing the
++	// accumulator and storing the target as a delta from the current angle.
++	d3_wearable_pending_yaw = D3_Normalize360( yaw ) - 100000.0f;
++}
++
++EMSCRIPTEN_KEEPALIVE
++int
++D3_GetEnemyIndicators( void )
++{
++	return d3_wearable_enemy_indicators;
++}
++
++EMSCRIPTEN_KEEPALIVE
++float
++D3_GetEnemyYaw( int direction )
++{
++	if ( ( direction < 0 ) && ( d3_wearable_enemy_indicators & 1 ) )
++	{
++		return d3_wearable_enemy_yaws[0];
++	}
++
++	if ( ( direction > 0 ) && ( d3_wearable_enemy_indicators & 2 ) )
++	{
++		return d3_wearable_enemy_yaws[1];
++	}
++
++	return 0.0f;
++}
++
++EMSCRIPTEN_KEEPALIVE
++void
++D3_RequestEnemyTurn( int direction )
++{
++	if ( direction < 0 )
++	{
++		d3_wearable_enemy_turn_request = -1;
++	}
++	else if ( direction > 0 )
++	{
++		d3_wearable_enemy_turn_request = 1;
++	}
++	else
++	{
++		d3_wearable_enemy_turn_request = 0;
++	}
++}
++
++EMSCRIPTEN_KEEPALIVE
++void
++D3_SetEnemyIndicators( int left, int right )
++{
++	d3_wearable_enemy_indicators = ( left ? 1 : 0 ) | ( right ? 2 : 0 );
++}
++
++EMSCRIPTEN_KEEPALIVE
++void
++D3_SetEnemyIndicatorYaw( int direction, float yaw )
++{
++	if ( direction < 0 )
++	{
++		d3_wearable_enemy_yaws[0] = D3_Normalize360( yaw );
++	}
++	else if ( direction > 0 )
++	{
++		d3_wearable_enemy_yaws[1] = D3_Normalize360( yaw );
++	}
++}
++
++EMSCRIPTEN_KEEPALIVE
++int
++D3_ConsumeEnemyTurn( void )
++{
++	const int direction = d3_wearable_enemy_turn_request;
++	d3_wearable_enemy_turn_request = 0;
++	return direction;
++}
++
++EMSCRIPTEN_KEEPALIVE
++void
++D3_SetWearableAction( int action, int down )
++{
++	if ( ( action < 0 ) || ( action >= D3_WEARABLE_ACTION_COUNT ) )
++	{
++		return;
++	}
++
++	const bool wasDown = d3_wearable_actions[action];
++	d3_wearable_actions[action] = down ? true : false;
++
++	if ( ( action == D3_WEARABLE_FLASHLIGHT ) && d3_wearable_actions[action] && !wasDown )
++	{
++		d3_wearable_flashlight_edge = true;
++	}
++}
++
++EMSCRIPTEN_KEEPALIVE
++void
++D3_ExecCommand( const char* cmd )
++{
++	// Run an arbitrary DOOM 3 console command from JavaScript (e.g. the web app or
++	// the Safari Web Inspector console): "r_lightScale 20", "r_gamma 3",
++	// "vid_restart", etc. APPEND so it executes at the normal point in the next
++	// engine frame (not reentrantly from the JS callback). Enables live on-device
++	// tuning of the renderer without a rebuild/redeploy.
++	if ( cmd && cmd[0] && cmdSystem )
++	{
++		cmdSystem->BufferCommandText( CMD_EXEC_APPEND, cmd );
++		cmdSystem->BufferCommandText( CMD_EXEC_APPEND, "\n" );
++	}
++}
++
++EMSCRIPTEN_KEEPALIVE
++void
++D3_AppendArea( int areaNum )
++{
++	// Area streaming: bind a deferred area whose .bproc.part / .bcm.part the JS
++	// shell just wrote into the FS. APPEND so it runs at the safe next-frame
++	// point (never reentrantly from the JS callback), like D3_ExecCommand.
++	// Collision is appended BEFORE render so a frame can never show walkable-
++	// looking floor the player would fall through (appendAreaCol no-ops if there
++	// is no collision part — render-only streaming).
++	if ( cmdSystem )
++	{
++		cmdSystem->BufferCommandText( CMD_EXEC_APPEND, va( "appendAreaCol %d\n", areaNum ) );
++		cmdSystem->BufferCommandText( CMD_EXEC_APPEND, va( "appendArea %d\n", areaNum ) );
++	}
++}
++
++EMSCRIPTEN_KEEPALIVE
++void
++D3_ReloadStreamedImages( void )
++{
++	// Iter 55 (progressive texture streaming): after the web shell writes a
++	// batch of streamed loose texture files into the FS, ask the renderer to
++	// re-read the images that are still showing the gray _default. APPEND so it
++	// runs at the safe next-frame point (never reentrantly from the JS callback,
++	// matching D3_ExecCommand's discipline).
++	if ( cmdSystem )
++	{
++		cmdSystem->BufferCommandText( CMD_EXEC_APPEND, "reloadStreamedImages\n" );
++	}
++}
++
++void
++D3_NotifyAutoFireStarted( void )
++{
++	EM_ASM({
++		if ( ( typeof Module !== "undefined" ) &&
++			( typeof Module.d3AutoFireStarted === "function" ) )
++		{
++			Module.d3AutoFireStarted();
++		}
++	});
++}
++
++} // extern "C"
++
++bool
++D3_WearableActionDown( int action )
++{
++	if ( ( action < 0 ) || ( action >= D3_WEARABLE_ACTION_COUNT ) )
++	{
++		return false;
++	}
++
++	return d3_wearable_actions[action];
++}
++
++void
++D3_ApplyWearableView( idVec3 &viewangles )
++{
++	if ( d3_wearable_pending_yaw <= -50000.0f )
++	{
++		// Absolute set requested via D3_SetViewYaw().
++		viewangles[YAW] = D3_Normalize360( d3_wearable_pending_yaw + 100000.0f );
++	}
++	else if ( d3_wearable_pending_yaw != 0.0f )
++	{
++		viewangles[YAW] = D3_Normalize360( viewangles[YAW] + d3_wearable_pending_yaw );
++	}
++
++	if ( d3_wearable_pending_pitch != 0.0f )
++	{
++		viewangles[PITCH] += d3_wearable_pending_pitch;
++
++		if ( viewangles[PITCH] > 89.0f )
++		{
++			viewangles[PITCH] = 89.0f;
++		}
++
++		if ( viewangles[PITCH] < -89.0f )
++		{
++			viewangles[PITCH] = -89.0f;
++		}
++	}
++
++	d3_wearable_pending_yaw = 0.0f;
++	d3_wearable_pending_pitch = 0.0f;
++}
++
++void
++D3_ApplyWearableButtons( usercmd_t &cmd )
++{
++	if ( d3_wearable_actions[D3_WEARABLE_FORWARD] && ( cmd.forwardmove < 100 ) )
++	{
++		cmd.forwardmove = 100;
++	}
++
++	// Arco touch movement: back + strafe.
++	if ( d3_wearable_actions[D3_WEARABLE_BACK] && ( cmd.forwardmove > -100 ) )
++	{
++		cmd.forwardmove = -100;
++	}
++
++	if ( d3_wearable_actions[D3_WEARABLE_MOVELEFT] && ( cmd.rightmove > -100 ) )
++	{
++		cmd.rightmove = -100;
++	}
++
++	if ( d3_wearable_actions[D3_WEARABLE_MOVERIGHT] && ( cmd.rightmove < 100 ) )
++	{
++		cmd.rightmove = 100;
++	}
++
++	if ( d3_wearable_actions[D3_WEARABLE_JUMP] && ( cmd.upmove < 127 ) )
++	{
++		cmd.upmove = 127;
++	}
++
++	if ( d3_wearable_actions[D3_WEARABLE_CROUCH] && ( cmd.upmove > -127 ) )
++	{
++		cmd.upmove = -127;
++	}
++
++	if ( d3_wearable_actions[D3_WEARABLE_ATTACK] )
++	{
++		cmd.buttons |= BUTTON_ATTACK;
++	}
++
++	if ( d3_wearable_flashlight_edge )
++	{
++		cmd.impulse = D3_FLASHLIGHT_IMPULSE;
++		cmd.flags ^= UCF_IMPULSE_SEQUENCE;
++		d3_wearable_flashlight_edge = false;
++	}
++}
++
++#endif // __EMSCRIPTEN__
+diff --git a/neo/framework/d3_wearable.h b/neo/framework/d3_wearable.h
+new file mode 100644
+index 0000000..f49ecf8
+--- /dev/null
++++ b/neo/framework/d3_wearable.h
+@@ -0,0 +1,79 @@
++/*
++===========================================================================
++
++Meta Ray-Ban Display wearable bridge for dhewm3 (DOOM 3).
++
++This header declares the C interface shared between the engine (framework) and
++the game module. The JavaScript host calls the EMSCRIPTEN_KEEPALIVE exports to
++drive the camera and inject wearable actions; the game module calls the enemy
++indicator helpers to mirror the Quake II Ray-Ban Display assist behaviour.
++
++===========================================================================
++*/
++
++#ifndef __D3_WEARABLE_H__
++#define __D3_WEARABLE_H__
++
++#ifdef __EMSCRIPTEN__
++
++#include "idlib/math/Vector.h"
++#include "framework/UsercmdGen.h"
++
++// Wearable action ids, matching src/wearableInput.js ACTION_IDS.
++enum {
++	D3_WEARABLE_FORWARD,
++	D3_WEARABLE_ATTACK,
++	D3_WEARABLE_JUMP,
++	D3_WEARABLE_CROUCH,
++	D3_WEARABLE_USE,
++	D3_WEARABLE_FLASHLIGHT,
++	// Arco touch movement (appended so existing action ids don't shift):
++	D3_WEARABLE_BACK,
++	D3_WEARABLE_MOVELEFT,
++	D3_WEARABLE_MOVERIGHT,
++	D3_WEARABLE_ACTION_COUNT
++};
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Camera control, called from JavaScript head tracking / turn bursts.
++void	D3_AddViewAngles( float dyaw, float dpitch );
++void	D3_SetViewYaw( float yaw );
++
++// Wearable action latch, called from JavaScript gesture input.
++void	D3_SetWearableAction( int action, int down );
++
++// Run a DOOM 3 console command from JavaScript (live renderer tuning, etc.).
++void	D3_ExecCommand( const char* cmd );
++
++// Enemy assist state, written by the game module, read by JavaScript.
++int		D3_GetEnemyIndicators( void );
++float	D3_GetEnemyYaw( int direction );
++void	D3_RequestEnemyTurn( int direction );
++void	D3_SetEnemyIndicators( int left, int right );
++void	D3_SetEnemyIndicatorYaw( int direction, float yaw );
++int		D3_ConsumeEnemyTurn( void );
++
++// Notify the JavaScript host that auto-fire engaged (so it can drop sticky
++// forward and lower IMU sensitivity briefly).
++void	D3_NotifyAutoFireStarted( void );
++
++#ifdef __cplusplus
++}
++#endif
++
++// Engine-side helpers used by the usercmd generator (C++ only).
++#ifdef __cplusplus
++// Consume the pending head-tracking deltas into the live view angles.
++void	D3_ApplyWearableView( idVec3 &viewangles );
++// Force movement / button bits from the latched wearable actions.
++void	D3_ApplyWearableButtons( usercmd_t &cmd );
++// Read a latched wearable action (for the game module).
++bool	D3_WearableActionDown( int action );
++#endif
++
++#endif // __EMSCRIPTEN__
++
++#endif // __D3_WEARABLE_H__
+diff --git a/neo/game/D3Wearable.cpp b/neo/game/D3Wearable.cpp
+new file mode 100644
+index 0000000..82b468f
+--- /dev/null
++++ b/neo/game/D3Wearable.cpp
+@@ -0,0 +1,338 @@
++/*
++===========================================================================
++
++Meta Ray-Ban Display wearable assist for dhewm3 (DOOM 3) — game module side.
++
++Only compiled for the Emscripten/WebAssembly target. Scans for hostile idAI
++actors and:
++
++  - lights the left/right edge indicators when an off-screen enemy is near,
++  - snaps the player view toward a side enemy on a host turn request,
++  - forces BUTTON_ATTACK when a hostile is centered in view (auto-fire).
++
++The heavy lifting lives here so the Player.cpp hook stays a single line.
++
++===========================================================================
++*/
++
++#include "sys/platform.h"
++#include "idlib/Lib.h"
++#include "framework/UsercmdGen.h"
++#include "framework/d3_wearable.h"
++
++#include "Game_local.h"
++#include "Player.h"
++#include "ai/AI.h"
++#include "D3Wearable.h"
++
++#ifdef __EMSCRIPTEN__
++
++#define D3_WEARABLE_ENEMY_RANGE			1200.0f
++#define D3_WEARABLE_AUTOFIRE_DOT		0.9063078f	// cos(25 degrees)
++#define D3_WEARABLE_VIEW_HALF_ANGLE		35.0f
++#define D3_WEARABLE_REAR_BOTH_ANGLE		160.0f
++// iter-127: close-range auto-fire robustness. A monster in the player's face
++// FILLS the view, so its center can sit well outside the tight 25-degree cone
++// (a small positional offset is a large ANGULAR one at point-blank). Treat any
++// hostile within CLOSE_RANGE that is in the front-ish hemisphere (>= CLOSE_DOT)
++// and visible as a valid auto-fire target regardless of the precise cone.
++#define D3_WEARABLE_CLOSE_RANGE			160.0f		// "in your face" / melee-lunge distance
++#define D3_WEARABLE_CLOSE_DOT			0.5f		// cos(60 degrees): front-ish hemisphere
++
++static float
++D3_Normalize180( float angle )
++{
++	angle = idMath::AngleNormalize180( angle );
++	return angle;
++}
++
++static bool
++D3_WearableIsHostile( idPlayer *player, idEntity *candidate )
++{
++	if ( !candidate || candidate == player )
++	{
++		return false;
++	}
++
++	if ( !candidate->IsType( idAI::Type ) )
++	{
++		return false;
++	}
++
++	// A monster that has not been revealed yet must never be auto-targeted.
++	// enpro spawns most of its monsters HIDDEN (spawnArgs "hide" "1") and
++	// trigger-shows them later; idAI::Hide() also makes them non-solid, so the
++	// D3_WearableCanSee trace passes straight through to the hidden actor's
++	// origin and reports it "visible" — which made the gun auto-fire at an imp
++	// that is not on screen yet. Skip hidden actors so auto-fire only engages
++	// monsters the player can actually see.
++	if ( candidate->IsHidden() )
++	{
++		return false;
++	}
++
++	if ( candidate->health <= 0 )
++	{
++		return false;
++	}
++
++	idActor *actor = static_cast<idActor *>( candidate );
++
++	// Different team from the player is treated as hostile.
++	if ( actor->team == player->team )
++	{
++		return false;
++	}
++
++	return true;
++}
++
++static idVec3
++D3_WearableTargetCenter( idEntity *candidate )
++{
++	idVec3 center = candidate->GetPhysics()->GetOrigin();
++	const idBounds &bounds = candidate->GetPhysics()->GetBounds();
++	center.z += ( bounds[0].z + bounds[1].z ) * 0.5f;
++	return center;
++}
++
++static bool
++D3_WearableCanSee( idPlayer *player, idEntity *candidate, const idVec3 &start, const idVec3 &end )
++{
++	trace_t tr;
++	gameLocal.clip.TracePoint( tr, start, end, MASK_SHOT_BOUNDINGBOX, player );
++
++	if ( tr.fraction >= 1.0f )
++	{
++		return true;
++	}
++
++	return ( gameLocal.GetTraceEntity( tr ) == candidate );
++}
++
++static idEntity *
++D3_WearableFindCenterEnemy( idPlayer *player, const idVec3 &eye, const idVec3 &forward )
++{
++	// Far targets: precise 25-degree cone, pick the most-centered.
++	idEntity *best = NULL;
++	float best_dot = D3_WEARABLE_AUTOFIRE_DOT;
++
++	// iter-127: close targets get priority. A hostile inside CLOSE_RANGE that is
++	// roughly in front (>= CLOSE_DOT) and visible is the imminent threat even if
++	// it falls outside the tight cone, so track the NEAREST one and prefer it.
++	// Firing only presses BUTTON_ATTACK along `forward`, so any non-NULL return
++	// means "fire" — keeping the gun shooting when something lunges into the
++	// player's face instead of going silent because the monster left the cone.
++	idEntity *close_best = NULL;
++	float close_best_dist = D3_WEARABLE_CLOSE_RANGE + 1.0f;
++
++	for ( int i = 0; i < MAX_GENTITIES; i++ )
++	{
++		idEntity *candidate = gameLocal.entities[i];
++
++		if ( !D3_WearableIsHostile( player, candidate ) )
++		{
++			continue;
++		}
++
++		idVec3 target = D3_WearableTargetCenter( candidate );
++		idVec3 dir = target - eye;
++		float dist = dir.Normalize();
++
++		if ( ( dist <= 0.5f ) || ( dist > D3_WEARABLE_ENEMY_RANGE ) )
++		{
++			continue;
++		}
++
++		float dot = dir * forward;
++
++		// Close-range threat: front-ish hemisphere + visible -> valid target
++		// regardless of the tight aim cone. Nearest wins.
++		if ( ( dist < D3_WEARABLE_CLOSE_RANGE ) && ( dot >= D3_WEARABLE_CLOSE_DOT ) )
++		{
++			if ( ( dist < close_best_dist ) && D3_WearableCanSee( player, candidate, eye, target ) )
++			{
++				close_best = candidate;
++				close_best_dist = dist;
++			}
++			continue;
++		}
++
++		// Far-range: precise cone, most-centered.
++		if ( dot < best_dot )
++		{
++			continue;
++		}
++
++		if ( !D3_WearableCanSee( player, candidate, eye, target ) )
++		{
++			continue;
++		}
++
++		best = candidate;
++		best_dot = dot;
++	}
++
++	return close_best ? close_best : best;
++}
++
++static idEntity *
++D3_WearableFindSideEnemy( idPlayer *player, const idVec3 &eye, float viewYaw, int direction, float *yaw_out )
++{
++	idEntity *best = NULL;
++	float best_dist = D3_WEARABLE_ENEMY_RANGE + 1.0f;
++
++	for ( int i = 0; i < MAX_GENTITIES; i++ )
++	{
++		idEntity *candidate = gameLocal.entities[i];
++
++		if ( !D3_WearableIsHostile( player, candidate ) )
++		{
++			continue;
++		}
++
++		idVec3 target = D3_WearableTargetCenter( candidate );
++		idVec3 flat = target - eye;
++		flat.z = 0.0f;
++		float dist = flat.Normalize();
++
++		if ( ( dist <= 1.0f ) || ( dist > D3_WEARABLE_ENEMY_RANGE ) )
++		{
++			continue;
++		}
++
++		float target_yaw = flat.ToYaw();
++		float yaw_delta = D3_Normalize180( target_yaw - viewYaw );
++		float abs_delta = idMath::Fabs( yaw_delta );
++
++		if ( abs_delta <= D3_WEARABLE_VIEW_HALF_ANGLE )
++		{
++			continue;
++		}
++
++		// direction < 0 == player's left == positive yaw delta in DOOM 3.
++		if ( ( ( direction < 0 ) && ( yaw_delta <= D3_WEARABLE_VIEW_HALF_ANGLE ) && ( abs_delta < D3_WEARABLE_REAR_BOTH_ANGLE ) ) ||
++			 ( ( direction > 0 ) && ( yaw_delta >= -D3_WEARABLE_VIEW_HALF_ANGLE ) && ( abs_delta < D3_WEARABLE_REAR_BOTH_ANGLE ) ) )
++		{
++			continue;
++		}
++
++		if ( !D3_WearableCanSee( player, candidate, eye, target ) )
++		{
++			continue;
++		}
++
++		if ( dist < best_dist )
++		{
++			best = candidate;
++			best_dist = dist;
++
++			if ( yaw_out )
++			{
++				*yaw_out = target_yaw;
++			}
++		}
++	}
++
++	return best;
++}
++
++// A friendly AI on the player's team (e.g. the enpro Sentry Bot) must not be
++// hit by the auto-fire, but the auto-fire must still work on enemies. The
++// auto-fire presses BUTTON_ATTACK and the weapon fires along the player's
++// `forward` (the crosshair). So the ONLY time a friendly is actually hit is
++// when a straight shot along `forward` would strike it — exactly what a
++// line-of-fire trace detects. Suppress in that case only. This never blocks
++// firing at an enemy (the trace hits the enemy, a different team, and returns
++// false), and it does NOT over-suppress when the escort drone merely hovers
++// near the view (an earlier wide-cone guard did, which broke auto-fire in the
++// sentry section). If the trace hits the enemy first, fire goes through even
++// with a friendly somewhere behind it.
++static bool
++D3_WearableFriendlyBlocks( idPlayer *player, const idVec3 &eye, const idVec3 &forward )
++{
++	trace_t tr;
++	idVec3 end = eye + forward * D3_WEARABLE_ENEMY_RANGE;
++	gameLocal.clip.TracePoint( tr, eye, end, MASK_SHOT_BOUNDINGBOX, player );
++
++	if ( tr.fraction < 1.0f )
++	{
++		idEntity *hit = gameLocal.GetTraceEntity( tr );
++
++		if ( hit && ( hit != player ) && hit->IsType( idAI::Type ) && ( hit->health > 0 ) )
++		{
++			idActor *actor = static_cast<idActor *>( hit );
++
++			if ( actor->team == player->team )
++			{
++				return true;	// a same-team friendly is in the line of fire
++			}
++		}
++	}
++
++	return false;
++}
++
++void
++D3_WearablePlayerAssist( idPlayer *player, usercmd_t *cmd )
++{
++	if ( !player || !cmd || player->health <= 0 || player->spectating )
++	{
++		D3_SetEnemyIndicators( 0, 0 );
++		return;
++	}
++
++	const idVec3 eye = player->GetEyePosition();
++	const float viewYaw = player->viewAngles.yaw;
++	idVec3 forward = player->viewAngles.ToForward();
++
++	// Side-enemy indicators.
++	float left_yaw = viewYaw;
++	float right_yaw = viewYaw;
++	idEntity *left_enemy = D3_WearableFindSideEnemy( player, eye, viewYaw, -1, &left_yaw );
++	idEntity *right_enemy = D3_WearableFindSideEnemy( player, eye, viewYaw, 1, &right_yaw );
++
++	D3_SetEnemyIndicators( left_enemy != NULL, right_enemy != NULL );
++
++	if ( left_enemy )
++	{
++		D3_SetEnemyIndicatorYaw( -1, left_yaw );
++	}
++
++	if ( right_enemy )
++	{
++		D3_SetEnemyIndicatorYaw( 1, right_yaw );
++	}
++
++	// Snap toward a side enemy when the host requests a turn burst.
++	int turn = D3_ConsumeEnemyTurn();
++
++	if ( ( ( turn < 0 ) && left_enemy ) || ( ( turn > 0 ) && right_enemy ) )
++	{
++		float yaw = ( turn < 0 ) ? left_yaw : right_yaw;
++		idAngles angles = player->viewAngles;
++		angles.yaw = yaw;
++		player->SetViewAngles( angles );
++		D3_SetViewYaw( yaw );
++
++		// recompute forward for auto-fire after the snap
++		forward = angles.ToForward();
++	}
++
++	// Auto-fire when a hostile is centered and visible.
++	idEntity *centered = D3_WearableFindCenterEnemy( player, eye, forward );
++
++	if ( centered )
++	{
++		// Don't shoot a friendly (e.g. the Sentry Bot) near the line of fire:
++		// the shot goes along `forward`, so suppress if a same-team AI is in
++		// the way or near the aim cone.
++		if ( !D3_WearableFriendlyBlocks( player, eye, forward ) )
++		{
++			cmd->buttons |= BUTTON_ATTACK;
++			D3_NotifyAutoFireStarted();
++		}
++	}
++}
++
++#endif // __EMSCRIPTEN__
+diff --git a/neo/game/D3Wearable.h b/neo/game/D3Wearable.h
+new file mode 100644
+index 0000000..bd37bff
+--- /dev/null
++++ b/neo/game/D3Wearable.h
+@@ -0,0 +1,27 @@
++/*
++===========================================================================
++
++Meta Ray-Ban Display wearable assist for dhewm3 (DOOM 3) — game module side.
++
++Mirrors the GLQuake II Display auto-fire / enemy-indicator assist. Only built
++for the Emscripten/WebAssembly target.
++
++===========================================================================
++*/
++
++#ifndef __D3_WEARABLE_GAME_H__
++#define __D3_WEARABLE_GAME_H__
++
++#ifdef __EMSCRIPTEN__
++
++class idPlayer;
++class usercmd_t;
++
++// Called once per player think, after the usercmd is latched. Updates the
++// left/right enemy indicators, snaps the view toward a side enemy when the
++// host requests a turn, and forces attack when a hostile is centered.
++void D3_WearablePlayerAssist( idPlayer *player, usercmd_t *cmd );
++
++#endif // __EMSCRIPTEN__
++
++#endif // __D3_WEARABLE_GAME_H__
+diff --git a/neo/game/Entity.cpp b/neo/game/Entity.cpp
+index 451aaa8..8211e36 100644
+--- a/neo/game/Entity.cpp
++++ b/neo/game/Entity.cpp
+@@ -5206,7 +5206,10 @@ void idAnimatedEntity::AddLocalDamageEffect( jointHandle_t jointNum, const idVec
+ 	if ( *splat == '\0' ) {
+ 		splat = def->dict.RandomPrefix( key, gameLocal.random );
+ 	}
+-	if ( *splat != '\0' ) {
++	// iter-127: g_bloodSplats gates blood thrown onto the WORLD (walls/floor).
++	// Off by default in this build — the on-actor wound overlay + blood spurt
++	// below still play, so enemies still bleed; the environment just stays clean.
++	if ( *splat != '\0' && g_bloodSplats.GetBool() ) {
+ 		gameLocal.BloodSplat( origin, dir, 64.0f, splat );
+ 	}
+ 
+diff --git a/neo/game/Game_local.cpp b/neo/game/Game_local.cpp
+index 1fca78f..5935183 100644
+--- a/neo/game/Game_local.cpp
++++ b/neo/game/Game_local.cpp
+@@ -27,6 +27,10 @@ If you have questions concerning this license or the applicable additional terms
+ */
+ 
+ #include "sys/platform.h"
++
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++#endif
+ #include "idlib/LangDict.h"
+ #include "idlib/Timer.h"
+ #include "framework/async/NetworkSystem.h"
+@@ -216,6 +220,7 @@ void idGameLocal::Clear( void ) {
+ 	cinematicSkipTime = 0;
+ 	cinematicStopTime = 0;
+ 	cinematicMaxSkipTime = 0;
++	cinSkipArmedFrame = -1;
+ 	framenum = 0;
+ 	previousTime = 0;
+ 	time = 0;
+@@ -972,6 +977,7 @@ void idGameLocal::LoadMap( const char *mapName, int randseed ) {
+ 	cinematicSkipTime = 0;
+ 	cinematicStopTime = 0;
+ 	cinematicMaxSkipTime = 0;
++	cinSkipArmedFrame = -1;
+ 
+ 	clip.Init();
+ 	pvs.Init();
+@@ -1177,6 +1183,282 @@ void idGameLocal::NextMap_f( const idCmdArgs &args ) {
+ 	gameLocal.MapRestart( );
+ }
+ 
++/*
++===================
++GameAreaForPoint
++
++Phase 0 (area-streaming): thunk handed to the collision-model bake so cm/ can
++classify a world point's render area without depending on the renderer.
++===================
++*/
++static int GameAreaForPoint( void *ctx, const idVec3 &point ) {
++	return gameRenderWorld ? gameRenderWorld->PointInArea( point ) : -1;
++}
++
++/*
++===================
++idGameLocal::DumpAreaSplit_f
++===================
++*/
++void idGameLocal::DumpAreaSplit_f( const idCmdArgs &args ) {
++	// Boot-region areas kept resident in the boot .bcm (must match
++	// split-bproc-areas.py --boot-areas). Use Args() (the whole arg string), NOT
++	// Argv(1): idCmdArgs tokenizes on commas, so "0,1,2" gives Argv(1)="0".
++	// DumpAreaSplit's parser accepts space- or comma-separated.
++	gameLocal.DumpAreaSplit( args.Args() );
++}
++
++/*
++===================
++idGameLocal::AppendArea_f
++
++Area streaming (Phase 1): bind a deferred area's render model now. Driven from
++JS via D3_AppendArea (buffered to a frame boundary). `appendArea <n>`.
++===================
++*/
++void idGameLocal::AppendArea_f( const idCmdArgs &args ) {
++	if ( args.Argc() < 2 ) {
++		common->Printf( "usage: appendArea <areaNum>\n" );
++		return;
++	}
++	if ( gameRenderWorld == NULL ) {
++		return;
++	}
++	int areaNum = atoi( args.Argv( 1 ) );
++	bool ok = gameRenderWorld->AppendAreaModel( areaNum );
++	common->Printf( "appendArea %d: %s\n", areaNum, ok ? "bound" : "skipped (absent/already loaded)" );
++}
++
++/*
++===================
++idGameLocal::AppendAreaCollision_f
++
++Area streaming (Phase 2): append a deferred area's collision polys/brushes now.
++Driven from JS via D3_AppendArea too (it buffers both appendArea + appendAreaCol).
++`appendAreaCol <n>`.
++===================
++*/
++void idGameLocal::AppendAreaCollision_f( const idCmdArgs &args ) {
++	if ( args.Argc() < 2 ) {
++		common->Printf( "usage: appendAreaCol <areaNum>\n" );
++		return;
++	}
++	if ( collisionModelManager == NULL ) {
++		return;
++	}
++	int areaNum = atoi( args.Argv( 1 ) );
++	bool ok = collisionModelManager->AppendAreaCollision( areaNum );
++	common->Printf( "appendAreaCol %d: %s\n", areaNum, ok ? "appended" : "skipped (no part)" );
++}
++
++/*
++===================
++idGameLocal::DumpAreaSplit
++
++Partition the loaded map by render area and write per-area render/collision/
++entity dumps + json metrics to /save/areadump for scripts/pack-area-stream.py.
++Read-only; never touches the running game. See the Phase 0 build spec.
++===================
++*/
++void idGameLocal::DumpAreaSplit( const char *bootAreas ) {
++	const char *dir = "areadump";
++
++	if ( gameRenderWorld == NULL ) {
++		common->Printf( "dumpAreaSplit: no render world loaded\n" );
++		return;
++	}
++	int numAreas = gameRenderWorld->NumAreas();
++	common->Printf( "dumpAreaSplit: %d render areas; writing to /save/%s\n", numAreas, dir );
++
++	// boot region mask (areas kept resident in the boot .bcm), from the comma
++	// arg (e.g. "0,1,2,...,9"). Must match split-bproc-areas.py --boot-areas.
++	// Manual split — idLexer mis-tokenizes a bare comma-separated int list.
++	bool *isBootArea = (bool *)Mem_ClearedAlloc( numAreas * sizeof( bool ) );
++	int numBoot = 0;
++	if ( bootAreas && bootAreas[0] ) {
++		idStr s = bootAreas;
++		int start = 0;
++		for ( int i = 0; i <= s.Length(); i++ ) {
++			if ( i == s.Length() || s[i] == ',' || s[i] == ' ' ) {
++				if ( i > start ) {
++					int a = atoi( s.Mid( start, i - start ).c_str() );
++					if ( a >= 0 && a < numAreas && !isBootArea[a] ) { isBootArea[a] = true; numBoot++; }
++				}
++				start = i + 1;
++			}
++		}
++	}
++	common->Printf( "dumpAreaSplit: boot region = %d areas\n", numBoot );
++
++	// (1) RENDER: per-area _areaN.bproc.part + _shared.bproc.part + render.json
++	gameRenderWorld->DumpAreaModels( dir );
++
++	// (3) ENTITIES: bucket by origin; bootstrap (worldspawn/player/cross-area
++	//     target+bind/void) forced into _boot. Re-parse the .map fresh so we
++	//     do not depend on the live mapFile (may be freed mid-game).
++	idMapFile  localMap;
++	idMapFile *mf = mapFile;
++	if ( mf == NULL ) {
++		if ( localMap.Parse( idStr( mapFileName ) + ".map" ) ) {
++			mf = &localMap;
++		}
++	}
++
++	// (2) COLLISION: census (collision.json) + per-area split (boot .bcm + parts)
++	if ( collisionModelManager ) {
++		collisionModelManager->DumpAreaCollisionStats( dir, numAreas, GameAreaForPoint, NULL );
++		unsigned int mapCRC = mf ? mf->GetGeometryCRC() : 0;
++		collisionModelManager->DumpAreaCollision( dir, numAreas, isBootArea, mapCRC, GameAreaForPoint, NULL );
++	}
++
++	if ( mf == NULL ) {
++		common->Printf( "dumpAreaSplit: no map file (%s) — skipped entity dump\n", mapFileName.c_str() );
++		Mem_Free( isBootArea );
++		return;
++	}
++
++	int numEnt = mf->GetNumEntities();
++	idList<idStr>	names;		names.SetNum( numEnt );
++	idList<int>		areas;		areas.SetNum( numEnt );
++	idList<bool>	boot;		boot.SetNum( numEnt );
++	idHashIndex		nameHash;
++
++	for ( int i = 0; i < numEnt; i++ ) {
++		const idDict &ep = mf->GetEntity( i )->epairs;
++		idStr nm = ep.GetString( "name", "" );
++		nm.ToLower();
++		names[i] = nm;
++		idVec3 org = ep.GetVector( "origin", "0 0 0" );
++		int a = gameRenderWorld->PointInArea( org );
++		areas[i] = a;
++		boot[i] = false;
++		if ( nm.Length() ) {
++			nameHash.Add( nameHash.GenerateKey( nm, false ), i );
++		}
++	}
++
++	// bootstrap classification (pass 1): worldspawn / player / void
++	for ( int i = 0; i < numEnt; i++ ) {
++		const idDict &ep = mf->GetEntity( i )->epairs;
++		idStr cls = ep.GetString( "classname", "" );
++		cls.ToLower();
++		if ( i == 0 || cls == "worldspawn" || cls.Cmpn( "info_player", 11 ) == 0 ) {
++			boot[i] = true;
++		}
++		if ( areas[i] < 0 || areas[i] >= numAreas ) {
++			boot[i] = true;	// unclassifiable -> always boot
++		}
++	}
++
++	// edge analysis (target* + bind*): record edges, force cross-area pairs boot
++	idFile *targets = fileSystem->OpenFileWrite( idStr( dir ) + "/targets.json" );
++	if ( targets ) {
++		targets->WriteFloatString( "{\n  \"targetEdges\": [\n" );
++	}
++	bool firstEdge = true;
++	int crossTargetEdges = 0, crossBindEdges = 0;
++
++	for ( int i = 0; i < numEnt; i++ ) {
++		const idDict &ep = mf->GetEntity( i )->epairs;
++		// gather outgoing references: target*, and bind / bindMaster
++		for ( int pass = 0; pass < 2; pass++ ) {
++			const char *prefix = ( pass == 0 ) ? "target" : "bind";
++			const idKeyValue *kv = NULL;
++			while ( ( kv = ep.MatchPrefix( prefix, kv ) ) != NULL ) {
++				idStr tname = kv->GetValue();
++				tname.ToLower();
++				if ( !tname.Length() ) {
++					continue;
++				}
++				int j = -1;
++				for ( int h = nameHash.First( nameHash.GenerateKey( tname, false ) ); h >= 0; h = nameHash.Next( h ) ) {
++					if ( names[h] == tname ) { j = h; break; }
++				}
++				if ( j < 0 ) {
++					continue;
++				}
++				bool cross = ( areas[i] != areas[j] );
++				if ( cross ) {
++					boot[i] = true;
++					boot[j] = true;
++					if ( pass == 0 ) crossTargetEdges++; else crossBindEdges++;
++				}
++				if ( targets ) {
++					targets->WriteFloatString( "%s    { \"kind\": \"%s\", \"from\": \"%s\", \"fromArea\": %d, \"to\": \"%s\", \"toArea\": %d }",
++						firstEdge ? "" : ",\n", prefix, names[i].c_str(), areas[i], names[j].c_str(), areas[j] );
++					firstEdge = false;
++				}
++			}
++		}
++	}
++	if ( targets ) {
++		targets->WriteFloatString( "\n  ],\n  \"crossTargetEdges\": %d,\n  \"crossBindEdges\": %d\n}\n", crossTargetEdges, crossBindEdges );
++		fileSystem->CloseFile( targets );
++	}
++
++	// write per-area + boot entity buckets (binary idDict blocks: count, then dicts)
++	int *areaCounts = (int *)Mem_ClearedAlloc( numAreas * sizeof( int ) );
++	int bootCount = 0;
++	idFile **areaFiles = (idFile **)Mem_ClearedAlloc( numAreas * sizeof( idFile * ) );
++	idFile *bootFile = fileSystem->OpenFileWrite( idStr( dir ) + "/_boot.entities" );
++	// reserve a slot for the count by writing a placeholder we patch via re-count:
++	// simplest: two-pass — first count, then write counts as headers.
++	// Here we stream and keep counts; rewrite headers by closing/reopening is
++	// awkward, so write count LAST is not possible with a forward file. Instead
++	// write each bucket as: repeated [int hasMore=1, dict]; terminate with int 0.
++	for ( int i = 0; i < numEnt; i++ ) {
++		const idDict &ep = mf->GetEntity( i )->epairs;
++		if ( boot[i] ) {
++			if ( bootFile ) {
++				bootFile->WriteInt( 1 );
++				ep.WriteToFileHandle( bootFile );
++			}
++			bootCount++;
++		} else {
++			int a = areas[i];
++			if ( areaFiles[a] == NULL ) {
++				areaFiles[a] = fileSystem->OpenFileWrite( idStr( dir ) + "/_area" + a + ".entities" );
++			}
++			if ( areaFiles[a] ) {
++				areaFiles[a]->WriteInt( 1 );
++				ep.WriteToFileHandle( areaFiles[a] );
++			}
++			areaCounts[a]++;
++		}
++	}
++	if ( bootFile ) {
++		bootFile->WriteInt( 0 );	// terminator
++		fileSystem->CloseFile( bootFile );
++	}
++	for ( int a = 0; a < numAreas; a++ ) {
++		if ( areaFiles[a] ) {
++			areaFiles[a]->WriteInt( 0 );	// terminator
++			fileSystem->CloseFile( areaFiles[a] );
++		}
++	}
++
++	// entities.json metrics
++	idFile *ej = fileSystem->OpenFileWrite( idStr( dir ) + "/entities.json" );
++	if ( ej ) {
++		ej->WriteFloatString( "{\n  \"numEntities\": %d,\n  \"bootEntities\": %d,\n", numEnt, bootCount );
++		ej->WriteFloatString( "  \"streamablePct\": %f,\n", numEnt ? ( 100.0f * ( numEnt - bootCount ) / numEnt ) : 0.0f );
++		ej->WriteFloatString( "  \"perArea\": [\n" );
++		for ( int a = 0; a < numAreas; a++ ) {
++			ej->WriteFloatString( "%s    { \"area\": %d, \"entities\": %d }", a ? ",\n" : "", a, areaCounts[a] );
++		}
++		ej->WriteFloatString( "\n  ]\n}\n" );
++		fileSystem->CloseFile( ej );
++	}
++
++	common->Printf( "dumpAreaSplit: %d entities (%d boot, %d streamable), %d cross-target + %d cross-bind edges\n",
++		numEnt, bootCount, numEnt - bootCount, crossTargetEdges, crossBindEdges );
++	common->Printf( "dumpAreaSplit: done. Pull /save/%s with scripts/pack-area-stream.py\n", dir );
++
++	Mem_Free( areaCounts );
++	Mem_Free( areaFiles );
++	Mem_Free( isBootArea );
++}
++
+ /*
+ ===================
+ idGameLocal::MapPopulate
+@@ -1769,12 +2051,21 @@ void idGameLocal::CacheDictionaryMedia( const idDict *dict ) {
+ 				|| !idStr::Icmp( kv->GetKey(), "gui_inventory" ) ) {
+ 				// unfortunate flag names, they aren't actually a gui
+ 			} else {
++#ifdef __EMSCRIPTEN__
++				// Boot-speed (iter 61): this precache PARSES the full .gui script
++				// per gui-bearing entity (~wall monitors) and immediately throws
++				// it away — the real GUI is re-created at spawn. With image_preload
++				// 0 (texture streaming) its media loads lazily on first view anyway,
++				// so the parse-then-discard is pure boot churn. Skip it; a wall
++				// screen's media loads when you first look at it.
++#else
+ 				declManager->MediaPrint( "Precaching gui %s\n", kv->GetValue().c_str() );
+ 				idUserInterface *gui = uiManager->Alloc();
+ 				if ( gui ) {
+ 					gui->InitFromFile( kv->GetValue() );
+ 					uiManager->DeAlloc( gui );
+ 				}
++#endif
+ 			}
+ 		}
+ 		kv = dict->MatchPrefix( "gui", kv );
+@@ -2273,6 +2564,19 @@ gameReturn_t idGameLocal::RunFrame( const usercmd_t *clientCmds ) {
+ 			player->Think();
+ 		}
+ 	} else do {
++		// Iter 34 (g_skipCinematics): apply the deferred auto-skip armed by
++		// SetCamera once the camera has run at least one full game frame —
++		// firing at camera-start frame zero truncated multi-camera intros
++		// before their end-of-sequence teleport (see SetCamera).
++		if ( cinSkipArmedFrame >= 0 && framenum > cinSkipArmedFrame ) {
++			cinSkipArmedFrame = -1;
++			if ( inCinematic && !skipCinematic ) {
++				soundSystem->SetMute( true );
++				skipCinematic = true;
++				cinematicMaxSkipTime = time + SEC2MS( g_cinematicMaxSkipTime.GetFloat() );
++			}
++		}
++
+ 		// update the game time
+ 		framenum++;
+ 		previousTime = time;
+@@ -3276,6 +3580,7 @@ idGameLocal::SpawnMapEntities
+ Parses textual entity definitions out of an entstring and spawns gentities.
+ ==============
+ */
++
+ void idGameLocal::SpawnMapEntities( void ) {
+ 	int			i;
+ 	int			num;
+@@ -3878,6 +4183,16 @@ void idGameLocal::ProjectDecal( const idVec3 &origin, const idVec3 &dir, float d
+ 	idFixedWinding winding;
+ 	idVec3 windingOrigin, projectionOrigin;
+ 
++	// iter-128: honor g_decals for ALL projected world decals (bullet holes /
++	// mtr_detonate impacts, scorch, etc.). Stock dhewm3 gates only the
++	// AddDamageEffect overlay on g_decals; the projectile-impact decals went
++	// straight to ProjectDecal ungated, so g_decals 0 never cleared bullet holes.
++	// Default g_decals is 0 in this build (clean environment); set g_decals 1 to
++	// restore. On-actor wound overlays + blood spurts are separate and unaffected.
++	if ( !g_decals.GetBool() ) {
++		return;
++	}
++
+ 	static idVec3 decalWinding[4] = {
+ 		idVec3(  1.0f,  1.0f, 0.0f ),
+ 		idVec3( -1.0f,  1.0f, 0.0f ),
+@@ -3960,9 +4275,30 @@ void idGameLocal::SetCamera( idCamera *cam ) {
+ 	}
+ 
+ 	camera = cam;
++#ifdef __EMSCRIPTEN__
++	// Iter 34: cinematic state for the web shell (the auto-flashlight must
++	// wait — its impulse is swallowed during cinematics, which made the
++	// fast-forwarded boot KEEP the flashlight while a played intro lost it).
++	EM_ASM_({ window.__d3InCinematic = $0; }, cam ? 1 : 0);
++#endif
+ 	if ( camera ) {
+ 		inCinematic = true;
+ 
++		// Wearable/kiosk build (g_skipCinematics 1): fast-forward cinematics,
++		// since a touchscreen has no ESC key and the reduced data renders
++		// them poorly. Iter 34: do NOT set skipCinematic here at camera-start
++		// frame zero — that truncated multi-camera intros (enpro's arrival
++		// sequence) before their end-of-sequence triggers/teleport ran,
++		// stranding the player in the cinematic STAGING AREA with its warm
++		// machinery lights on (the "wrong lighting vs native" bug: the
++		// fast-forwarded boot ended in a DIFFERENT corridor than a played
++		// intro). Instead arm a deferred skip; RunFrame applies it after the
++		// camera has run a frame — the earliest possible human ESC, the code
++		// path the sequences were authored against.
++		if ( g_skipCinematics.GetBool() && !skipCinematic ) {
++			cinSkipArmedFrame = framenum;
++		}
++
+ 		if ( skipCinematic && camera->spawnArgs.GetBool( "disconnect" ) ) {
+ 			camera->spawnArgs.SetBool( "disconnect", false );
+ 			cvarSystem->SetCVarFloat( "r_znear", 3.0f );
+diff --git a/neo/game/Game_local.h b/neo/game/Game_local.h
+index 60b0b88..ce679bf 100644
+--- a/neo/game/Game_local.h
++++ b/neo/game/Game_local.h
+@@ -265,6 +265,7 @@ public:
+ 	int						cinematicSkipTime;		// don't allow skipping cinemetics until this time has passed so player doesn't skip out accidently from a firefight
+ 	int						cinematicStopTime;		// cinematics have several camera changes, so keep track of when we stop them so that we don't reset cinematicSkipTime unnecessarily
+ 	int						cinematicMaxSkipTime;	// time to end cinematic when skipping.  there's a possibility of an infinite loop if the map isn't set up right.
++	int						cinSkipArmedFrame;		// iter 34 (g_skipCinematics): SetCamera arms, RunFrame applies one frame later (-1 = unarmed)
+ 	bool					inCinematic;			// game is playing cinematic (player controls frozen)
+ 	bool					skipCinematic;
+ 
+@@ -363,6 +364,15 @@ public:
+ 	bool					NextMap( void );	// returns wether serverinfo settings have been modified
+ 	static void				NextMap_f( const idCmdArgs &args );
+ 
++	// Phase 0 (area-streaming bake): partition the loaded map by render area and
++	// write per-area render/collision/entity dumps + json metrics to /save/areadump.
++	void					DumpAreaSplit( const char *bootAreas );
++	static void				DumpAreaSplit_f( const idCmdArgs &args );
++	// Phase 1/2 (area streaming): lazily bind a deferred area's render model /
++	// append its collision polys.
++	static void				AppendArea_f( const idCmdArgs &args );
++	static void				AppendAreaCollision_f( const idCmdArgs &args );
++
+ 	idMapFile *				GetLevelMap( void );
+ 	const char *			GetMapName( void ) const;
+ 
+diff --git a/neo/game/Item.cpp b/neo/game/Item.cpp
+index 97ae952..ac0a910 100644
+--- a/neo/game/Item.cpp
++++ b/neo/game/Item.cpp
+@@ -937,8 +937,16 @@ void idMoveableItem::Spawn( void ) {
+ 
+ 	// load the trace model
+ 	if ( !collisionModelManager->TrmFromModel( clipModelName, trm ) ) {
++#ifdef __EMSCRIPTEN__
++		// Reduced browser PK4 may omit a moveable item's collision model — drop
++		// just this item instead of aborting the whole map load.
++		gameLocal.Warning( "idMoveableItem '%s': cannot load collision model %s — removing entity", name.c_str(), clipModelName.c_str() );
++		PostEventMS( &EV_Remove, 0 );
++		return;
++#else
+ 		gameLocal.Error( "idMoveableItem '%s': cannot load collision model %s", name.c_str(), clipModelName.c_str() );
+ 		return;
++#endif
+ 	}
+ 
+ 	// if the model should be shrinked
+diff --git a/neo/game/Misc.cpp b/neo/game/Misc.cpp
+index e0c0e89..5dab569 100644
+--- a/neo/game/Misc.cpp
++++ b/neo/game/Misc.cpp
+@@ -226,7 +226,7 @@ idPlayerStart::Event_TeleportPlayer
+ void idPlayerStart::Event_TeleportPlayer( idEntity *activator ) {
+ 	idPlayer *player;
+ 
+-	if ( activator->IsType( idPlayer::Type ) ) {
++	if ( activator && activator->IsType( idPlayer::Type ) ) {
+ 		player = static_cast<idPlayer*>( activator );
+ 	} else {
+ 		player = gameLocal.GetLocalPlayer();
+diff --git a/neo/game/Moveable.cpp b/neo/game/Moveable.cpp
+index e3458b3..4443dad 100644
+--- a/neo/game/Moveable.cpp
++++ b/neo/game/Moveable.cpp
+@@ -105,8 +105,17 @@ void idMoveable::Spawn( void ) {
+ 	}
+ 
+ 	if ( !collisionModelManager->TrmFromModel( clipModelName, trm ) ) {
++#ifdef __EMSCRIPTEN__
++		// A reduced (single-map) browser PK4 can be missing a prop's collision
++		// model. Don't abort the whole map for one missing moveable — warn and
++		// drop just this entity so the level still loads and renders.
++		gameLocal.Warning( "idMoveable '%s': cannot load collision model %s — removing entity", name.c_str(), clipModelName.c_str() );
++		PostEventMS( &EV_Remove, 0 );
++		return;
++#else
+ 		gameLocal.Error( "idMoveable '%s': cannot load collision model %s", name.c_str(), clipModelName.c_str() );
+ 		return;
++#endif
+ 	}
+ 
+ 	// if the model should be shrinked
+diff --git a/neo/game/Player.cpp b/neo/game/Player.cpp
+index 01b05ab..f1d9ed6 100644
+--- a/neo/game/Player.cpp
++++ b/neo/game/Player.cpp
+@@ -37,6 +37,7 @@ If you have questions concerning this license or the applicable additional terms
+ #include "ai/AI.h"
+ #include "WorldSpawn.h"
+ #include "Player.h"
++#include "D3Wearable.h"
+ #include "Camera.h"
+ #include "Fx.h"
+ #include "Misc.h"
+@@ -1133,6 +1134,15 @@ idPlayer::idPlayer() {
+ 	isChatting				= false;
+ 
+ 	selfSmooth				= false;
++
++#ifdef __EMSCRIPTEN__
++	// Permanent view-attached flashlight (iter 72). Zero the light def now; its
++	// static fields are lazily set on first UpdateFlashlight (so the material
++	// decl lookup happens once the decl system is up). Default ON.
++	memset( &flashlight, 0, sizeof( flashlight ) );
++	flashlightHandle		= -1;
++	flashlightOn			= true;
++#endif
+ }
+ 
+ /*
+@@ -1609,6 +1619,12 @@ Release any resources used by the player.
+ ==============
+ */
+ idPlayer::~idPlayer() {
++#ifdef __EMSCRIPTEN__
++	if ( flashlightHandle != -1 ) {
++		gameRenderWorld->FreeLightDef( flashlightHandle );
++		flashlightHandle = -1;
++	}
++#endif
+ 	delete weapon.GetEntity();
+ 	weapon = NULL;
+ }
+@@ -5575,6 +5591,16 @@ void idPlayer::PerformImpulse( int impulse ) {
+ 		ClientSendEvent( EVENT_IMPULSE, &msg );
+ 	}
+ 
++#ifdef __EMSCRIPTEN__
++	// Iter 72: the overlay FLASHLIGHT button (bound to _impulse11) toggles the
++	// permanent view-attached flashlight instead of equipping the flashlight
++	// weapon — the light now stays on with any weapon held.
++	if ( impulse == IMPULSE_11 ) {
++		ToggleFlashlight();
++		return;
++	}
++#endif
++
+ 	if ( impulse >= IMPULSE_0 && impulse <= IMPULSE_12 ) {
+ 		SelectWeapon( impulse, false );
+ 		return;
+@@ -6206,6 +6232,78 @@ idPlayer::Think
+ Called every tic for each player
+ ==============
+ */
++#ifdef __EMSCRIPTEN__
++/*
++==============
++idPlayer::UpdateFlashlight
++
++Iter 72: a permanent, view-attached projected flashlight, decoupled from the
++base-DOOM-3 weapon_flashlight (which is a weapon that replaces your gun).
++Mirrors the weapon's projected-light construction (lights/flashlight5 + the
++def's flashRadius/flashTarget/flashUp/flashRight) but follows the player view
++and stays lit no matter which weapon is equipped. Never drains.
++==============
++*/
++void idPlayer::UpdateFlashlight( void ) {
++	// Off / dead / spectating / cinematic: drop the light.
++	if ( !flashlightOn || ( health <= 0 ) || spectating || gameLocal.inCinematic ) {
++		if ( flashlightHandle != -1 ) {
++			gameRenderWorld->FreeLightDef( flashlightHandle );
++			flashlightHandle = -1;
++		}
++		return;
++	}
++
++	// One-time static setup (the decl system is up by the first Think).
++	if ( flashlight.shader == NULL ) {
++		flashlight.pointLight = false;					// projected spotlight
++		flashlight.shader = declManager->FindMaterial( "lights/flashlight5", false );
++		flashlight.lightRadius[0] = flashlight.lightRadius[1] = flashlight.lightRadius[2] = 400.0f;
++		flashlight.shaderParms[ SHADERPARM_RED ]		= 1.0f;
++		flashlight.shaderParms[ SHADERPARM_GREEN ]		= 1.0f;
++		flashlight.shaderParms[ SHADERPARM_BLUE ]		= 1.0f;
++		flashlight.shaderParms[ SHADERPARM_TIMESCALE ]	= 1.0f;
++		// Projection frustum from weapon_flashlight.def (light-local space).
++		flashlight.target	= idVec3(    0.0f,   0.0f, 1280.0f );
++		flashlight.up		= idVec3(    0.0f, 640.0f,    0.0f );
++		flashlight.right	= idVec3( -640.0f,   0.0f,    0.0f );
++		flashlight.end		= flashlight.target;
++		// A view-following shadow-casting light re-derives every frame; skip
++		// shadows so the always-on light stays cheap on the mobile target.
++		flashlight.noShadows = true;
++	}
++
++	// Follow the eye/view each frame. The frustum target is light-local +Z, up
++	// is +Y, right is -X (per the def), so map +Z->forward, +Y->up, +X->left.
++	idVec3 forward, right, up;
++	viewAngles.ToVectors( &forward, &right, &up );
++	flashlight.origin = GetEyePosition() + forward * 8.0f;
++	flashlight.axis[0] = -right;
++	flashlight.axis[1] = up;
++	flashlight.axis[2] = forward;
++	flashlight.shaderParms[ SHADERPARM_TIMEOFFSET ] = -MS2SEC( gameLocal.time );
++
++	if ( flashlightHandle == -1 ) {
++		flashlightHandle = gameRenderWorld->AddLightDef( &flashlight );
++	} else {
++		gameRenderWorld->UpdateLightDef( flashlightHandle, &flashlight );
++	}
++}
++
++/*
++==============
++idPlayer::ToggleFlashlight
++==============
++*/
++void idPlayer::ToggleFlashlight( void ) {
++	flashlightOn = !flashlightOn;
++	if ( !flashlightOn && flashlightHandle != -1 ) {
++		gameRenderWorld->FreeLightDef( flashlightHandle );
++		flashlightHandle = -1;
++	}
++}
++#endif // __EMSCRIPTEN__
++
+ void idPlayer::Think( void ) {
+ 	renderEntity_t *headRenderEnt;
+ 
+@@ -6220,6 +6318,20 @@ void idPlayer::Think( void ) {
+ 	buttonMask &= usercmd.buttons;
+ 	usercmd.buttons &= ~buttonMask;
+ 
++#ifdef __EMSCRIPTEN__
++	// Meta Ray-Ban Display: enemy indicators + auto-fire assist.
++	D3_WearablePlayerAssist( this, &usercmd );
++	// Iter 72: unlimited ammo — keep every reserve topped up to 999 each frame
++	// (mirrors the engine's own give-all). The stock HasAmmo/UseAmmo are left
++	// intact, so the HUD + gun ammo readout show a real number; it just never
++	// runs down. Clip still empties + reloads normally.
++	if ( !gameLocal.isMultiplayer && health > 0 ) {
++		for ( int ai = 0; ai < AMMO_NUMTYPES; ai++ ) {
++			inventory.ammo[ ai ] = 999;
++		}
++	}
++#endif
++
+ 	if ( gameLocal.inCinematic && gameLocal.skipCinematic ) {
+ 		return;
+ 	}
+@@ -6343,6 +6455,11 @@ void idPlayer::Think( void ) {
+ 	// this may use firstPersonView, or a thirdPeroson / camera view
+ 	CalculateRenderView();
+ 
++#ifdef __EMSCRIPTEN__
++	// Iter 72: keep the permanent flashlight following the view.
++	UpdateFlashlight();
++#endif
++
+ 	inventory.UpdateArmor();
+ 
+ 	if ( spectating ) {
+diff --git a/neo/game/Player.h b/neo/game/Player.h
+index b411a0c..eeafeb5 100644
+--- a/neo/game/Player.h
++++ b/neo/game/Player.h
+@@ -325,6 +325,16 @@ public:
+ 	idVec3					firstPersonViewOrigin;
+ 	idMat3					firstPersonViewAxis;
+ 
++#ifdef __EMSCRIPTEN__
++	// Meta Ray-Ban Display (iter 72): a permanent, view-attached projected
++	// flashlight that stays lit regardless of the equipped weapon and never
++	// drains. Decoupled from the base-DOOM-3 weapon_flashlight (a weapon that
++	// replaces your gun). Default on; the overlay FLASHLIGHT button toggles it.
++	renderLight_t			flashlight;
++	int						flashlightHandle;
++	bool					flashlightOn;
++#endif
++
+ 	idDragEntity			dragEntity;
+ 
+ public:
+@@ -336,6 +346,11 @@ public:
+ 	void					Spawn( void );
+ 	void					Think( void );
+ 
++#ifdef __EMSCRIPTEN__
++	void					UpdateFlashlight( void );
++	void					ToggleFlashlight( void );
++#endif
++
+ 	// save games
+ 	void					Save( idSaveGame *savefile ) const;					// archives object for save game file
+ 	void					Restore( idRestoreGame *savefile );					// unarchives object from save game file
+diff --git a/neo/game/SecurityCamera.cpp b/neo/game/SecurityCamera.cpp
+index 36a0cbe..58d9a22 100644
+--- a/neo/game/SecurityCamera.cpp
++++ b/neo/game/SecurityCamera.cpp
+@@ -167,8 +167,16 @@ void idSecurityCamera::Spawn( void ) {
+ 	}
+ 
+ 	if ( !collisionModelManager->TrmFromModel( str, trm ) ) {
++#ifdef __EMSCRIPTEN__
++		// Reduced browser PK4 may omit the camera's collision model — drop just
++		// this entity instead of aborting the whole map load.
++		gameLocal.Warning( "idSecurityCamera '%s': cannot load collision model %s — removing entity", name.c_str(), str.c_str() );
++		PostEventMS( &EV_Remove, 0 );
++		return;
++#else
+ 		gameLocal.Error( "idSecurityCamera '%s': cannot load collision model %s", name.c_str(), str.c_str() );
+ 		return;
++#endif
+ 	}
+ 
+ 	GetPhysics()->SetContents( CONTENTS_SOLID );
+diff --git a/neo/game/ai/AI.cpp b/neo/game/ai/AI.cpp
+index 2ac9948..c374ea8 100644
+--- a/neo/game/ai/AI.cpp
++++ b/neo/game/ai/AI.cpp
+@@ -925,6 +925,10 @@ void idAI::Spawn( void ) {
+ 
+ 	BecomeActive( TH_THINK );
+ 
++	// Arco COMBAT milestone P0: replicate this monster to clients. Without networkSync the
++	// server's ServerWriteSnapshot skips it (Game_network.cpp:610) and no client ever sees it.
++	fl.networkSync = true;
++
+ 	if ( af_push_moveables ) {
+ 		af.SetupPose( this, gameLocal.time );
+ 		af.GetPhysics()->EnableClip();
+@@ -1043,12 +1047,80 @@ void idAI::DormantEnd( void ) {
+ 	idActor::DormantEnd();
+ }
+ 
++/*
++=====================
++idAI::WriteToSnapshot
++
++Arco COMBAT P1: replicate the monster's pose (origin + yaw + health) to clients. The base
++idEntity bodies are empty and the monster physics don't network, so write it explicitly.
++Byte layout MUST stay symmetric with ReadFromSnapshot below.
++=====================
++*/
++void idAI::WriteToSnapshot( idBitMsgDelta &msg ) const {
++	const idVec3 &org = GetPhysics()->GetOrigin();
++	msg.WriteDeltaFloat( 0.0f, org.x );
++	msg.WriteDeltaFloat( 0.0f, org.y );
++	msg.WriteDeltaFloat( 0.0f, org.z );
++	msg.WriteDeltaFloat( 0.0f, current_yaw );
++	msg.WriteShort( health );
++	// Arco COMBAT P2: per-channel (TORSO+LEGS) anim selector so the client animates the monster.
++	for ( int ch = ANIMCHANNEL_TORSO; ch <= ANIMCHANNEL_LEGS; ch++ ) {
++		idAnimBlend *blend = ( (idAnimator &)animator ).CurrentAnim( ch );
++		msg.WriteBits( blend ? blend->AnimNum() : 0, 12 );
++	}
++}
++
++/*
++=====================
++idAI::ReadFromSnapshot
++=====================
++*/
++void idAI::ReadFromSnapshot( const idBitMsgDelta &msg ) {
++	idVec3 org;
++	org.x = msg.ReadDeltaFloat( 0.0f );
++	org.y = msg.ReadDeltaFloat( 0.0f );
++	org.z = msg.ReadDeltaFloat( 0.0f );
++	current_yaw = msg.ReadDeltaFloat( 0.0f );
++	health = msg.ReadShort();
++
++	// Arco COMBAT P2: drive the animator from the replicated per-channel anim selector so the MD5
++	// animates (UpdateAnimation in ClientPredictionThink advances it). animNum-only for now; the
++	// client (re)cycles a channel only when its anim changes. Frame-phase sync is a fast-follow.
++	for ( int ch = ANIMCHANNEL_TORSO; ch <= ANIMCHANNEL_LEGS; ch++ ) {
++		int animNum = msg.ReadBits( 12 );
++		if ( animNum > 0 ) {
++			idAnimBlend *cur = animator.CurrentAnim( ch );
++			if ( !cur || cur->AnimNum() != animNum ) {
++				animator.CycleAnim( ch, animNum, gameLocal.time, 0 );
++			}
++		}
++	}
++
++	// Drive the client-side pose from the server-authoritative state (P7 will interpolate;
++	// for now snap each snapshot — the client never runs the AI brain, see Think guard).
++	ideal_yaw = current_yaw;
++	viewAxis = idAngles( 0.0f, current_yaw, 0.0f ).ToMat3();
++	GetPhysics()->SetOrigin( org );
++	GetPhysics()->SetAxis( viewAxis );
++	UpdateVisuals();
++}
++
+ /*
+ =====================
+ idAI::Think
+ =====================
+ */
+ void idAI::Think( void ) {
++	// Arco COMBAT milestone P0: a replicated idAI on the CLIENT must NOT run the server-only
++	// scripted brain (it has no enemy / AAS / script-thread context and would mis-sim or assert).
++	// Route to the animated-entity client path (physics interp + animation + present) so the client
++	// renders a server-driven actor only. The dedicated server (isClient == false) runs the real
++	// brain below as normal. This is the load-bearing guard for monster replication.
++	if ( gameLocal.isClient ) {
++		idAnimatedEntity::ClientPredictionThink();
++		return;
++	}
++
+ 	// if we are completely closed off from the player, don't do anything at all
+ 	if ( CheckDormant() ) {
+ 		return;
+diff --git a/neo/game/ai/AI.h b/neo/game/ai/AI.h
+index b038ba4..595b069 100644
+--- a/neo/game/ai/AI.h
++++ b/neo/game/ai/AI.h
+@@ -427,6 +427,9 @@ protected:
+ 	virtual	void			DormantBegin( void );	// called when entity becomes dormant
+ 	virtual	void			DormantEnd( void );		// called when entity wakes from being dormant
+ 	void					Think( void );
++	// Arco COMBAT P1: replicate monster pose (origin+yaw+health) to clients over the snapshot.
++	virtual void			WriteToSnapshot( idBitMsgDelta &msg ) const;
++	virtual void			ReadFromSnapshot( const idBitMsgDelta &msg );
+ 	void					Activate( idEntity *activator );
+ 	int						ReactionTo( const idEntity *ent );
+ 	bool					CheckForEnemy( void );
+diff --git a/neo/game/gamesys/SysCmds.cpp b/neo/game/gamesys/SysCmds.cpp
+index 105ff57..e4b3f00 100644
+--- a/neo/game/gamesys/SysCmds.cpp
++++ b/neo/game/gamesys/SysCmds.cpp
+@@ -692,15 +692,29 @@ void Cmd_SetViewpos_f( const idCmdArgs &args ) {
+ 		return;
+ 	}
+ 
++#ifdef __EMSCRIPTEN__
++	// Wearable port: optional 6th arg sets pitch so a pos-chip screenshot
++	// ("pos X Y Z | yaw W pitch P") is a complete one-command repro.
++	if ( ( args.Argc() < 4 ) || ( args.Argc() > 6 ) ) {
++		gameLocal.Printf( "usage: setviewpos <x> <y> <z> [yaw] [pitch]\n" );
++		return;
++	}
++#else
+ 	if ( ( args.Argc() != 4 ) && ( args.Argc() != 5 ) ) {
+ 		gameLocal.Printf( "usage: setviewpos <x> <y> <z> <yaw>\n" );
+ 		return;
+ 	}
++#endif
+ 
+ 	angles.Zero();
+-	if ( args.Argc() == 5 ) {
++	if ( args.Argc() >= 5 ) {
+ 		angles.yaw = atof( args.Argv( 4 ) );
+ 	}
++#ifdef __EMSCRIPTEN__
++	if ( args.Argc() == 6 ) {
++		angles.pitch = atof( args.Argv( 5 ) );
++	}
++#endif
+ 
+ 	for ( i = 0 ; i < 3 ; i++ ) {
+ 		origin[i] = atof( args.Argv( i + 1 ) );
+@@ -2314,6 +2328,9 @@ void idGameLocal::InitConsoleCommands( void ) {
+ 	cmdSystem->AddCommand( "listActiveEntities",	Cmd_ActiveEntityList_f,		CMD_FL_GAME|CMD_FL_CHEAT,	"lists active game entities" );
+ 	cmdSystem->AddCommand( "listMonsters",			idAI::List_f,				CMD_FL_GAME|CMD_FL_CHEAT,	"lists monsters" );
+ 	cmdSystem->AddCommand( "listSpawnArgs",			Cmd_ListSpawnArgs_f,		CMD_FL_GAME|CMD_FL_CHEAT,	"list the spawn args of an entity", idGameLocal::ArgCompletion_EntityName );
++	cmdSystem->AddCommand( "dumpAreaSplit",			idGameLocal::DumpAreaSplit_f,	CMD_FL_GAME|CMD_FL_CHEAT,	"area-streaming bake: dump per-area render/collision/entity split to /save/areadump" );
++	cmdSystem->AddCommand( "appendArea",			idGameLocal::AppendArea_f,		CMD_FL_GAME|CMD_FL_CHEAT,	"area-streaming: lazily bind a deferred area's render model" );
++	cmdSystem->AddCommand( "appendAreaCol",			idGameLocal::AppendAreaCollision_f,	CMD_FL_GAME|CMD_FL_CHEAT,	"area-streaming: append a deferred area's collision polys/brushes" );
+ 	cmdSystem->AddCommand( "say",					Cmd_Say_f,					CMD_FL_GAME,				"text chat" );
+ 	cmdSystem->AddCommand( "sayTeam",				Cmd_SayTeam_f,				CMD_FL_GAME,				"team text chat" );
+ 	cmdSystem->AddCommand( "addChatLine",			Cmd_AddChatLine_f,			CMD_FL_GAME,				"internal use - core to game chat lines" );
+diff --git a/neo/game/gamesys/SysCvar.cpp b/neo/game/gamesys/SysCvar.cpp
+index 824d9c2..510f360 100644
+--- a/neo/game/gamesys/SysCvar.cpp
++++ b/neo/game/gamesys/SysCvar.cpp
+@@ -97,14 +97,16 @@ idCVar r_aspectRatio(				"r_aspectRatio",			"-1",			CVAR_RENDERER | CVAR_INTEGER
+ 
+ idCVar g_cinematic(					"g_cinematic",				"1",			CVAR_GAME | CVAR_BOOL, "skips updating entities that aren't marked 'cinematic' '1' during cinematics" );
+ idCVar g_cinematicMaxSkipTime(		"g_cinematicMaxSkipTime",	"600",			CVAR_GAME | CVAR_FLOAT, "# of seconds to allow game to run when skipping cinematic.  prevents lock-up when cinematic doesn't end.", 0, 3600 );
++idCVar g_skipCinematics(			"g_skipCinematics",			"0",			CVAR_GAME | CVAR_BOOL, "automatically fast-forward every cinematic as it starts (wearable/kiosk build has no ESC key to skip them)" );
+ 
+ idCVar g_muzzleFlash(				"g_muzzleFlash",			"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "show muzzle flashes" );
+ idCVar g_projectileLights(			"g_projectileLights",		"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "show dynamic lights on projectiles" );
+ idCVar g_bloodEffects(				"g_bloodEffects",			"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "show blood splats, sprays and gibs" );
++idCVar g_bloodSplats(				"g_bloodSplats",			"0",			CVAR_GAME | CVAR_BOOL, "iter-127: throw blood-splat decals onto environment surfaces (walls/floor) when an actor is hit. 0 (default in this build) keeps blood off the world; on-actor wound overlays, sprays/gibs (g_bloodEffects) and bullet-hole decals (g_decals) are unaffected" );
+ idCVar g_doubleVision(				"g_doubleVision",			"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "show double vision when taking damage" );
+ idCVar g_hitEffect(					"g_hitEffect",				"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "mess up player camera when taking damage" );
+ idCVar g_monsters(					"g_monsters",				"1",			CVAR_GAME | CVAR_BOOL, "" );
+-idCVar g_decals(					"g_decals",					"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "show decals such as bullet holes" );
++idCVar g_decals(					"g_decals",					"0",			CVAR_GAME | CVAR_BOOL, "iter-128: show world decals such as bullet holes / mtr_detonate impacts + scorch. DEFAULT 0 in this build = clean environment (no bullet holes on walls); set g_decals 1 to restore. ARCHIVE removed so it is deterministic per boot. On-actor wounds + blood spurts are separate" );
+ idCVar g_knockback(					"g_knockback",				"1000",			CVAR_GAME | CVAR_INTEGER, "" );
+ idCVar g_skill(						"g_skill",					"1",			CVAR_GAME | CVAR_INTEGER, "" );
+ idCVar g_nightmare(					"g_nightmare",				"0",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "if nightmare mode is allowed" );
+diff --git a/neo/game/gamesys/SysCvar.h b/neo/game/gamesys/SysCvar.h
+index a4883b5..233abca 100644
+--- a/neo/game/gamesys/SysCvar.h
++++ b/neo/game/gamesys/SysCvar.h
+@@ -35,6 +35,7 @@ extern idCVar	developer;
+ 
+ extern idCVar	g_cinematic;
+ extern idCVar	g_cinematicMaxSkipTime;
++extern idCVar	g_skipCinematics;
+ 
+ extern idCVar	r_aspectRatio;
+ 
+@@ -46,6 +47,7 @@ extern idCVar	g_gravity;
+ extern idCVar	g_skipFX;
+ extern idCVar	g_skipParticles;
+ extern idCVar	g_bloodEffects;
++extern idCVar	g_bloodSplats;
+ extern idCVar	g_projectileLights;
+ extern idCVar	g_doubleVision;
+ extern idCVar	g_hitEffect;
+diff --git a/neo/idlib/MapFile.cpp b/neo/idlib/MapFile.cpp
+index afbfa1d..cf83f9d 100644
+--- a/neo/idlib/MapFile.cpp
++++ b/neo/idlib/MapFile.cpp
+@@ -716,7 +716,21 @@ unsigned int idMapEntity::GetGeometryCRC( void ) const {
+ idMapFile::Parse
+ ===============
+ */
++// Boot-speed: parse-phase timer (logs [parse-time] via D3_ParseTimeLog)
++extern "C" void D3_ParseTimeLog(const char*, int);
++namespace { struct D3ParseTimer { const char* n; unsigned int t0; D3ParseTimer(const char* nm):n(nm),t0(Sys_Milliseconds()){} ~D3ParseTimer(){ D3_ParseTimeLog(n,(int)(Sys_Milliseconds()-t0)); } }; }
++
+ bool idMapFile::Parse( const char *filename, bool ignoreRegion, bool osPath ) {
++	D3ParseTimer _pt("MapFile::Parse(.map)");
++	extern idCVar cm_binaryCache;   // unified binary-geometry-cache kill-switch (defined in cm/CollisionModel_files.cpp)
++
++	// Boot-speed: try the binary entities-only .map cache first (skips the
++	// ~564ms ASCII brush/patch parse; the game only needs entity epairs + CRC
++	// at runtime). Only used for the default game path (no region file).
++	if ( !ignoreRegion && !osPath && cm_binaryCache.GetBool() && LoadBinaryMapFile( filename ) ) {
++		return true;
++	}
++
+ 	// no string concatenation for epairs and allow path names for materials
+ 	idLexer src( LEXFL_NOSTRINGCONCAT | LEXFL_NOSTRINGESCAPECHARS | LEXFL_ALLOWPATHNAMES );
+ 	idToken token;
+@@ -821,6 +835,93 @@ bool idMapFile::Parse( const char *filename, bool ignoreRegion, bool osPath ) {
+ 	}
+ 
+ 	hasPrimitiveData = true;
++
++	// Boot-speed: write the binary entities-only cache for next boot, but ONLY
++	// when a precompiled collision file (.cm or .bcm) exists for this map — that
++	// guarantees the brush/patch primitives we skip are never needed at runtime.
++	if ( cm_binaryCache.GetBool() ) {
++		ID_TIME_T ts;
++		idStr cmName = name;  cmName.SetFileExtension( "cm" );
++		idStr bcmName = name; bcmName.SetFileExtension( "bcm" );
++		bool collisionPrecompiled = ( idLib::fileSystem->ReadFile( cmName, NULL, &ts ) >= 0 ) ||
++									( idLib::fileSystem->ReadFile( bcmName, NULL, &ts ) >= 0 );
++		if ( collisionPrecompiled ) {
++			WriteBinaryMapFile( filename );
++		}
++	}
++	return true;
++}
++
++/*
++============
++idMapFile::WriteBinaryMapFile / LoadBinaryMapFile — binary entities-only cache
++============
++*/
++#define BMAP_MAGIC		(('B'<<0)|('M'<<8)|('A'<<16)|('P'<<24))
++#define BMAP_VERSION	1
++
++void idMapFile::WriteBinaryMapFile( const char * ) const {
++	// Derive the path from the (already once-stripped) map name so it matches
++	// the .bcm/.bproc convention — e.g. "maps/game/enpro.bmap", not
++	// "...enpro.map.bmap" (this map's name carries a .map suffix and the game
++	// calls Parse(name + ".map"), giving a doubled extension on the raw arg).
++	idStr qpath = name;
++	qpath.SetFileExtension( "bmap" );
++	idFile *fp = idLib::fileSystem->OpenFileWrite( qpath, "fs_devpath" );
++	if ( !fp ) {
++		return;
++	}
++	fp->WriteInt( BMAP_MAGIC );
++	fp->WriteInt( BMAP_VERSION );
++	fp->WriteFloat( version );
++	fp->WriteInt( (int)geometryCRC );
++	fp->WriteInt( entities.Num() );
++	for ( int i = 0; i < entities.Num(); i++ ) {
++		entities[i]->epairs.WriteToFileHandle( fp );
++	}
++	idLib::fileSystem->CloseFile( fp );
++	idLib::common->Printf( "wrote binary map cache %s\n", qpath.c_str() );
++}
++
++bool idMapFile::LoadBinaryMapFile( const char *filename ) {
++	// Match WriteBinaryMapFile's path: strip the arg once (= GetName()) then set
++	// the extension, so "maps/game/enpro.map.map" -> "maps/game/enpro.bmap".
++	idStr qpath = filename;
++	qpath.StripFileExtension();
++	qpath.SetFileExtension( "bmap" );
++	idFile *fp = idLib::fileSystem->OpenFileRead( qpath );
++	if ( !fp ) {
++		return false;
++	}
++	int magic = 0, ver = 0, n = 0, crc = 0;
++	float v = 0.0f;
++	fp->ReadInt( magic );
++	fp->ReadInt( ver );
++	if ( magic != BMAP_MAGIC || ver != BMAP_VERSION ) {
++		idLib::fileSystem->CloseFile( fp );
++		return false;
++	}
++	fp->ReadFloat( v );
++	fp->ReadInt( crc );
++	fp->ReadInt( n );
++	if ( n < 0 || n > 1000000 ) {
++		idLib::fileSystem->CloseFile( fp );
++		return false;
++	}
++	name = filename;
++	name.StripFileExtension();
++	version = v;
++	geometryCRC = (unsigned int)crc;
++	fileTime = 0;
++	{ idStr mapName = name; mapName.SetFileExtension( "map" ); idLib::fileSystem->ReadFile( mapName, NULL, &fileTime ); }
++	entities.DeleteContents( true );
++	for ( int i = 0; i < n; i++ ) {
++		idMapEntity *ent = new idMapEntity();
++		ent->epairs.ReadFromFileHandle( fp );
++		entities.Append( ent );
++	}
++	idLib::fileSystem->CloseFile( fp );
++	hasPrimitiveData = false;   // entities-only: brush/patch primitives were skipped
+ 	return true;
+ }
+ 
+diff --git a/neo/idlib/MapFile.h b/neo/idlib/MapFile.h
+index fb93339..925a089 100644
+--- a/neo/idlib/MapFile.h
++++ b/neo/idlib/MapFile.h
+@@ -228,6 +228,13 @@ protected:
+ 
+ private:
+ 	void					SetGeometryCRC( void );
++	// Boot-speed: binary entities-only .map cache. The game only reads entity
++	// epairs + the geometry CRC at runtime (brush/patch primitives feed only the
++	// collision/AAS compile, which is precompiled in .cm/.aas), so the binary
++	// cache stores epairs + CRC and skips the ~564ms ASCII brush/patch parse.
++	// Only written when a .cm exists for the map (so primitives are never needed).
++	void					WriteBinaryMapFile( const char *filename ) const;
++	bool					LoadBinaryMapFile( const char *filename );
+ };
+ 
+ ID_INLINE idMapFile::idMapFile( void ) {
+diff --git a/neo/sound/snd_local.h b/neo/sound/snd_local.h
+index 808faaa..a1f260a 100644
+--- a/neo/sound/snd_local.h
++++ b/neo/sound/snd_local.h
+@@ -42,6 +42,13 @@ If you have questions concerning this license or the applicable additional terms
+ #include <AL/al.h>
+ #include <AL/alc.h>
+ #include <AL/alext.h>
++#ifdef __EMSCRIPTEN__
++// Emscripten's OpenAL port ships only a stub <AL/alext.h> without the EFX
++// LPAL* typedefs. Pull in OpenAL-Soft's efx.h (vendored) so the sound system
++// compiles; the EFX functions stay unresolved but are never called because
++// Emscripten's OpenAL reports no ALC_EXT_EFX at runtime.
++#include <AL/efx.h>
++#endif
+ 
+ // DG: make this code build with older OpenAL headers that don't know about ALC_SOFT_HRTF
+ //     which provides LPALCRESETDEVICESOFT for idSoundSystemLocal::alcResetDeviceSOFT()
+diff --git a/neo/sys/events.cpp b/neo/sys/events.cpp
+index 3550256..e81e3cb 100644
+--- a/neo/sys/events.cpp
++++ b/neo/sys/events.cpp
+@@ -1804,6 +1804,14 @@ Sys_GenerateEvents
+ void Sys_GenerateEvents() {
+ 	D3P_ScopedCPUSample(Sys_GenerateEvents);
+ 
++#ifdef __EMSCRIPTEN__
++	// In the browser: no pointer to grab (the wearable bridge drives the camera
++	// via D3_AddViewAngles) and no terminal to read (Sys_ConsoleInput would
++	// block forever on stdin). Just pump SDL/browser events.
++	SDL_PumpEvents();
++	return;
++#endif
++
+ 	handleMouseGrab();
+ 
+ 	char *s = Sys_ConsoleInput();
+diff --git a/neo/sys/glimp.cpp b/neo/sys/glimp.cpp
+index 7efe196..afa6fe1 100644
+--- a/neo/sys/glimp.cpp
++++ b/neo/sys/glimp.cpp
+@@ -122,6 +122,22 @@ static SDL_Surface *window = NULL;
+ #define SDL_WINDOW_FULLSCREEN SDL_FULLSCREEN
+ #endif
+ 
++#ifdef __EMSCRIPTEN__
++// GL4ES translates DOOM 3's legacy/fixed-function GL to WebGL2. It must be
++// initialized with the underlying (browser GLES2) proc loader and a
++// framebuffer-size callback, after which gl4es_GetProcAddress returns the
++// wrapped entry points the engine looks up at runtime.
++#include "gl4esinit.h"
++#include <emscripten/html5.h>
++#include <emscripten/html5_webgl.h>
++static int d3_em_fb_w = 600;
++static int d3_em_fb_h = 600;
++static void APIENTRY_GL4ES D3_Emscripten_GetMainFBSize(int *width, int *height) {
++	if (width)  *width  = d3_em_fb_w;
++	if (height) *height = d3_em_fb_h;
++}
++#endif
++
+ #if SDL_VERSION_ATLEAST(3, 0, 0)
+ 
+ extern idCVar in_grabKeyboard;
+@@ -184,6 +200,20 @@ bool GLimp_Init(glimpParms_t parms) {
+ 
+ 	assert(SDL_WasInit(SDL_INIT_VIDEO));
+ 
++#ifdef __EMSCRIPTEN__
++	// SDL3's Emscripten video driver creates the WebGL context on the canvas
++	// matched by this CSS selector (default "#canvas") via
++	// emscripten_webgl_create_context(). Our page hosts the engine on
++	// "#gameCanvas", so without this the selector resolves to null, context
++	// creation returns 0, GLctx stays undefined (getSupportedExtensions crash)
++	// and nothing the engine renders ever reaches the visible canvas.
++  #ifdef SDL_HINT_EMSCRIPTEN_CANVAS_SELECTOR
++	SDL_SetHint(SDL_HINT_EMSCRIPTEN_CANVAS_SELECTOR, "#gameCanvas");
++  #else
++	SDL_SetHint("SDL_EMSCRIPTEN_CANVAS_SELECTOR", "#gameCanvas");
++  #endif
++#endif
++
+ 	My_SDL_WindowFlags flags = SDL_WINDOW_OPENGL;
+ 
+ 	if (parms.fullScreen == 1)
+@@ -205,7 +235,14 @@ bool GLimp_Init(glimpParms_t parms) {
+ 
+ 	r_windowResizable.ClearModified();
+ #if SDL_VERSION_ATLEAST(2, 0, 0)
++#ifndef __EMSCRIPTEN__
++	// On Emscripten, high-DPI blows the canvas drawable up to css-size * dpr
++	// (e.g. 402pt * 3 = 1206px) while the engine still renders at r_customWidth
++	// (e.g. 448), so the scene draws into a small corner of a big canvas and
++	// looks tiny on a phone. Skip high-DPI so the drawable matches the render
++	// resolution and the scene fills the canvas (which CSS then scales to fit).
+ 	flags |= SDL_WINDOW_ALLOW_HIGHDPI;
++#endif
+ 
+ 	if ( r_windowResizable.GetBool() ) {
+ 		flags |= SDL_WINDOW_RESIZABLE;
+@@ -315,13 +352,30 @@ try_again:
+ 		SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, tdepthbits);
+ 		SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, tstencilbits);
+ 
++#ifdef __EMSCRIPTEN__
++		// Request 0 alpha bits so the WebGL canvas is created opaque
++		// (alpha:false). DOOM 3 renders to an opaque framebuffer and never
++		// writes meaningful framebuffer alpha; on an alpha:true canvas the
++		// browser would composite the page background through it (black screen).
++		SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 0);
++#else
+ 		SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, talphabits);
++#endif
+ 
+ 		SDL_GL_SetAttribute(SDL_GL_STEREO, parms.stereo ? 1 : 0);
+ 
+ 		SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, (multisamples > 1) ? 1 : 0);
+ 		SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, multisamples);
+ 
++#ifdef __EMSCRIPTEN__
++		// Request a GLES 3.0 context (the proven Qwasm2 recipe). Emscripten's
++		// SDL3 port creates a WebGL2 context that composites to the canvas;
++		// GL4ES then translates DOOM 3's desktop GL into it.
++		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
++		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
++		SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
++#endif
++
+ #if SDL_VERSION_ATLEAST(2, 0, 0) // SDL2 and SDL3 window creation
+ 
+ 		if ( r_glDebugContext.GetBool() ) {
+@@ -575,12 +629,42 @@ try_again:
+ 
+ 		context = SDL_GL_CreateContext(window);
+ 
++#ifdef __EMSCRIPTEN__
++		// SDL3 created the WebGL context on "#gameCanvas" (see the canvas-selector
++		// hint above) and already made it current, so the engine renders straight
++		// to the displayed canvas. Bring up GL4ES against that context so the
++		// engine's runtime GL lookups (glBegin, glColor*, ...) resolve to GL4ES
++		// rather than the browser's bare GLES2 (where they are all null).
++		d3_em_fb_w = parms.width;
++		d3_em_fb_h = parms.height;
++		// Render straight to the real WebGL backbuffer: disable GL4ES's main
++		// framebuffer / FBO-blit emulation, which otherwise redirects the
++		// "default framebuffer" into an internal texture that never reaches the
++		// canvas (the engine renders, but the canvas stays blank).
++		setenv( "LIBGL_FB", "0", 1 );
++		setenv( "LIBGL_FBOFORCETEX", "0", 1 );
++		setenv( "LIBGL_BLITFULLSCREEN", "0", 1 );
++		setenv( "LIBGL_NOTEST", "1", 1 );
++		set_getprocaddress( (void *(APIENTRY_GL4ES *)(const char *))SDL_GL_GetProcAddress );
++		set_getmainfbsize( D3_Emscripten_GetMainFBSize );
++		initialize_gl4es();
++#endif
++
+ 		GLimp_SetSwapInterval( r_swapInterval.GetInteger() );
+ 		r_swapInterval.ClearModified();
+ 
+ 		// for HighDPI, window size and drawable size can differ
+ 		GLimp_UpdateWindowSize();
+ 
++#ifdef __EMSCRIPTEN__
++		// Emscripten's SDL reports a 0x0 window; pin the dimensions to the
++		// canvas size we requested so the renderer viewport isn't degenerate.
++		glConfig.vidWidth = parms.width;
++		glConfig.vidHeight = parms.height;
++		glConfig.winWidth = parms.width;
++		glConfig.winHeight = parms.height;
++#endif
++
+ 		SetSDLIcon(); // for SDL2  this must be done after creating the window
+ 
+ 		// TODO: also check for fullscreen-desktop?
+@@ -1130,8 +1214,19 @@ void GLimp_Shutdown() {
+ GLimp_SwapBuffers
+ ===================
+ */
++#ifdef __EMSCRIPTEN__
++// GL4ES batches GL commands; flush them to the WebGL backbuffer before the
++// platform swap. Declared in GL4ES.
++extern "C" void gl4es_pre_swap( void );
++#endif
++
+ void GLimp_SwapBuffers() {
+ 	D3P_BeginCPUSample(SDL_GL_SwapWindow);
++#ifdef __EMSCRIPTEN__
++	// GL4ES batches GL commands; flush them to the WebGL backbuffer before the
++	// platform swap presents the frame.
++	gl4es_pre_swap();
++#endif
+ #if SDL_VERSION_ATLEAST(2, 0, 0)
+ 	SDL_GL_SwapWindow(window);
+ #else
+@@ -1242,7 +1337,12 @@ GLimp_ExtensionPointer
+ GLExtension_t GLimp_ExtensionPointer(const char *name) {
+ 	assert(SDL_WasInit(SDL_INIT_VIDEO));
+ 
++#ifdef __EMSCRIPTEN__
++	// Resolve through GL4ES so legacy/fixed-function entry points exist.
++	return (GLExtension_t)gl4es_GetProcAddress(name);
++#else
+ 	return (GLExtension_t)SDL_GL_GetProcAddress(name);
++#endif
+ }
+ 
+ void GLimp_GrabInput(int flags) {
+diff --git a/neo/sys/linux/main.cpp b/neo/sys/linux/main.cpp
+index 3468d39..a789d1f 100644
+--- a/neo/sys/linux/main.cpp
++++ b/neo/sys/linux/main.cpp
+@@ -407,9 +407,30 @@ void idSysLocal::OpenURL( const char *url, bool quit ) {
+ main
+ ===============
+ */
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++static void D3_EmscriptenFrame(void) {
++	// Iter 46b: ProMotion iPhones run rAF at 120Hz — with com_fixedTic 1
++	// (one sim tic per engine frame, the 62.5Hz-vs-60Hz stutter fix) an
++	// ungated loop ran the game at DOUBLE speed. Phase-locked 60Hz gate:
++	// at 120Hz every other callback skips (the WebGPU backend re-presents
++	// the last frame), at 60Hz every callback runs; a stall (>50ms behind)
++	// resyncs instead of bursting catch-up frames.
++	static double nextDue = 0.0;
++	const double now = emscripten_get_now();
++	if ( now + 0.5 < nextDue ) {
++		return;
++	}
++	nextDue = ( nextDue < now - 50.0 ) ? now + 16.6667 : nextDue + 16.6667;
++	common->Frame();
++}
++#endif
++
+ int main(int argc, char **argv) {
+ 	// Prevent running Doom 3 as root
+ 	// Borrowed from Yamagi Quake II
++	// (Emscripten reports uid 0 in the browser sandbox, so skip the check there.)
++#ifndef __EMSCRIPTEN__
+ 	if (getuid() == 0) {
+ 		printf("Doom 3 shouldn't be run as root! Backing out to save your ass. If\n");
+ 		printf("you really know what you're doing, edit neo/sys/linux/main.cpp and remove\n");
+@@ -417,6 +438,7 @@ int main(int argc, char **argv) {
+ 
+ 		return 1;
+ 	}
++#endif
+ 	// fallback path to the binary for systems without /proc
+ 	// while not 100% reliable, its good enough
+ 	if (argc > 0) {
+@@ -448,8 +470,16 @@ int main(int argc, char **argv) {
+ 		common->Init( 0, NULL );
+ 	}
+ 
++#ifdef __EMSCRIPTEN__
++	// A blocking while(1) loop never yields to the browser; drive one
++	// common->Frame() per animation frame via the Emscripten main loop instead.
++	// simulate_infinite_loop=1 unwinds the stack and hands control back to the
++	// browser so rendering, input, and timers run.
++	emscripten_set_main_loop( D3_EmscriptenFrame, 0, 1 );
++#else
+ 	while (1) {
+ 		common->Frame();
+ 	}
++#endif
+ 	return 0;
+ }
+diff --git a/neo/sys/posix/posix_main.cpp b/neo/sys/posix/posix_main.cpp
+index bb0232b..7975128 100644
+--- a/neo/sys/posix/posix_main.cpp
++++ b/neo/sys/posix/posix_main.cpp
+@@ -565,6 +565,16 @@ Sys_SleepUntilPrecise
+ =====================
+ */
+ void Sys_SleepUntilPrecise( double targetTimeMS ) {
++#ifdef __EMSCRIPTEN__
++	// On WASM there is no real sleep without ASYNCIFY: usleep() AND the
++	// precision busy-loop below both SPIN on the clock, each read a
++	// wasm->JS crossing. Profiling showed ~45% of ALL CPU time burned in
++	// Com_WaitForNextTicStart -> here (emscripten_get_now + nanosleep
++	// spin). The browser's rAF already paces frames — waiting inside the
++	// rAF callback is pure waste (and heat -> throttling on the phone).
++	(void)targetTimeMS;
++	return;
++#else
+ 	double msec = targetTimeMS - Sys_MillisecondsPrecise();
+ 	if ( msec < 0.01 ) // don't bother for less than 10usec
+ 		return;
+@@ -590,6 +600,7 @@ void Sys_SleepUntilPrecise( double targetTimeMS ) {
+ 
+ 		msec = targetTimeMS - Sys_MillisecondsPrecise();
+ 	} while ( msec >= 0.01 );
++#endif
+ }
+ 
+ // ----------- lots of signal handling stuff ------------
+diff --git a/neo/sys/posix/posix_net.cpp b/neo/sys/posix/posix_net.cpp
+index 746a945..269a19f 100644
+--- a/neo/sys/posix/posix_net.cpp
++++ b/neo/sys/posix/posix_net.cpp
+@@ -49,6 +49,44 @@ If you have questions concerning this license or the applicable additional terms
+ 
+ #include "sys/posix/posix_public.h"
+ 
++#ifdef __EMSCRIPTEN__
++// Arco F0 #2b: WASM idPort over a JS WebSocket to the ws-udp-bridge (browsers can't
++// do UDP). One WebSocket = the client's link to the server (via the bridge). The
++// async client's UDP idPort calls below early-return to these JS-backed paths.
++#include <emscripten.h>
++EM_JS( void, arco_ws_open, (), {
++	if ( Module.__arcoWs ) return;
++	var url = Module.ARCO_BRIDGE_URL ||
++		( (location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.hostname + ':27667' );
++	Module.__arcoWsQueue = [];
++	Module.__arcoWsOpen = 0;
++	try {
++		var ws = new WebSocket( url ); ws.binaryType = 'arraybuffer';
++		ws.onopen = function(){ Module.__arcoWsOpen = 1; out('[arco-net] ws open ' + url); };
++		ws.onmessage = function(e){ Module.__arcoWsQueue.push( new Uint8Array( e.data ) ); };
++		ws.onclose = function(){ Module.__arcoWsOpen = 0; };
++		ws.onerror = function(){ out('[arco-net] ws error'); };
++		Module.__arcoWs = ws;
++	} catch (e) { out('[arco-net] ws open failed: ' + e); }
++});
++EM_JS( int, arco_ws_send, (int ptr, int len), {
++	var ws = Module.__arcoWs; if ( !ws || ws.readyState !== 1 ) return 0;
++	ws.send( HEAPU8.slice( ptr, ptr + len ) ); return len;
++});
++EM_JS( int, arco_ws_recv, (int ptr, int max), {
++	var q = Module.__arcoWsQueue; if ( !q || !q.length ) return -1;
++	var msg = q.shift(); var n = Math.min( msg.length, max );
++	HEAPU8.set( msg.subarray( 0, n ), ptr ); return n;
++});
++EM_JS( void, arco_ws_close, (), {
++	if ( Module.__arcoWs ) { try { Module.__arcoWs.close(); } catch(e){} Module.__arcoWs = null; }
++});
++// Synthetic server address the bridge fronts (must match the +connect target).
++static void Arco_ServerAdr( netadr_t &a ) {
++	a.type = NA_IP; a.ip[0]=127; a.ip[1]=0; a.ip[2]=0; a.ip[3]=1; a.port = 27666;
++}
++#endif
++
+ idPort clientPort, serverPort;
+ 
+ idCVar net_ip( "net_ip", "localhost", CVAR_SYSTEM, "local IP address" );
+@@ -171,6 +209,13 @@ Sys_StringToAdr
+ =============
+ */
+ bool Sys_StringToNetAdr( const char *s, netadr_t * a, bool doDNSResolve ) {
++#ifdef __EMSCRIPTEN__
++	// No DNS/sockets in the browser; the bridge fronts the server. Resolve to the
++	// synthetic loopback adr (optionally honoring an explicit :port).
++	Arco_ServerAdr( *a );
++	{ const char *col = strchr( s, ':' ); if ( col ) a->port = (unsigned short)atoi( col + 1 ); }
++	return true;
++#else
+ 	struct sockaddr_in sadr;
+ 
+ 	if ( !StringToSockaddr( s, &sadr, doDNSResolve ) ) {
+@@ -179,6 +224,7 @@ bool Sys_StringToNetAdr( const char *s, netadr_t * a, bool doDNSResolve ) {
+ 
+ 	SockadrToNetadr( &sadr, a );
+ 	return true;
++#endif
+ }
+ 
+ /*
+@@ -277,6 +323,13 @@ void Sys_InitNetworking(void)
+ 
+ 	num_interfaces = 0;
+ 
++#ifdef __EMSCRIPTEN__
++	// The browser sandbox has no network interfaces to enumerate (getifaddrs
++	// is unsupported); networking is unused in the wearable single-player build.
++	common->Printf( "InitNetworking: skipped (Emscripten browser build)\n" );
++	return;
++#endif
++
+ 	if( getifaddrs( &ifap ) < 0 ) {
+ 		common->FatalError( "InitNetworking: SIOCGIFCONF error - %s\n", strerror( errno ) );
+ 		return;
+@@ -412,6 +465,9 @@ idPort::Close
+ ==================
+ */
+ void idPort::Close() {
++#ifdef __EMSCRIPTEN__
++	arco_ws_close(); netSocket = 0; return;
++#endif
+ 	if ( netSocket ) {
+ 		close(netSocket);
+ 		netSocket = 0;
+@@ -425,6 +481,13 @@ idPort::GetPacket
+ ==================
+ */
+ bool idPort::GetPacket( netadr_t &net_from, void *data, int &size, int maxSize ) {
++#ifdef __EMSCRIPTEN__
++	int n = arco_ws_recv( (int)(uintptr_t)data, maxSize );
++	if ( n <= 0 ) return false;
++	Arco_ServerAdr( net_from );
++	size = n;
++	return true;
++#else
+ 	int ret;
+ 	struct sockaddr_in from;
+ 	int fromlen;
+@@ -450,6 +513,7 @@ bool idPort::GetPacket( netadr_t &net_from, void *data, int &size, int maxSize )
+ 	SockadrToNetadr( &from, &net_from );
+ 	size = ret;
+ 	return true;
++#endif
+ }
+ 
+ /*
+@@ -458,6 +522,10 @@ idPort::GetPacketBlocking
+ ==================
+ */
+ bool idPort::GetPacketBlocking( netadr_t &net_from, void *data, int &size, int maxSize, int timeout ) {
++#ifdef __EMSCRIPTEN__
++	// No select() blocking in the browser — single poll; callers retry across frames.
++	return GetPacket( net_from, data, size, maxSize );
++#else
+ 	fd_set				set;
+ 	struct timeval		tv;
+ 	int					ret;
+@@ -502,6 +570,7 @@ bool idPort::GetPacketBlocking( netadr_t &net_from, void *data, int &size, int m
+ 	SockadrToNetadr( &from, &net_from );
+ 	size = ret;
+ 	return true;
++#endif
+ }
+ 
+ /*
+@@ -510,6 +579,10 @@ idPort::SendPacket
+ ==================
+ */
+ void idPort::SendPacket( const netadr_t to, const void *data, int size ) {
++#ifdef __EMSCRIPTEN__
++	arco_ws_send( (int)(uintptr_t)data, size );
++	return;
++#endif
+ 	int ret;
+ 	struct sockaddr_in addr;
+ 
+@@ -536,6 +609,13 @@ idPort::InitForPort
+ ==================
+ */
+ bool idPort::InitForPort( int portNumber ) {
++#ifdef __EMSCRIPTEN__
++	arco_ws_open();
++	bound_to.type = NA_IP; bound_to.ip[0]=127; bound_to.ip[1]=0; bound_to.ip[2]=0; bound_to.ip[3]=1;
++	bound_to.port = (unsigned short)( portNumber ? portNumber : 1 );
++	netSocket = 1; // non-zero so the port reads as "open"
++	return true;
++#endif
+ 	netSocket = IPSocket( net_ip.GetString(), portNumber, &bound_to );
+ 	if ( netSocket <= 0 ) {
+ 		netSocket = 0;
+diff --git a/neo/sys/wasm/d3_runtime_exports.js b/neo/sys/wasm/d3_runtime_exports.js
+new file mode 100644
+index 0000000..2e7755b
+--- /dev/null
++++ b/neo/sys/wasm/d3_runtime_exports.js
+@@ -0,0 +1,28 @@
++// Meta Ray-Ban Display: re-expose Emscripten runtime helpers on Module so the
++// web app shell (src/d3Runtime.js) can install PK4 data and call main itself.
++(function () {
++	if (typeof callMain === "function") {
++		Module["callMain"] = callMain;
++	}
++	if (typeof ccall === "function") {
++		Module["ccall"] = ccall;
++	}
++	if (typeof cwrap === "function") {
++		Module["cwrap"] = cwrap;
++	}
++	if (typeof FS === "object") {
++		Module["FS"] = FS;
++	}
++	if (typeof FS_createPath === "function") {
++		Module["FS_createPath"] = FS_createPath;
++	}
++	if (typeof FS_createDataFile === "function") {
++		Module["FS_createDataFile"] = FS_createDataFile;
++	}
++	if (typeof addRunDependency === "function") {
++		Module["addRunDependency"] = addRunDependency;
++	}
++	if (typeof removeRunDependency === "function") {
++		Module["removeRunDependency"] = removeRunDependency;
++	}
++}());
+diff --git a/neo/sys/wasm/embed/base/autoexec.cfg b/neo/sys/wasm/embed/base/autoexec.cfg
+new file mode 100644
+index 0000000..350f6f7
+--- /dev/null
++++ b/neo/sys/wasm/embed/base/autoexec.cfg
+@@ -0,0 +1,6 @@
++seta com_skipIntroVideos "1"
++seta r_fullscreen "0"
++seta r_customWidth "600"
++seta r_customHeight "600"
++seta r_mode "-1"
++seta in_mouse "0"
+diff --git a/neo/tools/compilers/aas/AASFile.cpp b/neo/tools/compilers/aas/AASFile.cpp
+index bcbb8a0..297416a 100644
+--- a/neo/tools/compilers/aas/AASFile.cpp
++++ b/neo/tools/compilers/aas/AASFile.cpp
+@@ -1200,6 +1200,272 @@ bool idAASFileLocal::Load( const idStr &fileName, unsigned int mapFileCRC ) {
+ 	return true;
+ }
+ 
++/*
++================================================================================
++
++	Binary AAS cache (.baas48)
++
++	Boot-speed: the ASCII .aas48 is multi-MB and parsed by idLexer at map load —
++	the same tokenizer cost class the .bcm/.bmap/.bproc bakes eliminated (CLAUDE.md
++	iter 62). WriteBinary dumps the in-memory lists raw; because the bake writes the
++	binary right after an ASCII Load, the dumped floats are exactly the %f-rounded
++	values the engine already uses, so a binary load is bit-identical to the ASCII
++	load (same routing tables, same AI). The small/complex idAASSettings is kept as
++	an embedded ASCII blob (cheap to parse, zero risk of missing a field) and the
++	rare TFL_SPECIAL reach dicts go through idDict's binary I/O. CRC-guarded with
++	ASCII fallback; toggle off with aas_binaryCache 0.
++
++================================================================================
++*/
++
++idCVar aas_binaryCache( "aas_binaryCache", "1", CVAR_SYSTEM | CVAR_BOOL, "use the binary .baas48 AAS cache (0 = ASCII .aas48 only)" );
++
++static const int BAAS_MAGIC   = ('B'<<0) | ('A'<<8) | ('A'<<16) | ('S'<<24);	// "BAAS"
++static const int BAAS_VERSION = 1;
++
++static void Reachability_WriteBinary( idFile *fp, idReachability *reach ) {
++	fp->WriteInt( reach->travelType );
++	fp->WriteInt( reach->toAreaNum );
++	fp->WriteFloat( reach->start.x ); fp->WriteFloat( reach->start.y ); fp->WriteFloat( reach->start.z );
++	fp->WriteFloat( reach->end.x );   fp->WriteFloat( reach->end.y );   fp->WriteFloat( reach->end.z );
++	fp->WriteInt( reach->edgeNum );
++	fp->WriteInt( reach->travelTime );
++}
++
++static void Reachability_ReadBinary( idFile *fp, idReachability *reach ) {
++	int i;
++	fp->ReadInt( i ); reach->travelType = i;
++	fp->ReadInt( i ); reach->toAreaNum = i;
++	fp->ReadFloat( reach->start.x ); fp->ReadFloat( reach->start.y ); fp->ReadFloat( reach->start.z );
++	fp->ReadFloat( reach->end.x );   fp->ReadFloat( reach->end.y );   fp->ReadFloat( reach->end.z );
++	fp->ReadInt( i ); reach->edgeNum = i;
++	fp->ReadInt( i ); reach->travelTime = i;
++}
++
++/*
++================
++idAASFileLocal::WriteBinary
++================
++*/
++bool idAASFileLocal::WriteBinary( const idStr &fileName, unsigned int mapFileCRC ) {
++	int i, num;
++	idReachability *reach;
++
++	idFile *fp = fileSystem->OpenFileWrite( fileName, "fs_devpath" );
++	if ( !fp ) {
++		common->Warning( "Error opening %s", fileName.c_str() );
++		return false;
++	}
++	name = fileName;
++	crc = mapFileCRC;
++
++	fp->WriteInt( BAAS_MAGIC );
++	fp->WriteInt( BAAS_VERSION );
++	fp->WriteUnsignedInt( mapFileCRC );
++
++	// settings as an embedded ASCII blob (parsed by FromParser on load)
++	idFile_Memory mem( "aassettings" );
++	settings.WriteToFile( &mem );
++	int slen = mem.Length();
++	fp->WriteInt( slen );
++	if ( slen > 0 ) {
++		fp->Write( mem.GetDataPtr(), slen );
++	}
++
++	fp->WriteInt( planeList.Num() );
++	for ( i = 0; i < planeList.Num(); i++ ) {
++		fp->WriteFloat( planeList[i].Normal().x );
++		fp->WriteFloat( planeList[i].Normal().y );
++		fp->WriteFloat( planeList[i].Normal().z );
++		fp->WriteFloat( planeList[i].Dist() );
++	}
++	fp->WriteInt( vertices.Num() );
++	for ( i = 0; i < vertices.Num(); i++ ) {
++		fp->WriteFloat( vertices[i].x ); fp->WriteFloat( vertices[i].y ); fp->WriteFloat( vertices[i].z );
++	}
++	fp->WriteInt( edges.Num() );
++	for ( i = 0; i < edges.Num(); i++ ) {
++		fp->WriteInt( edges[i].vertexNum[0] ); fp->WriteInt( edges[i].vertexNum[1] );
++	}
++	fp->WriteInt( edgeIndex.Num() );
++	for ( i = 0; i < edgeIndex.Num(); i++ ) { fp->WriteInt( edgeIndex[i] ); }
++	fp->WriteInt( faces.Num() );
++	for ( i = 0; i < faces.Num(); i++ ) {
++		fp->WriteInt( faces[i].planeNum ); fp->WriteInt( faces[i].flags );
++		fp->WriteInt( faces[i].areas[0] ); fp->WriteInt( faces[i].areas[1] );
++		fp->WriteInt( faces[i].firstEdge ); fp->WriteInt( faces[i].numEdges );
++	}
++	fp->WriteInt( faceIndex.Num() );
++	for ( i = 0; i < faceIndex.Num(); i++ ) { fp->WriteInt( faceIndex[i] ); }
++	fp->WriteInt( areas.Num() );
++	for ( i = 0; i < areas.Num(); i++ ) {
++		fp->WriteInt( areas[i].flags ); fp->WriteInt( areas[i].contents );
++		fp->WriteInt( areas[i].firstFace ); fp->WriteInt( areas[i].numFaces );
++		fp->WriteInt( areas[i].cluster ); fp->WriteInt( areas[i].clusterAreaNum );
++		for ( num = 0, reach = areas[i].reach; reach; reach = reach->next ) { num++; }
++		fp->WriteInt( num );
++		for ( reach = areas[i].reach; reach; reach = reach->next ) {
++			Reachability_WriteBinary( fp, reach );
++			if ( reach->travelType == TFL_SPECIAL ) {
++				static_cast<idReachability_Special *>( reach )->dict.WriteToFileHandle( fp );
++			}
++		}
++	}
++	fp->WriteInt( nodes.Num() );
++	for ( i = 0; i < nodes.Num(); i++ ) {
++		fp->WriteInt( nodes[i].planeNum ); fp->WriteInt( nodes[i].children[0] ); fp->WriteInt( nodes[i].children[1] );
++	}
++	fp->WriteInt( portals.Num() );
++	for ( i = 0; i < portals.Num(); i++ ) {
++		fp->WriteInt( portals[i].areaNum );
++		fp->WriteInt( portals[i].clusters[0] ); fp->WriteInt( portals[i].clusters[1] );
++		fp->WriteInt( portals[i].clusterAreaNum[0] ); fp->WriteInt( portals[i].clusterAreaNum[1] );
++	}
++	fp->WriteInt( portalIndex.Num() );
++	for ( i = 0; i < portalIndex.Num(); i++ ) { fp->WriteInt( portalIndex[i] ); }
++	fp->WriteInt( clusters.Num() );
++	for ( i = 0; i < clusters.Num(); i++ ) {
++		fp->WriteInt( clusters[i].numAreas ); fp->WriteInt( clusters[i].numReachableAreas );
++		fp->WriteInt( clusters[i].firstPortal ); fp->WriteInt( clusters[i].numPortals );
++	}
++
++	fileSystem->CloseFile( fp );
++	return true;
++}
++
++/*
++================
++idAASFileLocal::LoadBinary
++================
++*/
++bool idAASFileLocal::LoadBinary( const idStr &fileName, unsigned int mapFileCRC ) {
++	int i, j, num, n, t;
++
++	idFile *fp = fileSystem->OpenFileRead( fileName );
++	if ( !fp ) {
++		return false;	// no binary cache -> caller falls back to ASCII
++	}
++
++	int magic = 0, version = 0;
++	unsigned int c = 0;
++	fp->ReadInt( magic );
++	fp->ReadInt( version );
++	if ( magic != BAAS_MAGIC || version != BAAS_VERSION ) {
++		fileSystem->CloseFile( fp );
++		return false;
++	}
++	fp->ReadUnsignedInt( c );
++	if ( mapFileCRC && c != mapFileCRC ) {
++		common->Warning( "Binary AAS '%s' is out of date", fileName.c_str() );
++		fileSystem->CloseFile( fp );
++		return false;
++	}
++
++	name = fileName;
++	crc = mapFileCRC;
++	Clear();
++
++	// settings blob
++	int slen = 0;
++	fp->ReadInt( slen );
++	if ( slen > 0 ) {
++		char *buf = (char *)Mem_Alloc( slen + 1 );
++		fp->Read( buf, slen );
++		buf[slen] = '\0';
++		idLexer lex( buf, slen, "aassettings", LEXFL_NOFATALERRORS | LEXFL_NOSTRINGESCAPECHARS | LEXFL_NOSTRINGCONCAT | LEXFL_ALLOWPATHNAMES );
++		settings.FromParser( lex );
++		Mem_Free( buf );
++	}
++
++	fp->ReadInt( num ); planeList.Resize( num );
++	for ( i = 0; i < num; i++ ) {
++		float a, b, d, e;
++		fp->ReadFloat( a ); fp->ReadFloat( b ); fp->ReadFloat( d ); fp->ReadFloat( e );
++		idPlane plane; plane.SetNormal( idVec3( a, b, d ) ); plane.SetDist( e );
++		planeList.Append( plane );
++	}
++	fp->ReadInt( num ); vertices.Resize( num );
++	for ( i = 0; i < num; i++ ) {
++		idVec3 v; fp->ReadFloat( v.x ); fp->ReadFloat( v.y ); fp->ReadFloat( v.z );
++		vertices.Append( v );
++	}
++	fp->ReadInt( num ); edges.Resize( num );
++	for ( i = 0; i < num; i++ ) {
++		aasEdge_t edge; fp->ReadInt( t ); edge.vertexNum[0] = t; fp->ReadInt( t ); edge.vertexNum[1] = t;
++		edges.Append( edge );
++	}
++	fp->ReadInt( num ); edgeIndex.Resize( num );
++	for ( i = 0; i < num; i++ ) { aasIndex_t idx; fp->ReadInt( t ); idx = t; edgeIndex.Append( idx ); }
++	fp->ReadInt( num ); faces.Resize( num );
++	for ( i = 0; i < num; i++ ) {
++		aasFace_t face;
++		fp->ReadInt( t ); face.planeNum = t; fp->ReadInt( t ); face.flags = t;
++		fp->ReadInt( t ); face.areas[0] = t; fp->ReadInt( t ); face.areas[1] = t;
++		fp->ReadInt( t ); face.firstEdge = t; fp->ReadInt( t ); face.numEdges = t;
++		faces.Append( face );
++	}
++	fp->ReadInt( num ); faceIndex.Resize( num );
++	for ( i = 0; i < num; i++ ) { aasIndex_t idx; fp->ReadInt( t ); idx = t; faceIndex.Append( idx ); }
++	fp->ReadInt( num ); areas.Resize( num );
++	for ( i = 0; i < num; i++ ) {
++		aasArea_t area;
++		fp->ReadInt( t ); area.flags = t; fp->ReadInt( t ); area.contents = t;
++		fp->ReadInt( t ); area.firstFace = t; fp->ReadInt( t ); area.numFaces = t;
++		fp->ReadInt( t ); area.cluster = t; fp->ReadInt( t ); area.clusterAreaNum = t;
++		area.reach = NULL; area.rev_reach = NULL; area.bounds.Zero(); area.center.Zero(); area.travelFlags = 0;
++		areas.Append( area );
++		// reachabilities (appended to preserve the exact ASCII-load order)
++		fp->ReadInt( n );
++		areas[i].travelFlags = AreaContentsTravelFlags( i );
++		idReachability *lastReach = NULL;
++		for ( j = 0; j < n; j++ ) {
++			idReachability rbase, *newReach;
++			Reachability_ReadBinary( fp, &rbase );
++			if ( rbase.travelType == TFL_SPECIAL ) {
++				idReachability_Special *special = new idReachability_Special();
++				special->dict.ReadFromFileHandle( fp );
++				newReach = special;
++			} else {
++				newReach = new idReachability();
++			}
++			newReach->CopyBase( rbase );
++			newReach->fromAreaNum = i;
++			newReach->next = NULL;
++			if ( lastReach ) { lastReach->next = newReach; } else { areas[i].reach = newReach; }
++			lastReach = newReach;
++		}
++	}
++	LinkReversedReachability();
++	fp->ReadInt( num ); nodes.Resize( num );
++	for ( i = 0; i < num; i++ ) {
++		aasNode_t node; fp->ReadInt( t ); node.planeNum = t; fp->ReadInt( t ); node.children[0] = t; fp->ReadInt( t ); node.children[1] = t;
++		nodes.Append( node );
++	}
++	fp->ReadInt( num ); portals.Resize( num );
++	for ( i = 0; i < num; i++ ) {
++		aasPortal_t portal;
++		fp->ReadInt( t ); portal.areaNum = t;
++		fp->ReadInt( t ); portal.clusters[0] = t; fp->ReadInt( t ); portal.clusters[1] = t;
++		fp->ReadInt( t ); portal.clusterAreaNum[0] = t; fp->ReadInt( t ); portal.clusterAreaNum[1] = t;
++		portals.Append( portal );
++	}
++	fp->ReadInt( num ); portalIndex.Resize( num );
++	for ( i = 0; i < num; i++ ) { aasIndex_t idx; fp->ReadInt( t ); idx = t; portalIndex.Append( idx ); }
++	fp->ReadInt( num ); clusters.Resize( num );
++	for ( i = 0; i < num; i++ ) {
++		aasCluster_t cluster;
++		fp->ReadInt( t ); cluster.numAreas = t; fp->ReadInt( t ); cluster.numReachableAreas = t;
++		fp->ReadInt( t ); cluster.firstPortal = t; fp->ReadInt( t ); cluster.numPortals = t;
++		clusters.Append( cluster );
++	}
++
++	fileSystem->CloseFile( fp );
++
++	FinishAreas();
++
++	return true;
++}
++
+ /*
+ ================
+ idAASFileLocal::MemorySize
+diff --git a/neo/tools/compilers/aas/AASFileManager.cpp b/neo/tools/compilers/aas/AASFileManager.cpp
+index 1a89498..be22ca9 100644
+--- a/neo/tools/compilers/aas/AASFileManager.cpp
++++ b/neo/tools/compilers/aas/AASFileManager.cpp
+@@ -27,6 +27,7 @@ If you have questions concerning this license or the applicable additional terms
+ */
+ 
+ #include "sys/platform.h"
++#include "framework/CVarSystem.h"
+ #include "tools/compilers/aas/AASFileManager.h"
+ 
+ #include "tools/compilers/aas/AASFile_local.h"
+@@ -56,12 +57,30 @@ idAASFileManager *				AASFileManager = &AASFileManagerLocal;
+ idAASFileManagerLocal::LoadAAS
+ ================
+ */
++extern idCVar aas_binaryCache;
++
+ idAASFile *idAASFileManagerLocal::LoadAAS( const char *fileName, unsigned int mapFileCRC ) {
+ 	idAASFileLocal *file = new idAASFileLocal();
++
++	// Boot-speed: prefer the binary .baas48 cache (skips the idLexer ASCII parse
++	// of the multi-MB .aas48 — same lever as the .bcm/.bmap/.bproc bakes).
++	idStr binaryName = fileName;
++	binaryName.SetFileExtension( "baas48" );
++	if ( aas_binaryCache.GetBool() && file->LoadBinary( binaryName, mapFileCRC ) ) {
++		return file;
++	}
++
+ 	if ( !file->Load( fileName, mapFileCRC ) ) {
+ 		delete file;
+ 		return NULL;
+ 	}
++
++	// Write the binary cache so the bake / next boot can skip the ASCII parse.
++	// (Verified bit-identical to the ASCII load via a round-trip ASCII-dump diff.)
++	if ( aas_binaryCache.GetBool() ) {
++		file->WriteBinary( binaryName, mapFileCRC );
++	}
++
+ 	return file;
+ }
+ 
+diff --git a/neo/tools/compilers/aas/AASFile_local.h b/neo/tools/compilers/aas/AASFile_local.h
+index cb91cf5..dfcf586 100644
+--- a/neo/tools/compilers/aas/AASFile_local.h
++++ b/neo/tools/compilers/aas/AASFile_local.h
+@@ -66,6 +66,10 @@ public:
+ public:
+ 	bool						Load( const idStr &fileName, unsigned int mapFileCRC );
+ 	bool						Write( const idStr &fileName, unsigned int mapFileCRC );
++	// Boot-speed: binary .baas48 cache that skips the idLexer ASCII parse of the
++	// multi-MB .aas48 (same lever as the .bcm/.bmap/.bproc bakes, CLAUDE.md iter 62).
++	bool						LoadBinary( const idStr &fileName, unsigned int mapFileCRC );
++	bool						WriteBinary( const idStr &fileName, unsigned int mapFileCRC );
+ 
+ 	int							MemorySize( void ) const;
+ 	void						ReportRoutingEfficiency( void ) const;

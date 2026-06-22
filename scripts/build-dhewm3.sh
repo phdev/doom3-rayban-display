@@ -4,15 +4,17 @@ set -euo pipefail
 # Build dhewm3 (DOOM 3) as a WebAssembly engine for Meta Ray-Ban Display.
 #
 # This is an EXPERIMENTAL target: dhewm3 does not ship an official Emscripten
-# build. The patch in patches/dhewm3-meta-rayban-display.patch is generated
-# against the pinned commit below; if you bump DHEWM3_COMMIT you may need to
-# regenerate it. See NOTICE.md / README.md for status.
+# build. The patches in patches/rayban-base.patch + patches/rayban-renderer.patch are
+# generated against the pinned commit below (split by file: neo/renderer vs the rest, so the
+# renderer and game/combat can be regenerated independently); if you bump DHEWM3_COMMIT you may
+# need to regenerate them. See NOTICE.md / README.md for status.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${DHEWM3_BUILD_DIR:-$ROOT_DIR/.build/dhewm3}"
 UPSTREAM_REPO="${DHEWM3_REPO:-https://github.com/dhewm/dhewm3.git}"
 DHEWM3_COMMIT="${DHEWM3_COMMIT:-8ebc11260d52638d2aff12ce73fbfccaa70db1b9}"
-PATCH_FILE="$ROOT_DIR/patches/dhewm3-meta-rayban-display.patch"
+BASE_PATCH="$ROOT_DIR/patches/rayban-base.patch"
+RENDER_PATCH="$ROOT_DIR/patches/rayban-renderer.patch"
 PUBLIC_WASM="$ROOT_DIR/public/wasm"
 EMBED_DIR="$BUILD_DIR/neo/sys/wasm/embed"
 # Vendored OpenAL-Soft EFX headers — Emscripten's OpenAL port ships only stub
@@ -48,14 +50,23 @@ git reset --hard --quiet "$DHEWM3_COMMIT"
 # preserves incremental build state.
 git clean -fdq neo
 
-if git apply --check "$PATCH_FILE" >/dev/null 2>&1; then
-  git apply "$PATCH_FILE"
-  echo "Applied Meta Ray-Ban Display patch."
-else
-  echo "ERROR: dhewm3 patch does not apply cleanly to $DHEWM3_COMMIT; aborting" >&2
-  echo "       (regenerate patches/dhewm3-meta-rayban-display.patch from the working tree)" >&2
-  exit 1
-fi
+# The Ray-Ban patch is SPLIT into two disjoint-file patches so the renderer (Session D) and the
+# game/combat (Session A) can be regenerated INDEPENDENTLY without clobbering one shared file:
+#   rayban-base.patch     = everything EXCEPT neo/renderer (game/combat, sys, framework, cm, CMakeLists, ...)
+#   rayban-renderer.patch = neo/renderer (the WebGPU backend)
+# They touch DISJOINT files, so they apply in either order and together == the old single patch
+# (proven by a git tree-hash compare). Regenerate ONLY your half (run in $BUILD_DIR after editing):
+#   base:     git add -A -N neo && git diff -- . ':!neo/renderer' > "$ROOT_DIR"/patches/rayban-base.patch
+#   renderer: git add -A -N neo && git diff -- neo/renderer        > "$ROOT_DIR"/patches/rayban-renderer.patch
+for P in "$BASE_PATCH" "$RENDER_PATCH"; do
+  if git apply --check "$P" >/dev/null 2>&1; then
+    git apply "$P"; echo "Applied $(basename "$P")."
+  else
+    echo "ERROR: $(basename "$P") does not apply cleanly to $DHEWM3_COMMIT; aborting" >&2
+    echo "       (regenerate it from the working tree — see the comment above)" >&2
+    exit 1
+  fi
+done
 
 # Generate embedded WGSL header from webgpu-port/shaders/*.wgsl. The patch's
 # RenderBackend_WebGPU.cpp #includes wgsl/embedded_shaders.h which lives
