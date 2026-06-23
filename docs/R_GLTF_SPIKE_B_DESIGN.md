@@ -92,6 +92,19 @@ file-load fails → MakeDefault → (b) red.
   delta-upload/GPU-RSS paths tuned for static geometry — measure on device.
 
 ## Status
-Design complete + grounded. **BLOCKED on SPINE confirming the contract + implementing the two
-`neo/anim` methods** (the SPINE ask is handed to the owner). On SPINE's go: RENDER builds the parser +
-skinned model + the call, then runs the kill-criterion test (Dawn), then the phone gate.
+**SPINE HALF DONE + CONTRACT CONFIRMED (2026-06-22, rayban-base.patch `ea79367` on `render-track`).**
+SPINE verified the POD + both signatures field-for-field against `Anim.h`/`Anim.cpp` (LoadAnim 161-331,
+CheckModelHierarchy, GetAnim) and implemented `idMD5Anim::BuildFromGLTF` + `idAnimManager::RegisterMemoryAnim`
+in `neo/game/anim/Anim.{h,cpp}` only (regen verified: base patch + ONLY those 2 files, 0 renderer leakage).
+Contract is OK AS-IS — one nit: `JointIndex` is **public**, not private (the "must be members" reason still
+holds: `idMD5Anim` fields + `idAnimManager::animations` are private). **RENDER-side disciplines that are
+LOAD-BEARING (verified in source — get these wrong and it's a hard Error or a silent-wrong animation):**
+1. **Quats: canonicalize w≥0 before storing x,y,z.** `idQuat::CalcW`/`idCQuat::ToQuat` recover `w = +sqrt(|1-(x²+y²+z²)|)` (POSITIVE). A clip quat with w<0 → recovered as +w → silently INVERTED rotation (the "animates visibly wrong" risk). Normalize + flip sign so w≥0.
+2. **`joints[]` order == the model's idMD5Joint order; names + `parentNum` EXACT.** CheckModelHierarchy HARD-Errors on count / name / parent mismatch. Share ONE topo-sort between `gltfSkin_t` (model) and `gltfAnimClip_t.joints` (anim).
+3. **`clip.name` must EXACTLY equal the `.def` anim token, ending `.md5anim`** — that's the GetAnim key; RegisterMemoryAnim pre-inserts under it so GetAnim(token) is a cache hit (never file-loads).
+4. **Simplest correct packing: `animBits = 0x3F` for every joint + fill `frames` fully** (full idJointQuat per joint per frame). SPINE derives `firstComponent`/`numAnimatedComponents` from popcount and extracts only the flagged channels; `baseFrame` is the reference for any non-animated channel + the w-sign + totaldelta. Provide `bounds` (numFrames entries) for correct culling; else SPINE uses a conservative box (may cull wrong for large models).
+5. **Build dependency:** the `gltfSkelJoint_t`/`gltfAnimClip_t` POD must be declared in `neo/renderer/Model.h` in the SAME build — SPINE's `Anim.h`/`Anim.cpp` reference `gltfAnimClip_t` (Anim.h already `#include "renderer/Model.h"`), so a build with the base patch but without the Model.h POD won't compile. Land both halves together.
+
+NOTE: committed on `render-track` to unblock the spike; cherry-pick/merge to `main` (SPINE line) when the
+spike concludes. **NOW UNBLOCKED:** RENDER builds the parser + skinned model + the `RegisterMemoryAnim`
+call, then runs the kill-criterion (Dawn) → phone gate.
