@@ -1,0 +1,68 @@
+// R-MBLUR: camera motion blur via DEPTH RECONSTRUCTION (fullscreen post-pass,
+// after tonemap / before GUI). Reconstruct each pixel's world position from the
+// depth buffer + the inverse current view-projection, reproject it through the
+// PREVIOUS frame's view-projection, and blur the composited scene copy along the
+// resulting screen-space velocity. Deterministic (cur/prev VP are fixed per
+// frame) -> __d3WgpuDet-safe, like the R0 tonemap pass. Camera-only (no per-object
+// velocity buffer): the mobile-friendly variant.
+//
+// Conventions (the convention pitfalls the review flagged):
+//  - depth is the WebGPU depth buffer value [0,1]; the port's vertex shaders store
+//    z' = (glClipZ + w)/2, so GL NDC z = 2*d - 1.
+//  - framebuffer uv is y-down; GL NDC is y-up -> ndc.y = 1 - 2*uv.y.
+//  - invCurVP / prevVP are the GL-convention (column-major) view-projections.
+//  - textureSampleLevel (not textureSample) so sampling is legal under the
+//    conditional early-outs (no implicit-derivative uniform-control-flow rule).
+
+struct MB {
+  invCurVP    : mat4x4<f32>,
+  prevVP      : mat4x4<f32>,
+  screenSize  : vec2<f32>,
+  scale       : f32,
+  maxOffsetPx : f32,
+  samples     : f32,
+  zeroVel     : f32,
+  pad         : vec2<f32>,
+};
+@group(0) @binding(0) var<uniform> u : MB;
+@group(0) @binding(1) var sceneTex : texture_2d<f32>;
+@group(0) @binding(2) var sceneSamp : sampler;
+@group(0) @binding(3) var depthTex : texture_depth_2d;
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {
+  var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+  return vec4<f32>(p[vi], 0.0, 1.0);
+}
+
+@fragment
+fn fs_main(@builtin(position) fc : vec4<f32>) -> @location(0) vec4<f32> {
+  let uv = fc.xy / u.screenSize;                                  // [0,1], framebuffer (y-down)
+  let scene = textureSampleLevel(sceneTex, sceneSamp, uv, 0.0);
+  if (u.zeroVel > 0.5 || u.scale < 0.01) { return scene; }         // disabled / mutation -> identity
+  let d = textureLoad(depthTex, vec2<i32>(fc.xy), 0);              // [0,1] WebGPU depth
+  if (d >= 0.9999) { return scene; }                               // skybox / far plane -> no blur
+  let ndc = vec3<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 2.0 * d - 1.0);  // GL NDC
+  let wH = u.invCurVP * vec4<f32>(ndc, 1.0);
+  if (abs(wH.w) < 1e-6) { return scene; }
+  let world = wH.xyz / wH.w;
+  let pH = u.prevVP * vec4<f32>(world, 1.0);
+  if (pH.w <= 1e-4) { return scene; }                              // behind the previous camera
+  let pNdc = pH.xy / pH.w;                                          // GL NDC, y-up
+  let pUv = vec2<f32>(pNdc.x * 0.5 + 0.5, 0.5 - pNdc.y * 0.5);      // -> framebuffer uv (y-down)
+  var velPx = (uv - pUv) * u.screenSize;                           // pixels, current - previous
+  if (!(dot(velPx, velPx) >= 0.0)) { return scene; }               // NaN guard (false for NaN)
+  let len = length(velPx);
+  if (len > u.maxOffsetPx) { velPx = velPx * (u.maxOffsetPx / len); }
+  velPx = velPx * u.scale;
+  if (length(velPx) < 0.5) { return scene; }                       // sub-pixel -> no blur
+  let velUv = velPx / u.screenSize;
+  let cnt = max(2, i32(u.samples));
+  let fcnt = f32(cnt);
+  var acc = vec4<f32>(0.0);
+  for (var i = 0; i < cnt; i = i + 1) {
+    let t = (f32(i) / (fcnt - 1.0)) - 0.5;                         // -0.5 .. 0.5, centered
+    acc = acc + textureSampleLevel(sceneTex, sceneSamp, uv + velUv * t, 0.0);
+  }
+  return acc / fcnt;
+}

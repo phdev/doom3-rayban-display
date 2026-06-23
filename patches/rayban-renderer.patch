@@ -1982,10 +1982,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..6551d5a
+index 0000000..1eb44c3
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,4816 @@
+@@ -0,0 +1,4960 @@
 +/*
 +================================================================================
 +
@@ -2136,6 +2136,15 @@ index 0000000..6551d5a
 +extern "C" uint32_t g_capTonemapOn;
 +extern "C" float    g_capTonemapExposure;
 +extern "C" uint32_t g_capTonemapDither;
++// R-MBLUR: camera motion blur mirrors + the primary-view VP / inverse-VP.
++extern "C" uint32_t g_capMotionBlurOn;
++extern "C" float    g_capMotionBlurScale;
++extern "C" int      g_capMotionBlurSamples;
++extern "C" float    g_capMotionBlurMaxOffset;
++extern "C" uint32_t g_capMotionBlurZeroVel;
++extern "C" uint32_t g_capInCinematic;
++extern "C" float    g_mbViewProj[16];
++extern "C" float    g_mbInvViewProj[16];
 +extern "C" int D3_WebGPU_CachedImageCount( void );
 +extern "C" const void* D3_WebGPU_CachedImagePtr( int i );
 +
@@ -2281,6 +2290,7 @@ index 0000000..6551d5a
 +            initFogPipeline();
 +            initHazePipeline();
 +            initBloomPipelines();
++            initMotionBlurPipeline();
 +            initBlendPipelines();
 +            initSkyPipeline();
 +            initReflectPipeline();
@@ -3150,6 +3160,72 @@ index 0000000..6551d5a
 +        currentRenderView = currentRenderTex ? wgpuTextureCreateView(currentRenderTex, nullptr) : nullptr;
 +        currentRenderW = w; currentRenderH = h;
 +        currentRenderGen++;   // existing haze bind groups now stale
++    }
++
++    // R-MBLUR: camera motion-blur pipeline (motionblur.wgsl) — fullscreen pass,
++    // own BGL (UB + scene color + sampler + depth-as-texture_depth_2d). REPLACE blend.
++    void initMotionBlurPipeline() {
++        WGPUShaderSourceWGSL wgsl = {};
++        wgsl.chain.sType = WGPUSType_ShaderSourceWGSL;
++        wgsl.code = { kWGSL_motionblur, WGPU_STRLEN };
++        WGPUShaderModuleDescriptor smd = {};
++        smd.nextInChain = &wgsl.chain;
++        WGPUShaderModule mod = wgpuDeviceCreateShaderModule(device, &smd);
++        if (!mod) { fprintf(stderr, "[WebGPU] motionblur.wgsl create FAILED\n"); return; }
++
++        WGPUBindGroupLayoutEntry ble[4] = {};
++        ble[0].binding = 0;   // MB uniform (matrices + params)
++        ble[0].visibility = WGPUShaderStage_Fragment;
++        ble[0].buffer.type = WGPUBufferBindingType_Uniform;
++        ble[0].buffer.minBindingSize = 160;
++        ble[1].binding = 1;   // scene color copy
++        ble[1].visibility = WGPUShaderStage_Fragment;
++        ble[1].texture.sampleType = WGPUTextureSampleType_Float;
++        ble[1].texture.viewDimension = WGPUTextureViewDimension_2D;
++        ble[2].binding = 2;   // scene sampler (filtering)
++        ble[2].visibility = WGPUShaderStage_Fragment;
++        ble[2].sampler.type = WGPUSamplerBindingType_Filtering;
++        ble[3].binding = 3;   // depth (sampled via textureLoad as texture_depth_2d)
++        ble[3].visibility = WGPUShaderStage_Fragment;
++        ble[3].texture.sampleType = WGPUTextureSampleType_Depth;
++        ble[3].texture.viewDimension = WGPUTextureViewDimension_2D;
++        WGPUBindGroupLayoutDescriptor bld = {};
++        bld.entryCount = 4;
++        bld.entries = ble;
++        motionBlurBGL = wgpuDeviceCreateBindGroupLayout(device, &bld);
++        WGPUPipelineLayoutDescriptor pld = {};
++        pld.bindGroupLayoutCount = 1;
++        pld.bindGroupLayouts = &motionBlurBGL;
++        WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(device, &pld);
++
++        WGPUColorTargetState target = {};
++        target.format = surfaceFormat;
++        target.writeMask = WGPUColorWriteMask_All;
++        WGPUBlendState blend = {};
++        blend.color.srcFactor = WGPUBlendFactor_One; blend.color.dstFactor = WGPUBlendFactor_Zero;
++        blend.alpha.srcFactor = WGPUBlendFactor_One; blend.alpha.dstFactor = WGPUBlendFactor_Zero;
++        target.blend = &blend;
++        WGPUFragmentState frag = {};
++        frag.module = mod;
++        frag.entryPoint = { "fs_main", WGPU_STRLEN };
++        frag.targetCount = 1;
++        frag.targets = &target;
++        WGPURenderPipelineDescriptor pd = {};
++        pd.label = { "motionBlur", WGPU_STRLEN };
++        pd.layout = pl;
++        pd.vertex.module = mod;
++        pd.vertex.entryPoint = { "vs_main", WGPU_STRLEN };
++        pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
++        pd.primitive.cullMode = WGPUCullMode_None;
++        pd.multisample.count = 1;
++        pd.multisample.mask = 0xFFFFFFFF;
++        pd.fragment = &frag;
++        motionBlurPipeline = wgpuDeviceCreateRenderPipeline(device, &pd);
++
++        WGPUBufferDescriptor ubd = {};
++        ubd.size = 160;
++        ubd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
++        motionBlurUB = wgpuDeviceCreateBuffer(device, &ubd);
 +    }
 +
 +    // Iter 19: bloom pipelines (bloom.wgsl) — fullscreen-triangle passes,
@@ -5520,7 +5596,9 @@ index 0000000..6551d5a
 +            // R0: tonemap grade — loose active flag (mirrors bloomActive); the
 +            // ensureCurrentRenderTarget + size-match guard live inside the block.
 +            const bool tonemapActive = g_capTonemapOn && tonemapPipeline && tonemapUB && bloomBGL && colorTex;
-+            const bool splitGUI = hazeActive || bloomActive || tonemapActive;   // GUI draws after post-FX (incl. the grade — HUD must not be tone-crushed)
++            // R-MBLUR: camera motion blur — after tonemap, before GUI; suppressed in cinematics.
++            const bool motionBlurActive = g_capMotionBlurOn && motionBlurPipeline && motionBlurUB && motionBlurBGL && depthSampleView && colorTex && g_capMotionBlurScale > 0.01f && !g_capInCinematic;
++            const bool splitGUI = hazeActive || bloomActive || tonemapActive || motionBlurActive;   // GUI draws after post-FX (HUD must not be tone-crushed / blurred)
 +            WGPURenderPassColorAttachment ca = {};
 +            ca.view = color;
 +            ca.loadOp = colorCleared ? WGPULoadOp_Load : WGPULoadOp_Clear;
@@ -5796,6 +5874,72 @@ index 0000000..6551d5a
 +                        wgpuRenderPassEncoderRelease(frp);
 +                        tonemapDrawCount++;   // gate: must advance inside det rounds
 +                    }
++                }
++            }
++
++            // R-MBLUR: camera motion blur — copy the (post-tonemap) frame into
++            // currentRenderTex and blur it back into `color` along the screen-space
++            // velocity reconstructed from depth + cur/prev VP. After tonemap, before
++            // GUI. One extra copy + one fullscreen pass + one writeBuffer when on.
++            if (motionBlurActive) {
++                ensureCurrentRenderTarget((uint32_t)depthW, (uint32_t)depthH);
++                if (currentRenderTex && currentRenderView && depthSampleView &&
++                    currentRenderW == (uint32_t)depthW && currentRenderH == (uint32_t)depthH) {
++                    WGPUTexelCopyTextureInfo src = {}; src.texture = colorTex;
++                    WGPUTexelCopyTextureInfo dst = {}; dst.texture = currentRenderTex;
++                    WGPUExtent3D ext = { currentRenderW, currentRenderH, 1 };
++                    wgpuCommandEncoderCopyTextureToTexture(enc, &src, &dst, &ext);
++
++                    // first frame (or first active frame): prev = cur so velocity is 0.
++                    if (!mbPrevValid) { memcpy(mbPrevViewProj, g_mbViewProj, 64); mbPrevValid = true; }
++
++                    // UB: invCurVP[16], prevVP[16], screenSize, scale, maxOffset, samples, zeroVel, pad
++                    float ub[40];
++                    memcpy(&ub[0],  g_mbInvViewProj, 64);
++                    memcpy(&ub[16], mbPrevViewProj,  64);
++                    ub[32] = (float)currentRenderW; ub[33] = (float)currentRenderH;
++                    ub[34] = g_capMotionBlurScale;
++                    ub[35] = g_capMotionBlurMaxOffset;
++                    ub[36] = (float)g_capMotionBlurSamples;
++                    ub[37] = g_capMotionBlurZeroVel ? 1.0f : 0.0f;
++                    ub[38] = 0.0f; ub[39] = 0.0f;
++                    wgpuQueueWriteBuffer(queue, motionBlurUB, 0, ub, 160);
++
++                    if (motionBlurBGGen != currentRenderGen || !motionBlurBG) {
++                        if (motionBlurBG) { wgpuBindGroupRelease(motionBlurBG); motionBlurBG = nullptr; }
++                        WGPUBindGroupEntry e[4] = {};
++                        e[0].binding = 0; e[0].buffer = motionBlurUB; e[0].size = 160;
++                        e[1].binding = 1; e[1].textureView = currentRenderView;
++                        e[2].binding = 2; e[2].sampler = interactionLightSampler;
++                        e[3].binding = 3; e[3].textureView = depthSampleView;
++                        WGPUBindGroupDescriptor bgd = {};
++                        bgd.layout = motionBlurBGL;
++                        bgd.entryCount = 4;
++                        bgd.entries = e;
++                        motionBlurBG = wgpuDeviceCreateBindGroup(device, &bgd);
++                        motionBlurBGGen = currentRenderGen;
++                    }
++                    if (motionBlurBG) {
++                        WGPURenderPassColorAttachment fca = {};
++                        fca.view = color;
++                        fca.loadOp = WGPULoadOp_Load;
++                        fca.storeOp = WGPUStoreOp_Store;
++                        fca.clearValue = { 0.0, 0.0, 0.0, 1.0 };
++                        fca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
++                        WGPURenderPassDescriptor frpd = {};
++                        frpd.colorAttachmentCount = 1;
++                        frpd.colorAttachments = &fca;
++                        WGPURenderPassEncoder frp = wgpuCommandEncoderBeginRenderPass(enc, &frpd);
++                        wgpuRenderPassEncoderSetPipeline(frp, motionBlurPipeline);
++                        wgpuRenderPassEncoderSetBindGroup(frp, 0, motionBlurBG, 0, nullptr);
++                        wgpuRenderPassEncoderDraw(frp, 3, 1, 0, 0);
++                        wgpuRenderPassEncoderEnd(frp);
++                        wgpuRenderPassEncoderRelease(frp);
++                        motionBlurDrawCount++;
++                    }
++                    // advance prev VP for next frame (Build A: live path only; Build B
++                    // moves this strictly after the det rounds + adds the det-path pass).
++                    memcpy(mbPrevViewProj, g_mbViewProj, 64);
 +                }
 +            }
 +
@@ -6835,7 +6979,7 @@ index 0000000..0f9c8e6
 +    return nullptr;
 +}
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
-index 7914093..b0dbbbe 100644
+index 7914093..a1ccbfa 100644
 --- a/neo/renderer/RenderSystem_init.cpp
 +++ b/neo/renderer/RenderSystem_init.cpp
 @@ -39,6 +39,11 @@ If you have questions concerning this license or the applicable additional terms
@@ -6850,7 +6994,7 @@ index 7914093..b0dbbbe 100644
  
  #include "framework/GameCallbacks_local.h"
  #include "framework/Game.h"
-@@ -102,6 +107,54 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
+@@ -102,6 +107,60 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
  
  idCVar r_skipSuppress( "r_skipSuppress", "0", CVAR_RENDERER | CVAR_BOOL, "ignore the per-view suppressions" );
  idCVar r_skipPostProcess( "r_skipPostProcess", "0", CVAR_RENDERER | CVAR_BOOL, "skip all post-process renderings" );
@@ -6896,6 +7040,12 @@ index 7914093..b0dbbbe 100644
 +idCVar r_tonemap( "r_tonemap", "0", CVAR_RENDERER | CVAR_BOOL, "WebGPU R0: ACES filmic tonemap grade (deep blacks + highlight rolloff; replaces the gamma wash)" );
 +idCVar r_tonemapExposure( "r_tonemapExposure", "1.0", CVAR_RENDERER | CVAR_FLOAT, "WebGPU R0: tonemap linear exposure pre-scale (look call; live-tunable on the fx panel)" );
 +idCVar r_tonemapDither( "r_tonemapDither", "1", CVAR_RENDERER | CVAR_BOOL, "WebGPU R0: ordered dither folded into the tonemap pass (breaks 8-bit banding in crushed blacks)" );
++// R-MBLUR: camera motion blur (depth-reconstruction post-pass; default OFF, ?motionblur opt-in).
++idCVar r_motionBlur( "r_motionBlur", "0", CVAR_RENDERER | CVAR_BOOL, "WebGPU: camera motion blur (depth-reconstruction post-pass)" );
++idCVar r_motionBlurScale( "r_motionBlurScale", "1.0", CVAR_RENDERER | CVAR_FLOAT, "WebGPU motion blur: intensity scale (0 = off; live-tunable)" );
++idCVar r_motionBlurSamples( "r_motionBlurSamples", "4", CVAR_RENDERER | CVAR_INTEGER, "WebGPU motion blur: taps along the velocity vector (2/4/8)" );
++idCVar r_motionBlurMaxOffsetPixels( "r_motionBlurMaxOffsetPixels", "50", CVAR_RENDERER | CVAR_FLOAT, "WebGPU motion blur: max screen-space velocity clamp in pixels" );
++idCVar r_motionBlurZeroVelocity( "r_motionBlurZeroVelocity", "0", CVAR_RENDERER | CVAR_BOOL, "WebGPU motion blur: force zero velocity (falsifiability mutation — output must == no-blur)" );
 +idCVar r_skipGLDraw( "r_skipGLDraw", "0", CVAR_RENDERER | CVAR_BOOL,
 +	"skip GL draw calls (WebGPU-primary cutover; the WebGPU echo renders instead). "
 +	"Tiny views (lightgem) keep drawing so gameplay light readback works." );
@@ -6905,7 +7055,7 @@ index 7914093..b0dbbbe 100644
  idCVar r_skipLightScale( "r_skipLightScale", "0", CVAR_RENDERER | CVAR_BOOL, "don't do any post-interaction light scaling, makes things dim on low-dynamic range cards" );
  idCVar r_skipInteractions( "r_skipInteractions", "0", CVAR_RENDERER | CVAR_BOOL, "skip all light/surface interaction drawing" );
  idCVar r_skipDynamicTextures( "r_skipDynamicTextures", "0", CVAR_RENDERER | CVAR_BOOL, "don't dynamically create textures" );
-@@ -158,6 +211,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
+@@ -158,6 +217,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
  idCVar r_useExternalShadows( "r_useExternalShadows", "1", CVAR_RENDERER | CVAR_INTEGER, "1 = skip drawing caps when outside the light volume, 2 = force to no caps for testing", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
  idCVar r_useOptimizedShadows( "r_useOptimizedShadows", "1", CVAR_RENDERER | CVAR_BOOL, "use the dmap generated static shadow volumes" );
  idCVar r_useScissor( "r_useScissor", "1", CVAR_RENDERER | CVAR_BOOL, "scissor clip as portals and lights are processed" );
@@ -6913,7 +7063,7 @@ index 7914093..b0dbbbe 100644
  idCVar r_useCombinerDisplayLists( "r_useCombinerDisplayLists", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "put all nvidia register combiner programming in display lists" );
  idCVar r_useDepthBoundsTest( "r_useDepthBoundsTest", "1", CVAR_RENDERER | CVAR_BOOL, "use depth bounds test to reduce shadow fill" );
  
-@@ -819,11 +873,63 @@ void R_InitOpenGL( void ) {
+@@ -819,11 +879,63 @@ void R_InitOpenGL( void ) {
  		r_multiSamples.SetInteger( 0 );
  	}
  
@@ -6977,7 +7127,26 @@ index 7914093..b0dbbbe 100644
  
  #include "renderer/qgl_proc.h"
  
-@@ -2505,6 +2611,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
+@@ -910,6 +1022,18 @@ GL_CheckErrors
+ ==================
+ */
+ void GL_CheckErrors( void ) {
++#ifdef __EMSCRIPTEN__
++	// PERF (arco-doom — THE multiplayer fps fix): GL_CheckErrors runs EVERY frame (from
++	// idRenderSystemLocal::EndFrame) and loops qglGetError() up to 10x. On WASM/GL4ES each
++	// qglGetError is a SYNCHRONOUS WebGL round-trip that flushes the GL pipeline and BLOCKS the
++	// CPU until the GPU drains all pending GL commands — its latency scales with the queued GL
++	// work (the per-frame lightgem render +, in MP, the replicated imps' interactions/shadows).
++	// A CDP profile during an MP dip showed ~90% of the frame blocked HERE (getError callers =
++	// 100% GL_CheckErrors); single-player d3dm3 (no imps, tiny GL queue) was a flat 60. GL is
++	// non-primary under WebGPU (r_skipGLDraw) and its errors are cosmetic, so skip the per-frame
++	// synchronous error drain entirely. (This is the real fix the renderer/netcode hunts circled.)
++	return;
++#endif
+ 	int		err;
+ 	char	s[64];
+ 	int		i;
+@@ -2505,6 +2629,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
  	// is destroyed (relevant when starting a mod which also recreates window)
  	Sys_ShutdownInput();
  
@@ -8478,7 +8647,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..c5fdec8 100644
+index c83ebb5..05248d0 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -8504,7 +8673,7 @@ index c83ebb5..c5fdec8 100644
  
  /*
  
-@@ -38,6 +50,1128 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,1139 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -8729,6 +8898,17 @@ index c83ebb5..c5fdec8 100644
 +    uint32_t g_capTonemapOn = 0;
 +    float    g_capTonemapExposure = 1.0f;
 +    uint32_t g_capTonemapDither = 1;
++    // R-MBLUR: camera motion blur. Mirrors r_motionBlur* + the PRIMARY-view
++    // view-projection and its inverse (the backend reconstructs screen velocity
++    // from depth + cur/prev VP). g_capInCinematic suppresses the blur in cutscenes.
++    uint32_t g_capMotionBlurOn = 0;
++    float    g_capMotionBlurScale = 1.0f;
++    int      g_capMotionBlurSamples = 4;
++    float    g_capMotionBlurMaxOffset = 50.0f;
++    uint32_t g_capMotionBlurZeroVel = 0;
++    uint32_t g_capInCinematic = 0;
++    float    g_mbViewProj[16]    = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
++    float    g_mbInvViewProj[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
 +}
 +
 +// Boot-speed: route a labelled millisecond timing to the browser console
@@ -9633,7 +9813,7 @@ index c83ebb5..c5fdec8 100644
  
  /*
  =================
-@@ -49,6 +1183,22 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +1194,22 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -9656,7 +9836,7 @@ index c83ebb5..c5fdec8 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +1228,22 @@ RB_DrawElementsWithCounters
+@@ -78,6 +1239,22 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -9679,7 +9859,7 @@ index c83ebb5..c5fdec8 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1282,23 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1293,23 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -9703,7 +9883,7 @@ index c83ebb5..c5fdec8 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1349,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1360,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -9711,7 +9891,7 @@ index c83ebb5..c5fdec8 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1576,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1587,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -9724,7 +9904,47 @@ index c83ebb5..c5fdec8 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1745,93 @@ void RB_BeginDrawingView (void) {
+@@ -553,26 +1752,155 @@ Any mirrored or portaled views have already been drawn, so prepare
+ to actually render the visible surfaces for this view
+ =================
+ */
++// R-MBLUR: column-major (OpenGL-layout) 4x4 helpers — the primary-view
++// view-projection + its inverse, computed once per frame for the motion-blur
++// depth-reconstruction post-pass (avoids a per-fragment mat4 inverse).
++static void MB_Mat4MulColMajor( float *out, const float *a, const float *b ) {
++	for ( int c = 0; c < 4; c++ )
++		for ( int r = 0; r < 4; r++ ) {
++			float s = 0.0f;
++			for ( int k = 0; k < 4; k++ ) s += a[k*4+r] * b[c*4+k];
++			out[c*4+r] = s;
++		}
++}
++static bool MB_Mat4Inverse( float *invOut, const float *m ) {
++	float inv[16], det;
++	inv[0]  =  m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
++	inv[4]  = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
++	inv[8]  =  m[4]*m[9]*m[15] - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
++	inv[12] = -m[4]*m[9]*m[14] + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
++	inv[1]  = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
++	inv[5]  =  m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
++	inv[9]  = -m[0]*m[9]*m[15] + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
++	inv[13] =  m[0]*m[9]*m[14] - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
++	inv[2]  =  m[1]*m[6]*m[15] - m[1]*m[7]*m[14] - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7] - m[13]*m[3]*m[6];
++	inv[6]  = -m[0]*m[6]*m[15] + m[0]*m[7]*m[14] + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7] + m[12]*m[3]*m[6];
++	inv[10] =  m[0]*m[5]*m[15] - m[0]*m[7]*m[13] - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7] - m[12]*m[3]*m[5];
++	inv[14] = -m[0]*m[5]*m[14] + m[0]*m[6]*m[13] + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6] + m[12]*m[2]*m[5];
++	inv[3]  = -m[1]*m[6]*m[11] + m[1]*m[7]*m[10] + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7] + m[9]*m[3]*m[6];
++	inv[7]  =  m[0]*m[6]*m[11] - m[0]*m[7]*m[10] - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7] - m[8]*m[3]*m[6];
++	inv[11] = -m[0]*m[5]*m[11] + m[0]*m[7]*m[9] + m[4]*m[1]*m[11] - m[4]*m[3]*m[9] - m[8]*m[1]*m[7] + m[8]*m[3]*m[5];
++	inv[15] =  m[0]*m[5]*m[10] - m[0]*m[6]*m[9] - m[4]*m[1]*m[10] + m[4]*m[2]*m[9] + m[8]*m[1]*m[6] - m[8]*m[2]*m[5];
++	det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
++	if ( det == 0.0f ) return false;
++	det = 1.0f / det;
++	for ( int i = 0; i < 16; i++ ) invOut[i] = inv[i] * det;
++	return true;
++}
++
+ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
@@ -9783,6 +10003,28 @@ index c83ebb5..c5fdec8 100644
 +		g_capTonemapOn = r_tonemap.GetBool() ? 1u : 0u;
 +		g_capTonemapExposure = r_tonemapExposure.GetFloat();
 +		g_capTonemapDither = r_tonemapDither.GetBool() ? 1u : 0u;
++		// R-MBLUR: motion-blur tunables + the cinematic-suppression flag (read the
++		// JS window global published by SetCamera — base-patch, no SPINE edit).
++		extern idCVar r_motionBlur, r_motionBlurScale, r_motionBlurSamples, r_motionBlurMaxOffsetPixels, r_motionBlurZeroVelocity;
++		g_capMotionBlurOn = r_motionBlur.GetBool() ? 1u : 0u;
++		g_capMotionBlurScale = r_motionBlurScale.GetFloat();
++		g_capMotionBlurSamples = r_motionBlurSamples.GetInteger();
++		g_capMotionBlurMaxOffset = r_motionBlurMaxOffsetPixels.GetFloat();
++		g_capMotionBlurZeroVel = r_motionBlurZeroVelocity.GetBool() ? 1u : 0u;
++#ifdef __EMSCRIPTEN__
++		g_capInCinematic = (uint32_t)EM_ASM_INT({ return ( window.__d3InCinematic ? 1 : 0 ); });
++#endif
++	}
++	// R-MBLUR: compute the PRIMARY view's view-projection + its inverse once per
++	// frame (the backend reconstructs screen velocity from depth + cur/prev VP).
++	// VP = proj * modelView (GL column-major); swap into prevVP happens in the
++	// backend at end-of-frame AFTER the det rounds.
++	if ( viewDef == tr.primaryView ) {
++		float vp[16];
++		MB_Mat4MulColMajor( vp, viewDef->projectionMatrix, viewDef->worldSpace.modelViewMatrix );
++		memcpy( g_mbViewProj, vp, sizeof( vp ) );
++		float invvp[16];
++		if ( MB_Mat4Inverse( invvp, vp ) ) memcpy( g_mbInvViewProj, invvp, sizeof( invvp ) );
 +	}
 +	// Iter 6.6: the multi-surface accumulator is intentionally NOT reset
 +	// here. RB_BeginDrawingView runs once per VIEW (main view, lightgem,
@@ -9830,10 +10072,10 @@ index c83ebb5..c5fdec8 100644
  	// ensures that depth writes are enabled for the depth clear
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..722dfa9
+index 0000000..e4a619f
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,997 @@
+@@ -0,0 +1,1068 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -10586,6 +10828,77 @@ index 0000000..722dfa9
 +"    color = pow(max(color * u.params.w, vec3<f32>(0.0)), vec3<f32>(u.params2.x));\n"
 +"\n"
 +"    return vec4<f32>(color, 1.0);\n"
++"}\n"
++"";
++
++// motionblur.wgsl
++static const char* const kWGSL_motionblur = "// R-MBLUR: camera motion blur via DEPTH RECONSTRUCTION (fullscreen post-pass,\n"
++"// after tonemap / before GUI). Reconstruct each pixel's world position from the\n"
++"// depth buffer + the inverse current view-projection, reproject it through the\n"
++"// PREVIOUS frame's view-projection, and blur the composited scene copy along the\n"
++"// resulting screen-space velocity. Deterministic (cur/prev VP are fixed per\n"
++"// frame) -> __d3WgpuDet-safe, like the R0 tonemap pass. Camera-only (no per-object\n"
++"// velocity buffer): the mobile-friendly variant.\n"
++"//\n"
++"// Conventions (the convention pitfalls the review flagged):\n"
++"//  - depth is the WebGPU depth buffer value [0,1]; the port's vertex shaders store\n"
++"//    z' = (glClipZ + w)/2, so GL NDC z = 2*d - 1.\n"
++"//  - framebuffer uv is y-down; GL NDC is y-up -> ndc.y = 1 - 2*uv.y.\n"
++"//  - invCurVP / prevVP are the GL-convention (column-major) view-projections.\n"
++"//  - textureSampleLevel (not textureSample) so sampling is legal under the\n"
++"//    conditional early-outs (no implicit-derivative uniform-control-flow rule).\n"
++"\n"
++"struct MB {\n"
++"  invCurVP    : mat4x4<f32>,\n"
++"  prevVP      : mat4x4<f32>,\n"
++"  screenSize  : vec2<f32>,\n"
++"  scale       : f32,\n"
++"  maxOffsetPx : f32,\n"
++"  samples     : f32,\n"
++"  zeroVel     : f32,\n"
++"  pad         : vec2<f32>,\n"
++"};\n"
++"@group(0) @binding(0) var<uniform> u : MB;\n"
++"@group(0) @binding(1) var sceneTex : texture_2d<f32>;\n"
++"@group(0) @binding(2) var sceneSamp : sampler;\n"
++"@group(0) @binding(3) var depthTex : texture_depth_2d;\n"
++"\n"
++"@vertex\n"
++"fn vs_main(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\n"
++"  var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));\n"
++"  return vec4<f32>(p[vi], 0.0, 1.0);\n"
++"}\n"
++"\n"
++"@fragment\n"
++"fn fs_main(@builtin(position) fc : vec4<f32>) -> @location(0) vec4<f32> {\n"
++"  let uv = fc.xy / u.screenSize;                                  // [0,1], framebuffer (y-down)\n"
++"  let scene = textureSampleLevel(sceneTex, sceneSamp, uv, 0.0);\n"
++"  if (u.zeroVel > 0.5 || u.scale < 0.01) { return scene; }         // disabled / mutation -> identity\n"
++"  let d = textureLoad(depthTex, vec2<i32>(fc.xy), 0);              // [0,1] WebGPU depth\n"
++"  if (d >= 0.9999) { return scene; }                               // skybox / far plane -> no blur\n"
++"  let ndc = vec3<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 2.0 * d - 1.0);  // GL NDC\n"
++"  let wH = u.invCurVP * vec4<f32>(ndc, 1.0);\n"
++"  if (abs(wH.w) < 1e-6) { return scene; }\n"
++"  let world = wH.xyz / wH.w;\n"
++"  let pH = u.prevVP * vec4<f32>(world, 1.0);\n"
++"  if (pH.w <= 1e-4) { return scene; }                              // behind the previous camera\n"
++"  let pNdc = pH.xy / pH.w;                                          // GL NDC, y-up\n"
++"  let pUv = vec2<f32>(pNdc.x * 0.5 + 0.5, 0.5 - pNdc.y * 0.5);      // -> framebuffer uv (y-down)\n"
++"  var velPx = (uv - pUv) * u.screenSize;                           // pixels, current - previous\n"
++"  if (!(dot(velPx, velPx) >= 0.0)) { return scene; }               // NaN guard (false for NaN)\n"
++"  let len = length(velPx);\n"
++"  if (len > u.maxOffsetPx) { velPx = velPx * (u.maxOffsetPx / len); }\n"
++"  velPx = velPx * u.scale;\n"
++"  if (length(velPx) < 0.5) { return scene; }                       // sub-pixel -> no blur\n"
++"  let velUv = velPx / u.screenSize;\n"
++"  let cnt = max(2, i32(u.samples));\n"
++"  let fcnt = f32(cnt);\n"
++"  var acc = vec4<f32>(0.0);\n"
++"  for (var i = 0; i < cnt; i = i + 1) {\n"
++"    let t = (f32(i) / (fcnt - 1.0)) - 0.5;                         // -0.5 .. 0.5, centered\n"
++"    acc = acc + textureSampleLevel(sceneTex, sceneSamp, uv + velUv * t, 0.0);\n"
++"  }\n"
++"  return acc / fcnt;\n"
 +"}\n"
 +"";
 +
