@@ -3347,7 +3347,7 @@ index b038ba4..595b069 100644
  	int						ReactionTo( const idEntity *ent );
  	bool					CheckForEnemy( void );
 diff --git a/neo/game/anim/Anim.cpp b/neo/game/anim/Anim.cpp
-index a9f6252..d37ad23 100644
+index a9f6252..4d960b1 100644
 --- a/neo/game/anim/Anim.cpp
 +++ b/neo/game/anim/Anim.cpp
 @@ -330,6 +330,143 @@ bool idMD5Anim::LoadAnim( const char *filename ) {
@@ -3494,7 +3494,7 @@ index a9f6252..d37ad23 100644
  /*
  ====================
  idMD5Anim::IncreaseRefs
-@@ -999,6 +1136,36 @@ void idAnimManager::ReloadAnims( void ) {
+@@ -999,6 +1136,50 @@ void idAnimManager::ReloadAnims( void ) {
  	}
  }
  
@@ -3526,6 +3526,20 @@ index a9f6252..d37ad23 100644
 +	animations.Set( clip.name, anim );
 +
 +	return anim;
++}
++
++/*
++====================
++D3_RegisterGltfAnim
++
++Free shim declared by RENDER in renderer/Model.h (so neo/renderer never needs an
++anim header / the animationLib global). RENDER's GLB loader calls this once per
++clip; it routes to the manager. Defined here where animationLib lives (linked into
++the monolithic HARDLINK_GAME build).
++====================
++*/
++idMD5Anim *D3_RegisterGltfAnim( const gltfAnimClip_t &clip ) {
++	return animationLib.RegisterMemoryAnim( clip );
 +}
 +
  /*
