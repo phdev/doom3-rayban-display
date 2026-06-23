@@ -524,6 +524,47 @@ index 3016bf2..b81d829 100644
  	} else {
  		common->Warning( "idRenderModelStatic::InitFromFile: unknown type for model: \'%s\'", name.c_str() );
  		loaded		= false;
+diff --git a/neo/renderer/Model.h b/neo/renderer/Model.h
+index 79ff89c..9e3c189 100644
+--- a/neo/renderer/Model.h
++++ b/neo/renderer/Model.h
+@@ -167,6 +167,36 @@ public:
+ 	const idMD5Joint *			parent;
+ };
+ 
++// R-GLTF Spike-B — the render<->SPINE bridge contract (POD, idlib-only).
++// RENDER (neo/renderer/Model.cpp) parses a GLB and FILLS these; SPINE
++// (neo/game/anim/Anim.cpp) CONSUMES gltfAnimClip_t to build an in-memory
++// idMD5Anim. Declared here (RENDER-owned) because Anim.h already #includes
++// renderer/Model.h, so both halves see ONE definition (no ODR clash, no
++// renderer->anim header dependency). See docs/R_GLTF_SPIKE_B_DESIGN.md.
++struct gltfSkelJoint_t {		// one joint of the topo-sorted (root-first, parentNum < index) skeleton
++	idStr						name;
++	int							parentNum;	// -1 for the single root (index 0)
++};
++struct gltfAnimClip_t {
++	idStr						name;		// synthetic key, MUST end ".md5anim" (the GetAnim cache key)
++	int							numJoints;
++	int							numFrames;
++	int							frameRate;	// RENDER's resample rate -> animLength
++	idList<gltfSkelJoint_t>		joints;		// [numJoints], order == the mesh idMD5Joint order
++	idList<idJointQuat>			baseFrame;	// [numJoints] bind/first pose; Z-up; q normalized + w>=0
++	idList<idJointQuat>			frames;		// [numFrames*numJoints] row-major (frame f, joint j at f*numJoints+j)
++	idList<unsigned char>		animBits;	// [numJoints] TX/TY/TZ/QX/QY/QZ bits 0..5 (RENDER sends 0x3F)
++	idList<idBounds>			bounds;		// [numFrames] per-frame AABB, or empty (SPINE derives a default)
++};
++struct gltfSkin_t {				// mesh-side skeleton, SAME ordering as gltfAnimClip_t.joints
++	idList<gltfSkelJoint_t>		joints;
++	idList<idJointQuat>			bindPose;
++};
++// SPINE-provided free shim (defined in neo/game/anim where animationLib lives;
++// the monolithic HARDLINK_GAME build links it). RENDER calls this once per clip.
++class idMD5Anim;
++idMD5Anim *						D3_RegisterGltfAnim( const gltfAnimClip_t &clip );
++
+ 
+ // the init methods may be called again on an already created model when
+ // a reloadModels is issued
 diff --git a/neo/renderer/ModelManager.cpp b/neo/renderer/ModelManager.cpp
 index ddbff1c..16a3b0e 100644
 --- a/neo/renderer/ModelManager.cpp
