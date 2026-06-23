@@ -22,6 +22,9 @@ struct MB {
   maxOffsetPx : f32,
   samples     : f32,
   zeroVel     : f32,
+  selfTest    : f32,   // P4 operator gate: reconstruct velocity for (testUv,testDepth) -> output it
+  testDepth   : f32,
+  testUv      : vec2<f32>,
   pad         : vec2<f32>,
 };
 @group(0) @binding(0) var<uniform> u : MB;
@@ -37,6 +40,20 @@ fn vs_main(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {
 
 @fragment
 fn fs_main(@builtin(position) fc : vec4<f32>) -> @location(0) vec4<f32> {
+  // P4 operator self-test: reconstruct the screen velocity for a synthetic
+  // (testUv, testDepth) from the UB matrices and output it ENCODED in [0,1]
+  // (R = vx, G = vy, ±128 px range). The CPU compares against a forward-projection
+  // ground truth -> proves the unproject/reproject + clip-z/Y-flip conventions.
+  if (u.selfTest > 0.5) {
+    let uvT = u.testUv;
+    let ndcT = vec3<f32>(uvT.x * 2.0 - 1.0, 1.0 - uvT.y * 2.0, 2.0 * u.testDepth - 1.0);
+    let wHt = u.invCurVP * vec4<f32>(ndcT, 1.0);
+    let worldT = wHt.xyz / wHt.w;
+    let pHt = u.prevVP * vec4<f32>(worldT, 1.0);
+    let pUvT = vec2<f32>(pHt.x / pHt.w * 0.5 + 0.5, 0.5 - pHt.y / pHt.w * 0.5);
+    let velT = (uvT - pUvT) * u.screenSize;
+    return vec4<f32>(velT.x * (1.0 / 256.0) + 0.5, velT.y * (1.0 / 256.0) + 0.5, 0.0, 1.0);
+  }
   let uv = fc.xy / u.screenSize;                                  // [0,1], framebuffer (y-down)
   let scene = textureSampleLevel(sceneTex, sceneSamp, uv, 0.0);
   if (u.zeroVel > 0.5 || u.scale < 0.01) { return scene; }         // disabled / mutation -> identity
