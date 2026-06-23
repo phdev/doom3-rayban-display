@@ -25,17 +25,18 @@ if (!ready) { console.log("[gltf-spike] never rendered"); console.log(log.slice(
 console.log("[gltf-spike] booted + rendering");
 
 // write the GLB into MEMFS as a loose model (engine base = /base), then testmodel it.
+const ASSET = process.env.GLTF_ASSET || "/wasm/spike-rigged.glb";   // rigged fixture (skin + 1 anim clip)
 const wrote = await page.evaluate(async (glbUrl) => {
   const M = window.Module; if (!M || !M.FS) return "no Module.FS";
   const buf = new Uint8Array(await (await fetch(glbUrl)).arrayBuffer());
   const mk = (d) => { try { M.FS.mkdir(d); } catch {} };
   mk("/base/models"); mk("/base/models/spike");
-  try { M.FS.writeFile("/base/models/spike/crate.glb", buf); } catch (e) { return "write ERR " + e.message; }
-  return "wrote " + buf.length + " bytes to /base/models/spike/crate.glb";
-}, "/wasm/spike-crate.glb").catch((e) => "ERR " + e.message);
+  try { M.FS.writeFile("/base/models/spike/rigged.glb", buf); } catch (e) { return "write ERR " + e.message; }
+  return "wrote " + buf.length + " bytes to /base/models/spike/rigged.glb";
+}, ASSET).catch((e) => "ERR " + e.message);
 console.log("[gltf-spike] FS:", wrote);
 
-await page.evaluate(() => window.d3cmd && window.d3cmd("testmodel models/spike/crate.glb"));
+await page.evaluate(() => window.d3cmd && window.d3cmd("testmodel models/spike/rigged.glb"));
 await page.waitForTimeout(5000);
 
 const canvas = await page.$("#webgpuCanvas") || await page.$("#gameCanvas");
@@ -46,6 +47,9 @@ const sig = await page.evaluate(() => ({
   called: window.__d3GltfCalled || 0,
   surfaces: window.__d3GltfSurfaces,
   loaded: window.__d3GltfLoaded,
+  animJoints: window.__d3GltfAnimJoints,     // parsed skeleton joint count
+  animFrames: window.__d3GltfAnimFrames,     // resampled clip frame count
+  modelJoints: window.__d3GltfModelJoints,   // joints exposed on the skinned model
 })).catch(() => ({}));
 console.log("\n=== LoadGLTF signals ===", JSON.stringify(sig));
 const det = await page.evaluate(() => window.__d3WgpuDet || null).catch(() => null);
@@ -57,7 +61,8 @@ await browser.close();
 
 const detArr = Array.isArray(det) ? det : [];
 const detOk = detArr.length === 0 || detArr.every((r) => r.diffPx === 0 && r.maxDelta === 0);
-const ran = (sig.called || 0) > 0;
-const ok = ran && sig.loaded === true && (sig.surfaces || 0) > 0;
-console.log(`\nVERDICT: LoadGLTF ${ran ? "RAN" : "did NOT run"} (called=${sig.called||0}, surfaces=${sig.surfaces}) ${ok ? "✓" : "✗"} | det ${detOk ? "IDENTICAL ✓" : "NOT IDENTICAL ✗"}`);
-process.exit(ok && detOk ? 0 : 1);
+const meshOk = (sig.called || 0) > 0 && sig.loaded === true && (sig.surfaces || 0) > 0;
+const skelOk = (sig.animJoints || 0) > 0 && (sig.modelJoints || 0) === (sig.animJoints || 0);
+const animOk = (sig.animFrames || 0) > 1;   // resampled to >1 frame
+console.log(`\nVERDICT: mesh ${meshOk ? "✓" : "✗"} (surfaces=${sig.surfaces}) | skeleton ${skelOk ? "✓" : "✗"} (animJoints=${sig.animJoints}, modelJoints=${sig.modelJoints}) | anim-clip ${animOk ? "✓" : "✗"} (frames=${sig.animFrames}) | det ${detOk ? "IDENTICAL ✓" : "NOT IDENTICAL ✗"}`);
+process.exit(meshOk && skelOk && animOk && detOk ? 0 : 1);

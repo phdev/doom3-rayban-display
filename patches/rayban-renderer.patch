@@ -234,7 +234,7 @@ index f9ae002..9430a1e 100644
  
  			qglCopyTexSubImage2D( GL_TEXTURE_2D, 0, 0, 0, x, y, imageWidth, imageHeight );
 diff --git a/neo/renderer/Model.cpp b/neo/renderer/Model.cpp
-index 3016bf2..02c7fcd 100644
+index 3016bf2..a38ef14 100644
 --- a/neo/renderer/Model.cpp
 +++ b/neo/renderer/Model.cpp
 @@ -35,6 +35,9 @@ If you have questions concerning this license or the applicable additional terms
@@ -247,7 +247,7 @@ index 3016bf2..02c7fcd 100644
  
  #include "renderer/Model.h"
  
-@@ -262,6 +265,564 @@ void idRenderModelStatic::MakeDefaultModel() {
+@@ -262,6 +265,579 @@ void idRenderModelStatic::MakeDefaultModel() {
  	FinishSurfaces();
  }
  
@@ -789,15 +789,30 @@ index 3016bf2..02c7fcd 100644
 +	}
 +
 +#ifdef __EMSCRIPTEN__
-+	// Spike-B: if this GLB is skinned + animated, build the clip and register the
-+	// in-memory idMD5Anim (D3_RegisterGltfAnim is the SPINE shim, Model.h:198) so a
-+	// later GetAnim(token) is a cache hit. (A skeleton-exposing model so SetupJoints/
-+	// CheckModelHierarchy bind it is the next increment.)
++	// Spike-B: if this GLB is skinned + animated, parse the clip + skeleton.
 +	{
 +		gltfAnimClip_t clip; gltfSkin_t skin;
 +		if ( GLTF_ParseAnimClip( json, (int)jsonLen, bin, fileName, clip, skin ) ) {
-+			D3_RegisterGltfAnim( clip );
-+			EM_ASM({ window.__d3GltfAnimRegistered = 1; window.__d3GltfAnimFrames = $0; window.__d3GltfAnimJoints = $1; }, clip.numFrames, clip.numJoints );
++			// Expose the skeleton on THIS model so idDeclModelDef::SetupJoints +
++			// CheckModelHierarchy can bind the anim. idMD5Joint::parent is a POINTER
++			// into gltfJoints, so fill names first (stable array), then wire parents.
++			const int nj = skin.joints.Num();
++			gltfJoints.SetNum( nj );
++			gltfDefaultPose.SetNum( nj );
++			for ( int j = 0; j < nj; j++ ) {
++				gltfJoints[j].name = skin.joints[j].name;
++				gltfDefaultPose[j] = skin.bindPose[j];
++			}
++			for ( int j = 0; j < nj; j++ ) {
++				const int pn = skin.joints[j].parentNum;
++				gltfJoints[j].parent = ( pn >= 0 && pn < nj ) ? &gltfJoints[pn] : NULL;
++			}
++			// TODO(Spike-B): register the in-memory idMD5Anim so GetAnim(token) is a
++			// cache hit — gated until SPINE ships the D3_RegisterGltfAnim free shim
++			// (its member RegisterMemoryAnim isn't reachable from neo/renderer; calling
++			// the undefined symbol now would abort). Parse + skeleton verified meanwhile.
++			//   D3_RegisterGltfAnim( clip );
++			EM_ASM({ window.__d3GltfAnimJoints = $0; window.__d3GltfAnimFrames = $1; window.__d3GltfModelJoints = $2; }, clip.numJoints, clip.numFrames, gltfJoints.Num() );
 +		}
 +	}
 +#endif
@@ -812,7 +827,7 @@ index 3016bf2..02c7fcd 100644
  /*
  ================
  idRenderModelStatic::PartialInitFromFile
-@@ -299,6 +860,9 @@ void idRenderModelStatic::InitFromFile( const char *fileName ) {
+@@ -299,6 +875,9 @@ void idRenderModelStatic::InitFromFile( const char *fileName ) {
  	} else if ( extension.Icmp( "ma" ) == 0 ) {
  		loaded		= LoadMA( name );
  		reloadable	= true;
@@ -822,6 +837,33 @@ index 3016bf2..02c7fcd 100644
  	} else {
  		common->Warning( "idRenderModelStatic::InitFromFile: unknown type for model: \'%s\'", name.c_str() );
  		loaded		= false;
+@@ -503,7 +1082,7 @@ idRenderModelStatic::NumJoints
+ ================
+ */
+ int idRenderModelStatic::NumJoints( void ) const {
+-	return 0;
++	return gltfJoints.Num();	// R-GLTF Spike-B: 0 for non-glTF static models (unchanged)
+ }
+ 
+ /*
+@@ -512,7 +1091,7 @@ idRenderModelStatic::GetJoints
+ ================
+ */
+ const idMD5Joint *idRenderModelStatic::GetJoints( void ) const {
+-	return NULL;
++	return gltfJoints.Num() ? gltfJoints.Ptr() : NULL;	// R-GLTF Spike-B
+ }
+ 
+ /*
+@@ -539,7 +1118,7 @@ idRenderModelStatic::GetDefaultPose
+ ================
+ */
+ const idJointQuat *idRenderModelStatic::GetDefaultPose( void ) const {
+-	return NULL;
++	return gltfDefaultPose.Num() ? gltfDefaultPose.Ptr() : NULL;	// R-GLTF Spike-B
+ }
+ 
+ /*
 diff --git a/neo/renderer/Model.h b/neo/renderer/Model.h
 index 79ff89c..9e3c189 100644
 --- a/neo/renderer/Model.h
@@ -878,7 +920,7 @@ index ddbff1c..16a3b0e 100644
  		model->InitFromFile( modelName );
  	} else if ( extension.Icmp( "ma" ) == 0 ) {
 diff --git a/neo/renderer/Model_local.h b/neo/renderer/Model_local.h
-index a56c999..e769579 100644
+index a56c999..1108652 100644
 --- a/neo/renderer/Model_local.h
 +++ b/neo/renderer/Model_local.h
 @@ -94,6 +94,7 @@ public:
@@ -889,6 +931,18 @@ index a56c999..e769579 100644
  
  	bool						ConvertASEToModelSurfaces( const struct aseModel_s *ase );
  	bool						ConvertLWOToModelSurfaces( const struct st_lwObject *lwo );
+@@ -109,6 +110,11 @@ public:
+ 	idList<modelSurface_t>		surfaces;
+ 	idBounds					bounds;
+ 	int							overlaysAdded;
++	// R-GLTF Spike-B: skeleton exposed by a skinned glTF model (empty for every
++	// other static model -> NumJoints()==0 unchanged). LoadGLTF fills these so
++	// idDeclModelDef::SetupJoints + CheckModelHierarchy bind the anim.
++	idList<idMD5Joint>			gltfJoints;
++	idList<idJointQuat>			gltfDefaultPose;
+ 
+ protected:
+ 	int							lastModifiedFrame;
 diff --git a/neo/renderer/RenderBackend.h b/neo/renderer/RenderBackend.h
 new file mode 100644
 index 0000000..c123b24
