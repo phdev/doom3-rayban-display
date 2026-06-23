@@ -3346,6 +3346,211 @@ index b038ba4..595b069 100644
  	void					Activate( idEntity *activator );
  	int						ReactionTo( const idEntity *ent );
  	bool					CheckForEnemy( void );
+diff --git a/neo/game/anim/Anim.cpp b/neo/game/anim/Anim.cpp
+index a9f6252..d37ad23 100644
+--- a/neo/game/anim/Anim.cpp
++++ b/neo/game/anim/Anim.cpp
+@@ -330,6 +330,143 @@ bool idMD5Anim::LoadAnim( const char *filename ) {
+ 	return true;
+ }
+ 
++/*
++====================
++idMD5Anim::BuildFromGLTF
++
++In-memory equivalent of LoadAnim() (R-GLTF Spike-B): builds this idMD5Anim from a
++glTF-derived clip (RENDER fills gltfAnimClip_t from a GLB) instead of parsing a
++.md5anim file. Mirrors LoadAnim field-for-field so a glTF-animated entity resolves
++through the SHIPPED combat wire unchanged (animNum -> CycleAnim -> idAnim -> idMD5Anim).
++The clip's quaternions are already normalized with w>=0, so only x,y,z are stored
++per the .md5anim convention and CalcW recovers w at sample time.
++====================
++*/
++bool idMD5Anim::BuildFromGLTF( const gltfAnimClip_t &clip ) {
++	int i, j;
++
++	if ( clip.numJoints <= 0 || clip.numFrames <= 0 || clip.frameRate < 0 ) {
++		return false;
++	}
++	if ( clip.joints.Num() != clip.numJoints ||
++	     clip.baseFrame.Num() != clip.numJoints ||
++	     clip.animBits.Num() != clip.numJoints ||
++	     clip.frames.Num() != clip.numFrames * clip.numJoints ) {
++		return false;
++	}
++
++	Free();
++
++	name = clip.name;
++	numFrames = clip.numFrames;
++	numJoints = clip.numJoints;
++	frameRate = clip.frameRate;
++
++	// hierarchy + per-joint anim bits; LoadAnim reads firstComponent + numAnimatedComponents
++	// from the file, we DERIVE them: firstComponent = running popcount, total = sum of popcounts.
++	jointInfo.SetGranularity( 1 );
++	jointInfo.SetNum( numJoints );
++	numAnimatedComponents = 0;
++	for ( i = 0; i < numJoints; i++ ) {
++		// SAME intern table as the model's idMD5Joint names so CheckModelHierarchy matches.
++		jointInfo[ i ].nameIndex = animationLib.JointIndex( clip.joints[ i ].name );
++		jointInfo[ i ].parentNum = clip.joints[ i ].parentNum;
++		int bits = clip.animBits[ i ] & 63;
++		jointInfo[ i ].animBits = bits;
++		jointInfo[ i ].firstComponent = numAnimatedComponents;
++		for ( j = 0; j < 6; j++ ) {
++			if ( bits & ( 1 << j ) ) {
++				numAnimatedComponents++;
++			}
++		}
++	}
++
++	// base frame (direct idJointQuat assign; q already normalized w>=0).
++	baseFrame.SetGranularity( 1 );
++	baseFrame.SetNum( numJoints );
++	for ( i = 0; i < numJoints; i++ ) {
++		baseFrame[ i ] = clip.baseFrame[ i ];
++	}
++
++	// component frames: pack ONLY the animBits-flagged channels per frame/joint,
++	// in [tx,ty,tz,qx,qy,qz] order (rotations store x,y,z; w recovered by CalcW).
++	componentFrames.SetGranularity( 1 );
++	componentFrames.SetNum( numAnimatedComponents * numFrames );
++	float *componentPtr = componentFrames.Ptr();
++	for ( i = 0; i < numFrames; i++ ) {
++		for ( j = 0; j < numJoints; j++ ) {
++			const idJointQuat &jq = clip.frames[ i * numJoints + j ];
++			int bits = jointInfo[ j ].animBits;
++			if ( bits & ANIM_TX ) { *componentPtr++ = jq.t.x; }
++			if ( bits & ANIM_TY ) { *componentPtr++ = jq.t.y; }
++			if ( bits & ANIM_TZ ) { *componentPtr++ = jq.t.z; }
++			if ( bits & ANIM_QX ) { *componentPtr++ = jq.q.x; }
++			if ( bits & ANIM_QY ) { *componentPtr++ = jq.q.y; }
++			if ( bits & ANIM_QZ ) { *componentPtr++ = jq.q.z; }
++		}
++	}
++
++	// bounds: prefer the clip's per-frame bounds; else a conservative box over the
++	// base-pose joint translations (start >= +-64u) so culling never drops the model.
++	bounds.SetGranularity( 1 );
++	bounds.SetNum( numFrames );
++	if ( clip.bounds.Num() == numFrames ) {
++		for ( i = 0; i < numFrames; i++ ) {
++			bounds[ i ] = clip.bounds[ i ];
++		}
++	} else {
++		idBounds def;
++		def[ 0 ].Set( -64.0f, -64.0f, -64.0f );
++		def[ 1 ].Set(  64.0f,  64.0f,  64.0f );
++		for ( i = 0; i < numJoints; i++ ) {
++			def.AddPoint( clip.baseFrame[ i ].t );
++		}
++		for ( i = 0; i < numFrames; i++ ) {
++			bounds[ i ] = def;
++		}
++	}
++
++	// total movement delta — IDENTICAL extraction to LoadAnim (subtracts baseFrame[0].t
++	// from the root joint's translation columns in place, then zeroes baseFrame[0].t).
++	if ( !numAnimatedComponents ) {
++		totaldelta.Zero();
++	} else {
++		componentPtr = &componentFrames[ jointInfo[ 0 ].firstComponent ];
++		if ( jointInfo[ 0 ].animBits & ANIM_TX ) {
++			for ( i = 0; i < numFrames; i++ ) {
++				componentPtr[ numAnimatedComponents * i ] -= baseFrame[ 0 ].t.x;
++			}
++			totaldelta.x = componentPtr[ numAnimatedComponents * ( numFrames - 1 ) ];
++			componentPtr++;
++		} else {
++			totaldelta.x = 0.0f;
++		}
++		if ( jointInfo[ 0 ].animBits & ANIM_TY ) {
++			for ( i = 0; i < numFrames; i++ ) {
++				componentPtr[ numAnimatedComponents * i ] -= baseFrame[ 0 ].t.y;
++			}
++			totaldelta.y = componentPtr[ numAnimatedComponents * ( numFrames - 1 ) ];
++			componentPtr++;
++		} else {
++			totaldelta.y = 0.0f;
++		}
++		if ( jointInfo[ 0 ].animBits & ANIM_TZ ) {
++			for ( i = 0; i < numFrames; i++ ) {
++				componentPtr[ numAnimatedComponents * i ] -= baseFrame[ 0 ].t.z;
++			}
++			totaldelta.z = componentPtr[ numAnimatedComponents * ( numFrames - 1 ) ];
++		} else {
++			totaldelta.z = 0.0f;
++		}
++	}
++	baseFrame[ 0 ].t.Zero();
++
++	// we don't count last frame because it would cause a 1 frame pause at the end
++	animLength = ( ( numFrames - 1 ) * 1000 + frameRate - 1 ) / frameRate;
++
++	return true;
++}
++
+ /*
+ ====================
+ idMD5Anim::IncreaseRefs
+@@ -999,6 +1136,36 @@ void idAnimManager::ReloadAnims( void ) {
+ 	}
+ }
+ 
++/*
++====================
++idAnimManager::RegisterMemoryAnim
++
++Pre-insert an in-memory idMD5Anim built from a glTF clip under its synthetic
++".md5anim" key, so a later GetAnim(key) (e.g. from idDeclModelDef::ParseAnim) is a
++CACHE HIT and never file-loads. Sibling of GetAnim; RENDER calls this once per clip
++after parsing a GLB. The shipped combat wire (animNum -> CycleAnim -> idAnim ->
++idMD5Anim) then resolves the glTF anim with no wire/idAnim/idAnimator change.
++====================
++*/
++idMD5Anim *idAnimManager::RegisterMemoryAnim( const gltfAnimClip_t &clip ) {
++	idMD5Anim **animptrptr = NULL;
++
++	// idempotent: if already registered (or a real file of that name was loaded), reuse it.
++	if ( animations.Get( clip.name, &animptrptr ) ) {
++		return animptrptr ? *animptrptr : NULL;
++	}
++
++	idMD5Anim *anim = new idMD5Anim();
++	if ( !anim->BuildFromGLTF( clip ) ) {
++		gameLocal.Warning( "Couldn't build in-memory anim: '%s'", clip.name.c_str() );
++		delete anim;
++		anim = NULL;
++	}
++	animations.Set( clip.name, anim );
++
++	return anim;
++}
++
+ /*
+ ================
+ idAnimManager::JointIndex
+diff --git a/neo/game/anim/Anim.h b/neo/game/anim/Anim.h
+index dcba853..6f97139 100644
+--- a/neo/game/anim/Anim.h
++++ b/neo/game/anim/Anim.h
+@@ -248,6 +248,7 @@ public:
+ 	size_t					Allocated( void ) const;
+ 	size_t					Size( void ) const { return sizeof( *this ) + Allocated(); };
+ 	bool					LoadAnim( const char *filename );
++	bool					BuildFromGLTF( const gltfAnimClip_t &clip );	// in-memory LoadAnim (R-GLTF Spike-B; RENDER fills the clip from a GLB)
+ 
+ 	void					IncreaseRefs( void ) const;
+ 	void					DecreaseRefs( void ) const;
+@@ -611,6 +612,7 @@ public:
+ 
+ 	void						Shutdown( void );
+ 	idMD5Anim *					GetAnim( const char *name );
++	idMD5Anim *					RegisterMemoryAnim( const gltfAnimClip_t &clip );	// pre-insert a glTF-built anim under its .md5anim key so GetAnim is a cache hit (no file load)
+ 	void						ReloadAnims( void );
+ 	void						ListAnims( void ) const;
+ 	int							JointIndex( const char *name );
 diff --git a/neo/game/gamesys/SysCmds.cpp b/neo/game/gamesys/SysCmds.cpp
 index 105ff57..e4b3f00 100644
 --- a/neo/game/gamesys/SysCmds.cpp
