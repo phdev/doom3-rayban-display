@@ -58,6 +58,33 @@ console.log("=== det ===", JSON.stringify(det));
 console.log("=== JS console (errors/warnings) ===");
 console.log(log.filter((l) => /PAGEERROR|Couldn't|Error|Warning/i.test(l)).slice(-6).join("\n") || "(none)");
 console.log("\n=== __d3WgpuDet ===", JSON.stringify(det));
+
+// --- P0 scaffolding for the P3 full-animate kill-criterion ---
+// Drive the clip via the shipped testanim (CycleAnim) path and sample the P3
+// skinned-vertex probe at two animation phases. Until P2 (CPU-skinning in
+// InstantiateDynamicModel) + P3 (the __d3SkinnedVertPos_W EM_ASM probe in
+// tr_render.cpp) land, the probe is undefined and this block is a NON-FATAL
+// "pending" report. It auto-activates as the hard motion gate once the
+// instrument exists (instrument => require delta>threshold AND measuredFrames>=2).
+const ANIM_THRESHOLD = Number(process.env.GLTF_ANIM_THRESHOLD || 0.1); // D3 units; make-rig.py derives ~25
+let anim = { instrument: false, frames: 0, delta: null };
+try {
+  await page.evaluate(() => window.d3cmd && window.d3cmd("testanim bend"));
+  const sample = () => page.evaluate(() => ({
+    pos: window.__d3SkinnedVertPos_W || null,
+    frames: window.__d3SkinnedVertMeasuredFrames || 0,
+  })).catch(() => ({ pos: null, frames: 0 }));
+  await page.waitForTimeout(350); const a = await sample();   // ~clip start
+  await page.waitForTimeout(700); const b = await sample();   // ~clip extreme (clip is 1.0s)
+  anim.frames = b.frames || 0;
+  if (a.pos && b.pos) { anim.instrument = true; anim.delta = Math.hypot(b.pos[0] - a.pos[0], b.pos[1] - a.pos[1], b.pos[2] - a.pos[2]); }
+} catch { /* non-fatal in P0 */ }
+if (anim.instrument) {
+  console.log(`=== ANIMATE === probe delta=${anim.delta.toFixed(3)} D3u (threshold ${ANIM_THRESHOLD}), measuredFrames=${anim.frames}`);
+} else {
+  console.log("=== ANIMATE (scaffolding) === __d3SkinnedVertPos_W not published yet — pending P2 CPU-skinning + P3 probe (non-fatal in P0)");
+}
+
 await browser.close();
 
 const detArr = Array.isArray(det) ? det : [];
@@ -69,5 +96,10 @@ const animOk = (sig.animFrames || 0) > 1;   // resampled to >1 frame
 // earlier instantiate failure was a stale wasm/JS minify mismatch, not a code bug).
 const regOk = sig.animRegistered === 1;
 const reg = regOk ? "fired" : "NOT REGISTERED";
-console.log(`\nVERDICT: mesh ${meshOk ? "✓" : "✗"} (surfaces=${sig.surfaces}) | skeleton ${skelOk ? "✓" : "✗"} (animJoints=${sig.animJoints}, modelJoints=${sig.modelJoints}) | anim-clip ${animOk ? "✓" : "✗"} (frames=${sig.animFrames}) | register=${reg} | det ${detOk ? "IDENTICAL ✓" : "NOT IDENTICAL ✗"}`);
-process.exit(meshOk && skelOk && animOk && regOk && detOk ? 0 : 1);
+// P0: non-blocking (no instrument yet). P3: hard motion gate (delta>threshold AND >=2 measured frames AND det IDENTICAL).
+const animateOk = !anim.instrument || (anim.delta > ANIM_THRESHOLD && anim.frames >= 2 && detOk);
+const animStatus = anim.instrument
+  ? (animateOk ? `✓ (delta=${anim.delta.toFixed(2)}D3u)` : `✗ (delta=${(anim.delta || 0).toFixed(2)}D3u, frames=${anim.frames})`)
+  : "pending P2/P3";
+console.log(`\nVERDICT: mesh ${meshOk ? "✓" : "✗"} (surfaces=${sig.surfaces}) | skeleton ${skelOk ? "✓" : "✗"} (animJoints=${sig.animJoints}, modelJoints=${sig.modelJoints}) | anim-clip ${animOk ? "✓" : "✗"} (frames=${sig.animFrames}) | register=${reg} | det ${detOk ? "IDENTICAL ✓" : "NOT IDENTICAL ✗"} | animate ${animStatus}`);
+process.exit(meshOk && skelOk && animOk && regOk && detOk && animateOk ? 0 : 1);
