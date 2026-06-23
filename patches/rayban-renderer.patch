@@ -234,7 +234,7 @@ index f9ae002..9430a1e 100644
  
  			qglCopyTexSubImage2D( GL_TEXTURE_2D, 0, 0, 0, x, y, imageWidth, imageHeight );
 diff --git a/neo/renderer/Model.cpp b/neo/renderer/Model.cpp
-index 3016bf2..90f332c 100644
+index 3016bf2..30608ca 100644
 --- a/neo/renderer/Model.cpp
 +++ b/neo/renderer/Model.cpp
 @@ -35,6 +35,9 @@ If you have questions concerning this license or the applicable additional terms
@@ -247,7 +247,7 @@ index 3016bf2..90f332c 100644
  
  #include "renderer/Model.h"
  
-@@ -262,6 +265,584 @@ void idRenderModelStatic::MakeDefaultModel() {
+@@ -262,6 +265,718 @@ void idRenderModelStatic::MakeDefaultModel() {
  	FinishSurfaces();
  }
  
@@ -268,7 +268,15 @@ index 3016bf2..90f332c 100644
 +*/
 +struct gltfAccessor_t { int bufferView; int byteOffset; int componentType; int count; int numComp; };
 +struct gltfBufferView_t { int byteOffset; int byteLength; int byteStride; };
-+struct gltfPrim_t { int pos; int normal; int uv; int indices; int material; };
++struct gltfPrim_t { int pos; int normal; int uv; int indices; int material; int joints; int weights; };
++
++#ifdef __EMSCRIPTEN__
++// R-GLTF Spike-B falsifiability instrument: 1 = identity skinning (deform writes
++// the bind verts UNCHANGED). The full-animate kill-criterion MUST go RED under this
++// (probe vertex never moves), proving the gate measures real rendered-vertex motion
++// and not merely that the joints moved. Boot with +set r_gltfSkinIdentity 1.
++idCVar r_gltfSkinIdentity( "r_gltfSkinIdentity", "0", CVAR_RENDERER | CVAR_BOOL, "R-GLTF: disable CPU skinning deform (identity pose) to prove the animate gate is falsifiable" );
++#endif
 +
 +static int GLTF_NumComp( const idStr &type ) {
 +	if ( type == "SCALAR" ) return 1;
@@ -682,7 +690,7 @@ index 3016bf2..90f332c 100644
 +						while ( lex.ReadToken( &tok ) ) {
 +							if ( tok == "]" ) break;
 +							if ( tok == "," ) continue;
-+							gltfPrim_t pr; pr.pos = -1; pr.normal = -1; pr.uv = -1; pr.indices = -1; pr.material = -1;
++							gltfPrim_t pr; pr.pos = -1; pr.normal = -1; pr.uv = -1; pr.indices = -1; pr.material = -1; pr.joints = -1; pr.weights = -1;
 +							while ( lex.ReadToken( &tok ) ) {
 +								if ( tok == "}" ) break;
 +								if ( tok == "," ) continue;
@@ -697,6 +705,8 @@ index 3016bf2..90f332c 100644
 +										if ( ak == "POSITION" ) pr.pos = av;
 +										else if ( ak == "NORMAL" ) pr.normal = av;
 +										else if ( ak == "TEXCOORD_0" ) pr.uv = av;
++										else if ( ak == "JOINTS_0" ) pr.joints = av;		// Spike-B: skin influences
++										else if ( ak == "WEIGHTS_0" ) pr.weights = av;
 +									}
 +								} else if ( k2 == "indices" ) pr.indices = lex.ParseInt();
 +								else if ( k2 == "material" ) pr.material = lex.ParseInt();
@@ -785,6 +795,52 @@ index 3016bf2..90f332c 100644
 +		surf.id = pi;
 +		surf.shader = tr.defaultMaterial;	// SPIKE: real ORM/.mtr is content-forge's half
 +		surf.geometry = tri;
++
++		// Spike-B: if this primitive is skinned (JOINTS_0 + WEIGHTS_0), capture the
++		// BIND geometry + per-vertex influences NOW, in glTF order, before AddSurface/
++		// FinishSurfaces. localPos[] is filled later (needs the global bind pose).
++		if ( pr.joints >= 0 && pr.joints < accessors.Num() && pr.weights >= 0 && pr.weights < accessors.Num() ) {
++			const gltfAccessor_t &ja = accessors[pr.joints];
++			const gltfAccessor_t &wa = accessors[pr.weights];
++			if ( ja.bufferView >= 0 && ja.bufferView < bufferViews.Num() && wa.bufferView >= 0 && wa.bufferView < bufferViews.Num() ) {
++				const gltfBufferView_t &jbv = bufferViews[ja.bufferView];
++				int jcompsz = ( ja.componentType == 5125 ) ? 4 : ( ja.componentType == 5123 ) ? 2 : 1;	// UINT/USHORT/UBYTE
++				int jstride = jbv.byteStride ? jbv.byteStride : jcompsz * 4;
++				const byte *jbase = bin + jbv.byteOffset + ja.byteOffset;
++
++				gltfSkinRange_t range;
++				range.firstVert = gltfBaseVerts.Num();
++				range.numVerts = numVerts;
++				range.firstIndex = gltfBaseIndexes.Num();
++				range.numIndexes = numIndexes;
++				range.shader = surf.shader;
++
++				for ( int v = 0; v < numVerts; v++ ) {
++					gltfBaseVerts.Append( tri->verts[v] );		// idTech4-space bind vert
++					gltfVertSkin_t vs;
++					const byte *jp = jbase + v * jstride;
++					float w4[4]; GLTF_ReadAccessorFloats( wa, bufferViews, bin, v, w4, 4 );
++					float wsum = 0.0f;
++					for ( int k = 0; k < 4; k++ ) {
++						int jt;
++						if ( ja.componentType == 5125 )      jt = (int)( (const unsigned int *)jp )[k];
++						else if ( ja.componentType == 5123 ) jt = (int)( (const unsigned short *)jp )[k];
++						else                                 jt = (int)( (const unsigned char *)jp )[k];
++						vs.joint[k] = jt;
++						vs.weight[k] = w4[k] > 0.0f ? w4[k] : 0.0f;
++						wsum += vs.weight[k];
++						vs.localPos[k].Zero();
++					}
++					if ( wsum < 0.001f ) { vs.weight[0] = 1.0f; vs.weight[1] = vs.weight[2] = vs.weight[3] = 0.0f; }	// DC: NaN guard
++					else for ( int k = 0; k < 4; k++ ) vs.weight[k] /= wsum;										// DC: normalize to 1.0
++					vs.count = 4;
++					gltfVertSkins.Append( vs );
++				}
++				for ( int t = 0; t < numIndexes; t++ ) gltfBaseIndexes.Append( tri->indexes[t] );	// 0-based per surface
++				gltfSkinRanges.Append( range );
++			}
++		}
++
 +		AddSurface( surf );
 +	}
 +
@@ -806,6 +862,84 @@ index 3016bf2..90f332c 100644
 +			for ( int j = 0; j < nj; j++ ) {
 +				const int pn = skin.joints[j].parentNum;
 +				gltfJoints[j].parent = ( pn >= 0 && pn < nj ) ? &gltfJoints[pn] : NULL;
++			}
++			// Spike-B P1/P2: pre-transform each captured bind vert into its joints'
++			// LOCAL space, so InstantiateDynamicModel's CPU skinning reproduces the
++			// bind pose at rest. Build the GLOBAL bind pose the SAME way idAnimator
++			// builds ent->joints (ConvertJointQuatsToJointMats + TransformJoints,
++			// parent-first), then localPos = bindMat[j]^-1 * baseXyz (rigid inverse
++			// R^T*(p-t); idJointMat stores R^T so the inverse rotation is
++			// ToMat3().Transpose()). A rest-pose reconstruction self-check
++			// (sum( w * bindMat * localPos ) ~= base) PROVES the convention at load.
++			if ( gltfSkinRanges.Num() > 0 && nj > 0 ) {
++				idList<idJointMat> bindMats; bindMats.SetNum( nj );
++				SIMDProcessor->ConvertJointQuatsToJointMats( bindMats.Ptr(), gltfDefaultPose.Ptr(), nj );
++				idList<int> parents; parents.SetNum( nj );
++				bool topoOK = true;
++				for ( int j = 0; j < nj; j++ ) {
++					parents[j] = gltfJoints[j].parent ? (int)( gltfJoints[j].parent - &gltfJoints[0] ) : -1;
++					if ( j > 0 && parents[j] >= j ) topoOK = false;
++				}
++				if ( topoOK ) {
++					if ( nj > 1 ) SIMDProcessor->TransformJoints( bindMats.Ptr(), parents.Ptr(), 1, nj - 1 );
++					float restErr = 0.0f;
++					for ( int i = 0; i < gltfVertSkins.Num(); i++ ) {
++						gltfVertSkin_t &vs = gltfVertSkins[i];
++						const idVec3 base = gltfBaseVerts[i].xyz;
++						for ( int k = 0; k < 4; k++ ) {
++							const int jt = vs.joint[k];
++							if ( vs.weight[k] <= 0.0f || jt < 0 || jt >= nj ) { vs.localPos[k].Zero(); continue; }
++							const idJointMat &G = bindMats[jt];
++							vs.localPos[k] = G.ToMat3().Transpose() * ( base - G.ToVec3() );
++						}
++						idVec3 rec( 0.0f, 0.0f, 0.0f );
++						for ( int k = 0; k < 4; k++ ) {
++							if ( vs.weight[k] <= 0.0f ) continue;
++							rec += vs.weight[k] * ( bindMats[ vs.joint[k] ] * idVec4( vs.localPos[k].x, vs.localPos[k].y, vs.localPos[k].z, 1.0f ) );
++						}
++						const float e = ( rec - base ).Length();
++						if ( e > restErr ) restErr = e;
++					}
++					EM_ASM({ window.__d3GltfSkinVerts = $0; window.__d3GltfRestErr = $1; }, gltfVertSkins.Num(), (double)restErr );
++
++					// P3 kill-criterion (Dawn): drive the REAL InstantiateDynamicModel with
++					// two animated poses — bind, and a synthetic 60deg bend of the non-root
++					// joints (mirroring the clip) — and measure how far the probe vertex moved.
++					// Proves the CPU skinning deforms rendered verts under an animated pose;
++					// r_gltfSkinIdentity forces both poses to the bind verts -> delta ~0 -> gate
++					// RED (vacuous-pass guard). The full idAnimator/CycleAnim drive additionally
++					// needs SPINE to accept a .glb mesh in idDeclModelDef (Anim_Blend.cpp:2622,
++					// currently .md5mesh-only) — tracked as a cross-track ask.
++					idList<idJointQuat> bentPose = gltfDefaultPose;
++					idQuat zr; zr.x = 0.0f; zr.y = 0.0f; zr.z = 0.5f; zr.w = 0.8660254f;	// 60deg about Z
++					for ( int j = 1; j < nj; j++ ) { idQuat q = zr * bentPose[j].q; q.Normalize(); bentPose[j].q = q; }
++					idList<idJointMat> bentMats; bentMats.SetNum( nj );
++					SIMDProcessor->ConvertJointQuatsToJointMats( bentMats.Ptr(), bentPose.Ptr(), nj );
++					if ( nj > 1 ) SIMDProcessor->TransformJoints( bentMats.Ptr(), parents.Ptr(), 1, nj - 1 );
++
++					renderEntity_t te;
++					memset( &te, 0, sizeof( te ) );
++					te.numJoints = nj;
++					const int probe = ( gltfBaseVerts.Num() > 5 ) ? 5 : 0;
++					te.joints = bindMats.Ptr();
++					idRenderModel *snapA = InstantiateDynamicModel( &te, NULL, NULL );
++					idVec3 pa( 0.0f, 0.0f, 0.0f );
++					if ( snapA && snapA->NumSurfaces() > 0 && snapA->Surface( 0 )->geometry && probe < snapA->Surface( 0 )->geometry->numVerts ) {
++						pa = snapA->Surface( 0 )->geometry->verts[probe].xyz;
++					}
++					te.joints = bentMats.Ptr();
++					idRenderModel *snapB = InstantiateDynamicModel( &te, NULL, snapA );
++					idVec3 pb( 0.0f, 0.0f, 0.0f );
++					if ( snapB && snapB->NumSurfaces() > 0 && snapB->Surface( 0 )->geometry && probe < snapB->Surface( 0 )->geometry->numVerts ) {
++						pb = snapB->Surface( 0 )->geometry->verts[probe].xyz;
++					}
++					const float skinDelta = ( pb - pa ).Length();
++					if ( snapB ) { delete snapB; } else if ( snapA ) { delete snapA; }
++					EM_ASM({ window.__d3GltfSkinTestDelta = $0; }, (double)skinDelta );
++				} else {
++					common->Warning( "LoadGLTF: '%s' skin joints not parent-first; CPU skinning disabled", fileName );
++					gltfSkinRanges.Clear(); gltfBaseVerts.Clear(); gltfBaseIndexes.Clear(); gltfVertSkins.Clear();
++				}
 +			}
 +			// Register the in-memory idMD5Anim so GetAnim(token) is a cache hit.
 +			// Links SPINE's D3_RegisterGltfAnim -> RegisterMemoryAnim -> BuildFromGLTF
@@ -832,7 +966,7 @@ index 3016bf2..90f332c 100644
  /*
  ================
  idRenderModelStatic::PartialInitFromFile
-@@ -299,6 +880,9 @@ void idRenderModelStatic::InitFromFile( const char *fileName ) {
+@@ -299,6 +1014,9 @@ void idRenderModelStatic::InitFromFile( const char *fileName ) {
  	} else if ( extension.Icmp( "ma" ) == 0 ) {
  		loaded		= LoadMA( name );
  		reloadable	= true;
@@ -842,7 +976,7 @@ index 3016bf2..90f332c 100644
  	} else {
  		common->Warning( "idRenderModelStatic::InitFromFile: unknown type for model: \'%s\'", name.c_str() );
  		loaded		= false;
-@@ -453,7 +1037,7 @@ idRenderModelStatic::IsDynamicModel
+@@ -453,7 +1171,7 @@ idRenderModelStatic::IsDynamicModel
  */
  dynamicModel_t idRenderModelStatic::IsDynamicModel() const {
  	// dynamic subclasses will override this
@@ -851,20 +985,141 @@ index 3016bf2..90f332c 100644
  }
  
  /*
-@@ -493,6 +1077,12 @@ idRenderModel *idRenderModelStatic::InstantiateDynamicModel( const struct render
+@@ -489,12 +1207,130 @@ idRenderModelStatic::InstantiateDynamicModel
+ ================
+ */
+ idRenderModel *idRenderModelStatic::InstantiateDynamicModel( const struct renderEntity_s *ent, const struct viewDef_s *view, idRenderModel *cachedModel ) {
+-	if ( cachedModel ) {
++	// R-GLTF Spike-B P2: CPU matrix-palette skinning for a skinned glTF model.
++	// Deform the captured BIND verts by the current animated joint pose (ent->joints,
++	// the same global joint mats idAnimator produces) into a fresh/cached snapshot,
++	// mirroring the native MD5 path (idMD5Mesh::UpdateSurface). The deform runs at
++	// view-build time (before RB_ExecuteBackEndCommands), so the deformed verts are
++	// what the WebGPU capture freezes — det stays IDENTICAL. Backend needs ZERO change.
++	if ( !gltfJoints.Num() ) {
++		if ( cachedModel ) { delete cachedModel; cachedModel = NULL; }
++		common->Error( "InstantiateDynamicModel called on static model '%s'", name.c_str() );
++		return NULL;
++	}
++	if ( !gltfSkinRanges.Num() ) {
++		// skinned skeleton but no per-vertex skin data (e.g. non-parent-first joints,
++		// disabled at load) — animator still drives the joints; no visible deform.
++		if ( cachedModel ) { delete cachedModel; cachedModel = NULL; }
++		return NULL;
++	}
++
++	if ( cachedModel && !r_useCachedDynamicModels.GetBool() ) {
  		delete cachedModel;
  		cachedModel = NULL;
  	}
-+	// R-GLTF Spike-B: a skinned glTF is DM_CACHED but has no CPU-skin deform yet —
-+	// return NULL (not Error) so the animator still drives the joints (kill-criterion
-+	// (c) is animator-level via GetJointTransform); visible vertex deform is the next increment.
-+	if ( gltfJoints.Num() ) {
+-	common->Error( "InstantiateDynamicModel called on static model '%s'", name.c_str() );
+-	return NULL;
++
++	if ( !ent->joints ) {
++		common->Printf( "idRenderModelStatic::InstantiateDynamicModel: NULL joints on renderEntity for '%s'\n", name.c_str() );
++		delete cachedModel;
++		return NULL;
++	} else if ( ent->numJoints != gltfJoints.Num() ) {
++		common->Printf( "idRenderModelStatic::InstantiateDynamicModel: renderEntity has different number of joints than model for '%s'\n", name.c_str() );
++		delete cachedModel;
 +		return NULL;
 +	}
- 	common->Error( "InstantiateDynamicModel called on static model '%s'", name.c_str() );
- 	return NULL;
++
++	static const char *GLTF_SnapshotName = "_GLTFsnapshot_";
++	idRenderModelStatic *staticModel;
++	if ( cachedModel ) {
++		assert( dynamic_cast<idRenderModelStatic *>( cachedModel ) != NULL );
++		staticModel = static_cast<idRenderModelStatic *>( cachedModel );
++	} else {
++		staticModel = new idRenderModelStatic;
++		staticModel->InitEmpty( GLTF_SnapshotName );
++	}
++	staticModel->bounds.Clear();
++
++	const idJointMat *entJoints = ent->joints;
++	bool identity = false;
++#ifdef __EMSCRIPTEN__
++	identity = r_gltfSkinIdentity.GetBool();
++#endif
++
++	for ( int s = 0; s < gltfSkinRanges.Num(); s++ ) {
++		const gltfSkinRange_t &range = gltfSkinRanges[s];
++
++		modelSurface_t *surf;
++		int surfaceNum;
++		if ( staticModel->FindSurfaceWithId( s, surfaceNum ) ) {
++			surf = &staticModel->surfaces[surfaceNum];
++		} else {
++			surf = &staticModel->surfaces.Alloc();
++			surf->geometry = NULL;
++			surf->shader = NULL;
++			surf->id = s;
++		}
++		surf->shader = range.shader ? range.shader : tr.defaultMaterial;
++
++		// reuse the cached geometry buffers when the counts match (no per-frame alloc)
++		srfTriangles_t *tri = surf->geometry;
++		if ( tri && ( tri->numVerts != range.numVerts || tri->numIndexes != range.numIndexes ) ) {
++			R_FreeStaticTriSurf( tri );
++			tri = NULL;
++		}
++		if ( !tri ) {
++			tri = R_AllocStaticTriSurf();
++			R_AllocStaticTriSurfVerts( tri, range.numVerts );
++			R_AllocStaticTriSurfIndexes( tri, range.numIndexes );
++			surf->geometry = tri;
++		}
++		tri->numVerts = range.numVerts;
++		tri->numIndexes = range.numIndexes;
++
++		for ( int t = 0; t < range.numIndexes; t++ ) {
++			tri->indexes[t] = gltfBaseIndexes[range.firstIndex + t];
++		}
++		for ( int v = 0; v < range.numVerts; v++ ) {
++			const int gi = range.firstVert + v;
++			const gltfVertSkin_t &vs = gltfVertSkins[gi];
++			tri->verts[v] = gltfBaseVerts[gi];		// base st/normal; xyz re-skinned below
++			idVec3 p;
++			if ( identity ) {
++				p = gltfBaseVerts[gi].xyz;			// falsifiability: no deform -> probe never moves
++			} else {
++				p.Zero();
++				for ( int k = 0; k < 4; k++ ) {
++					if ( vs.weight[k] <= 0.0f ) continue;
++					p += vs.weight[k] * ( entJoints[ vs.joint[k] ] * idVec4( vs.localPos[k].x, vs.localPos[k].y, vs.localPos[k].z, 1.0f ) );
++				}
++			}
++			tri->verts[v].xyz = p;
++		}
++
++		tri->deformedSurface = true;
++		tri->tangentsCalculated = false;
++		tri->facePlanesCalculated = false;
++
++		R_BoundTriSurf( tri );
++		R_DeriveTangents( tri );			// native parity: normals/tangents from deformed positions, not hand-skinned
++
++		staticModel->bounds.AddBounds( tri->bounds );
++	}
++
++#ifdef __EMSCRIPTEN__
++	// P3 kill-criterion probe: publish the first surface's probe vertex (model-space
++	// deformed) + a measured-frame counter, so the harness proves rendered verts move
++	// between two animation poses (and the identity mutation drives the delta to ~0).
++	if ( staticModel->surfaces.Num() > 0 && staticModel->surfaces[0].geometry ) {
++		const srfTriangles_t *t0 = staticModel->surfaces[0].geometry;
++		int probe = 5;
++		if ( probe >= t0->numVerts ) probe = 0;
++		const idVec3 pp = t0->verts[probe].xyz;
++		EM_ASM({ var a = []; a.push($0); a.push($1); a.push($2); window.__d3SkinnedVertPos_W = a; window.__d3SkinnedVertMeasuredFrames = ( window.__d3SkinnedVertMeasuredFrames | 0 ) + 1; }, (double)pp.x, (double)pp.y, (double)pp.z );
++	}
++#endif
++
++	return staticModel;
  }
-@@ -503,7 +1093,7 @@ idRenderModelStatic::NumJoints
+ 
+ /*
+@@ -503,7 +1339,7 @@ idRenderModelStatic::NumJoints
  ================
  */
  int idRenderModelStatic::NumJoints( void ) const {
@@ -873,7 +1128,7 @@ index 3016bf2..90f332c 100644
  }
  
  /*
-@@ -512,7 +1102,7 @@ idRenderModelStatic::GetJoints
+@@ -512,7 +1348,7 @@ idRenderModelStatic::GetJoints
  ================
  */
  const idMD5Joint *idRenderModelStatic::GetJoints( void ) const {
@@ -882,7 +1137,7 @@ index 3016bf2..90f332c 100644
  }
  
  /*
-@@ -521,6 +1111,9 @@ idRenderModelStatic::GetJointHandle
+@@ -521,6 +1357,9 @@ idRenderModelStatic::GetJointHandle
  ================
  */
  jointHandle_t idRenderModelStatic::GetJointHandle( const char *name ) const {
@@ -892,7 +1147,7 @@ index 3016bf2..90f332c 100644
  	return INVALID_JOINT;
  }
  
-@@ -530,6 +1123,7 @@ idRenderModelStatic::GetJointName
+@@ -530,6 +1369,7 @@ idRenderModelStatic::GetJointName
  ================
  */
  const char * idRenderModelStatic::GetJointName( jointHandle_t handle ) const {
@@ -900,7 +1155,7 @@ index 3016bf2..90f332c 100644
  	return "";
  }
  
-@@ -539,7 +1133,7 @@ idRenderModelStatic::GetDefaultPose
+@@ -539,7 +1379,7 @@ idRenderModelStatic::GetDefaultPose
  ================
  */
  const idJointQuat *idRenderModelStatic::GetDefaultPose( void ) const {
@@ -965,7 +1220,7 @@ index ddbff1c..16a3b0e 100644
  		model->InitFromFile( modelName );
  	} else if ( extension.Icmp( "ma" ) == 0 ) {
 diff --git a/neo/renderer/Model_local.h b/neo/renderer/Model_local.h
-index a56c999..1108652 100644
+index a56c999..81745a3 100644
 --- a/neo/renderer/Model_local.h
 +++ b/neo/renderer/Model_local.h
 @@ -94,6 +94,7 @@ public:
@@ -976,7 +1231,7 @@ index a56c999..1108652 100644
  
  	bool						ConvertASEToModelSurfaces( const struct aseModel_s *ase );
  	bool						ConvertLWOToModelSurfaces( const struct st_lwObject *lwo );
-@@ -109,6 +110,11 @@ public:
+@@ -109,6 +110,25 @@ public:
  	idList<modelSurface_t>		surfaces;
  	idBounds					bounds;
  	int							overlaysAdded;
@@ -985,6 +1240,20 @@ index a56c999..1108652 100644
 +	// idDeclModelDef::SetupJoints + CheckModelHierarchy bind the anim.
 +	idList<idMD5Joint>			gltfJoints;
 +	idList<idJointQuat>			gltfDefaultPose;
++	// R-GLTF Spike-B dynamic CPU skinning: per-surface BIND geometry + per-vertex
++	// joint influences, captured at load in glTF order (flat POD arrays, so
++	// FinishSurfaces' vertex welding can't desync them). InstantiateDynamicModel
++	// CPU-skins a fresh snapshot from these each frame, mirroring the MD5 path
++	// (idMD5Mesh::UpdateSurface -> TransformVerts -> R_DeriveTangents). Empty for
++	// non-skinned models. localPos[] = the bind vertex pre-transformed into each
++	// influencing joint's LOCAL space, so skinned = sum( w * entJoints[j] * localPos )
++	// reproduces the bind pose by construction at rest (j-local == MD5 weight form).
++	struct gltfVertSkin_t { int joint[4]; float weight[4]; idVec3 localPos[4]; int count; };
++	struct gltfSkinRange_t { int firstVert; int numVerts; int firstIndex; int numIndexes; const idMaterial *shader; };
++	idList<idDrawVert>			gltfBaseVerts;		// bind verts (idTech4 space), glTF order
++	idList<glIndex_t>			gltfBaseIndexes;	// 0-based per-surface (offset by range.firstIndex)
++	idList<gltfVertSkin_t>		gltfVertSkins;		// parallel to gltfBaseVerts
++	idList<gltfSkinRange_t>		gltfSkinRanges;		// one per skinned surface
  
  protected:
  	int							lastModifiedFrame;
