@@ -4409,3 +4409,21 @@ index cb91cf5..dfcf586 100644
  
  	int							MemorySize( void ) const;
  	void						ReportRoutingEfficiency( void ) const;
+diff --git a/neo/game/anim/Anim_Blend.cpp b/neo/game/anim/Anim_Blend.cpp
+index e3409ba..fa025e1 100644
+--- a/neo/game/anim/Anim_Blend.cpp
++++ b/neo/game/anim/Anim_Blend.cpp
+@@ -2619,7 +2619,12 @@ bool idDeclModelDef::Parse( const char *text, const int textLength ) {
+ 			}
+ 			filename = token2;
+ 			filename.ExtractFileExtension( extension );
+-			if ( extension != MD5_MESH_EXT ) {
++			// CONTENT/RENDER (arco-doom): accept rigged glTF (.glb/.gltf) as a modelDef mesh, not just
++			// .md5mesh. RENDER's CPU-skinned glTF render model implements the same abstract idRenderModel
++			// interface (IsDefaultModel/NumJoints/GetJoints) that everything below this gate uses, so a
++			// .glb enemy drives through the UNMODIFIED idAnimator + combat wire. Unblocks the content-forge
++			// rigged-enemy packer->engine path + RENDER's full-animator-drive re-verify.
++			if ( extension != MD5_MESH_EXT && extension.Icmp( "glb" ) != 0 && extension.Icmp( "gltf" ) != 0 ) {
+ 				src.Warning( "Invalid model for MD5 mesh" );
+ 				MakeDefault();
+ 				return false;
