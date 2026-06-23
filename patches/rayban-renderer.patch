@@ -234,7 +234,7 @@ index f9ae002..9430a1e 100644
  
  			qglCopyTexSubImage2D( GL_TEXTURE_2D, 0, 0, 0, x, y, imageWidth, imageHeight );
 diff --git a/neo/renderer/Model.cpp b/neo/renderer/Model.cpp
-index 3016bf2..b81d829 100644
+index 3016bf2..02c7fcd 100644
 --- a/neo/renderer/Model.cpp
 +++ b/neo/renderer/Model.cpp
 @@ -35,6 +35,9 @@ If you have questions concerning this license or the applicable additional terms
@@ -247,7 +247,7 @@ index 3016bf2..b81d829 100644
  
  #include "renderer/Model.h"
  
-@@ -262,6 +265,266 @@ void idRenderModelStatic::MakeDefaultModel() {
+@@ -262,6 +265,564 @@ void idRenderModelStatic::MakeDefaultModel() {
  	FinishSurfaces();
  }
  
@@ -290,6 +290,291 @@ index 3016bf2..b81d829 100644
 +			else if ( tok == "}" || tok == "]" ) depth--;
 +		}
 +	}
++}
++
++// ============================================================================
++// R-GLTF Spike-B — skinned-clip PARSER: glTF nodes/skins/animations ->
++// gltfAnimClip_t (+ gltfSkin_t skeleton). SPINE's idMD5Anim::BuildFromGLTF then
++// consumes the clip so a glTF anim drives through the SHIPPED combat wire. The
++// STATIC surface build stays in LoadGLTF (Spike-A); this is an additive pass.
++// ============================================================================
++struct gltfNode_t { idVec3 t; idQuat r; idVec3 s; idList<int> children; bool hasT; bool hasR; };
++struct gltfSampler_t { int input; int output; int interp; };		// interp: 0 LINEAR, 1 STEP, 2 CUBICSPLINE
++struct gltfChannel_t { int sampler; int targetNode; int path; };	// path: 0 T, 1 R, 2 S
++
++// read element i (n floats) of a float accessor
++static void GLTF_ReadAccessorFloats( const gltfAccessor_t &a, const idList<gltfBufferView_t> &bvs, const byte *bin, int i, float *out, int n ) {
++	for ( int c = 0; c < n; c++ ) out[c] = 0.0f;
++	if ( a.bufferView < 0 || a.bufferView >= bvs.Num() ) return;
++	const gltfBufferView_t &bv = bvs[a.bufferView];
++	int stride = bv.byteStride ? bv.byteStride : a.numComp * 4;
++	const float *fp = (const float *)( bin + bv.byteOffset + a.byteOffset + i * stride );
++	for ( int c = 0; c < n && c < a.numComp; c++ ) out[c] = fp[c];
++}
++
++// Y-up(glTF) -> Z-up(idTech4) basis change as a quaternion CONJUGATION (not a swizzle);
++// normalize + canonicalize w>=0 (BuildFromGLTF stores x,y,z and CalcW recovers +w).
++static idQuat GLTF_BasisRot( const idQuat &q ) {
++	static const idQuat C( -0.70710678f, 0.0f, 0.0f, 0.70710678f );		// -90 deg about X
++	static const idQuat Cinv( 0.70710678f, 0.0f, 0.0f, 0.70710678f );	// conjugate of C
++	idQuat r = C * q * Cinv;
++	r.Normalize();
++	if ( r.w < 0.0f ) { r.x = -r.x; r.y = -r.y; r.z = -r.z; r.w = -r.w; }
++	return r;
++}
++static idVec3 GLTF_BasisTrans( const idVec3 &t, float scale ) {
++	return idVec3( t.x * scale, -t.z * scale, t.y * scale );
++}
++
++// sample a vec3 channel (LINEAR / STEP) at time tf
++static idVec3 GLTF_SampleVec3( const gltfSampler_t &s, const idList<gltfAccessor_t> &acc, const idList<gltfBufferView_t> &bvs, const byte *bin, float tf, const idVec3 &dflt ) {
++	if ( s.input < 0 || s.input >= acc.Num() || s.output < 0 || s.output >= acc.Num() ) return dflt;
++	const gltfAccessor_t &in = acc[s.input];
++	const gltfAccessor_t &out = acc[s.output];
++	int nk = in.count;
++	if ( nk <= 0 ) return dflt;
++	float t0, t1; float v0[3], v1[3];
++	GLTF_ReadAccessorFloats( in, bvs, bin, 0, &t0, 1 );
++	if ( tf <= t0 ) { GLTF_ReadAccessorFloats( out, bvs, bin, 0, v0, 3 ); return idVec3( v0[0], v0[1], v0[2] ); }
++	for ( int k = 0; k < nk - 1; k++ ) {
++		GLTF_ReadAccessorFloats( in, bvs, bin, k, &t0, 1 );
++		GLTF_ReadAccessorFloats( in, bvs, bin, k + 1, &t1, 1 );
++		if ( tf >= t0 && tf <= t1 ) {
++			GLTF_ReadAccessorFloats( out, bvs, bin, k, v0, 3 );
++			if ( s.interp == 1 ) return idVec3( v0[0], v0[1], v0[2] );	// STEP
++			GLTF_ReadAccessorFloats( out, bvs, bin, k + 1, v1, 3 );
++			float u = ( t1 > t0 ) ? ( tf - t0 ) / ( t1 - t0 ) : 0.0f;
++			return idVec3( v0[0] + ( v1[0] - v0[0] ) * u, v0[1] + ( v1[1] - v0[1] ) * u, v0[2] + ( v1[2] - v0[2] ) * u );
++		}
++	}
++	GLTF_ReadAccessorFloats( out, bvs, bin, nk - 1, v0, 3 );		// past the end -> last key
++	return idVec3( v0[0], v0[1], v0[2] );
++}
++
++// sample a quaternion channel (SLERP / STEP) at time tf
++static idQuat GLTF_SampleQuat( const gltfSampler_t &s, const idList<gltfAccessor_t> &acc, const idList<gltfBufferView_t> &bvs, const byte *bin, float tf, const idQuat &dflt ) {
++	if ( s.input < 0 || s.input >= acc.Num() || s.output < 0 || s.output >= acc.Num() ) return dflt;
++	const gltfAccessor_t &in = acc[s.input];
++	const gltfAccessor_t &out = acc[s.output];
++	int nk = in.count;
++	if ( nk <= 0 ) return dflt;
++	float t0, t1; float q0[4], q1[4];
++	GLTF_ReadAccessorFloats( in, bvs, bin, 0, &t0, 1 );
++	if ( tf <= t0 ) { GLTF_ReadAccessorFloats( out, bvs, bin, 0, q0, 4 ); return idQuat( q0[0], q0[1], q0[2], q0[3] ); }
++	for ( int k = 0; k < nk - 1; k++ ) {
++		GLTF_ReadAccessorFloats( in, bvs, bin, k, &t0, 1 );
++		GLTF_ReadAccessorFloats( in, bvs, bin, k + 1, &t1, 1 );
++		if ( tf >= t0 && tf <= t1 ) {
++			GLTF_ReadAccessorFloats( out, bvs, bin, k, q0, 4 );
++			idQuat a( q0[0], q0[1], q0[2], q0[3] );
++			if ( s.interp == 1 ) return a;	// STEP
++			GLTF_ReadAccessorFloats( out, bvs, bin, k + 1, q1, 4 );
++			idQuat b( q1[0], q1[1], q1[2], q1[3] );
++			float u = ( t1 > t0 ) ? ( tf - t0 ) / ( t1 - t0 ) : 0.0f;
++			idQuat r; r.Slerp( a, b, u ); return r;
++		}
++	}
++	GLTF_ReadAccessorFloats( out, bvs, bin, nk - 1, q0, 4 );
++	return idQuat( q0[0], q0[1], q0[2], q0[3] );
++}
++
++// Parse the GLB's first skin + first animation into a gltfAnimClip_t (+ skeleton).
++// Returns false if the GLB is not skinned/animated. Additive; never touches the
++// Spike-A static path. (Glue to register + a skinned model are the next increments.)
++bool GLTF_ParseAnimClip( const char *json, int jsonLen, const byte *bin, const char *fileName, gltfAnimClip_t &clip, gltfSkin_t &skin ) {
++	idList<gltfAccessor_t> acc;
++	idList<gltfBufferView_t> bvs;
++	idList<gltfNode_t> nodes;
++	idList<int> skinJoints;			// node indices, in skin.joints order
++	idList<gltfSampler_t> samplers;
++	idList<gltfChannel_t> channels;
++	bool gotSkin = false;
++
++	idLexer lex;
++	lex.LoadMemory( json, jsonLen, fileName );
++	lex.SetFlags( LEXFL_NOERRORS | LEXFL_NOWARNINGS | LEXFL_NOFATALERRORS );
++	idToken tok;
++	if ( !lex.ExpectTokenString( "{" ) ) { lex.FreeSource(); return false; }
++	while ( lex.ReadToken( &tok ) ) {
++		if ( tok == "}" ) break;
++		if ( tok == "," ) continue;
++		idStr key = tok; lex.ExpectTokenString( ":" );
++		if ( key == "accessors" ) {
++			lex.ExpectTokenString( "[" );
++			while ( lex.ReadToken( &tok ) ) {
++				if ( tok == "]" ) break; if ( tok == "," ) continue;
++				gltfAccessor_t a; a.bufferView = -1; a.byteOffset = 0; a.componentType = 5126; a.count = 0; a.numComp = 1;
++				while ( lex.ReadToken( &tok ) ) {
++					if ( tok == "}" ) break; if ( tok == "," ) continue;
++					idStr k = tok; lex.ExpectTokenString( ":" );
++					if ( k == "bufferView" ) a.bufferView = lex.ParseInt();
++					else if ( k == "byteOffset" ) a.byteOffset = lex.ParseInt();
++					else if ( k == "componentType" ) a.componentType = lex.ParseInt();
++					else if ( k == "count" ) a.count = lex.ParseInt();
++					else if ( k == "type" ) { idToken t2; lex.ReadToken( &t2 ); a.numComp = GLTF_NumComp( t2 ); }
++					else GLTF_SkipValue( lex );
++				}
++				acc.Append( a );
++			}
++		} else if ( key == "bufferViews" ) {
++			lex.ExpectTokenString( "[" );
++			while ( lex.ReadToken( &tok ) ) {
++				if ( tok == "]" ) break; if ( tok == "," ) continue;
++				gltfBufferView_t bv; bv.byteOffset = 0; bv.byteLength = 0; bv.byteStride = 0;
++				while ( lex.ReadToken( &tok ) ) {
++					if ( tok == "}" ) break; if ( tok == "," ) continue;
++					idStr k = tok; lex.ExpectTokenString( ":" );
++					if ( k == "byteOffset" ) bv.byteOffset = lex.ParseInt();
++					else if ( k == "byteLength" ) bv.byteLength = lex.ParseInt();
++					else if ( k == "byteStride" ) bv.byteStride = lex.ParseInt();
++					else GLTF_SkipValue( lex );
++				}
++				bvs.Append( bv );
++			}
++		} else if ( key == "nodes" ) {
++			lex.ExpectTokenString( "[" );
++			while ( lex.ReadToken( &tok ) ) {
++				if ( tok == "]" ) break; if ( tok == "," ) continue;
++				gltfNode_t n; n.t.Zero(); n.r.Set( 0, 0, 0, 1 ); n.s.Set( 1, 1, 1 ); n.hasT = false; n.hasR = false;
++				while ( lex.ReadToken( &tok ) ) {
++					if ( tok == "}" ) break; if ( tok == "," ) continue;
++					idStr k = tok; lex.ExpectTokenString( ":" );
++					if ( k == "translation" ) { lex.ExpectTokenString( "[" ); n.t.x = lex.ParseFloat(); lex.ExpectTokenString( "," ); n.t.y = lex.ParseFloat(); lex.ExpectTokenString( "," ); n.t.z = lex.ParseFloat(); lex.ExpectTokenString( "]" ); n.hasT = true; }
++					else if ( k == "rotation" ) { lex.ExpectTokenString( "[" ); n.r.x = lex.ParseFloat(); lex.ExpectTokenString( "," ); n.r.y = lex.ParseFloat(); lex.ExpectTokenString( "," ); n.r.z = lex.ParseFloat(); lex.ExpectTokenString( "," ); n.r.w = lex.ParseFloat(); lex.ExpectTokenString( "]" ); n.hasR = true; }
++					else if ( k == "scale" ) { lex.ExpectTokenString( "[" ); n.s.x = lex.ParseFloat(); lex.ExpectTokenString( "," ); n.s.y = lex.ParseFloat(); lex.ExpectTokenString( "," ); n.s.z = lex.ParseFloat(); lex.ExpectTokenString( "]" ); }
++					else if ( k == "children" ) { lex.ExpectTokenString( "[" ); while ( lex.ReadToken( &tok ) ) { if ( tok == "]" ) break; if ( tok == "," ) continue; n.children.Append( atoi( tok.c_str() ) ); } }
++					else GLTF_SkipValue( lex );
++				}
++				nodes.Append( n );
++			}
++		} else if ( key == "skins" ) {
++			lex.ExpectTokenString( "[" );
++			int skinIdx = 0;
++			while ( lex.ReadToken( &tok ) ) {
++				if ( tok == "]" ) break; if ( tok == "," ) continue;
++				bool first = ( skinIdx == 0 ); skinIdx++;
++				while ( lex.ReadToken( &tok ) ) {
++					if ( tok == "}" ) break; if ( tok == "," ) continue;
++					idStr k = tok; lex.ExpectTokenString( ":" );
++					if ( k == "joints" && first ) { lex.ExpectTokenString( "[" ); while ( lex.ReadToken( &tok ) ) { if ( tok == "]" ) break; if ( tok == "," ) continue; skinJoints.Append( atoi( tok.c_str() ) ); } gotSkin = true; }
++					else GLTF_SkipValue( lex );
++				}
++			}
++		} else if ( key == "animations" ) {
++			lex.ExpectTokenString( "[" );
++			int animIdx = 0;
++			while ( lex.ReadToken( &tok ) ) {
++				if ( tok == "]" ) break; if ( tok == "," ) continue;
++				bool first = ( animIdx == 0 ); animIdx++;
++				while ( lex.ReadToken( &tok ) ) {
++					if ( tok == "}" ) break; if ( tok == "," ) continue;
++					idStr k = tok; lex.ExpectTokenString( ":" );
++					if ( k == "samplers" && first ) {
++						lex.ExpectTokenString( "[" );
++						while ( lex.ReadToken( &tok ) ) {
++							if ( tok == "]" ) break; if ( tok == "," ) continue;
++							gltfSampler_t sm; sm.input = -1; sm.output = -1; sm.interp = 0;
++							while ( lex.ReadToken( &tok ) ) {
++								if ( tok == "}" ) break; if ( tok == "," ) continue;
++								idStr k2 = tok; lex.ExpectTokenString( ":" );
++								if ( k2 == "input" ) sm.input = lex.ParseInt();
++								else if ( k2 == "output" ) sm.output = lex.ParseInt();
++								else if ( k2 == "interpolation" ) { idToken it; lex.ReadToken( &it ); sm.interp = ( it == "STEP" ) ? 1 : ( it == "CUBICSPLINE" ? 2 : 0 ); }
++								else GLTF_SkipValue( lex );
++							}
++							samplers.Append( sm );
++						}
++					} else if ( k == "channels" && first ) {
++						lex.ExpectTokenString( "[" );
++						while ( lex.ReadToken( &tok ) ) {
++							if ( tok == "]" ) break; if ( tok == "," ) continue;
++							gltfChannel_t ch; ch.sampler = -1; ch.targetNode = -1; ch.path = -1;
++							while ( lex.ReadToken( &tok ) ) {
++								if ( tok == "}" ) break; if ( tok == "," ) continue;
++								idStr k2 = tok; lex.ExpectTokenString( ":" );
++								if ( k2 == "sampler" ) ch.sampler = lex.ParseInt();
++								else if ( k2 == "target" ) {
++									lex.ExpectTokenString( "{" );
++									while ( lex.ReadToken( &tok ) ) {
++										if ( tok == "}" ) break; if ( tok == "," ) continue;
++										idStr k3 = tok; lex.ExpectTokenString( ":" );
++										if ( k3 == "node" ) ch.targetNode = lex.ParseInt();
++										else if ( k3 == "path" ) { idToken pt; lex.ReadToken( &pt ); ch.path = ( pt == "translation" ) ? 0 : ( pt == "rotation" ? 1 : ( pt == "scale" ? 2 : -1 ) ); }
++										else GLTF_SkipValue( lex );
++									}
++								} else GLTF_SkipValue( lex );
++							}
++							channels.Append( ch );
++						}
++					} else GLTF_SkipValue( lex );
++				}
++			}
++		} else {
++			GLTF_SkipValue( lex );
++		}
++	}
++	lex.FreeSource();
++
++	int nj = skinJoints.Num();
++	if ( !gotSkin || nj <= 0 || channels.Num() == 0 ) return false;
++
++	clip.joints.SetNum( nj ); clip.baseFrame.SetNum( nj ); clip.animBits.SetNum( nj );
++	skin.joints.SetNum( nj ); skin.bindPose.SetNum( nj );
++	for ( int j = 0; j < nj; j++ ) {
++		int node = skinJoints[j];
++		// parent = the skin-joint whose children[] contains this node, else -1 (root)
++		int parent = -1;
++		for ( int p = 0; p < nj && parent < 0; p++ ) {
++			int pn = skinJoints[p];
++			if ( pn < 0 || pn >= nodes.Num() ) continue;
++			for ( int c = 0; c < nodes[pn].children.Num(); c++ ) if ( nodes[pn].children[c] == node ) { parent = p; break; }
++		}
++		idStr jname; sprintf( jname, "joint%d", j );		// glTF node names not parsed in the spike; synthetic (clip & skin share them)
++		clip.joints[j].name = jname; clip.joints[j].parentNum = parent;
++		skin.joints[j] = clip.joints[j];
++		idJointQuat bq;
++		bq.t = GLTF_BasisTrans( ( node >= 0 && node < nodes.Num() ) ? nodes[node].t : vec3_origin, 24.0f );
++		bq.q = GLTF_BasisRot( ( node >= 0 && node < nodes.Num() ) ? nodes[node].r : idQuat( 0, 0, 0, 1 ) );
++		clip.baseFrame[j] = bq; skin.bindPose[j] = bq;
++		clip.animBits[j] = 0x3F;	// all 6 channels (SPINE packs only flagged; simplest correct)
++	}
++
++	float maxT = 0.0f;
++	for ( int s = 0; s < samplers.Num(); s++ ) {
++		if ( samplers[s].input < 0 || samplers[s].input >= acc.Num() ) continue;
++		const gltfAccessor_t &in = acc[ samplers[s].input ];
++		if ( in.count <= 0 ) continue;
++		float last; GLTF_ReadAccessorFloats( in, bvs, bin, in.count - 1, &last, 1 );
++		if ( last > maxT ) maxT = last;
++	}
++	clip.frameRate = 24;
++	clip.numJoints = nj;
++	clip.numFrames = ( maxT > 0.0f ) ? ( (int)( maxT * clip.frameRate + 0.5f ) + 1 ) : 1;
++	if ( clip.numFrames < 1 ) clip.numFrames = 1;
++	clip.frames.SetNum( clip.numFrames * nj );
++
++	for ( int f = 0; f < clip.numFrames; f++ ) {
++		float tf = (float)f / (float)clip.frameRate;
++		for ( int j = 0; j < nj; j++ ) {
++			int node = skinJoints[j];
++			idVec3 lt = ( node >= 0 && node < nodes.Num() ) ? nodes[node].t : vec3_origin;
++			idQuat lr = ( node >= 0 && node < nodes.Num() ) ? nodes[node].r : idQuat( 0, 0, 0, 1 );
++			for ( int c = 0; c < channels.Num(); c++ ) {
++				const gltfChannel_t &ch = channels[c];
++				if ( ch.targetNode != node || ch.sampler < 0 || ch.sampler >= samplers.Num() ) continue;
++				if ( ch.path == 0 ) lt = GLTF_SampleVec3( samplers[ch.sampler], acc, bvs, bin, tf, lt );
++				else if ( ch.path == 1 ) lr = GLTF_SampleQuat( samplers[ch.sampler], acc, bvs, bin, tf, lr );
++				// scale (path 2) ignored — idMD5Anim has no per-joint scale
++			}
++			idJointQuat &dst = clip.frames[ f * nj + j ];
++			dst.t = GLTF_BasisTrans( lt, 24.0f );
++			dst.q = GLTF_BasisRot( lr );
++		}
++	}
++
++	idStr base = fileName; base.StripFileExtension();
++	clip.name = base + ".md5anim";	// synthetic GetAnim key (must end .md5anim)
++	return true;
 +}
 +
 +bool idRenderModelStatic::LoadGLTF( const char *fileName ) {
@@ -503,6 +788,19 @@ index 3016bf2..b81d829 100644
 +		AddSurface( surf );
 +	}
 +
++#ifdef __EMSCRIPTEN__
++	// Spike-B: if this GLB is skinned + animated, build the clip and register the
++	// in-memory idMD5Anim (D3_RegisterGltfAnim is the SPINE shim, Model.h:198) so a
++	// later GetAnim(token) is a cache hit. (A skeleton-exposing model so SetupJoints/
++	// CheckModelHierarchy bind it is the next increment.)
++	{
++		gltfAnimClip_t clip; gltfSkin_t skin;
++		if ( GLTF_ParseAnimClip( json, (int)jsonLen, bin, fileName, clip, skin ) ) {
++			D3_RegisterGltfAnim( clip );
++			EM_ASM({ window.__d3GltfAnimRegistered = 1; window.__d3GltfAnimFrames = $0; window.__d3GltfAnimJoints = $1; }, clip.numFrames, clip.numJoints );
++		}
++	}
++#endif
 +	fileSystem->FreeFile( fileBuf );
 +	common->Printf( "LoadGLTF: '%s' -> %d surfaces\n", fileName, surfaces.Num() );
 +#ifdef __EMSCRIPTEN__
@@ -514,7 +812,7 @@ index 3016bf2..b81d829 100644
  /*
  ================
  idRenderModelStatic::PartialInitFromFile
-@@ -299,6 +562,9 @@ void idRenderModelStatic::InitFromFile( const char *fileName ) {
+@@ -299,6 +860,9 @@ void idRenderModelStatic::InitFromFile( const char *fileName ) {
  	} else if ( extension.Icmp( "ma" ) == 0 ) {
  		loaded		= LoadMA( name );
  		reloadable	= true;
