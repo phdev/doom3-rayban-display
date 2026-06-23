@@ -4,11 +4,19 @@ Guidance for working in this repo. Keep this file updated as the project changes
 
 ## What this is
 
-An open-source DOOM 3 engine/demo shell for Meta Ray-Ban Display: a
-[dhewm3](https://github.com/dhewm/dhewm3) (GPL id Tech 4) build compiled to
-WebAssembly, wrapped in a Vite web app, driven by Neural Band gestures +
-`DeviceOrientationEvent` head turning. Sibling of
+An open-source DOOM 3 ([dhewm3](https://github.com/dhewm/dhewm3), GPL id Tech 4)
+build compiled to WebAssembly and rendered with a **custom WebGPU backend**,
+wrapped in a Vite web app. **Targets mobile (iOS Safari + Android Chrome) and
+desktop (Mac + PC) web browsers** — touch controls on mobile, mouse + keyboard
+on desktop; falls back to WebGL2 (GL4ES) where WebGPU isn't available. Sibling of
 [glquake2-rayban-display](https://github.com/phdev/glquake2-rayban-display).
+
+> **Naming note (2026-06-23):** the project **no longer targets the Meta Ray-Ban
+> glasses** — it's a mobile + desktop web game. The repo, branch (`render-track`),
+> and patch (`rayban-*.patch`) names still carry the historical `rayban` prefix,
+> and older entries in the iteration log below mention "wearable"/"glasses"/"iPhone"
+> as that history; the `inputMode==="wearable"` code path is now just the
+> **mobile/touch** profile. Identity/targeting is browser mobile + desktop.
 
 **No game data lives here.** DOOM 3 PK4s are proprietary; users supply their own
 reduced `base/pak-display.pk4` (or `?pk4=<url>`).
@@ -276,7 +284,7 @@ starts it sets `skipCinematic`/`cinematicMaxSkipTime` (the non-disconnect path o
 gameplay. Fast-forward (not abort) means the cinematic's script triggers still fire,
 so progression isn't broken.
 
-### Controls (mobile / wearable profile)
+### Controls (mobile / touch profile)
 
 - **Movement pad** — a bottom-left on-screen d-pad (`#moveControls`, forward / back /
   strafe-left / strafe-right). Each button drives the engine's existing `w/a/s/d`

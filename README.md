@@ -1,25 +1,24 @@
-# DOOM 3 — Meta Ray-Ban Display
+# DOOM 3 in the Browser — WebGPU (mobile + desktop)
 
-[![DOOM 3 — Meta Ray-Ban Display gameplay preview](public/media/demo-preview.gif)](https://phdev.github.io/doom3-rayban-display/media/doom3-rayban-display-demo.mp4)
+[![DOOM 3 WebGPU gameplay preview](public/media/demo-preview.gif)](https://phdev.github.io/doom3-rayban-display/media/doom3-rayban-display-demo.mp4)
 
 [Watch the MP4 demo](https://phdev.github.io/doom3-rayban-display/media/doom3-rayban-display-demo.mp4)
 
-**Runs on iOS Safari and mobile Chrome** (via WebGPU) — as well as desktop
-Chrome / Safari and the Meta Ray-Ban Display.
+**Runs in the browser on mobile (iOS Safari + Android Chrome) and desktop
+(Mac + PC) via WebGPU**, with a WebGL2 (GL4ES) fallback where WebGPU isn't available.
 
 An open-source [dhewm3](https://github.com/dhewm/dhewm3) (DOOM 3, GPL idTech4)
 build compiled to WebAssembly and rendered with a **custom WebGPU backend**,
-packaged as a web app shell for the **Meta Ray-Ban Display**. It uses Meta
-Neural Band pinch gestures + W3C `DeviceOrientationEvent` head-turning for input,
-and streams a reduced first-level (`maps/game/enpro`, the Enpro Plant) so it
-loads fast on a wearable.
+packaged as a Vite web app. Touch controls on mobile, mouse + keyboard on desktop.
+It streams a reduced first level (`maps/game/enpro`, the Enpro Plant) so it loads
+fast over the network.
 
 📺 **[Full development breakdown on X →](https://x.com/peterhowell/status/2067729471852212437?s=20)**
 
-**It is not glasses-only.** It's a standard web app that runs in any modern
-browser with WebGPU — **mobile Safari (iOS) and mobile Chrome (Android)** on
-phones, and desktop Chrome / Safari — and falls back to WebGL2 (GL4ES) where
-WebGPU isn't available. The glasses just get the clean, gesture-driven UI.
+It's a standard web app that runs in any modern browser with WebGPU —
+**mobile Safari (iOS) and mobile Chrome (Android)** on phones, and **desktop
+Chrome / Safari / Edge** — and falls back to WebGL2 (GL4ES) where WebGPU isn't
+available.
 
 It is the DOOM 3 sibling of
 [glquake2-rayban-display](https://github.com/phdev/glquake2-rayban-display) and
@@ -69,10 +68,10 @@ the Pages origin to `GET` (the scripts set `Access-Control-Allow-Origin`).
 
 ---
 
-## Generate your own glasses-optimized pak
+## Generate your own size-optimized pak
 
 You must own DOOM 3 and supply your own PK4s — **no game data is in this repo**.
-This repo ships the tools to turn your owned data into the small, glasses-tuned
+This repo ships the tools to turn your owned data into the small, mobile-friendly
 package the app loads (reduced to one level, binary-geometry-baked, per-area
 streamed, unused monsters stripped, sound off).
 
@@ -85,12 +84,12 @@ I own DOOM 3 and have my legally obtained PK4s at:
 
 DOOM3_BASE=/absolute/path/to/dhewm3/base   # has pak000.pk4..pak008.pk4 + game00..03.pk4
 
-Build a GLASSES-OPTIMIZED display pak for the doom3-rayban-display web app (this
+Build a SIZE-OPTIMIZED display pak for the doom3-rayban-display web app (this
 repo) from maps/game/enpro, install it into public/wasm/, and verify it.
 
 Goal:
 - A reduced single-level package for maps/game/enpro (the Enpro Plant), small
-  enough to load fast on a Meta Ray-Ban Display: per-area RENDER geometry
+  enough to load fast over the network on mobile: per-area RENDER geometry
   streaming with ALL textures resident at boot.
 - Outputs, chunked + manifested, ready for scripts/upload-paks-to-pages.sh:
   - public/wasm/base/          (monolith, the ?noareastream fallback)
@@ -184,10 +183,11 @@ the browser. Highlights of what this fork adds on top of stock dhewm3:
   stripped. Current download: **~17.7 MB boot pak + ~2.7 MB streamed geometry**
   (~20 MB to first-playable; the monolith `?noareastream` fallback is ~23 MB).
 
-### Wearable / glasses build
-- **Clean UI on the glasses**: the debug readout, log/copy buttons, fx panel, and
-  on-screen D-pad are hidden on the wearable (small-display / Android-WebView /
-  `?glasses`). `?diag` forces the debug UI back on any device.
+### Mobile / touch build
+- **Clean UI on mobile**: the debug readout, log/copy buttons, and fx panel are
+  hidden on the touch/clean-UI profile (small-display / `?glasses` — a
+  historically-named flag, now just "clean mobile UI"). `?diag` forces the debug
+  UI back on any device.
 - **Permanent flashlight** — a view-attached projected light that stays lit with
   any weapon equipped (toggle with the on-screen chip / the flashlight gesture).
 - **Unlimited ammo** — reserves are kept topped up; the readout shows real
@@ -199,8 +199,10 @@ the browser. Highlights of what this fork adds on top of stock dhewm3:
   init.
 
 ### Input
-- Meta Neural Band **pinch** = attack, **pinch-hold** = flashlight; head turning
-  via `DeviceOrientationEvent`; an on-screen D-pad is the touch/desktop fallback.
+- **Mobile (touch):** on-screen D-pad to move, drag to look, on-screen FIRE/JUMP.
+- **Desktop:** mouse-look (drag) + keyboard (WASD / Space / F).
+- (A `DeviceOrientationEvent` tilt-look path and the historical pinch-gesture
+  bindings remain in code but the Ray-Ban glasses are no longer a target.)
 
 ---
 
@@ -214,8 +216,8 @@ the browser. Highlights of what this fork adds on top of stock dhewm3:
 | `?echo` | Render GL + WebGPU side-by-side (debug). |
 | `?noareastream` / `?nostream` | Load the monolith (everything at boot, no geometry streaming). |
 | `?hd` | 256px-texture monolith tier. |
-| `?diag` / `?debug` | Force the debug overlay on (incl. on the glasses). |
-| `?glasses` | Force the clean wearable UI (hides debug + D-pad). |
+| `?diag` / `?debug` | Force the debug overlay on (any device). |
+| `?glasses` | Historically-named flag — forces the clean mobile/touch UI (hides debug). |
 | `?nodiag` | Hide the debug overlay. |
 
 ---
