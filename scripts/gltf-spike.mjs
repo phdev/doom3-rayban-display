@@ -50,6 +50,7 @@ const sig = await page.evaluate(() => ({
   animJoints: window.__d3GltfAnimJoints,     // parsed skeleton joint count
   animFrames: window.__d3GltfAnimFrames,     // resampled clip frame count
   modelJoints: window.__d3GltfModelJoints,   // joints exposed on the skinned model
+  animRegistered: window.__d3GltfAnimRegistered,  // D3_RegisterGltfAnim returned (no abort)
 })).catch(() => ({}));
 console.log("\n=== LoadGLTF signals ===", JSON.stringify(sig));
 const det = await page.evaluate(() => window.__d3WgpuDet || null).catch(() => null);
@@ -64,5 +65,6 @@ const detOk = detArr.length === 0 || detArr.every((r) => r.diffPx === 0 && r.max
 const meshOk = (sig.called || 0) > 0 && sig.loaded === true && (sig.surfaces || 0) > 0;
 const skelOk = (sig.animJoints || 0) > 0 && (sig.modelJoints || 0) === (sig.animJoints || 0);
 const animOk = (sig.animFrames || 0) > 1;   // resampled to >1 frame
-console.log(`\nVERDICT: mesh ${meshOk ? "✓" : "✗"} (surfaces=${sig.surfaces}) | skeleton ${skelOk ? "✓" : "✗"} (animJoints=${sig.animJoints}, modelJoints=${sig.modelJoints}) | anim-clip ${animOk ? "✓" : "✗"} (frames=${sig.animFrames}) | det ${detOk ? "IDENTICAL ✓" : "NOT IDENTICAL ✗"}`);
+const reg = sig.animRegistered === 1 ? "fired" : "GATED (instantiate bug)";   // register call is gated pending the link fix
+console.log(`\nVERDICT: mesh ${meshOk ? "✓" : "✗"} (surfaces=${sig.surfaces}) | skeleton ${skelOk ? "✓" : "✗"} (animJoints=${sig.animJoints}, modelJoints=${sig.modelJoints}) | anim-clip ${animOk ? "✓" : "✗"} (frames=${sig.animFrames}) | register=${reg} | det ${detOk ? "IDENTICAL ✓" : "NOT IDENTICAL ✗"}`);
 process.exit(meshOk && skelOk && animOk && detOk ? 0 : 1);

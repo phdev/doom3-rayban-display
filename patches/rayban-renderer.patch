@@ -234,7 +234,7 @@ index f9ae002..9430a1e 100644
  
  			qglCopyTexSubImage2D( GL_TEXTURE_2D, 0, 0, 0, x, y, imageWidth, imageHeight );
 diff --git a/neo/renderer/Model.cpp b/neo/renderer/Model.cpp
-index 3016bf2..a38ef14 100644
+index 3016bf2..7007a42 100644
 --- a/neo/renderer/Model.cpp
 +++ b/neo/renderer/Model.cpp
 @@ -35,6 +35,9 @@ If you have questions concerning this license or the applicable additional terms
@@ -247,7 +247,7 @@ index 3016bf2..a38ef14 100644
  
  #include "renderer/Model.h"
  
-@@ -262,6 +265,579 @@ void idRenderModelStatic::MakeDefaultModel() {
+@@ -262,6 +265,582 @@ void idRenderModelStatic::MakeDefaultModel() {
  	FinishSurfaces();
  }
  
@@ -807,10 +807,13 @@ index 3016bf2..a38ef14 100644
 +				const int pn = skin.joints[j].parentNum;
 +				gltfJoints[j].parent = ( pn >= 0 && pn < nj ) ? &gltfJoints[pn] : NULL;
 +			}
-+			// TODO(Spike-B): register the in-memory idMD5Anim so GetAnim(token) is a
-+			// cache hit — gated until SPINE ships the D3_RegisterGltfAnim free shim
-+			// (its member RegisterMemoryAnim isn't reachable from neo/renderer; calling
-+			// the undefined symbol now would abort). Parse + skeleton verified meanwhile.
++			// Register the in-memory idMD5Anim so GetAnim(token) is a cache hit.
++			// SPINE's D3_RegisterGltfAnim shim is live (d07f2c9), BUT un-gating this call
++			// (which links SPINE's BuildFromGLTF/RegisterMemoryAnim via gc-sections) breaks
++			// wasm instantiation ("Import #0 env: module is not an object") — a cross-module
++			// link interaction under investigation (the error asks for an -sASSERTIONS build
++			// to name the symbol). RE-GATED so render-track keeps a working wasm; the parser +
++			// skeleton + the dynamic-model wiring below are verified meanwhile.
 +			//   D3_RegisterGltfAnim( clip );
 +			EM_ASM({ window.__d3GltfAnimJoints = $0; window.__d3GltfAnimFrames = $1; window.__d3GltfModelJoints = $2; }, clip.numJoints, clip.numFrames, gltfJoints.Num() );
 +		}
@@ -827,7 +830,7 @@ index 3016bf2..a38ef14 100644
  /*
  ================
  idRenderModelStatic::PartialInitFromFile
-@@ -299,6 +875,9 @@ void idRenderModelStatic::InitFromFile( const char *fileName ) {
+@@ -299,6 +878,9 @@ void idRenderModelStatic::InitFromFile( const char *fileName ) {
  	} else if ( extension.Icmp( "ma" ) == 0 ) {
  		loaded		= LoadMA( name );
  		reloadable	= true;
@@ -837,7 +840,29 @@ index 3016bf2..a38ef14 100644
  	} else {
  		common->Warning( "idRenderModelStatic::InitFromFile: unknown type for model: \'%s\'", name.c_str() );
  		loaded		= false;
-@@ -503,7 +1082,7 @@ idRenderModelStatic::NumJoints
+@@ -453,7 +1035,7 @@ idRenderModelStatic::IsDynamicModel
+ */
+ dynamicModel_t idRenderModelStatic::IsDynamicModel() const {
+ 	// dynamic subclasses will override this
+-	return DM_STATIC;
++	return gltfJoints.Num() ? DM_CACHED : DM_STATIC;	// R-GLTF Spike-B: skinned glTF is dynamic (static GLBs unchanged)
+ }
+ 
+ /*
+@@ -493,6 +1075,12 @@ idRenderModel *idRenderModelStatic::InstantiateDynamicModel( const struct render
+ 		delete cachedModel;
+ 		cachedModel = NULL;
+ 	}
++	// R-GLTF Spike-B: a skinned glTF is DM_CACHED but has no CPU-skin deform yet —
++	// return NULL (not Error) so the animator still drives the joints (kill-criterion
++	// (c) is animator-level via GetJointTransform); visible vertex deform is the next increment.
++	if ( gltfJoints.Num() ) {
++		return NULL;
++	}
+ 	common->Error( "InstantiateDynamicModel called on static model '%s'", name.c_str() );
+ 	return NULL;
+ }
+@@ -503,7 +1091,7 @@ idRenderModelStatic::NumJoints
  ================
  */
  int idRenderModelStatic::NumJoints( void ) const {
@@ -846,7 +871,7 @@ index 3016bf2..a38ef14 100644
  }
  
  /*
-@@ -512,7 +1091,7 @@ idRenderModelStatic::GetJoints
+@@ -512,7 +1100,7 @@ idRenderModelStatic::GetJoints
  ================
  */
  const idMD5Joint *idRenderModelStatic::GetJoints( void ) const {
@@ -855,7 +880,25 @@ index 3016bf2..a38ef14 100644
  }
  
  /*
-@@ -539,7 +1118,7 @@ idRenderModelStatic::GetDefaultPose
+@@ -521,6 +1109,9 @@ idRenderModelStatic::GetJointHandle
+ ================
+ */
+ jointHandle_t idRenderModelStatic::GetJointHandle( const char *name ) const {
++	for ( int i = 0; i < gltfJoints.Num(); i++ ) {	// R-GLTF Spike-B
++		if ( gltfJoints[i].name.Icmp( name ) == 0 ) return (jointHandle_t)i;
++	}
+ 	return INVALID_JOINT;
+ }
+ 
+@@ -530,6 +1121,7 @@ idRenderModelStatic::GetJointName
+ ================
+ */
+ const char * idRenderModelStatic::GetJointName( jointHandle_t handle ) const {
++	if ( (int)handle >= 0 && (int)handle < gltfJoints.Num() ) return gltfJoints[(int)handle].name.c_str();	// R-GLTF Spike-B
+ 	return "";
+ }
+ 
+@@ -539,7 +1131,7 @@ idRenderModelStatic::GetDefaultPose
  ================
  */
  const idJointQuat *idRenderModelStatic::GetDefaultPose( void ) const {
@@ -1668,10 +1711,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..e7e764e
+index 0000000..2acbe8f
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,4769 @@
+@@ -0,0 +1,4785 @@
 +/*
 +================================================================================
 +
@@ -5298,6 +5341,22 @@ index 0000000..e7e764e
 +            wgpuRenderPassEncoderEnd(rp);
 +            wgpuRenderPassEncoderRelease(rp);
 +
++            // SPLAT OVERLAY HOOK (splat-track spike): the opaque 3D world is now in the surface color +
++            // the world depth (depthView). Hand the encoder + the surface color view + the world depth
++            // view to app JS so it can record an extra pass (a Gaussian-splat pass) into the SAME encoder,
++            // depth-testing against the real world depth (the world occludes the splats), BEFORE post-FX.
++            // EM_ASM runs in the glue scope where WebGPU.getJsObject converts the C handles to JS objects;
++            // no-op unless Module.arcoOverlay is registered; gated to the LIVE surface (not the det
++            // self-test targets) so byte-identical determinism is preserved. See docs/SPLAT_ENGINE_OVERLAY.
++            if (colorTex && colorTex != detTexA && colorTex != detTexB) {
++                EM_ASM({
++                    if (!Module.arcoOverlay) return;
++                    Module.arcoOverlay(WebGPU.getJsObject($0), WebGPU.getJsObject($1),
++                                       WebGPU.getJsObject($2), WebGPU.getJsObject($3), $4, $5);
++                }, (uint32_t)device, (uint32_t)enc, (uint32_t)color, (uint32_t)depth,
++                   (uint32_t)depthW, (uint32_t)depthH);
++            }
++
 +            // Iter 16 part B: copy the frame so far, then draw the haze
 +            // surfaces (deflected samples of the copy) and the GUI overlay.
 +            if (hazeActive) {
@@ -8114,7 +8173,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..cca6606 100644
+index c83ebb5..d7391f0 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -9339,7 +9398,7 @@ index c83ebb5..cca6606 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -557,22 +1724,80 @@ void RB_BeginDrawingView (void) {
+@@ -557,22 +1724,93 @@ void RB_BeginDrawingView (void) {
  
  	const viewDef_t* viewDef = backEnd.viewDef;
  
@@ -9369,6 +9428,19 @@ index c83ebb5..cca6606 100644
 +			                 o.x, o.y, o.z, yaw, pitch );
 +			EM_ASM_({ window.__d3ViewPos = UTF8ToString($0); }, posLine);
 +		}
++	}
++	// Splat-overlay camera (splat-track): publish the live view UNROUNDED every main view (vieworg in
++	// INCHES, viewaxis mat3 where ax[0]=forward, + fov) so the JS splat overlay (Module.arcoOverlay) can
++	// build a matching camera. JSON string (one EM_ASM arg — avoids the >5-float-arg drain trap).
++	if ( backEnd.viewDef && backEnd.viewDef->viewEntitys ) {
++		const idVec3& vo = backEnd.viewDef->renderView.vieworg;
++		const idMat3& vax = backEnd.viewDef->renderView.viewaxis;
++		char vbuf[256];
++		idStr::snPrintf( vbuf, sizeof(vbuf),
++			"{\"org\":[%.4f,%.4f,%.4f],\"ax\":[%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f],\"fovx\":%.4f,\"fovy\":%.4f}",
++			vo.x, vo.y, vo.z, vax[0].x, vax[0].y, vax[0].z, vax[1].x, vax[1].y, vax[1].z, vax[2].x, vax[2].y, vax[2].z,
++			backEnd.viewDef->renderView.fov_x, backEnd.viewDef->renderView.fov_y );
++		EM_ASM_({ window.__d3View = JSON.parse(UTF8ToString($0)); }, vbuf);
 +	}
 +		extern idCVar r_shadowDarken;
 +		g_capShadowDarken = r_shadowDarken.GetFloat();
