@@ -25,7 +25,8 @@ struct MB {
   selfTest    : f32,   // P4 operator gate: reconstruct velocity for (testUv,testDepth) -> output it
   testDepth   : f32,
   testUv      : vec2<f32>,
-  pad         : vec2<f32>,
+  minDepth    : f32,   // view-weapon exclusion: skip blur where depth < minDepth (0 = off)
+  pad         : f32,
 };
 @group(0) @binding(0) var<uniform> u : MB;
 @group(0) @binding(1) var sceneTex : texture_2d<f32>;
@@ -44,6 +45,28 @@ fn fs_main(@builtin(position) fc : vec4<f32>) -> @location(0) vec4<f32> {
   // (testUv, testDepth) from the UB matrices and output it ENCODED in [0,1]
   // (R = vx, G = vy, ±128 px range). The CPU compares against a forward-projection
   // ground truth -> proves the unproject/reproject + clip-z/Y-flip conventions.
+  // P4 identity self-test (selfTest==3): blur a KNOWN sceneTex using a CONTROLLED
+  // depth (testDepth) — independent of the live depth buffer. zeroVel/scale=0 must
+  // return the scene EXACTLY (identity); otherwise the blur must CHANGE the image
+  // (the mutation arm) -> proves the disable path is a true no-op, not vacuous.
+  if (u.selfTest > 2.5) {
+    let uvI = fc.xy / u.screenSize;
+    let sceneI = textureSampleLevel(sceneTex, sceneSamp, uvI, 0.0);
+    if (u.zeroVel > 0.5 || u.scale < 0.01) { return sceneI; }
+    let ndcI = vec3<f32>(uvI.x * 2.0 - 1.0, 1.0 - uvI.y * 2.0, 2.0 * u.testDepth - 1.0);
+    let wHI = u.invCurVP * vec4<f32>(ndcI, 1.0);
+    let worldI = wHI.xyz / wHI.w;
+    let pHI = u.prevVP * vec4<f32>(worldI, 1.0);
+    let pUvI = vec2<f32>(pHI.x / pHI.w * 0.5 + 0.5, 0.5 - pHI.y / pHI.w * 0.5);
+    let velUvI = (uvI - pUvI) * u.scale;
+    let cntI = max(2, i32(u.samples));
+    var accI = vec4<f32>(0.0);
+    for (var i = 0; i < cntI; i = i + 1) {
+      let t = (f32(i) / (f32(cntI) - 1.0)) - 0.5;
+      accI = accI + textureSampleLevel(sceneTex, sceneSamp, uvI + velUvI * t, 0.0);
+    }
+    return accI / f32(cntI);
+  }
   if (u.selfTest > 0.5) {
     let uvT = u.testUv;
     let ndcT = vec3<f32>(uvT.x * 2.0 - 1.0, 1.0 - uvT.y * 2.0, 2.0 * u.testDepth - 1.0);
@@ -59,6 +82,7 @@ fn fs_main(@builtin(position) fc : vec4<f32>) -> @location(0) vec4<f32> {
   if (u.zeroVel > 0.5 || u.scale < 0.01) { return scene; }         // disabled / mutation -> identity
   let d = textureLoad(depthTex, vec2<i32>(fc.xy), 0);              // [0,1] WebGPU depth
   if (d >= 0.9999) { return scene; }                               // skybox / far plane -> no blur
+  if (d < u.minDepth) { return scene; }                            // view-weapon: compressed near slice -> no smear
   let ndc = vec3<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 2.0 * d - 1.0);  // GL NDC
   let wH = u.invCurVP * vec4<f32>(ndc, 1.0);
   if (abs(wH.w) < 1e-6) { return scene; }

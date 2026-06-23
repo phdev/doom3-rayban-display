@@ -1982,10 +1982,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..6356812
+index 0000000..4a7f7d6
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,5127 @@
+@@ -0,0 +1,5290 @@
 +/*
 +================================================================================
 +
@@ -2177,6 +2177,7 @@ index 0000000..6356812
 +extern "C" int      g_capMotionBlurSamples;
 +extern "C" float    g_capMotionBlurMaxOffset;
 +extern "C" uint32_t g_capMotionBlurZeroVel;
++extern "C" float    g_capMotionBlurMinDepth;
 +extern "C" uint32_t g_capInCinematic;
 +extern "C" float    g_mbViewProj[16];
 +extern "C" float    g_mbInvViewProj[16];
@@ -2454,6 +2455,20 @@ index 0000000..6356812
 +                    if (!mbSelfDone && motionBlurPipeline && motionBlurUB && depthSampleView && detFrameCounter >= 32) {
 +                        runMotionBlurSelfTest();
 +                    }
++                    // R-MBLUR P4 gate 3: zero-velocity identity self-test (one-shot,
++                    // independent of r_motionBlur — uses a known step + controlled depth).
++                    if (!mbIdDone && motionBlurPipeline && motionBlurBGL && depthSampleView && detFrameCounter >= 34) {
++                        runMotionBlurIdentitySelfTest();
++                    }
++                }
++                // R-MBLUR Build B: det-safe prev-VP swap. ONCE per frame, AFTER the live
++                // encodeRecordsPass AND runDeterminismRound (so both det re-encodes reproject
++                // against the SAME prev VP). NOT gated on lastRecordCount — the live blur can
++                // run on emissive/GUI-only frames, so gating the reset there would leak the flag.
++                if (mbActiveThisFrame) {
++                    memcpy(mbPrevViewProj, g_mbViewProj, 64);
++                    mbPrevValid = true;
++                    mbActiveThisFrame = false;
 +                }
 +            }
 +        }
@@ -5939,7 +5954,7 @@ index 0000000..6356812
 +                    if (!mbPrevValid) { memcpy(mbPrevViewProj, g_mbViewProj, 64); mbPrevValid = true; }
 +
 +                    // UB (176B): invCurVP[16], prevVP[16], screenSize, scale, maxOffset,
-+                    // samples, zeroVel, selfTest(0 live), testDepth, testUv, pad
++                    // samples, zeroVel, selfTest(0 live), testDepth, testUv, minDepth, pad
 +                    float ub[44];
 +                    memcpy(&ub[0],  g_mbInvViewProj, 64);
 +                    memcpy(&ub[16], mbPrevViewProj,  64);
@@ -5949,13 +5964,15 @@ index 0000000..6356812
 +                    ub[36] = (float)g_capMotionBlurSamples;
 +                    ub[37] = g_capMotionBlurZeroVel ? 1.0f : 0.0f;
 +                    ub[38] = 0.0f;   // selfTest off (live path)
-+                    ub[39] = 0.0f; ub[40] = 0.0f; ub[41] = 0.0f; ub[42] = 0.0f; ub[43] = 0.0f;
++                    ub[39] = 0.0f; ub[40] = 0.0f; ub[41] = 0.0f;
++                    ub[42] = g_capMotionBlurMinDepth;   // view-weapon exclusion (skip blur where depth < this)
++                    ub[43] = 0.0f;
 +                    wgpuQueueWriteBuffer(queue, motionBlurUB, 0, ub, 176);
 +
 +                    if (motionBlurBGGen != currentRenderGen || !motionBlurBG) {
 +                        if (motionBlurBG) { wgpuBindGroupRelease(motionBlurBG); motionBlurBG = nullptr; }
 +                        WGPUBindGroupEntry e[4] = {};
-+                        e[0].binding = 0; e[0].buffer = motionBlurUB; e[0].size = 160;
++                        e[0].binding = 0; e[0].buffer = motionBlurUB; e[0].size = 176;   // = the UB struct (BGL minBindingSize 176); 160 left u.minDepth@168 out of range -> invalid bind group
 +                        e[1].binding = 1; e[1].textureView = currentRenderView;
 +                        e[2].binding = 2; e[2].sampler = interactionLightSampler;
 +                        e[3].binding = 3; e[3].textureView = depthSampleView;
@@ -5983,10 +6000,13 @@ index 0000000..6356812
 +                        wgpuRenderPassEncoderEnd(frp);
 +                        wgpuRenderPassEncoderRelease(frp);
 +                        motionBlurDrawCount++;
++                        mbActiveThisFrame = true;
 +                    }
-+                    // advance prev VP for next frame (Build A: live path only; Build B
-+                    // moves this strictly after the det rounds + adds the det-path pass).
-+                    memcpy(mbPrevViewProj, g_mbViewProj, 64);
++                    // Build B: prevVP is advanced ONCE per frame at the end of EndFrame
++                    // (after runDeterminismRound) — NOT here. So the live pass AND both
++                    // det re-encodes reproject against the SAME previous-frame VP, and the
++                    // det arm stays byte-IDENTICAL with blur ON (Build A advanced here, so
++                    // det encode #2 saw prev==cur -> divergent -> det had to run blur-OFF).
 +                }
 +            }
 +
@@ -6274,6 +6294,123 @@ index 0000000..6356812
 +        wgpuBufferMapAsync(mbSelfBuf, WGPUMapMode_Read, 0, 256*4, cbi);
 +    }
 +
++    // R-MBLUR P4 (kill-criterion gate 3): zero-velocity IDENTITY self-test. Reads a
++    // 2KB buffer = [outA(256*4) | outB(256*4)]; outA = the disabled blur (zeroVel=1,
++    // must equal the known step input -> idErr~0) and outB = the enabled blur with a
++    // nonzero controlled velocity (must CHANGE the step -> mutErr large). The mutation
++    // arm proves the disable path is a TRUE no-op, not a vacuous pass.
++    static void mbIdMapCallback(WGPUMapAsyncStatus status, WGPUStringView /*msg*/, void* ud1, void* /*ud2*/) {
++        idRenderBackend_WebGPU* self = (idRenderBackend_WebGPU*)ud1;
++        if (status != WGPUMapAsyncStatus_Success) { EM_ASM({ console.warn("[d3] motion-blur identity self-test: map FAILED"); }); return; }
++        const uint8_t* p = (const uint8_t*)wgpuBufferGetConstMappedRange(self->mbIdBuf, 0, 2048);
++        int idErr = 0, mutErr = 0;
++        if (p) {
++            for (int i = 0; i < 256; i++) {
++                const int expect = (i < 128) ? 0 : 200;   // the gray step written into the input texture
++                for (int c = 0; c < 3; c++) {              // R=G=B for a gray step -> channel order doesn't matter
++                    int a = (int)p[i*4 + c] - expect;        if (a < 0) a = -a;   // outA: zeroVel=1 -> identity
++                    int bdiff = (int)p[1024 + i*4 + c] - expect; if (bdiff < 0) bdiff = -bdiff;  // outB: blur -> changed
++                    if (a > idErr) idErr = a;
++                    if (bdiff > mutErr) mutErr = bdiff;
++                }
++            }
++        }
++        wgpuBufferUnmap(self->mbIdBuf);
++        const int pass = (p && idErr <= 2 && mutErr >= 20) ? 1 : 0;
++        EM_ASM({
++            window.__d3MotionBlurIdentity = $0;
++            window.__d3MotionBlurIdentityMut = $1;
++            window.__d3MotionBlurIdentityPass = ($2 ? true : false);
++            console.info("[d3] motion-blur identity self-test: idErr=" + $0 + " (zeroVel->identity, want<=2) mutErr=" + $1 + " (blur->changed, want>=20) -> " + ($2 ? "PASS" : "FAIL"));
++        }, idErr, mutErr, pass);
++    }
++
++    void runMotionBlurIdentitySelfTest() {
++        if (mbIdDone) return;
++        if (!device || !queue || !motionBlurPipeline || !motionBlurBGL || !interactionLightSampler || !depthSampleView) return;
++        mbIdDone = true;
++        const float n = 4.0f, f = 4000.0f;
++        float P[16] = { 1,0,0,0,  0,1,0,0,  0,0,-(f+n)/(f-n),-1.0f,  0,0,-2.0f*f*n/(f-n),0 };
++        const float ang = 30.0f * 3.14159265f / 180.0f, cs = cosf(ang), sn = sinf(ang);
++        float M[16] = { cs,0,-sn,0,  0,1,0,0,  sn,0,cs,0,  120.0f,0,120.0f,1 };   // yaw + translate -> nonzero velocity
++        float prevVP[16]; mbb_mul(prevVP, P, M);
++        float invCur[16]; if (!mbb_inv(invCur, P)) return;
++        // Known input: a 256x1 gray STEP (0 -> 200 at the midpoint). A blur across the
++        // step produces intermediate values -> the mutation arm is detectable; identity
++        // preserves the step exactly.
++        WGPUTextureDescriptor itd = {};
++        itd.size = {256,1,1}; itd.mipLevelCount=1; itd.sampleCount=1; itd.dimension=WGPUTextureDimension_2D;
++        itd.format = surfaceFormat; itd.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
++        mbIdInTex = wgpuDeviceCreateTexture(device, &itd);
++        mbIdInView = wgpuTextureCreateView(mbIdInTex, nullptr);
++        uint8_t step[256*4];
++        for (int i = 0; i < 256; i++) { uint8_t v = (i < 128) ? 0 : 200; step[i*4+0]=v; step[i*4+1]=v; step[i*4+2]=v; step[i*4+3]=255; }
++        { WGPUTexelCopyTextureInfo dt = {}; dt.texture = mbIdInTex;
++          WGPUTexelCopyBufferLayout dl = {}; dl.bytesPerRow = 256*4; dl.rowsPerImage = 1;
++          WGPUExtent3D ie = {256,1,1};
++          wgpuQueueWriteTexture(queue, &dt, step, sizeof(step), &dl, &ie); }
++        WGPUTextureDescriptor otd = {};
++        otd.size = {256,1,1}; otd.mipLevelCount=1; otd.sampleCount=1; otd.dimension=WGPUTextureDimension_2D;
++        otd.format = surfaceFormat; otd.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc;
++        mbIdOutA = wgpuDeviceCreateTexture(device, &otd); mbIdOutAView = wgpuTextureCreateView(mbIdOutA, nullptr);
++        mbIdOutB = wgpuDeviceCreateTexture(device, &otd); mbIdOutBView = wgpuTextureCreateView(mbIdOutB, nullptr);
++        WGPUBufferDescriptor bd = {}; bd.size = 2048; bd.usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst;
++        mbIdBuf = wgpuDeviceCreateBuffer(device, &bd);
++        WGPUBufferDescriptor ud = {}; ud.size = 176; ud.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
++        mbIdUBz = wgpuDeviceCreateBuffer(device, &ud); mbIdUBb = wgpuDeviceCreateBuffer(device, &ud);
++        float u[44];
++        memset(u, 0, sizeof(u));
++        memcpy(&u[0], invCur, 64); memcpy(&u[16], prevVP, 64);
++        u[32]=256.0f; u[33]=1.0f; u[34]=1.0f; u[35]=100000.0f; u[36]=4.0f; u[38]=3.0f; u[39]=0.9f;   // selfTest=3, testDepth=0.9
++        u[37]=1.0f; wgpuQueueWriteBuffer(queue, mbIdUBz, 0, u, 176);   // zeroVel=1 (identity)
++        u[37]=0.0f; wgpuQueueWriteBuffer(queue, mbIdUBb, 0, u, 176);   // zeroVel=0 (blur)
++        WGPUBindGroupEntry ez[4] = {};
++        ez[0].binding=0; ez[0].buffer=mbIdUBz; ez[0].size=176;
++        ez[1].binding=1; ez[1].textureView=mbIdInView;
++        ez[2].binding=2; ez[2].sampler=interactionLightSampler;
++        ez[3].binding=3; ez[3].textureView=depthSampleView;   // unused by the selfTest==3 branch
++        WGPUBindGroupDescriptor bgz = {}; bgz.layout=motionBlurBGL; bgz.entryCount=4; bgz.entries=ez;
++        mbIdBGz = wgpuDeviceCreateBindGroup(device, &bgz);
++        WGPUBindGroupEntry eb[4] = {};
++        eb[0].binding=0; eb[0].buffer=mbIdUBb; eb[0].size=176;
++        eb[1].binding=1; eb[1].textureView=mbIdInView;
++        eb[2].binding=2; eb[2].sampler=interactionLightSampler;
++        eb[3].binding=3; eb[3].textureView=depthSampleView;
++        WGPUBindGroupDescriptor bgb = {}; bgb.layout=motionBlurBGL; bgb.entryCount=4; bgb.entries=eb;
++        mbIdBGb = wgpuDeviceCreateBindGroup(device, &bgb);
++        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(device, nullptr);
++        WGPURenderPassColorAttachment caA = {}; caA.view=mbIdOutAView; caA.loadOp=WGPULoadOp_Clear; caA.storeOp=WGPUStoreOp_Store;
++        caA.clearValue={0,0,0,1}; caA.depthSlice=WGPU_DEPTH_SLICE_UNDEFINED;
++        WGPURenderPassDescriptor rpA = {}; rpA.colorAttachmentCount=1; rpA.colorAttachments=&caA;
++        WGPURenderPassEncoder rA = wgpuCommandEncoderBeginRenderPass(enc, &rpA);
++        wgpuRenderPassEncoderSetPipeline(rA, motionBlurPipeline);
++        wgpuRenderPassEncoderSetBindGroup(rA, 0, mbIdBGz, 0, nullptr);
++        wgpuRenderPassEncoderDraw(rA, 3, 1, 0, 0);
++        wgpuRenderPassEncoderEnd(rA); wgpuRenderPassEncoderRelease(rA);
++        WGPURenderPassColorAttachment caB = caA; caB.view=mbIdOutBView;
++        WGPURenderPassDescriptor rpB = {}; rpB.colorAttachmentCount=1; rpB.colorAttachments=&caB;
++        WGPURenderPassEncoder rB = wgpuCommandEncoderBeginRenderPass(enc, &rpB);
++        wgpuRenderPassEncoderSetPipeline(rB, motionBlurPipeline);
++        wgpuRenderPassEncoderSetBindGroup(rB, 0, mbIdBGb, 0, nullptr);
++        wgpuRenderPassEncoderDraw(rB, 3, 1, 0, 0);
++        wgpuRenderPassEncoderEnd(rB); wgpuRenderPassEncoderRelease(rB);
++        WGPUTexelCopyBufferLayout lay = {}; lay.bytesPerRow = 256*4; lay.rowsPerImage = 1;
++        WGPUExtent3D ext1 = {256,1,1};
++        WGPUTexelCopyTextureInfo sA = {}; sA.texture = mbIdOutA;
++        WGPUTexelCopyBufferInfo dA = {}; dA.buffer = mbIdBuf; dA.layout = lay; dA.layout.offset = 0;
++        wgpuCommandEncoderCopyTextureToBuffer(enc, &sA, &dA, &ext1);
++        WGPUTexelCopyTextureInfo sB = {}; sB.texture = mbIdOutB;
++        WGPUTexelCopyBufferInfo dB = {}; dB.buffer = mbIdBuf; dB.layout = lay; dB.layout.offset = 1024;
++        wgpuCommandEncoderCopyTextureToBuffer(enc, &sB, &dB, &ext1);
++        WGPUCommandBuffer cb = wgpuCommandEncoderFinish(enc, nullptr); wgpuCommandEncoderRelease(enc);
++        wgpuQueueSubmit(queue, 1, &cb); wgpuCommandBufferRelease(cb);
++        WGPUBufferMapCallbackInfo cbi = {};
++        cbi.mode = WGPUCallbackMode_AllowSpontaneous;
++        cbi.callback = &idRenderBackend_WebGPU::mbIdMapCallback;
++        cbi.userdata1 = this;
++        wgpuBufferMapAsync(mbIdBuf, WGPUMapMode_Read, 0, 2048, cbi);
++    }
++
 +    // Run one self-test round: two identical passes → two readback buffers
 +    // → async compare. Called from EndFrame on a frame cadence.
 +    void runDeterminismRound() {
@@ -6308,6 +6445,7 @@ index 0000000..6356812
 +        WGPUCommandEncoderDescriptor cd = {};
 +        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(device, &cd);
 +        const uint32_t tmBefore = tonemapDrawCount;
++        const uint32_t mbBefore = motionBlurDrawCount;
 +        encodeRecordsPass(enc, detViewA, detDepthView, detTexA);
 +        encodeRecordsPass(enc, detViewB, detDepthView, detTexB);
 +        // R0 false-green guard: the IDENTICAL verdict is only meaningful for the
@@ -6326,6 +6464,23 @@ index 0000000..6356812
 +            } else if (g_capTonemapOn && fired >= 2u) {
 +                static bool loggedOk = false;
 +                if (!loggedOk) { loggedOk = true; EM_ASM({ console.log('[d3] tonemap exercised in det round (' + $0 + '/2) — IDENTICAL verdict covers the grade'); }, fired); }
++            }
++        }
++        // R-MBLUR Build B: the same false-green guard for the LIVE motion-blur pass.
++        // The blur runs INSIDE encodeRecordsPass (after tonemap), so with r_motionBlur 1
++        // it fires once per det encode -> must advance by 2; the det-safe prevVP swap
++        // (advanced only at EndFrame, after these encodes) makes both encodes reproject
++        // against the same prev VP, so IDENTICAL is a real blur-on determinism proof.
++        {
++            const uint32_t fired = motionBlurDrawCount - mbBefore;
++            EM_ASM({ window.__d3MotionBlurOn = $0; window.__d3MotionBlurDet = ($1 >= 2); }, g_capMotionBlurOn, fired);
++            static bool mbWarnedVacuous = false;
++            if (g_capMotionBlurOn && fired < 2u && !mbWarnedVacuous) {
++                mbWarnedVacuous = true;
++                EM_ASM({ console.warn('[d3] WARNING: det round did NOT exercise motion blur (fired ' + $0 + '/2) — IDENTICAL is vacuous for the blur'); }, fired);
++            } else if (g_capMotionBlurOn && fired >= 2u) {
++                static bool mbLoggedOk = false;
++                if (!mbLoggedOk) { mbLoggedOk = true; EM_ASM({ console.log('[d3] motion blur exercised in det round (' + $0 + '/2) — IDENTICAL verdict covers the blur'); }, fired); }
 +            }
 +        }
 +        WGPUTexelCopyTextureInfo srcA = {}; srcA.texture = detTexA;
@@ -7077,6 +7232,7 @@ index 0000000..6356812
 +    uint32_t                motionBlurDrawCount = 0;   // false-green guard (advances inside det)
 +    float                   mbPrevViewProj[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
 +    bool                    mbPrevValid = false;
++    bool                    mbActiveThisFrame = false;   // live blur ran this frame -> swap prevVP at EndFrame (det-safe)
 +    // P4 operator self-test (one-shot): reconstruct velocity for a synthetic
 +    // VP-delta and compare to a forward-projection ground truth (window.__d3MotionBlurVelErr).
 +    bool                    mbSelfDone = false;
@@ -7085,6 +7241,13 @@ index 0000000..6356812
 +    WGPUBuffer              mbSelfBuf = nullptr;
 +    WGPUBindGroup           mbSelfBG = nullptr;
 +    float                   mbVelGTx = 0.0f, mbVelGTy = 0.0f;
++    // R-MBLUR P4 gate 3: zero-velocity identity self-test (one-shot). outA = zeroVel
++    // (identity vs the step input), outB = enabled blur (must differ); 2KB readback.
++    bool                    mbIdDone = false;
++    WGPUTexture             mbIdInTex = nullptr, mbIdOutA = nullptr, mbIdOutB = nullptr;
++    WGPUTextureView         mbIdInView = nullptr, mbIdOutAView = nullptr, mbIdOutBView = nullptr;
++    WGPUBuffer              mbIdBuf = nullptr, mbIdUBz = nullptr, mbIdUBb = nullptr;
++    WGPUBindGroup           mbIdBGz = nullptr, mbIdBGb = nullptr;
 +    // Iter 23: Quest-style shadow darkening (union-of-volumes multiply).
 +    WGPURenderPipeline      shadowDarkenPipeline = nullptr;
 +    WGPURenderPipeline      shadowDarkenEqPipeline = nullptr;   // iter 38: -992/-991 stencil readout
@@ -7146,7 +7309,7 @@ index 0000000..0f9c8e6
 +    return nullptr;
 +}
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
-index 7914093..a1ccbfa 100644
+index 7914093..0c64d9d 100644
 --- a/neo/renderer/RenderSystem_init.cpp
 +++ b/neo/renderer/RenderSystem_init.cpp
 @@ -39,6 +39,11 @@ If you have questions concerning this license or the applicable additional terms
@@ -7161,7 +7324,7 @@ index 7914093..a1ccbfa 100644
  
  #include "framework/GameCallbacks_local.h"
  #include "framework/Game.h"
-@@ -102,6 +107,60 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
+@@ -102,6 +107,61 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
  
  idCVar r_skipSuppress( "r_skipSuppress", "0", CVAR_RENDERER | CVAR_BOOL, "ignore the per-view suppressions" );
  idCVar r_skipPostProcess( "r_skipPostProcess", "0", CVAR_RENDERER | CVAR_BOOL, "skip all post-process renderings" );
@@ -7213,6 +7376,7 @@ index 7914093..a1ccbfa 100644
 +idCVar r_motionBlurSamples( "r_motionBlurSamples", "4", CVAR_RENDERER | CVAR_INTEGER, "WebGPU motion blur: taps along the velocity vector (2/4/8)" );
 +idCVar r_motionBlurMaxOffsetPixels( "r_motionBlurMaxOffsetPixels", "50", CVAR_RENDERER | CVAR_FLOAT, "WebGPU motion blur: max screen-space velocity clamp in pixels" );
 +idCVar r_motionBlurZeroVelocity( "r_motionBlurZeroVelocity", "0", CVAR_RENDERER | CVAR_BOOL, "WebGPU motion blur: force zero velocity (falsifiability mutation — output must == no-blur)" );
++idCVar r_motionBlurMinDepth( "r_motionBlurMinDepth", "0", CVAR_RENDERER | CVAR_FLOAT, "WebGPU motion blur: skip blur where depth < this (view-weapon exclusion; 0 = off, ~0.2 excludes the gun's compressed near slice)" );
 +idCVar r_skipGLDraw( "r_skipGLDraw", "0", CVAR_RENDERER | CVAR_BOOL,
 +	"skip GL draw calls (WebGPU-primary cutover; the WebGPU echo renders instead). "
 +	"Tiny views (lightgem) keep drawing so gameplay light readback works." );
@@ -7222,7 +7386,7 @@ index 7914093..a1ccbfa 100644
  idCVar r_skipLightScale( "r_skipLightScale", "0", CVAR_RENDERER | CVAR_BOOL, "don't do any post-interaction light scaling, makes things dim on low-dynamic range cards" );
  idCVar r_skipInteractions( "r_skipInteractions", "0", CVAR_RENDERER | CVAR_BOOL, "skip all light/surface interaction drawing" );
  idCVar r_skipDynamicTextures( "r_skipDynamicTextures", "0", CVAR_RENDERER | CVAR_BOOL, "don't dynamically create textures" );
-@@ -158,6 +217,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
+@@ -158,6 +218,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
  idCVar r_useExternalShadows( "r_useExternalShadows", "1", CVAR_RENDERER | CVAR_INTEGER, "1 = skip drawing caps when outside the light volume, 2 = force to no caps for testing", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
  idCVar r_useOptimizedShadows( "r_useOptimizedShadows", "1", CVAR_RENDERER | CVAR_BOOL, "use the dmap generated static shadow volumes" );
  idCVar r_useScissor( "r_useScissor", "1", CVAR_RENDERER | CVAR_BOOL, "scissor clip as portals and lights are processed" );
@@ -7230,7 +7394,7 @@ index 7914093..a1ccbfa 100644
  idCVar r_useCombinerDisplayLists( "r_useCombinerDisplayLists", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "put all nvidia register combiner programming in display lists" );
  idCVar r_useDepthBoundsTest( "r_useDepthBoundsTest", "1", CVAR_RENDERER | CVAR_BOOL, "use depth bounds test to reduce shadow fill" );
  
-@@ -819,11 +879,63 @@ void R_InitOpenGL( void ) {
+@@ -819,11 +880,63 @@ void R_InitOpenGL( void ) {
  		r_multiSamples.SetInteger( 0 );
  	}
  
@@ -7294,7 +7458,7 @@ index 7914093..a1ccbfa 100644
  
  #include "renderer/qgl_proc.h"
  
-@@ -910,6 +1022,18 @@ GL_CheckErrors
+@@ -910,6 +1023,18 @@ GL_CheckErrors
  ==================
  */
  void GL_CheckErrors( void ) {
@@ -7313,7 +7477,7 @@ index 7914093..a1ccbfa 100644
  	int		err;
  	char	s[64];
  	int		i;
-@@ -2505,6 +2629,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
+@@ -2505,6 +2630,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
  	// is destroyed (relevant when starting a mod which also recreates window)
  	Sys_ShutdownInput();
  
@@ -8814,7 +8978,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..05248d0 100644
+index c83ebb5..a5a161c 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -8840,7 +9004,7 @@ index c83ebb5..05248d0 100644
  
  /*
  
-@@ -38,6 +50,1139 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,1140 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -9073,6 +9237,7 @@ index c83ebb5..05248d0 100644
 +    int      g_capMotionBlurSamples = 4;
 +    float    g_capMotionBlurMaxOffset = 50.0f;
 +    uint32_t g_capMotionBlurZeroVel = 0;
++    float    g_capMotionBlurMinDepth = 0.0f;
 +    uint32_t g_capInCinematic = 0;
 +    float    g_mbViewProj[16]    = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
 +    float    g_mbInvViewProj[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
@@ -9980,7 +10145,7 @@ index c83ebb5..05248d0 100644
  
  /*
  =================
-@@ -49,6 +1194,22 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +1195,22 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -10003,7 +10168,7 @@ index c83ebb5..05248d0 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +1239,22 @@ RB_DrawElementsWithCounters
+@@ -78,6 +1240,22 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -10026,7 +10191,7 @@ index c83ebb5..05248d0 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1293,23 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1294,23 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -10050,7 +10215,7 @@ index c83ebb5..05248d0 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1360,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1361,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -10058,7 +10223,7 @@ index c83ebb5..05248d0 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1587,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1588,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -10071,7 +10236,7 @@ index c83ebb5..05248d0 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -553,26 +1752,155 @@ Any mirrored or portaled views have already been drawn, so prepare
+@@ -553,26 +1753,156 @@ Any mirrored or portaled views have already been drawn, so prepare
  to actually render the visible surfaces for this view
  =================
  */
@@ -10172,12 +10337,13 @@ index c83ebb5..05248d0 100644
 +		g_capTonemapDither = r_tonemapDither.GetBool() ? 1u : 0u;
 +		// R-MBLUR: motion-blur tunables + the cinematic-suppression flag (read the
 +		// JS window global published by SetCamera — base-patch, no SPINE edit).
-+		extern idCVar r_motionBlur, r_motionBlurScale, r_motionBlurSamples, r_motionBlurMaxOffsetPixels, r_motionBlurZeroVelocity;
++		extern idCVar r_motionBlur, r_motionBlurScale, r_motionBlurSamples, r_motionBlurMaxOffsetPixels, r_motionBlurZeroVelocity, r_motionBlurMinDepth;
 +		g_capMotionBlurOn = r_motionBlur.GetBool() ? 1u : 0u;
 +		g_capMotionBlurScale = r_motionBlurScale.GetFloat();
 +		g_capMotionBlurSamples = r_motionBlurSamples.GetInteger();
 +		g_capMotionBlurMaxOffset = r_motionBlurMaxOffsetPixels.GetFloat();
 +		g_capMotionBlurZeroVel = r_motionBlurZeroVelocity.GetBool() ? 1u : 0u;
++		g_capMotionBlurMinDepth = r_motionBlurMinDepth.GetFloat();
 +#ifdef __EMSCRIPTEN__
 +		g_capInCinematic = (uint32_t)EM_ASM_INT({ return ( window.__d3InCinematic ? 1 : 0 ); });
 +#endif
@@ -10237,12 +10403,39 @@ index c83ebb5..05248d0 100644
  	backEnd.currentScissor = viewDef->scissor;
  
  	// ensures that depth writes are enabled for the depth clear
+@@ -897,6 +2227,26 @@ void RB_DrawView( const void *data ) {
+ 
+ 	backEnd.viewDef = cmd->viewDef;
+ 
++#ifdef __EMSCRIPTEN__
++	// PERF (arco-doom — THE multiplayer fps fix): under WebGPU-primary (r_skipGLDraw) the ONLY
++	// remaining GL draws are the tiny <128px lightgem view. With r_useVertexBuffers 0 (required for
++	// WebGPU flare/shadow capture, iter-35) GL4ES re-uploads ALL the lightgem's geometry via client
++	// arrays EVERY frame; in multiplayer the netcode-driven MOVING entities make that a 58-159ms
++	// per-frame render stall (MEASURED: 100% of MP slow frames; r_useVertexBuffers 1 cut MP slow
++	// frames 156->2; single-player has no moving entities so it never appeared — flat 60fps).
++	// The lightgem only feeds the player light-level readback. arco-doom does not use it (AI is
++	// server-side) so it opts in via r_skipLightgem 1 — but the rayban single-player campaign DOES
++	// use it (monster light detection), so this is GATED on r_skipLightgem (default 0) and leaves SP
++	// untouched. The WebGPU capture already ignores <128px views, so skipping the whole GL lightgem
++	// view — no draws, no client-array re-upload, no stall — is safe under WebGPU-primary.
++	extern idCVar r_skipGLDraw;
++	extern idCVar r_skipLightgem;
++	if ( r_skipGLDraw.GetBool() && r_skipLightgem.GetBool() && backEnd.viewDef
++			&& ( backEnd.viewDef->viewport.x2 - backEnd.viewDef->viewport.x1 ) < 128 ) {
++		return;
++	}
++#endif
++
+ 	// we will need to do a new copyTexSubImage of the screen
+ 	// when a SS_POST_PROCESS material is used
+ 	backEnd.currentRenderCopied = false;
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..d309458
+index 0000000..3314d7b
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,1085 @@
+@@ -0,0 +1,1109 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -11026,7 +11219,8 @@ index 0000000..d309458
 +"  selfTest    : f32,   // P4 operator gate: reconstruct velocity for (testUv,testDepth) -> output it\n"
 +"  testDepth   : f32,\n"
 +"  testUv      : vec2<f32>,\n"
-+"  pad         : vec2<f32>,\n"
++"  minDepth    : f32,   // view-weapon exclusion: skip blur where depth < minDepth (0 = off)\n"
++"  pad         : f32,\n"
 +"};\n"
 +"@group(0) @binding(0) var<uniform> u : MB;\n"
 +"@group(0) @binding(1) var sceneTex : texture_2d<f32>;\n"
@@ -11045,6 +11239,28 @@ index 0000000..d309458
 +"  // (testUv, testDepth) from the UB matrices and output it ENCODED in [0,1]\n"
 +"  // (R = vx, G = vy, ±128 px range). The CPU compares against a forward-projection\n"
 +"  // ground truth -> proves the unproject/reproject + clip-z/Y-flip conventions.\n"
++"  // P4 identity self-test (selfTest==3): blur a KNOWN sceneTex using a CONTROLLED\n"
++"  // depth (testDepth) — independent of the live depth buffer. zeroVel/scale=0 must\n"
++"  // return the scene EXACTLY (identity); otherwise the blur must CHANGE the image\n"
++"  // (the mutation arm) -> proves the disable path is a true no-op, not vacuous.\n"
++"  if (u.selfTest > 2.5) {\n"
++"    let uvI = fc.xy / u.screenSize;\n"
++"    let sceneI = textureSampleLevel(sceneTex, sceneSamp, uvI, 0.0);\n"
++"    if (u.zeroVel > 0.5 || u.scale < 0.01) { return sceneI; }\n"
++"    let ndcI = vec3<f32>(uvI.x * 2.0 - 1.0, 1.0 - uvI.y * 2.0, 2.0 * u.testDepth - 1.0);\n"
++"    let wHI = u.invCurVP * vec4<f32>(ndcI, 1.0);\n"
++"    let worldI = wHI.xyz / wHI.w;\n"
++"    let pHI = u.prevVP * vec4<f32>(worldI, 1.0);\n"
++"    let pUvI = vec2<f32>(pHI.x / pHI.w * 0.5 + 0.5, 0.5 - pHI.y / pHI.w * 0.5);\n"
++"    let velUvI = (uvI - pUvI) * u.scale;\n"
++"    let cntI = max(2, i32(u.samples));\n"
++"    var accI = vec4<f32>(0.0);\n"
++"    for (var i = 0; i < cntI; i = i + 1) {\n"
++"      let t = (f32(i) / (f32(cntI) - 1.0)) - 0.5;\n"
++"      accI = accI + textureSampleLevel(sceneTex, sceneSamp, uvI + velUvI * t, 0.0);\n"
++"    }\n"
++"    return accI / f32(cntI);\n"
++"  }\n"
 +"  if (u.selfTest > 0.5) {\n"
 +"    let uvT = u.testUv;\n"
 +"    let ndcT = vec3<f32>(uvT.x * 2.0 - 1.0, 1.0 - uvT.y * 2.0, 2.0 * u.testDepth - 1.0);\n"
@@ -11060,6 +11276,7 @@ index 0000000..d309458
 +"  if (u.zeroVel > 0.5 || u.scale < 0.01) { return scene; }         // disabled / mutation -> identity\n"
 +"  let d = textureLoad(depthTex, vec2<i32>(fc.xy), 0);              // [0,1] WebGPU depth\n"
 +"  if (d >= 0.9999) { return scene; }                               // skybox / far plane -> no blur\n"
++"  if (d < u.minDepth) { return scene; }                            // view-weapon: compressed near slice -> no smear\n"
 +"  let ndc = vec3<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 2.0 * d - 1.0);  // GL NDC\n"
 +"  let wH = u.invCurVP * vec4<f32>(ndc, 1.0);\n"
 +"  if (abs(wH.w) < 1e-6) { return scene; }\n"

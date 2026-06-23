@@ -917,6 +917,22 @@ function buildArguments(config) {
         String((() => { const m = /[?&]texdim=(\d+)\b/.exec(typeof window !== "undefined" ? window.location.search : "");
                         return m ? Number(m[1]) : (config.inputMode === "wearable" ? 128 : 0); })()),
     "+set", "r_wgpuDetTest", config.inputMode === "wearable" ? "0" : "1",
+    // R-MBLUR: camera motion blur (depth-reconstruction, WebGPU-backend-only).
+    // Default OFF on every tier (the r_motionBlur cvar default is 0, the native-
+    // parity default). ?motionblur opts in with the plan's locked tier quality:
+    //   desktop (Mac/PC) + Android Chrome = Dawn/ANGLE-class -> 1.0 scale / 4-tap
+    //   iOS Safari = the constrained WebKit->Metal tier        -> 0.5 scale / 2-tap
+    // No wearable/glasses tier (the project targets mobile iOS+Android + desktop web).
+    // r_motionBlurMinDepth excludes the view-weapon (its compressed near-depth slice);
+    // the exact scale/tap/min-depth values are tuned on-device in P5. ?motionblur=force
+    // is accepted as an alias so it can be enabled even on a tier that would default off.
+    ...((/[?&]motionblur(\b|=)/.test(typeof window !== "undefined" ? window.location.search : ""))
+        ? (isIOSDevice()
+            ? ["+set", "r_motionBlur", "1", "+set", "r_motionBlurScale", "0.5",
+               "+set", "r_motionBlurSamples", "2", "+set", "r_motionBlurMinDepth", "0.2"]
+            : ["+set", "r_motionBlur", "1", "+set", "r_motionBlurScale", "1.0",
+               "+set", "r_motionBlurSamples", "4", "+set", "r_motionBlurMinDepth", "0.2"])
+        : []),
     // iter-132: throttled background GPU-texture pre-warm. With image_preload 0
     // the wearable creates each GPU texture lazily on first DRAW — an unthrottled
     // per-view burst that reads black on the weak glasses GPU until it finishes.
