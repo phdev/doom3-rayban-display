@@ -1,5 +1,19 @@
 # RENDER/PERF track roadmap — modern-renderer feature program (owner-directed 2026-06-22)
 
+> **⟡ RE-SCOPED 2026-06-23 (owner) — read this first; the Phase A/B/C plan below is SUPERSEDED.**
+> After the mobile-friendliness analysis of soft shadows and HDR/IBL, the owner **CUT M4 soft
+> shadows, F1/M1 HDR, and M2 IBL**, and chose **mobile-friendly motion blur → then M6 PBR** instead.
+> The new sequence is: **(1) camera motion blur (mobile) → (2) PBR (GGX, authored metallic-roughness).**
+> Motion-blur TYPE locked = **CAMERA/world via DEPTH RECONSTRUCTION** (screen velocity from depth +
+> cur/prev view-proj; one bloom-class fullscreen pass; **no per-object velocity G-buffer**; viewmodel
+> excluded; tier-scaled, default-OFF, off on the glasses tier). **Determinism correction:** §3/§6 below
+> say "motion blur is nondeterministic → cut" — that was conflated with TAA. Motion blur from
+> *deterministic* velocity (cur+prev VP are fixed per frame) is `__d3WgpuDet`-compatible, exactly like
+> the R0 tonemap post-pass, so it is buildable without sacrificing the determinism instrument. The
+> detailed motion-blur milestone plan lives in `docs/MOTIONBLUR_PLAN.md`. PBR (§ below) is unchanged.
+> M5 PCF shadow maps remain never-mobile (iter-39 per-light-pass trap). Everything below is retained
+> as the superseded prior plan + the still-valid tier/cross-session/PBR detail.
+
 Owner directive: add **PBR, image-based lighting/environment probes, shadow mapping, bloom, motion
 blur, and modern antialiasing** to the WebGPU backend. This doc re-architects the R-track to deliver
 that, ordered by dependency × value × on-device viability. Produced via a recon→synthesis→adversarial
