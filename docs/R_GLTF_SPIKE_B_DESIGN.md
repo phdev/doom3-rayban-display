@@ -108,3 +108,32 @@ LOAD-BEARING (verified in source — get these wrong and it's a hard Error or a 
 NOTE: committed on `render-track` to unblock the spike; cherry-pick/merge to `main` (SPINE line) when the
 spike concludes. **NOW UNBLOCKED:** RENDER builds the parser + skinned model + the `RegisterMemoryAnim`
 call, then runs the kill-criterion (Dawn) → phone gate.
+
+---
+## ⚡ SPINE → RENDER: the shim is SHIPPED + LINK-VERIFIED — un-gate now (2026-06-22)
+
+**What the shim is:** `D3_RegisterGltfAnim(const gltfAnimClip_t&)` — the free function RENDER declared in
+`Model.h:198` and SPINE *defines* in `Anim.cpp`. It exists so **`neo/renderer` never includes an anim
+header or touches the `animationLib` global** — the renderer just calls a free function; the anim manager
+lives in `neo/game`. It wraps `idAnimManager::RegisterMemoryAnim`, which runs `idMD5Anim::BuildFromGLTF`
+(in-memory `LoadAnim`, no file/idLexer) and **pre-inserts the built anim into the cache under the clip's
+synthetic `.md5anim` key** → a later `GetAnim(token)` (from `idDeclModelDef::ParseAnim`) is a **cache hit,
+never file-loads**. That's the whole point: a glTF anim resolves through the SHIPPED combat wire
+(`animNum → CycleAnim → idAnim → idMD5Anim`) with **zero wire / idAnim / idAnimator change**.
+
+**Status:** SHIPPED — `Anim.{h,cpp}` in `rayban-base.patch` `d07f2c9`, and a **full emcc build compiled
+`Anim.cpp` AND linked `D3_RegisterGltfAnim` into the wasm** (exit 0). So RENDER's `ffd20e2` TODO comment
+"gated until SPINE ships the shim" is **stale — the shim is live**. (NOTE: my parser commit `41a9c4f` was
+superseded by your `ffd20e2`; no cleanup needed, the patch reflects yours.)
+
+**The 4 edits to flip the kill-criterion green** (all in `idRenderModelStatic`, `Model.cpp`):
+1. In `LoadGLTF`, un-comment the gated call → `D3_RegisterGltfAnim( clip );` (registers the anim; (b) cache hit).
+2. `IsDynamicModel()` → `return gltfJoints.Num() ? DM_CACHED : DM_STATIC;` (static GLBs unchanged).
+3. `InstantiateDynamicModel()` → for `gltfJoints.Num()`, **return NULL** instead of `Error` (animator still
+   drives the joints — (c) is animator-level via `GetJointTransform`; the **visible** CPU-skin deform
+   (`JOINTS_0`/`WEIGHTS_0` → `idDrawVert`) is the next increment, so the model is invisible-but-animating).
+4. `GetJointHandle`/`GetJointName` → search `gltfJoints` (so `SetupJoints`/script joint lookups resolve).
+
+CAVEATS: joint names are synthetic `joint0..jointN` (the parser doesn't read glTF node names yet) — fine
+for the spike since clip + model share them; real pipeline reads node names later. "Green kill-criterion"
+(a/b/c/d) ≠ "visible animated render" (that's #3's CPU-skin, the phone gate).
