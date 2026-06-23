@@ -65,6 +65,9 @@ const detOk = detArr.length === 0 || detArr.every((r) => r.diffPx === 0 && r.max
 const meshOk = (sig.called || 0) > 0 && sig.loaded === true && (sig.surfaces || 0) > 0;
 const skelOk = (sig.animJoints || 0) > 0 && (sig.modelJoints || 0) === (sig.animJoints || 0);
 const animOk = (sig.animFrames || 0) > 1;   // resampled to >1 frame
-const reg = sig.animRegistered === 1 ? "fired" : "GATED (instantiate bug)";   // register call is gated pending the link fix
+// Spike-B green: D3_RegisterGltfAnim fires in the clean release build (the
+// earlier instantiate failure was a stale wasm/JS minify mismatch, not a code bug).
+const regOk = sig.animRegistered === 1;
+const reg = regOk ? "fired" : "NOT REGISTERED";
 console.log(`\nVERDICT: mesh ${meshOk ? "✓" : "✗"} (surfaces=${sig.surfaces}) | skeleton ${skelOk ? "✓" : "✗"} (animJoints=${sig.animJoints}, modelJoints=${sig.modelJoints}) | anim-clip ${animOk ? "✓" : "✗"} (frames=${sig.animFrames}) | register=${reg} | det ${detOk ? "IDENTICAL ✓" : "NOT IDENTICAL ✗"}`);
-process.exit(meshOk && skelOk && animOk && detOk ? 0 : 1);
+process.exit(meshOk && skelOk && animOk && regOk && detOk ? 0 : 1);

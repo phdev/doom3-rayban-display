@@ -234,7 +234,7 @@ index f9ae002..9430a1e 100644
  
  			qglCopyTexSubImage2D( GL_TEXTURE_2D, 0, 0, 0, x, y, imageWidth, imageHeight );
 diff --git a/neo/renderer/Model.cpp b/neo/renderer/Model.cpp
-index 3016bf2..7007a42 100644
+index 3016bf2..90f332c 100644
 --- a/neo/renderer/Model.cpp
 +++ b/neo/renderer/Model.cpp
 @@ -35,6 +35,9 @@ If you have questions concerning this license or the applicable additional terms
@@ -247,7 +247,7 @@ index 3016bf2..7007a42 100644
  
  #include "renderer/Model.h"
  
-@@ -262,6 +265,582 @@ void idRenderModelStatic::MakeDefaultModel() {
+@@ -262,6 +265,584 @@ void idRenderModelStatic::MakeDefaultModel() {
  	FinishSurfaces();
  }
  
@@ -808,14 +808,16 @@ index 3016bf2..7007a42 100644
 +				gltfJoints[j].parent = ( pn >= 0 && pn < nj ) ? &gltfJoints[pn] : NULL;
 +			}
 +			// Register the in-memory idMD5Anim so GetAnim(token) is a cache hit.
-+			// SPINE's D3_RegisterGltfAnim shim is live (d07f2c9), BUT un-gating this call
-+			// (which links SPINE's BuildFromGLTF/RegisterMemoryAnim via gc-sections) breaks
-+			// wasm instantiation ("Import #0 env: module is not an object") — a cross-module
-+			// link interaction under investigation (the error asks for an -sASSERTIONS build
-+			// to name the symbol). RE-GATED so render-track keeps a working wasm; the parser +
-+			// skeleton + the dynamic-model wiring below are verified meanwhile.
-+			//   D3_RegisterGltfAnim( clip );
-+			EM_ASM({ window.__d3GltfAnimJoints = $0; window.__d3GltfAnimFrames = $1; window.__d3GltfModelJoints = $2; }, clip.numJoints, clip.numFrames, gltfJoints.Num() );
++			// Links SPINE's D3_RegisterGltfAnim -> RegisterMemoryAnim -> BuildFromGLTF
++			// (shim live d07f2c9) across the game/renderer boundary via gc-sections.
++			// (An earlier "Import #0 env: module is not an object" instantiate failure
++			// on this call was NOT a code bug: it was a stale wasm/JS minification
++			// mismatch from incremental relinking during a flag-toggling diagnostic —
++			// the wasm imported module "env" while the minified glue provided "a".
++			// A clean/consistent link resolves it; proven register=fired, det IDENTICAL
++			// in a from-scratch release build.)
++			D3_RegisterGltfAnim( clip );
++			EM_ASM({ window.__d3GltfAnimJoints = $0; window.__d3GltfAnimFrames = $1; window.__d3GltfModelJoints = $2; window.__d3GltfAnimRegistered = 1; }, clip.numJoints, clip.numFrames, gltfJoints.Num() );
 +		}
 +	}
 +#endif
@@ -830,7 +832,7 @@ index 3016bf2..7007a42 100644
  /*
  ================
  idRenderModelStatic::PartialInitFromFile
-@@ -299,6 +878,9 @@ void idRenderModelStatic::InitFromFile( const char *fileName ) {
+@@ -299,6 +880,9 @@ void idRenderModelStatic::InitFromFile( const char *fileName ) {
  	} else if ( extension.Icmp( "ma" ) == 0 ) {
  		loaded		= LoadMA( name );
  		reloadable	= true;
@@ -840,7 +842,7 @@ index 3016bf2..7007a42 100644
  	} else {
  		common->Warning( "idRenderModelStatic::InitFromFile: unknown type for model: \'%s\'", name.c_str() );
  		loaded		= false;
-@@ -453,7 +1035,7 @@ idRenderModelStatic::IsDynamicModel
+@@ -453,7 +1037,7 @@ idRenderModelStatic::IsDynamicModel
  */
  dynamicModel_t idRenderModelStatic::IsDynamicModel() const {
  	// dynamic subclasses will override this
@@ -849,7 +851,7 @@ index 3016bf2..7007a42 100644
  }
  
  /*
-@@ -493,6 +1075,12 @@ idRenderModel *idRenderModelStatic::InstantiateDynamicModel( const struct render
+@@ -493,6 +1077,12 @@ idRenderModel *idRenderModelStatic::InstantiateDynamicModel( const struct render
  		delete cachedModel;
  		cachedModel = NULL;
  	}
@@ -862,7 +864,7 @@ index 3016bf2..7007a42 100644
  	common->Error( "InstantiateDynamicModel called on static model '%s'", name.c_str() );
  	return NULL;
  }
-@@ -503,7 +1091,7 @@ idRenderModelStatic::NumJoints
+@@ -503,7 +1093,7 @@ idRenderModelStatic::NumJoints
  ================
  */
  int idRenderModelStatic::NumJoints( void ) const {
@@ -871,7 +873,7 @@ index 3016bf2..7007a42 100644
  }
  
  /*
-@@ -512,7 +1100,7 @@ idRenderModelStatic::GetJoints
+@@ -512,7 +1102,7 @@ idRenderModelStatic::GetJoints
  ================
  */
  const idMD5Joint *idRenderModelStatic::GetJoints( void ) const {
@@ -880,7 +882,7 @@ index 3016bf2..7007a42 100644
  }
  
  /*
-@@ -521,6 +1109,9 @@ idRenderModelStatic::GetJointHandle
+@@ -521,6 +1111,9 @@ idRenderModelStatic::GetJointHandle
  ================
  */
  jointHandle_t idRenderModelStatic::GetJointHandle( const char *name ) const {
@@ -890,7 +892,7 @@ index 3016bf2..7007a42 100644
  	return INVALID_JOINT;
  }
  
-@@ -530,6 +1121,7 @@ idRenderModelStatic::GetJointName
+@@ -530,6 +1123,7 @@ idRenderModelStatic::GetJointName
  ================
  */
  const char * idRenderModelStatic::GetJointName( jointHandle_t handle ) const {
@@ -898,7 +900,7 @@ index 3016bf2..7007a42 100644
  	return "";
  }
  
-@@ -539,7 +1131,7 @@ idRenderModelStatic::GetDefaultPose
+@@ -539,7 +1133,7 @@ idRenderModelStatic::GetDefaultPose
  ================
  */
  const idJointQuat *idRenderModelStatic::GetDefaultPose( void ) const {
