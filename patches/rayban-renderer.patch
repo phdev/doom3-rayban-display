@@ -1982,10 +1982,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..d575e27
+index 0000000..3326a7f
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,5458 @@
+@@ -0,0 +1,5512 @@
 +/*
 +================================================================================
 +
@@ -2203,6 +2203,7 @@ index 0000000..d575e27
 +extern "C" float    g_capMotionBlurMinDepth;
 +extern "C" uint32_t g_capMotionBlurNoDepth;
 +extern "C" uint32_t g_capMotionBlurWarmup;
++extern "C" uint32_t g_capWeaponDepthSep;   // R-VIEWMODEL: 1 = apply [0,0.5] viewport to weapon records
 +extern "C" uint32_t g_capInCinematic;
 +extern "C" float    g_mbViewProj[16];
 +extern "C" float    g_mbInvViewProj[16];
@@ -5034,6 +5035,24 @@ index 0000000..d575e27
 +                lastPublishedShadowVols = sn;
 +                EM_ASM_({ window.__d3ShadowVols = $0; }, sn);
 +            }
++            // R-VIEWMODEL: live count of weapon view-model records receiving the
++            // [0,0.5] depth-range viewport this frame (sPad1==1u across the lit
++            // interaction + pass-record sets, gated by r_weaponDepthSep). The
++            // falsifiable signal: >0 when the gun is in view AND the feature is on
++            // (capture flags it + the replay path fires); 0 with r_weaponDepthSep 0
++            // (feature off => OFF-identity) or no weapon in view. Published only on
++            // this LIVE drain — the det re-encodes don't touch it.
++            {
++                uint32_t wmRec = 0;
++                if (g_capWeaponDepthSep) {
++                    for (uint32_t i = 0; i < lastRecordCount; ++i) if (lastRecords[i].sPad1 == 1u) wmRec++;
++                    for (uint32_t i = 0; i < lastPassCount;   ++i) if (lastPassRecords[i].sPad1 == 1u) wmRec++;
++                }
++                if (wmRec != lastPublishedWeaponRecords) {
++                    lastPublishedWeaponRecords = wmRec;
++                    EM_ASM_({ window.__d3WeaponDepthRecords = $0; }, wmRec);
++                }
++            }
 +            if (sn > 0) {
 +                static bool shAnnounced = false;
 +                if (!shAnnounced) {
@@ -5327,6 +5346,27 @@ index 0000000..d575e27
 +    // haze (it then simply doesn't draw).
 +    void encodeRecordsPass(WGPUCommandEncoder enc, WGPUTextureView color, WGPUTextureView depth,
 +                           WGPUTexture colorTex = nullptr) {
++        // R-VIEWMODEL: GL's RB_EnterWeaponDepthHack confines the view weapon to
++        // the front half of the depth buffer via glDepthRange(0,0.5) (so it never
++        // clips into close world geometry) AND compresses its projection
++        // (matrix[14]*=0.25, baked into the captured MVP). The port baked only the
++        // projection half; this applies the depth-range half at replay. A record
++        // with sPad1==1u is a weapon view-model record (flagged at capture). Re-issues
++        // SetViewport only on a weapon<->world transition (world records dominate);
++        // each render pass starts at the default [0,1] range, so callers init their
++        // state var to 0 (world). Shadow-volume draws are always world space and must
++        // run at [0,1] — reset to 0 before drawing them. With NO weapon record present
++        // (sPad1==1 never true) this emits ZERO SetViewport calls => byte-identical to
++        // the pre-R-VIEWMODEL frame (OFF-identity). Used only in the full-res main-view
++        // passes (depthW x depthH); the 256px subview passes carry no weapon records.
++        auto setWeaponDepthRange = [&](WGPURenderPassEncoder rpW, const Rec& r, int& state) {
++            const int want = (g_capWeaponDepthSep && r.sPad1 == 1u) ? 1 : 0;
++            if (want != state) {
++                wgpuRenderPassEncoderSetViewport(rpW, 0.0f, 0.0f, (float)depthW, (float)depthH,
++                                                 0.0f, want ? 0.5f : 1.0f);
++                state = want;
++            }
++        };
 +        // Iter 14: render linked subviews (mirrors/monitors) into their
 +        // offscreen targets FIRST — the main view samples them.
 +        for (uint32_t g = 0; g < subGroupCount; ++g) {
@@ -5428,9 +5468,11 @@ index 0000000..d575e27
 +            rpd.depthStencilAttachment = &da;
 +            WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
 +            wgpuRenderPassEncoderSetPipeline(rp, depthPipeline);
++            int wmPre = 0;   // R-VIEWMODEL: viewport depth-range state for the whole prepass (interaction + pass-fill below)
 +            for (uint32_t i = 0; i < lastRecordCount; ++i) {
 +                const Rec& r = lastRecords[i];
 +                if (r.sPad2) continue;   // translucent interactions: no depth write
++                setWeaponDepthRange(rp, r, wmPre);   // R-VIEWMODEL: weapon prepass depth -> [0,0.5]
 +                wgpuRenderPassEncoderSetBindGroup(rp, 0, recordDepthBindGroups[i], 0, nullptr);
 +                wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
 +                wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
@@ -5482,6 +5524,7 @@ index 0000000..d575e27
 +                    if (!((r.pad3 == 0u && r.pad1 == 1u) || r.pad3 == 4u) || r.sPad2 || r.pad0 != mvPrepass) continue;
 +                    if (!passDepthBindGroups[i]) continue;
 +                    if (r.pad3 == 4u) dfDrawn++;
++                    setWeaponDepthRange(rp, r, wmPre);   // R-VIEWMODEL: weapon opaque-fill depth -> [0,0.5]
 +                    wgpuRenderPassEncoderSetBindGroup(rp, 0, passDepthBindGroups[i], 0, nullptr);
 +                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
 +                    wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
@@ -5575,13 +5618,20 @@ index 0000000..d575e27
 +                }
 +            };
 +            uint32_t i = 0;
++            int wmLit = 0;   // R-VIEWMODEL: viewport depth-range state for the lit pass
++            // Shadow volumes are world-space — they must mark/test stencil at the
++            // full [0,1] depth range, so reset before any drawVolumes call.
++            auto litResetWorld = [&]() {
++                if (wmLit != 0) { wgpuRenderPassEncoderSetViewport(rp, 0.0f, 0.0f, (float)depthW, (float)depthH, 0.0f, 1.0f); wmLit = 0; }
++            };
 +            while (i < lastRecordCount) {
 +                const uint32_t light = lastRecords[i].lightId;
 +                const bool shadowed = volsOK && lightIsShadowed(light);
-+                if (shadowed) drawVolumes(light, false);
++                if (shadowed) { litResetWorld(); drawVolumes(light, false); }
 +                wgpuRenderPassEncoderSetPipeline(rp, interactionPipeline);
 +                while (i < lastRecordCount && lastRecords[i].lightId == light) {
 +                    const Rec& r = lastRecords[i];
++                    setWeaponDepthRange(rp, r, wmLit);   // R-VIEWMODEL: weapon lit interactions -> [0,0.5]
 +                    wgpuRenderPassEncoderSetBindGroup(rp, 0, recordBindGroups[i], 0, nullptr);
 +                    wgpuRenderPassEncoderSetBindGroup(rp, 1, lastMatGroups[i] ? lastMatGroups[i] : fallbackMatGroup(), 0, nullptr);
 +                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
@@ -5589,7 +5639,7 @@ index 0000000..d575e27
 +                    wgpuRenderPassEncoderDrawIndexed(rp, r.indexCount, 1, 0, 0, 0);
 +                    i++;
 +                }
-+                if (shadowed) drawVolumes(light, true);
++                if (shadowed) { litResetWorld(); drawVolumes(light, true); }
 +            }
 +            wgpuRenderPassEncoderEnd(rp);
 +            wgpuRenderPassEncoderRelease(rp);
@@ -5759,6 +5809,7 @@ index 0000000..d575e27
 +                wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
 +                wgpuRenderPassEncoderDrawIndexed(rp, r.indexCount, 1, 0, 0, 0);
 +            }
++            int wmFinal = 0;   // R-VIEWMODEL: viewport depth-range state for the pass-record loop
 +            for (uint32_t i = 0; i < lastPassCount; ++i) {
 +                const Rec& r = lastPassRecords[i];
 +                if (r.pad3 == 4u) continue;   // iter-120 depth-fill: prepass-only, no color
@@ -5793,12 +5844,14 @@ index 0000000..d575e27
 +                if (!p || !lastPassGroups[i]) continue;
 +                wgpuRenderPassEncoderSetPipeline(rp, p);
 +                setRecordScissor(rp, r);   // iter 45: GL per-surf scissor
++                setWeaponDepthRange(rp, r, wmFinal);   // R-VIEWMODEL: weapon pass stages -> [0,0.5]
 +                wgpuRenderPassEncoderSetBindGroup(rp, 0, lastPassGroups[i], 0, nullptr);
 +                wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
 +                wgpuRenderPassEncoderSetIndexBuffer(rp, recordIndexBuf, WGPUIndexFormat_Uint16, r.indexOffset, (uint64_t)r.indexCount * 2u);
 +                wgpuRenderPassEncoderDrawIndexed(rp, r.indexCount, 1, 0, 0, 0);
 +            }
 +            wgpuRenderPassEncoderSetScissorRect(rp, 0, 0, (uint32_t)depthW, (uint32_t)depthH);
++            if (wmFinal != 0) wgpuRenderPassEncoderSetViewport(rp, 0.0f, 0.0f, (float)depthW, (float)depthH, 0.0f, 1.0f);   // R-VIEWMODEL: restore full depth range
 +            wgpuRenderPassEncoderEnd(rp);
 +            wgpuRenderPassEncoderRelease(rp);
 +
@@ -7206,6 +7259,7 @@ index 0000000..d575e27
 +    int                     preloadSeenCount = 0;    // cache count already fully covered
 +    int                     preloadLoggedTotal = 0;  // last cache size we logged "complete" for
 +    uint32_t                lastPublishedShadowVols = 0xFFFFFFFFu;   // iter 31: diag shadow state
++    uint32_t                lastPublishedWeaponRecords = 0xFFFFFFFFu; // R-VIEWMODEL: weapon-record count signal
 +    // Iter 30: delta-upload mirrors (CPU copy of last-uploaded accumulator
 +    // contents; uploads send only changed 256KB chunks).
 +    uint8_t*                vertMirror = nullptr;
@@ -7477,7 +7531,7 @@ index 0000000..0f9c8e6
 +    return nullptr;
 +}
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
-index 7914093..37c9f75 100644
+index 7914093..075dacc 100644
 --- a/neo/renderer/RenderSystem_init.cpp
 +++ b/neo/renderer/RenderSystem_init.cpp
 @@ -39,6 +39,11 @@ If you have questions concerning this license or the applicable additional terms
@@ -7492,7 +7546,7 @@ index 7914093..37c9f75 100644
  
  #include "framework/GameCallbacks_local.h"
  #include "framework/Game.h"
-@@ -102,6 +107,69 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
+@@ -102,6 +107,70 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
  
  idCVar r_skipSuppress( "r_skipSuppress", "0", CVAR_RENDERER | CVAR_BOOL, "ignore the per-view suppressions" );
  idCVar r_skipPostProcess( "r_skipPostProcess", "0", CVAR_RENDERER | CVAR_BOOL, "skip all post-process renderings" );
@@ -7547,6 +7601,7 @@ index 7914093..37c9f75 100644
 +idCVar r_motionBlurMinDepth( "r_motionBlurMinDepth", "0", CVAR_RENDERER | CVAR_FLOAT, "WebGPU motion blur: skip blur where depth < this (view-weapon exclusion; 0 = off, ~0.2 excludes the gun's compressed near slice)" );
 +idCVar r_motionBlurNoDepth( "r_motionBlurNoDepth", "0", CVAR_RENDERER | CVAR_BOOL, "WebGPU motion blur DIAGNOSTIC: skip the depth-buffer SAMPLE (const depth) — A/B whether depth-aspect sampling is the WebKit-Metal crash" );
 +idCVar r_motionBlurWarmup( "r_motionBlurWarmup", "0", CVAR_RENDERER | CVAR_INTEGER, "WebGPU motion blur: defer the blur for this many frames so it never stacks on the load-time GPU peak (iOS memory; 0 = desktop)" );
++idCVar r_weaponDepthSep( "r_weaponDepthSep", "1", CVAR_RENDERER | CVAR_BOOL, "WebGPU view-model depth separation: apply GL's glDepthRange(0,0.5) to weapon view-model records (the depth-range half of RB_EnterWeaponDepthHack) so the gun never clips into close world geometry. 1 = GL parity (fixes the clip); 0 = projection-compress only (the pre-R-VIEWMODEL WebGPU behavior, A/B)" );
 +idCVar r_pbr( "r_pbr", "1", CVAR_RENDERER | CVAR_BOOL, "WebGPU: enable metallic-roughness PBR (GGX) for ORM materials flagged isPBR in specular_color.w" );
 +idCVar r_pbrForce( "r_pbrForce", "0", CVAR_RENDERER | CVAR_BOOL, "WebGPU PBR: FORCE isPBR on every interaction (A/B test — reinterprets the specular map as ORM; 0 = only real isPBR materials)" );
 +idCVar r_pbrTest( "r_pbrTest", "0", CVAR_RENDERER | CVAR_BOOL, "WebGPU PBR: SYNTHETIC test material — render every surface as correct PBR using constant roughness/metallic/ao (r_pbrTest*) over the real diffuse, so the GGX look is visibly demonstrable before content's ORM GLB lands" );
@@ -7562,7 +7617,7 @@ index 7914093..37c9f75 100644
  idCVar r_skipLightScale( "r_skipLightScale", "0", CVAR_RENDERER | CVAR_BOOL, "don't do any post-interaction light scaling, makes things dim on low-dynamic range cards" );
  idCVar r_skipInteractions( "r_skipInteractions", "0", CVAR_RENDERER | CVAR_BOOL, "skip all light/surface interaction drawing" );
  idCVar r_skipDynamicTextures( "r_skipDynamicTextures", "0", CVAR_RENDERER | CVAR_BOOL, "don't dynamically create textures" );
-@@ -158,6 +226,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
+@@ -158,6 +227,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
  idCVar r_useExternalShadows( "r_useExternalShadows", "1", CVAR_RENDERER | CVAR_INTEGER, "1 = skip drawing caps when outside the light volume, 2 = force to no caps for testing", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
  idCVar r_useOptimizedShadows( "r_useOptimizedShadows", "1", CVAR_RENDERER | CVAR_BOOL, "use the dmap generated static shadow volumes" );
  idCVar r_useScissor( "r_useScissor", "1", CVAR_RENDERER | CVAR_BOOL, "scissor clip as portals and lights are processed" );
@@ -7570,7 +7625,7 @@ index 7914093..37c9f75 100644
  idCVar r_useCombinerDisplayLists( "r_useCombinerDisplayLists", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "put all nvidia register combiner programming in display lists" );
  idCVar r_useDepthBoundsTest( "r_useDepthBoundsTest", "1", CVAR_RENDERER | CVAR_BOOL, "use depth bounds test to reduce shadow fill" );
  
-@@ -819,11 +888,63 @@ void R_InitOpenGL( void ) {
+@@ -819,11 +889,63 @@ void R_InitOpenGL( void ) {
  		r_multiSamples.SetInteger( 0 );
  	}
  
@@ -7634,7 +7689,7 @@ index 7914093..37c9f75 100644
  
  #include "renderer/qgl_proc.h"
  
-@@ -910,6 +1031,18 @@ GL_CheckErrors
+@@ -910,6 +1032,18 @@ GL_CheckErrors
  ==================
  */
  void GL_CheckErrors( void ) {
@@ -7653,7 +7708,7 @@ index 7914093..37c9f75 100644
  	int		err;
  	char	s[64];
  	int		i;
-@@ -2505,6 +2638,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
+@@ -2505,6 +2639,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
  	// is destroyed (relevant when starting a mod which also recreates window)
  	Sys_ShutdownInput();
  
@@ -8383,7 +8438,7 @@ index ec0184e..2cfe895 100644
  		}
  	}
 diff --git a/neo/renderer/draw_arb2.cpp b/neo/renderer/draw_arb2.cpp
-index c1d0d3e..d4c0aee 100644
+index c1d0d3e..70c57f4 100644
 --- a/neo/renderer/draw_arb2.cpp
 +++ b/neo/renderer/draw_arb2.cpp
 @@ -31,6 +31,10 @@ If you have questions concerning this license or the applicable additional terms
@@ -8397,7 +8452,7 @@ index c1d0d3e..d4c0aee 100644
  // DG: if this is defined, the soft particle shaders will be compiled into the executable
  //  otherwise soft_particle.vfp will be opened as a file just like the other shaders
  //  (useful when tweaking that shader - when loaded from disk, you can use `reloadARBprograms`
-@@ -62,7 +66,228 @@ static void GL_SelectTextureNoClient( int unit ) {
+@@ -62,7 +66,234 @@ static void GL_SelectTextureNoClient( int unit ) {
  RB_ARB2_DrawInteraction
  ==================
  */
@@ -8550,6 +8605,12 @@ index c1d0d3e..d4c0aee 100644
 +			r.pad3 = (uint32_t)(r_brightness.GetFloat() * 1000.0f);
 +			r.lightId = g_capLightId;
 +			r.sPad2 = g_capTranslucent;   // 1 = translucent: no depth write
++			// R-VIEWMODEL: flag weapon view-model records (sPad1) so the backend
++			// applies a [0,0.5] depth-range viewport at replay — the GL
++			// glDepthRange(0,0.5) half of RB_EnterWeaponDepthHack (the
++			// projection-compress half is baked into the MVP below). Set
++			// unconditionally: this record is not memset.
++			r.sPad1 = ( din->surf->space && din->surf->space->weaponDepthHack ) ? 1u : 0u;
 +			{
 +				const float g = r_gamma.GetFloat();
 +				g_capInvGamma = (g > 0.01f) ? (1.0f / g) : 1.0f;
@@ -8626,7 +8687,7 @@ index c1d0d3e..d4c0aee 100644
  	// load all the vertex program parameters
  	qglProgramEnvParameter4fvARB( GL_VERTEX_PROGRAM_ARB, PP_LIGHT_ORIGIN, din->localLightOrigin.ToFloatPtr() );
  	qglProgramEnvParameter4fvARB( GL_VERTEX_PROGRAM_ARB, PP_VIEW_ORIGIN, din->localViewOrigin.ToFloatPtr() );
-@@ -190,6 +415,7 @@ void RB_ARB2_CreateDrawInteractions( const drawSurf_t *surf ) {
+@@ -190,6 +421,7 @@ void RB_ARB2_CreateDrawInteractions( const drawSurf_t *surf ) {
  	} else {
  		globalImages->specularTableImage->Bind();
  	}
@@ -8634,7 +8695,7 @@ index c1d0d3e..d4c0aee 100644
  
  
  	for ( ; surf ; surf=surf->nextOnLight ) {
-@@ -258,6 +484,45 @@ void RB_ARB2_DrawInteractions( void ) {
+@@ -258,6 +490,45 @@ void RB_ARB2_DrawInteractions( void ) {
  	//
  	for ( vLight = backEnd.viewDef->viewLights ; vLight ; vLight = vLight->next ) {
  		backEnd.vLight = vLight;
@@ -8680,7 +8741,7 @@ index c1d0d3e..d4c0aee 100644
  
  		// do fogging later
  		if ( vLight->lightShader->IsFogLight() ) {
-@@ -314,7 +579,9 @@ void RB_ARB2_DrawInteractions( void ) {
+@@ -314,7 +585,9 @@ void RB_ARB2_DrawInteractions( void ) {
  		qglStencilFunc( GL_ALWAYS, 128, 255 );
  
  		backEnd.depthFunc = GLS_DEPTHFUNC_LESS;
@@ -8690,7 +8751,7 @@ index c1d0d3e..d4c0aee 100644
  
  		backEnd.depthFunc = GLS_DEPTHFUNC_EQUAL;
  	}
-@@ -757,6 +1024,26 @@ int R_FindARBProgram( GLenum target, const char *program ) {
+@@ -757,6 +1030,26 @@ int R_FindARBProgram( GLenum target, const char *program ) {
  	return progs[i].ident;
  }
  
@@ -9178,7 +9239,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..9ae7014 100644
+index c83ebb5..eedf42d 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -9204,7 +9265,7 @@ index c83ebb5..9ae7014 100644
  
  /*
  
-@@ -38,6 +50,1148 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,1154 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -9440,6 +9501,7 @@ index c83ebb5..9ae7014 100644
 +    float    g_capMotionBlurMinDepth = 0.0f;
 +    uint32_t g_capMotionBlurNoDepth = 0;   // diagnostic: skip the depth sample (WebKit A/B)
 +    uint32_t g_capMotionBlurWarmup = 0;    // defer the blur N frames past the load peak (iOS memory)
++    uint32_t g_capWeaponDepthSep = 1;      // R-VIEWMODEL: apply [0,0.5] depth-range viewport to weapon records (1 = GL parity)
 +    uint32_t g_capPbr = 1;          // R-PBR P0: master enable for GGX on isPBR materials
 +    uint32_t g_capPbrForce = 0;     // R-PBR P0: force isPBR on every interaction (A/B)
 +    uint32_t g_capPbrTest = 0;      // R-PBR P0: synthetic test material (constant ORM)
@@ -10103,6 +10165,10 @@ index c83ebb5..9ae7014 100644
 +			capProj[14] -= surf->space->modelDepthHack;
 +		}
 +	}
++	// R-VIEWMODEL: flag weapon view-model pass records (sPad1) for the [0,0.5]
++	// replay viewport. The sky block below overrides sPad1 for sky records
++	// (never weaponDepthHack), so this is safe.
++	r.sPad1 = ( surf->space && surf->space->weaponDepthHack ) ? 1u : 0u;
 +	WGPU_PassMatMul4( r.modelMatrix, capProj,
 +	                  surf->space ? surf->space->modelViewMatrix : kIdent );
 +	memcpy( r.diffuseColor, color, 16 );
@@ -10271,6 +10337,7 @@ index c83ebb5..9ae7014 100644
 +	r.pad0  = (uint32_t)(uintptr_t)backEnd.viewDef;   // main-view tag
 +	r.pad3  = 4u;     // depth-fill sentinel: prepass-only, never drawn as color
 +	r.sPad2 = 0u;     // opaque (writes depth)
++	r.sPad1 = ( surf->space && surf->space->weaponDepthHack ) ? 1u : 0u;   // R-VIEWMODEL: [0,0.5] replay viewport
 +	g_passImagePtrs[g_passRecordCount] = NULL;
 +	g_passImageClamp[g_passRecordCount] = 0u;   // iter-130: no image -> default REPEAT path
 +	g_passRecordCount++;
@@ -10353,7 +10420,7 @@ index c83ebb5..9ae7014 100644
  
  /*
  =================
-@@ -49,6 +1203,22 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +1209,22 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -10376,7 +10443,7 @@ index c83ebb5..9ae7014 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +1248,22 @@ RB_DrawElementsWithCounters
+@@ -78,6 +1254,22 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -10399,7 +10466,7 @@ index c83ebb5..9ae7014 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1302,23 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1308,23 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -10423,7 +10490,7 @@ index c83ebb5..9ae7014 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1369,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1375,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -10431,7 +10498,7 @@ index c83ebb5..9ae7014 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1596,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1602,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -10444,7 +10511,7 @@ index c83ebb5..9ae7014 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -553,26 +1761,165 @@ Any mirrored or portaled views have already been drawn, so prepare
+@@ -553,26 +1767,166 @@ Any mirrored or portaled views have already been drawn, so prepare
  to actually render the visible surfaces for this view
  =================
  */
@@ -10554,6 +10621,7 @@ index c83ebb5..9ae7014 100644
 +		g_capMotionBlurMinDepth = r_motionBlurMinDepth.GetFloat();
 +		g_capMotionBlurNoDepth = r_motionBlurNoDepth.GetBool() ? 1u : 0u;
 +		extern idCVar r_motionBlurWarmup; g_capMotionBlurWarmup = (uint32_t)r_motionBlurWarmup.GetInteger();
++		extern idCVar r_weaponDepthSep; g_capWeaponDepthSep = r_weaponDepthSep.GetBool() ? 1u : 0u;
 +		extern idCVar r_pbr, r_pbrForce, r_pbrTest, r_pbrTestRough, r_pbrTestMetal, r_pbrTestAO;
 +		g_capPbr = r_pbr.GetBool() ? 1u : 0u;
 +		g_capPbrForce = r_pbrForce.GetBool() ? 1u : 0u;
@@ -10620,7 +10688,7 @@ index c83ebb5..9ae7014 100644
  	backEnd.currentScissor = viewDef->scissor;
  
  	// ensures that depth writes are enabled for the depth clear
-@@ -897,6 +2244,26 @@ void RB_DrawView( const void *data ) {
+@@ -897,6 +2251,26 @@ void RB_DrawView( const void *data ) {
  
  	backEnd.viewDef = cmd->viewDef;
  
