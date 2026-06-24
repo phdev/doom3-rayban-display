@@ -109,6 +109,32 @@ fn ordered8(p: vec2<u32>) -> f32 {
     return f32(v) / 64.0;
 }
 
+// R-TRACER (Path C) — renderer-solo approximate bullet tracer. An additive
+// screen-space streak from the muzzle toward the aim point, drawn only on frames
+// the game spawned a view muzzle-flash light (the backend detects the shot from
+// the light, projects the muzzle world-origin + an aim point ahead to screen UV,
+// and feeds them here). Procedural (no captured geometry), additive blend (One/One),
+// color-only pass. Deterministic: a pure function of the uniform endpoints +
+// in.uv — no time/RNG/feedback — so both det re-encodes are byte-identical.
+//
+// params.xy = muzzle UV, params.zw = far/aim UV (same space as in.uv).
+// dir.x = intensity, dir.y = half-width (UV units), dir.z = core power.
+@fragment
+fn fs_tracer(in: VSOut) -> @location(0) vec4<f32> {
+    let a = u.params.xy;            // muzzle
+    let b = u.params.zw;            // aim/far
+    let ab = b - a;
+    let denom = max(dot(ab, ab), 1e-6);
+    let t = clamp(dot(in.uv - a, ab) / denom, 0.0, 1.0);   // nearest point on the segment
+    let d = distance(in.uv, a + ab * t);                   // distance to the segment
+    let halfW = max(u.dir.y, 1e-4);
+    var glow = 1.0 - smoothstep(0.0, halfW, d);
+    glow = pow(glow, max(u.dir.z, 1.0));                   // tighten the core
+    glow = glow * (0.45 + 0.55 * t);                       // streak: dimmer at the muzzle, brighter outward
+    let col = vec3<f32>(1.0, 0.82, 0.45);                  // warm tracer
+    return vec4<f32>(col * glow * u.dir.x, 1.0);           // additive (pipeline blend One/One)
+}
+
 @fragment
 fn fs_tonemap(in: VSOut) -> @location(0) vec4<f32> {
     let src = textureSampleLevel(tex, samp, in.uv, 0.0).rgb;
