@@ -1,8 +1,12 @@
 name: Deploy GitHub Pages
 
+# Arco no longer targets the Ray-Ban glasses, so this glasses-demo Pages site is
+# NOT auto-deployed on push anymore (it was deploying on every commit to main).
+# Run it manually from the Actions tab (workflow_dispatch) when you actually want
+# to refresh the glasses demo. The wasm engine build steps below are unchanged, so
+# a manual run still produces + deploys the engine artifact for the demo. The
+# arco-doom client wasm is built separately via Arco/doom/scripts/deploy-client.sh.
 on:
-  push:
-    branches: ["main"]
   workflow_dispatch:
 
 permissions:
