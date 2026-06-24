@@ -122,6 +122,68 @@ fn vs_main(in: VSIn) -> VSOut {
     return out;
 }
 
+// R-PBR P0: metallic-roughness GGX/Cook-Torrance direct BRDF (Karis UE4 mobile).
+// ORM convention (content-forge §7 contract): albedo = base color, roughness/metallic
+// from the ORM pack (G/B), ao from R; F0 = mix(0.04, albedo, metallic). Returns the
+// BRDF (diffuse + spec); the caller applies N·L and the light radiance — same outer
+// structure as the legacy path, so it slots in where (diffuse + specFalloff*spec*2) was.
+// This SAME function is exercised by the fs_pbr_selftest operator gate (no divergence).
+const PBR_PI: f32 = 3.14159265;
+fn pbr_direct(N: vec3<f32>, L: vec3<f32>, V: vec3<f32>, albedo: vec3<f32>,
+              roughness: f32, metallic: f32, ao: f32) -> vec3<f32> {
+    let H = normalize(L + V);
+    let NdotL = max(dot(N, L), 0.0);
+    let NdotV = max(dot(N, V), 0.0);
+    let NdotH = max(dot(N, H), 0.0);
+    let VdotH = max(dot(V, H), 0.0);
+    let a  = max(roughness * roughness, 0.001);
+    let a2 = a * a;
+    let dterm = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
+    let D = a2 / max(PBR_PI * dterm * dterm, 1e-7);                  // Trowbridge-Reitz GGX
+    let k = (roughness + 1.0) * (roughness + 1.0) / 8.0;            // Smith k (direct lighting)
+    let gL = NdotL / (NdotL * (1.0 - k) + k);
+    let gV = NdotV / (NdotV * (1.0 - k) + k);
+    let G = gL * gV;                                                 // Smith Schlick-GGX
+    let F0 = mix(vec3<f32>(0.04), albedo, metallic);
+    let F = F0 + (vec3<f32>(1.0) - F0) * pow(1.0 - VdotH, 5.0);     // Schlick Fresnel
+    let spec = (D * G) * F / max(4.0 * NdotL * NdotV, 1e-4);        // Cook-Torrance
+    let kd = (vec3<f32>(1.0) - F) * (1.0 - metallic);
+    let diffuse = kd * albedo;                                       // Lambert (un-pi-normalized, engine scale)
+    return diffuse * ao + spec;
+}
+
+// R-PBR P0 operator gate: a fullscreen self-test that drives the REAL pbr_direct with
+// two known configs (left half = dielectric/diffuse-dominant; right half = metal/spec)
+// packed in the uniforms, so a CPU reference can byte-compare. vs_fs_main = the same
+// bufferless fullscreen triangle the bloom/tonemap passes use.
+@vertex
+fn vs_fs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
+    var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    return vec4<f32>(p[vi], 0.0, 1.0);
+}
+@fragment
+fn fs_pbr_selftest(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
+    // Config A (left): N/rough = light_origin_tangent, L/metal = view_origin_tangent,
+    //   V/ao = diffuse_color, albedo = specular_color.xyz.
+    // Config B (right): N/rough = light_proj_s, L/metal = light_proj_t,
+    //   V/ao = light_proj_q, albedo = light_falloff_s.xyz.
+    var N: vec3<f32>; var L: vec3<f32>; var V: vec3<f32>; var albedo: vec3<f32>;
+    var rough: f32; var metal: f32; var ao: f32;
+    if (fc.x < 128.0) {
+        N = u.light_origin_tangent.xyz; rough = u.light_origin_tangent.w;
+        L = u.view_origin_tangent.xyz;  metal = u.view_origin_tangent.w;
+        V = u.diffuse_color.xyz;        ao = u.diffuse_color.w;
+        albedo = u.specular_color.xyz;
+    } else {
+        N = u.light_proj_s.xyz; rough = u.light_proj_s.w;
+        L = u.light_proj_t.xyz; metal = u.light_proj_t.w;
+        V = u.light_proj_q.xyz; ao = u.light_proj_q.w;
+        albedo = u.light_falloff_s.xyz;
+    }
+    let brdf = pbr_direct(normalize(N), normalize(L), normalize(V), albedo, rough, metal, ao);
+    return vec4<f32>(brdf, 1.0);
+}
+
 @fragment
 fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     // Normalize L and H in tangent space
@@ -211,23 +273,31 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     // Material lookups
     let diffuse = textureSample(t_diffuse, s_material, in.tex_diffuse).rgb
                   * u.diffuse_color.rgb;
-    let spec = textureSample(t_specular, s_material, in.tex_specular).rgb
-               * u.specular_color.rgb;
+    let tspec = textureSample(t_specular, s_material, in.tex_specular).rgb;
 
-    // Specular falloff, two modes (iter 29):
-    //  - classic (params2.y = 0): dependent read of the engine's baked
-    //    specular table (texture 6 in interaction.vfp) — zero below
-    //    N·H 0.75, then (4(x-0.75))²: tight, sparse highlights.
-    //  - BFG (params2.y = 1): the BFG edition rewrote this to an analytic
-    //    pow(N·H, 10) (interaction.pixel:68-70, verified against the
-    //    id-Software/DOOM-3-BFG source) — broader highlights, the floor
-    //    sheen the BFG reference screenshots show.
-    // Vanilla also doubles the specular map (ADD R2, R2, R2) — both modes.
-    let specLUT = textureSample(t_specLUT, s_lighting, vec2<f32>(NdotH, 0.5)).r;
-    let specBFG = pow(NdotH, 10.0);
-    let specFalloff = mix(specLUT, specBFG, u.params2.y);
+    // R-PBR P0: per-record isPBR flag in the (otherwise unused) specular_color.w
+    // (§7 contract). When set, t_specular is the LINEAR ORM pack (R=AO,G=rough,B=metal)
+    // and the BRDF term is GGX; otherwise the legacy Blinn-Phong path runs VERBATIM
+    // (the OFF-identity guarantee — legacy materials are byte-identical, .w defaults 0).
+    // specular_color.w is a per-record uniform -> uniform control flow -> the branch +
+    // the textureSample inside the else are legal.
+    var brdfTerm: vec3<f32>;
+    if (u.specular_color.w > 0.5) {
+        brdfTerm = pbr_direct(N, L, V, diffuse, tspec.g, tspec.b, tspec.r);
+    } else {
+        let spec = tspec * u.specular_color.rgb;
+        // Specular falloff, two modes (iter 29):
+        //  - classic (params2.y = 0): dependent read of the engine's baked
+        //    specular table — zero below N·H 0.75, then (4(x-0.75))².
+        //  - BFG (params2.y = 1): analytic pow(N·H, 10).
+        // Vanilla also doubles the specular map (ADD R2, R2, R2) — both modes.
+        let specLUT = textureSample(t_specLUT, s_lighting, vec2<f32>(NdotH, 0.5)).r;
+        let specBFG = pow(NdotH, 10.0);
+        let specFalloff = mix(specLUT, specBFG, u.params2.y);
+        brdfTerm = diffuse + specFalloff * spec * 2.0;
+    }
 
-    var color = (diffuse + specFalloff * spec * 2.0)
+    var color = brdfTerm
                 * NdotL
                 * light_proj_color
                 * light_falloff;
