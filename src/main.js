@@ -320,7 +320,11 @@ function wireTouchLook() {
     for (const t of e.changedTouches) {
       if (t.clientX < window.innerWidth * 0.45) continue;        // left = move pad side
       const el = document.elementFromPoint(t.clientX, t.clientY);
-      if (el && (el.closest("button") || el.closest("#diag"))) continue;
+      // Don't hijack a touch on the UI as a look/aim gesture — must match the mouse
+      // handler below. WITHOUT #fxPanel/input here, touching an fx slider (it's on the
+      // right "look" side) was captured as a look gesture + preventDefault, which broke
+      // the slider AND wedged the view/input (the "fx panel freezes the game" bug).
+      if (el && (el.closest("button") || el.closest("#diag") || el.closest("#fxPanel") || el.closest("input"))) continue;
       lookId = t.identifier;
       lastX = t.clientX;
       lastY = t.clientY;
@@ -1866,11 +1870,29 @@ function armTracerDemo() {
     window.d3cmd("r_gamma 1.0");
     window.d3cmd("r_tonemap 1");
     window.d3cmd("r_tonemapExposure 0.5");
+    window.d3cmd("notarget");                 // imp won't charge into melee — stays out at range
     window.setTimeout(() => tapKey(WEAPON_MACHINEGUN_KEY), 600);   // raise the rifle
-    diag("tracer demo: god + rifle + ACES tonemap; spawning imps to auto-fire at");
-    const spawnImp = () => { if (typeof window.d3cmd === "function") window.d3cmd("spawn monster_demon_imp"); };
+    diag("tracer demo: god + rifle + ACES tonemap; spawning imps downrange");
+    // Spawn the imp ~260u down the player's forward (the console `spawn` hardcodes
+    // 80u — right in your face). __d3ViewPos = "X Y Z | yaw .. pitch ..". The spawn
+    // command applies key/value pairs AFTER its own origin, so an explicit `origin`
+    // overrides the 80u placement (SysCmds.cpp:823-830); physics settles it on the floor.
+    const spawnImp = () => {
+      if (typeof window.d3cmd !== "function") return;
+      const vp = typeof window.__d3ViewPos === "string" ? window.__d3ViewPos : "";
+      const m = vp.match(/(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+\|\s+yaw\s+(-?\d+)/);
+      if (m) {
+        const x = +m[1], y = +m[2], z = +m[3], r = (+m[4]) * Math.PI / 180, d = 260;
+        const ox = Math.round(x + Math.cos(r) * d);
+        const oy = Math.round(y + Math.sin(r) * d);
+        const oz = Math.round(z - 56);        // eye -> ~foot; the imp drops to the floor
+        window.d3cmd(`spawn monster_demon_imp origin "${ox} ${oy} ${oz}"`);
+      } else {
+        window.d3cmd("spawn monster_demon_imp");   // fallback: the 80u placement
+      }
+    };
     spawnImp();
-    window.setInterval(spawnImp, 5000);       // respawn so there's always a target in front
+    window.setInterval(spawnImp, 5000);       // respawn so there's always a target downrange
   };
   window.setTimeout(() => start(0), 3500);
 }
