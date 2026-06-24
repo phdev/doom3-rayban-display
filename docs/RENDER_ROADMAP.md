@@ -1,6 +1,24 @@
 # RENDER/PERF track roadmap — modern-renderer feature program (owner-directed 2026-06-22)
 
-> **⟡ RE-SCOPED 2026-06-23 (owner) — read this first; the Phase A/B/C plan below is SUPERSEDED.**
+> **⟡ UPDATE 2026-06-24 (owner) — read this FIRST (supersedes the 2026-06-23 header + the Phase A/B/C plan).**
+> - **Motion blur ✅ SHIPPED + iOS-VERIFIED** (`13114db`): camera/depth-reconstruction blur runs on a
+>   real iPhone (a warm-up defer dodges the load-time GPU-memory peak that was jetsam-killing the device).
+> - **PBR-P0 ✅ DONE** (`35730fe`): forward GGX/ORM shader behind the `isPBR` flag, falsifiable gate green.
+> - **HDR KILLED for good** — **F1 (RGBA16F linear scene buffer) + M1 (HDR bloom) are OUT**, not just
+>   deprioritized. The scene stays 8-bit BGRA8; bright speculars clamp (the ACES tonemap mitigates).
+> - **ACCEPTED to the roadmap (from the CoD-feasibility study):** (a) **Weapon-viewmodel separation**
+>   (viewport depth-range `[0,0.5]` on `weaponDepthHack` records — also fixes the known gun-clip bug;
+>   renderer-only, memory-safe), (b) **Muzzle flash / tracers / dynamic gunfire light** (additive
+>   pass-record sprites + a transient point light through the shipped interaction path; the light SPAWN
+>   is game-side → SPINE coordination).
+> - **TRUE PBR remaining** (PBR-P0 done): content-driven `isPBR` signal on real ORM assets → a content
+>   GLB rendering PBR end-to-end via R-GLTF → **specular IBL via parallax cube probes** (the reflection
+>   half) → the iPhone phone gate. **F3 G-buffer is NOT needed** — PBR-P0 is forward/per-light.
+> - **Other CoD candidates** (not yet accepted): FXAA + film-grain/CA/vignette, baked diffuse IBL ambient,
+>   screen-space soft shadows (memory-marginal). **AVOID:** TAA/temporal upscalers (break determinism),
+>   per-object motion blur (no velocity G-buffer), PCF/CSM (iter-39 crash), raymarched volumetrics, RT-GI.
+
+> **⟡ RE-SCOPED 2026-06-23 (owner) — the Phase A/B/C plan below is SUPERSEDED.**
 > After the mobile-friendliness analysis of soft shadows and HDR/IBL, the owner **CUT M4 soft
 > shadows, F1/M1 HDR, and M2 IBL**, and chose **mobile-friendly motion blur → then M6 PBR** instead.
 > The new sequence is: **(1) camera motion blur (mobile) → (2) PBR (GGX, authored metallic-roughness).**
