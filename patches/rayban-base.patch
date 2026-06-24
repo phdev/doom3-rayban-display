@@ -4427,3 +4427,24 @@ index e3409ba..fa025e1 100644
  				src.Warning( "Invalid model for MD5 mesh" );
  				MakeDefault();
  				return false;
+diff --git a/neo/game/MultiplayerGame.cpp b/neo/game/MultiplayerGame.cpp
+index 90180db..14acaec 100644
+--- a/neo/game/MultiplayerGame.cpp
++++ b/neo/game/MultiplayerGame.cpp
+@@ -1959,7 +1959,16 @@ void idMultiplayerGame::UpdateHud( idPlayer *player, idUserInterface *hud ) {
+ 		return;
+ 	}
+ 
++#ifdef __EMSCRIPTEN__
++	// arco-doom: SUPPRESS the "WARMING UP" HUD overlay. A touch client can't ready-up (no menu) and
++	// forcing GAMEON re-spectates everyone (the documented loop), so warmup is held — but the player is
++	// already auto-joined (si_spectators 0) and can move/shoot, so just DON'T SHOW the banner. The match
++	// STATE is unchanged (still warmup, stable); only the HUD display is hidden. Result: drops straight
++	// into playing, no "warming up" wait shown. (?args=+set ui_showWarmup 1 not wired — pure display gate.)
++	hud->SetStateBool( "warmup", false );
++#else
+ 	hud->SetStateBool( "warmup", Warmup() );
++#endif
+ 
+ 	if ( gameState == WARMUP ) {
+ 		if ( player->IsReady() ) {
