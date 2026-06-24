@@ -8383,7 +8383,7 @@ index ec0184e..2cfe895 100644
  		}
  	}
 diff --git a/neo/renderer/draw_arb2.cpp b/neo/renderer/draw_arb2.cpp
-index c1d0d3e..06b8e91 100644
+index c1d0d3e..d4c0aee 100644
 --- a/neo/renderer/draw_arb2.cpp
 +++ b/neo/renderer/draw_arb2.cpp
 @@ -31,6 +31,10 @@ If you have questions concerning this license or the applicable additional terms
@@ -8397,7 +8397,7 @@ index c1d0d3e..06b8e91 100644
  // DG: if this is defined, the soft particle shaders will be compiled into the executable
  //  otherwise soft_particle.vfp will be opened as a file just like the other shaders
  //  (useful when tweaking that shader - when loaded from disk, you can use `reloadARBprograms`
-@@ -62,7 +66,222 @@ static void GL_SelectTextureNoClient( int unit ) {
+@@ -62,7 +66,228 @@ static void GL_SelectTextureNoClient( int unit ) {
  RB_ARB2_DrawInteraction
  ==================
  */
@@ -8594,7 +8594,13 @@ index c1d0d3e..06b8e91 100644
 +					r.specularColor[2] = g_capPbrTestAO;
 +					r.specularColor[3] = 2.0f;
 +				} else {
-+					r.specularColor[3] = ( g_capPbr && g_capPbrForce ) ? 1.0f : 0.0f;
++					// PRODUCTION path: a material whose specular-slot image is named
++					// "*_orm*" IS content-forge's ORM pack (R=AO G=rough B=metal LINEAR)
++					// -> render PBR. No enpro texture matches, so default boot is
++					// byte-identical (OFF-identity). r_pbrForce overrides for A/B.
++					const bool ormName = din->specularImage &&
++						din->specularImage->imgName.Find( "_orm", false ) >= 0;
++					r.specularColor[3] = ( g_capPbr && ( g_capPbrForce || ormName ) ) ? 1.0f : 0.0f;
 +				}
 +			}
 +			// Iter 7: image pointers per binding slot (matches the order in
@@ -8620,7 +8626,7 @@ index c1d0d3e..06b8e91 100644
  	// load all the vertex program parameters
  	qglProgramEnvParameter4fvARB( GL_VERTEX_PROGRAM_ARB, PP_LIGHT_ORIGIN, din->localLightOrigin.ToFloatPtr() );
  	qglProgramEnvParameter4fvARB( GL_VERTEX_PROGRAM_ARB, PP_VIEW_ORIGIN, din->localViewOrigin.ToFloatPtr() );
-@@ -190,6 +409,7 @@ void RB_ARB2_CreateDrawInteractions( const drawSurf_t *surf ) {
+@@ -190,6 +415,7 @@ void RB_ARB2_CreateDrawInteractions( const drawSurf_t *surf ) {
  	} else {
  		globalImages->specularTableImage->Bind();
  	}
@@ -8628,7 +8634,7 @@ index c1d0d3e..06b8e91 100644
  
  
  	for ( ; surf ; surf=surf->nextOnLight ) {
-@@ -258,6 +478,45 @@ void RB_ARB2_DrawInteractions( void ) {
+@@ -258,6 +484,45 @@ void RB_ARB2_DrawInteractions( void ) {
  	//
  	for ( vLight = backEnd.viewDef->viewLights ; vLight ; vLight = vLight->next ) {
  		backEnd.vLight = vLight;
@@ -8674,7 +8680,7 @@ index c1d0d3e..06b8e91 100644
  
  		// do fogging later
  		if ( vLight->lightShader->IsFogLight() ) {
-@@ -314,7 +573,9 @@ void RB_ARB2_DrawInteractions( void ) {
+@@ -314,7 +579,9 @@ void RB_ARB2_DrawInteractions( void ) {
  		qglStencilFunc( GL_ALWAYS, 128, 255 );
  
  		backEnd.depthFunc = GLS_DEPTHFUNC_LESS;
@@ -8684,7 +8690,7 @@ index c1d0d3e..06b8e91 100644
  
  		backEnd.depthFunc = GLS_DEPTHFUNC_EQUAL;
  	}
-@@ -757,6 +1018,26 @@ int R_FindARBProgram( GLenum target, const char *program ) {
+@@ -757,6 +1024,26 @@ int R_FindARBProgram( GLenum target, const char *program ) {
  	return progs[i].ident;
  }
  
