@@ -1982,10 +1982,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..3326a7f
+index 0000000..98d8740
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,5512 @@
+@@ -0,0 +1,5513 @@
 +/*
 +================================================================================
 +
@@ -5641,6 +5641,7 @@ index 0000000..3326a7f
 +                }
 +                if (shadowed) { litResetWorld(); drawVolumes(light, true); }
 +            }
++            litResetWorld();   // R-VIEWMODEL: defensive restore (a weapon-last interaction left [0,0.5]); the next pass is a fresh BeginRenderPass so this is belt-and-suspenders, but keeps the lit pass symmetric with the pass-record loop's restore and safe-by-construction (not by accident).
 +            wgpuRenderPassEncoderEnd(rp);
 +            wgpuRenderPassEncoderRelease(rp);
 +        }
