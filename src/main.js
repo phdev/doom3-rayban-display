@@ -430,6 +430,9 @@ function wireFxPanel() {
     // above so the per-fragment gamma doesn't double-shape; exposure is the knob.
     { label: "tonemap",      cvar: "r_tonemap",          min: 0, max: 1,   step: 1,    value: 0 },
     { label: "tm exposure",  cvar: "r_tonemapExposure",  min: 0.3, max: 2, step: 0.05, value: 1.0 },
+    // R-TRACER: bullet-tracer streak — length (1.0 = from the barrel, short) + width.
+    { label: "tracer len",   cvar: "r_tracerLength",     min: 1, max: 4,   step: 0.1,  value: 1.2 },
+    { label: "tracer wide",  cvar: "r_tracerWidth",      min: 0.002, max: 0.03, step: 0.001, value: 0.0045 },
     // R-PBR P0: synthetic test material (every surface = a chosen metal/roughness),
     // so the GGX look is visible before content's ORM assets land.
     { label: "pbr test",     cvar: "r_pbrTest",          min: 0, max: 1,   step: 1,    value: 0 },
