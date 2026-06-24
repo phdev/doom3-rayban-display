@@ -5,6 +5,80 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#0a0a0a" />
     <title>Doom 3 Display</title>
+    <script>
+    // DEVICE-PLAYABILITY BEACON (render-track). The client reports progress OUTWARD via
+    // fetch/sendBeacon so a phone with no usable inspector still yields telemetry — version-proof
+    // (works where ios-webkit-debug-proxy can't read JS on iOS 18, and on iOS 26). Gated on
+    // ?beacon=<collector-base>; when absent this is a NO-OP that touches no globals (zero prod
+    // overhead). Drives the SHARED device-playability loop (Arco doom/dev/device_play_collector.mjs:
+    // POST /b · GET /active · GET /verdict). If the main thread hangs, beacons stop -> the LAST
+    // beacon pinpoints the hang phase + engine tail + gpu-lost reason. The critical target: the
+    // Safari-26/Emscripten WebGPU "device lost (destroyed)" (imgui#9103) in the capture-replay
+    // backend we own. Inline (not in the bundle) so it survives a bundle/wasm load hang.
+    (function () {
+      var BEACON = (new URLSearchParams(location.search).get("beacon") || "").replace(/\/+$/, "");
+      if (!BEACON) return;                       // production play: untouched
+      var RUN = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+      var phase = "boot", log = [], fps = null;
+      ["log", "warn", "error"].forEach(function (k) {
+        var o = console[k];
+        console[k] = function () {
+          try { var s = Array.prototype.join.call(arguments, " ");
+            if (/\[d3\]|DOOM|pak|WebGPU|Error|error|map|spawn|render|lost/i.test(s)) { log.push(s.slice(0, 160)); if (log.length > 24) log.shift(); }
+          } catch (e) {}
+          return o.apply(console, arguments);
+        };
+      });
+      var post = function (ev, extra) {
+        var body = JSON.stringify(Object.assign({
+          run: RUN, t: Date.now(), ev: ev, phase: phase, fps: fps,
+          heap: (window.__d3HeapMB == null ? null : window.__d3HeapMB),
+          vp: !!window.__d3ViewPos, shdw: (window.__d3ShadowVols == null ? null : window.__d3ShadowVols),
+          lost: (window.__d3DeviceLost || 0), tail: log.slice(-3)
+        }, extra || {}));
+        // Direct cross-origin POST to the collector: text/plain => no CORS preflight, and the
+        // collector sets ACAO:*. keepalive so an unload-time beacon still flushes. (iOS-26 can drop
+        // a cross-SITE POST; the device-loop serves the client same-origin / tunnel-fronted with the
+        // collector to avoid that — see docs/RENDER_DEVICE_LOOP.md.)
+        try {
+          fetch(BEACON + "/b", { method: "POST", body: body, keepalive: true, headers: { "content-type": "text/plain" } })
+            .catch(function () { try { navigator.sendBeacon(BEACON + "/b", body); } catch (e) {} });
+        } catch (e) { try { navigator.sendBeacon(BEACON + "/b", body); } catch (e2) {} }
+      };
+      // The engine calls this for lifecycle + gpu-lost (see d3Runtime.js device.lost handler).
+      window.__d3Beacon = function (ev, extra) { if (ev) phase = ev; post(ev, extra); };
+      post("boot", { ua: (navigator.userAgent || "").slice(0, 80), gpu: !!navigator.gpu });
+      // fps: count presented frames (one GPUQueue.submit per present; the iter-30 submit-skip means
+      // a static frame reads low = honest). Closure-scoped, no global pollution.
+      try {
+        if (window.GPUQueue && GPUQueue.prototype && GPUQueue.prototype.submit) {
+          var n = 0, t0 = performance.now(), su = GPUQueue.prototype.submit;
+          GPUQueue.prototype.submit = function () { n++; return su.apply(this, arguments); };
+          setInterval(function () { var now = performance.now(); fps = Math.round((n * 1000) / (now - t0)); n = 0; t0 = now; }, 1000);
+        }
+      } catch (e) {}
+      // Lifecycle by polling the engine's EXISTING window.__d3* signals (no engine edit needed for
+      // runtime/spawn): runtime = Module up; "spawn" = first real rendered view (__d3ViewPos set).
+      var sawRuntime = false, sawSpawn = false;
+      setInterval(function () {
+        if (!sawRuntime && window.Module && (window.Module.calledRun || window.__d3RuntimeConfig)) { sawRuntime = true; window.__d3Beacon("runtime"); }
+        if (!sawSpawn && window.__d3ViewPos) { sawSpawn = true; window.__d3Beacon("spawn"); }
+        post("hb");
+      }, 1500);
+      // ABANDONED-TAB GUARD: each device launch opens a NEW Safari tab (devicectl/webinspector can't
+      // reuse one), so without this the old test tabs stay live and N WebGPU contexts contend the
+      // GPU — tanking perf AND amplifying the device-loss we're chasing. Poll /active; on supersede
+      // (a newer run booted) or stop, blank this tab to RELEASE its WebGPU context. ?beacon only.
+      var blanked = false;
+      setInterval(function () {
+        if (blanked) return;
+        fetch(BEACON + "/active", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (j) {
+          if (j && (j.stop || (j.active && j.active !== RUN))) { blanked = true; post("blanked"); try { location.replace("about:blank"); } catch (e) { location.href = "about:blank"; } }
+        }).catch(function () {});
+      }, 3000);
+      window.addEventListener("pagehide", function () { post("pagehide"); });
+    })();
+    </script>
   </head>
   <body>
     <div id="app"></div>

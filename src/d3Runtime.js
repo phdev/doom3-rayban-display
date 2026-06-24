@@ -500,6 +500,15 @@ export async function bootDoom3({
           device.lost.then((info) => {
             log(`WebGPU DEVICE LOST (${info.reason}): ${info.message} — reload the page`);
             console.error("[d3] WebGPU device lost:", info.reason, info.message);
+            // Device-playability beacon (render-track): the critical signal — report the
+            // device-loss OUTWARD before the tab dies (the Safari-26/Emscripten "device lost
+            // (destroyed)" target, imgui#9103). __d3DeviceLost is also picked up by the beacon
+            // heartbeat in index.html; the explicit gpu-lost beacon fires immediately so a
+            // jetsam kill still lands the reason at the collector.
+            window.__d3DeviceLost = info.reason || "lost";
+            if (typeof window.__d3Beacon === "function") {
+              window.__d3Beacon("gpu-lost", { reason: info.reason || "lost", msg: (info.message || "").slice(0, 120) });
+            }
           });
         } else {
           log("WebGPU adapter request returned null; engine will use GL");
