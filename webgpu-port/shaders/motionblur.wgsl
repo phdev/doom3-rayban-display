@@ -26,7 +26,8 @@ struct MB {
   testDepth   : f32,
   testUv      : vec2<f32>,
   minDepth    : f32,   // view-weapon exclusion: skip blur where depth < minDepth (0 = off)
-  pad         : f32,
+  noDepth     : f32,   // DIAGNOSTIC: 1 = skip the depth-buffer SAMPLE (use const depth) to
+                       // A/B whether sampling the depth aspect is the WebKit-Metal crash
 };
 @group(0) @binding(0) var<uniform> u : MB;
 @group(0) @binding(1) var sceneTex : texture_2d<f32>;
@@ -80,7 +81,10 @@ fn fs_main(@builtin(position) fc : vec4<f32>) -> @location(0) vec4<f32> {
   let uv = fc.xy / u.screenSize;                                  // [0,1], framebuffer (y-down)
   let scene = textureSampleLevel(sceneTex, sceneSamp, uv, 0.0);
   if (u.zeroVel > 0.5 || u.scale < 0.01) { return scene; }         // disabled / mutation -> identity
-  let d = textureLoad(depthTex, vec2<i32>(fc.xy), 0);              // [0,1] WebGPU depth
+  // DIAGNOSTIC (r_motionBlurNoDepth): skip the depth-aspect SAMPLE entirely (use a const
+  // mid-depth) to A/B whether sampling the Depth24Plus aspect is the WebKit-Metal crash.
+  var d = 0.5;
+  if (u.noDepth < 0.5) { d = textureLoad(depthTex, vec2<i32>(fc.xy), 0); }   // [0,1] WebGPU depth
   if (d >= 0.9999) { return scene; }                               // skybox / far plane -> no blur
   if (d < u.minDepth) { return scene; }                            // view-weapon: compressed near slice -> no smear
   let ndc = vec3<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 2.0 * d - 1.0);  // GL NDC
