@@ -129,9 +129,12 @@ fn fs_tracer(in: VSOut) -> @location(0) vec4<f32> {
     let d = distance(in.uv, a + ab * t);                   // distance to the segment
     let halfW = max(u.dir.y, 1e-4);
     var glow = 1.0 - smoothstep(0.0, halfW, d);
-    glow = pow(glow, max(u.dir.z, 1.0));                   // tighten the core
-    glow = glow * (0.45 + 0.55 * t);                       // streak: dimmer at the muzzle, brighter outward
-    let col = vec3<f32>(1.0, 0.82, 0.45);                  // warm tracer
+    glow = pow(glow, max(u.dir.z, 1.0));                   // soft falloff across the width
+    // bright + fairly uniform ALONG the streak so it reads as a line toward the
+    // target (slightly hotter at the leading/aim end); only fade out very near the
+    // muzzle so it doesn't fight the muzzle-flash glow.
+    glow = glow * (0.7 + 0.3 * t) * smoothstep(0.0, 0.06, t);
+    let col = vec3<f32>(1.0, 0.85, 0.5);                   // warm tracer
     return vec4<f32>(col * glow * u.dir.x, 1.0);           // additive (pipeline blend One/One)
 }
 

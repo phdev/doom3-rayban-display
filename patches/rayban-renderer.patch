@@ -1982,10 +1982,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..58fccf0
+index 0000000..40b9f68
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,5616 @@
+@@ -0,0 +1,5619 @@
 +/*
 +================================================================================
 +
@@ -2208,8 +2208,7 @@ index 0000000..58fccf0
 +extern "C" float    g_capTracerIntensity;
 +extern "C" float    g_capTracerWidth;
 +extern "C" uint32_t g_capMuzzleFired;      // set this frame when a view muzzle-flash light is captured
-+extern "C" float    g_capMuzzleOrigin[3];  // muzzle world position (the flash light origin)
-+extern "C" float    g_capMuzzleFar[3];     // an aim point ahead along the view forward
++extern "C" float    g_capMuzzleUV[4];      // muzzle + aim points projected to screen UV at capture
 +extern "C" uint32_t g_capInCinematic;
 +extern "C" float    g_mbViewProj[16];
 +extern "C" float    g_mbInvViewProj[16];
@@ -5926,22 +5925,26 @@ index 0000000..58fccf0
 +            // live surface — it runs in both det re-encodes too (same g_capMuzzleFired + same
 +            // matrices -> byte-identical), so __d3WgpuDet stays IDENTICAL with the tracer on.
 +            if (tracerActive) {
-+                extern float g_lastViewMatrix[16], g_lastProjMatrix[16];
-+                auto projUV = [&](const float* w, float* uv) -> bool {
-+                    const float* V = g_lastViewMatrix; const float* P = g_lastProjMatrix;
-+                    float vp[4] = { w[0], w[1], w[2], 1.0f }, vv[4], cc[4];
-+                    for (int r = 0; r < 4; ++r) { vv[r] = 0.0f; for (int k = 0; k < 4; ++k) vv[r] += V[k*4+r] * vp[k]; }
-+                    for (int r = 0; r < 4; ++r) { cc[r] = 0.0f; for (int k = 0; k < 4; ++k) cc[r] += P[k*4+r] * vv[k]; }
-+                    if (cc[3] <= 0.0001f) return false;     // behind the camera
-+                    uv[0] =  (cc[0] / cc[3]) * 0.5f + 0.5f;
-+                    uv[1] = -(cc[1] / cc[3]) * 0.5f + 0.5f; // match vs_main uv = (x,-y)*0.5+0.5
-+                    return true;
-+                };
-+                float mU[2], fU[2];
-+                if (projUV(g_capMuzzleOrigin, mU) && projUV(g_capMuzzleFar, fU)) {
-+                    float ub[8] = { mU[0], mU[1], fU[0], fU[1],
++                {
++                    // g_capMuzzleUV was projected at CAPTURE in the main view (draw_arb2) —
++                    // use it directly (the backend's g_lastViewMatrix can be the lightgem's).
++                    // The true muzzle->aim screen segment is SHORT (a forward tracer
++                    // foreshortens to ~0.12 UV, ending at the vanishing point), so it reads
++                    // as a stub. Extend the muzzle end AWAY from the aim so the streak is a
++                    // clear line from the gun down low up to the target (the aim end stays
++                    // pinned on the enemy/crosshair).
++                    const float aU = g_capMuzzleUV[2], aV = g_capMuzzleUV[3];
++                    const float kLen = 2.8f;
++                    const float exU = aU + (g_capMuzzleUV[0] - aU) * kLen;
++                    const float exV = aV + (g_capMuzzleUV[1] - aV) * kLen;
++                    float ub[8] = { exU, exV, aU, aV,
 +                                    g_capTracerIntensity, g_capTracerWidth, 2.0f, 0.0f };
 +                    wgpuQueueWriteBuffer(queue, tracerUB, 0, ub, 32);
++                    // debug (live surface only): publish the streak endpoints in UV.
++                    if (colorTex && colorTex != detTexA && colorTex != detTexB) {
++                        EM_ASM_({ window.__d3TracerUV = $0.toFixed(3)+','+$1.toFixed(3)+' -> '+$2.toFixed(3)+','+$3.toFixed(3); },
++                                g_capMuzzleUV[0], g_capMuzzleUV[1], g_capMuzzleUV[2], g_capMuzzleUV[3]);
++                    }
 +                    if (!tracerBG && fbWhiteView) {
 +                        WGPUBindGroupEntry e[3] = {};
 +                        e[0].binding = 0; e[0].buffer = tracerUB; e[0].size = 32;
@@ -8545,7 +8548,7 @@ index ec0184e..2cfe895 100644
  		}
  	}
 diff --git a/neo/renderer/draw_arb2.cpp b/neo/renderer/draw_arb2.cpp
-index c1d0d3e..35b5fda 100644
+index c1d0d3e..81c6092 100644
 --- a/neo/renderer/draw_arb2.cpp
 +++ b/neo/renderer/draw_arb2.cpp
 @@ -31,6 +31,10 @@ If you have questions concerning this license or the applicable additional terms
@@ -8802,7 +8805,7 @@ index c1d0d3e..35b5fda 100644
  
  
  	for ( ; surf ; surf=surf->nextOnLight ) {
-@@ -258,6 +490,70 @@ void RB_ARB2_DrawInteractions( void ) {
+@@ -258,6 +490,85 @@ void RB_ARB2_DrawInteractions( void ) {
  	//
  	for ( vLight = backEnd.viewDef->viewLights ; vLight ; vLight = vLight->next ) {
  		backEnd.vLight = vLight;
@@ -8821,15 +8824,30 @@ index c1d0d3e..35b5fda 100644
 +		if ( vLight->lightDef && vLight->lightDef->parms.lightId >= 100 &&
 +		     ( backEnd.viewDef->viewport.x2 - backEnd.viewDef->viewport.x1 ) >= 128 ) {
 +			extern uint32_t g_capMuzzleFired;
-+			extern float    g_capMuzzleOrigin[3];
-+			extern float    g_capMuzzleFar[3];
++			extern float    g_capMuzzleUV[4];
++			// Project the muzzle world origin + an aim point ahead to screen UV HERE,
++			// using THIS view's (the main view's) projection * modelView — NOT in the
++			// backend, where g_lastViewMatrix may be the lightgem's by EndFrame.
++			const float* P  = backEnd.viewDef->projectionMatrix;
++			const float* MV = backEnd.viewDef->worldSpace.modelViewMatrix;
 +			const idVec3& o   = vLight->lightDef->parms.origin;
 +			const idVec3& fwd = backEnd.viewDef->renderView.viewaxis[0];
-+			g_capMuzzleFired   = 1u;
-+			g_capMuzzleOrigin[0] = o.x; g_capMuzzleOrigin[1] = o.y; g_capMuzzleOrigin[2] = o.z;
-+			g_capMuzzleFar[0]    = o.x + fwd.x * 512.0f;
-+			g_capMuzzleFar[1]    = o.y + fwd.y * 512.0f;
-+			g_capMuzzleFar[2]    = o.z + fwd.z * 512.0f;
++			const idVec3  aim = o + fwd * 512.0f;
++			auto projUV = []( const float* Pm, const float* MVm, const idVec3& w, float* uv ) -> bool {
++				float v[4] = { w.x, w.y, w.z, 1.0f }, mv[4], cc[4];
++				for ( int r = 0; r < 4; ++r ) { mv[r] = 0.0f; for ( int k = 0; k < 4; ++k ) mv[r] += MVm[k*4+r] * v[k]; }
++				for ( int r = 0; r < 4; ++r ) { cc[r] = 0.0f; for ( int k = 0; k < 4; ++k ) cc[r] += Pm[k*4+r] * mv[k]; }
++				if ( cc[3] <= 0.0001f ) return false;          // behind the camera
++				uv[0] =  ( cc[0] / cc[3] ) * 0.5f + 0.5f;
++				uv[1] = -( cc[1] / cc[3] ) * 0.5f + 0.5f;       // match the backend vs_main uv = (x,-y)*0.5+0.5
++				return true;
++			};
++			float mU[2], aU[2];
++			if ( projUV( P, MV, o, mU ) && projUV( P, MV, aim, aU ) ) {
++				g_capMuzzleFired  = 1u;
++				g_capMuzzleUV[0] = mU[0]; g_capMuzzleUV[1] = mU[1];
++				g_capMuzzleUV[2] = aU[0]; g_capMuzzleUV[3] = aU[1];
++			}
 +		}
 +#endif
 +
@@ -8873,7 +8891,7 @@ index c1d0d3e..35b5fda 100644
  
  		// do fogging later
  		if ( vLight->lightShader->IsFogLight() ) {
-@@ -314,7 +610,9 @@ void RB_ARB2_DrawInteractions( void ) {
+@@ -314,7 +625,9 @@ void RB_ARB2_DrawInteractions( void ) {
  		qglStencilFunc( GL_ALWAYS, 128, 255 );
  
  		backEnd.depthFunc = GLS_DEPTHFUNC_LESS;
@@ -8883,7 +8901,7 @@ index c1d0d3e..35b5fda 100644
  
  		backEnd.depthFunc = GLS_DEPTHFUNC_EQUAL;
  	}
-@@ -757,6 +1055,26 @@ int R_FindARBProgram( GLenum target, const char *program ) {
+@@ -757,6 +1070,26 @@ int R_FindARBProgram( GLenum target, const char *program ) {
  	return progs[i].ident;
  }
  
@@ -9371,7 +9389,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..36b8e6a 100644
+index c83ebb5..3e47b6a 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -9397,7 +9415,7 @@ index c83ebb5..36b8e6a 100644
  
  /*
  
-@@ -38,6 +50,1166 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,1168 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -9644,8 +9662,10 @@ index c83ebb5..36b8e6a 100644
 +    float    g_capTracerIntensity = 1.6f;
 +    float    g_capTracerWidth = 0.0045f;   // streak half-width in UV
 +    uint32_t g_capMuzzleFired = 0;         // set this frame when a view muzzle-flash light is captured
-+    float    g_capMuzzleOrigin[3] = {0,0,0};
-+    float    g_capMuzzleFar[3]    = {0,0,0};
++    // muzzle + aim points PROJECTED to screen UV at CAPTURE time (the main view's proj*modelView)
++    // — NOT projected in the backend, where g_lastViewMatrix can be the lightgem's (a 64px view
++    // that renders after the main view), which collapsed the streak to a sub-pixel dot.
++    float    g_capMuzzleUV[4] = {0,0,0,0};  // {muzzleU, muzzleV, aimU, aimV}
 +    uint32_t g_capPbr = 1;          // R-PBR P0: master enable for GGX on isPBR materials
 +    uint32_t g_capPbrForce = 0;     // R-PBR P0: force isPBR on every interaction (A/B)
 +    uint32_t g_capPbrTest = 0;      // R-PBR P0: synthetic test material (constant ORM)
@@ -10564,7 +10584,7 @@ index c83ebb5..36b8e6a 100644
  
  /*
  =================
-@@ -49,6 +1221,22 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +1223,22 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -10587,7 +10607,7 @@ index c83ebb5..36b8e6a 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +1266,22 @@ RB_DrawElementsWithCounters
+@@ -78,6 +1268,22 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -10610,7 +10630,7 @@ index c83ebb5..36b8e6a 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1320,23 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1322,23 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -10634,7 +10654,7 @@ index c83ebb5..36b8e6a 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1387,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1389,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -10642,7 +10662,7 @@ index c83ebb5..36b8e6a 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1614,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1616,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -10655,7 +10675,7 @@ index c83ebb5..36b8e6a 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -553,26 +1779,170 @@ Any mirrored or portaled views have already been drawn, so prepare
+@@ -553,26 +1781,170 @@ Any mirrored or portaled views have already been drawn, so prepare
  to actually render the visible surfaces for this view
  =================
  */
@@ -10836,7 +10856,7 @@ index c83ebb5..36b8e6a 100644
  	backEnd.currentScissor = viewDef->scissor;
  
  	// ensures that depth writes are enabled for the depth clear
-@@ -897,6 +2267,26 @@ void RB_DrawView( const void *data ) {
+@@ -897,6 +2269,26 @@ void RB_DrawView( const void *data ) {
  
  	backEnd.viewDef = cmd->viewDef;
  
@@ -10865,10 +10885,10 @@ index c83ebb5..36b8e6a 100644
  	backEnd.currentRenderCopied = false;
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..87eb2d4
+index 0000000..9438a17
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,1216 @@
+@@ -0,0 +1,1219 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -11157,9 +11177,12 @@ index 0000000..87eb2d4
 +"    let d = distance(in.uv, a + ab * t);                   // distance to the segment\n"
 +"    let halfW = max(u.dir.y, 1e-4);\n"
 +"    var glow = 1.0 - smoothstep(0.0, halfW, d);\n"
-+"    glow = pow(glow, max(u.dir.z, 1.0));                   // tighten the core\n"
-+"    glow = glow * (0.45 + 0.55 * t);                       // streak: dimmer at the muzzle, brighter outward\n"
-+"    let col = vec3<f32>(1.0, 0.82, 0.45);                  // warm tracer\n"
++"    glow = pow(glow, max(u.dir.z, 1.0));                   // soft falloff across the width\n"
++"    // bright + fairly uniform ALONG the streak so it reads as a line toward the\n"
++"    // target (slightly hotter at the leading/aim end); only fade out very near the\n"
++"    // muzzle so it doesn't fight the muzzle-flash glow.\n"
++"    glow = glow * (0.7 + 0.3 * t) * smoothstep(0.0, 0.06, t);\n"
++"    let col = vec3<f32>(1.0, 0.85, 0.5);                   // warm tracer\n"
 +"    return vec4<f32>(col * glow * u.dir.x, 1.0);           // additive (pipeline blend One/One)\n"
 +"}\n"
 +"\n"
