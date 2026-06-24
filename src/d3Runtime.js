@@ -929,7 +929,10 @@ function buildArguments(config) {
     ...((/[?&]motionblur(\b|=)/.test(typeof window !== "undefined" ? window.location.search : ""))
         ? (isIOSDevice()
             ? ["+set", "r_motionBlur", "1", "+set", "r_motionBlurScale", "0.5",
-               "+set", "r_motionBlurSamples", "2", "+set", "r_motionBlurMinDepth", "0.2"]
+               "+set", "r_motionBlurSamples", "2", "+set", "r_motionBlurMinDepth", "0.2",
+               // iOS: defer the blur ~300 frames so its full-res buffer + pass never stack
+               // on the load-time GPU peak (the jetsam "device lost: destroyed" cause).
+               "+set", "r_motionBlurWarmup", "300"]
             : ["+set", "r_motionBlur", "1", "+set", "r_motionBlurScale", "1.0",
                "+set", "r_motionBlurSamples", "4", "+set", "r_motionBlurMinDepth", "0.2"])
         : []),

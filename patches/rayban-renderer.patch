@@ -1982,10 +1982,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..2811291
+index 0000000..d575e27
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,5452 @@
+@@ -0,0 +1,5458 @@
 +/*
 +================================================================================
 +
@@ -2202,6 +2202,7 @@ index 0000000..2811291
 +extern "C" uint32_t g_capMotionBlurZeroVel;
 +extern "C" float    g_capMotionBlurMinDepth;
 +extern "C" uint32_t g_capMotionBlurNoDepth;
++extern "C" uint32_t g_capMotionBlurWarmup;
 +extern "C" uint32_t g_capInCinematic;
 +extern "C" float    g_mbViewProj[16];
 +extern "C" float    g_mbInvViewProj[16];
@@ -5685,7 +5686,12 @@ index 0000000..2811291
 +            // ensureCurrentRenderTarget + size-match guard live inside the block.
 +            const bool tonemapActive = g_capTonemapOn && tonemapPipeline && tonemapUB && bloomBGL && colorTex;
 +            // R-MBLUR: camera motion blur — after tonemap, before GUI; suppressed in cinematics.
-+            const bool motionBlurActive = g_capMotionBlurOn && motionBlurPipeline && motionBlurUB && motionBlurBGL && depthSampleView && colorTex && g_capMotionBlurScale > 0.01f && !g_capInCinematic;
++            // R-MBLUR iOS-memory fix: defer the blur (and its full-res currentRenderTex
++            // allocation + per-frame pass) past the load-time GPU peak — the iPhone's
++            // jetsam-kill ("device lost: destroyed") happens on the first heavy frame
++            // (texture-upload flood + shadow volumes + blur). g_capMotionBlurWarmup frames
++            // (0 = desktop, ~300 = iOS tier) lets the scene settle before the blur stacks on.
++            const bool motionBlurActive = g_capMotionBlurOn && motionBlurPipeline && motionBlurUB && motionBlurBGL && depthSampleView && colorTex && g_capMotionBlurScale > 0.01f && !g_capInCinematic && detFrameCounter >= (int)g_capMotionBlurWarmup;
 +            const bool splitGUI = hazeActive || bloomActive || tonemapActive || motionBlurActive;   // GUI draws after post-FX (HUD must not be tone-crushed / blurred)
 +            WGPURenderPassColorAttachment ca = {};
 +            ca.view = color;
@@ -7471,7 +7477,7 @@ index 0000000..0f9c8e6
 +    return nullptr;
 +}
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
-index 7914093..b1b1992 100644
+index 7914093..37c9f75 100644
 --- a/neo/renderer/RenderSystem_init.cpp
 +++ b/neo/renderer/RenderSystem_init.cpp
 @@ -39,6 +39,11 @@ If you have questions concerning this license or the applicable additional terms
@@ -7486,7 +7492,7 @@ index 7914093..b1b1992 100644
  
  #include "framework/GameCallbacks_local.h"
  #include "framework/Game.h"
-@@ -102,6 +107,68 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
+@@ -102,6 +107,69 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
  
  idCVar r_skipSuppress( "r_skipSuppress", "0", CVAR_RENDERER | CVAR_BOOL, "ignore the per-view suppressions" );
  idCVar r_skipPostProcess( "r_skipPostProcess", "0", CVAR_RENDERER | CVAR_BOOL, "skip all post-process renderings" );
@@ -7540,6 +7546,7 @@ index 7914093..b1b1992 100644
 +idCVar r_motionBlurZeroVelocity( "r_motionBlurZeroVelocity", "0", CVAR_RENDERER | CVAR_BOOL, "WebGPU motion blur: force zero velocity (falsifiability mutation — output must == no-blur)" );
 +idCVar r_motionBlurMinDepth( "r_motionBlurMinDepth", "0", CVAR_RENDERER | CVAR_FLOAT, "WebGPU motion blur: skip blur where depth < this (view-weapon exclusion; 0 = off, ~0.2 excludes the gun's compressed near slice)" );
 +idCVar r_motionBlurNoDepth( "r_motionBlurNoDepth", "0", CVAR_RENDERER | CVAR_BOOL, "WebGPU motion blur DIAGNOSTIC: skip the depth-buffer SAMPLE (const depth) — A/B whether depth-aspect sampling is the WebKit-Metal crash" );
++idCVar r_motionBlurWarmup( "r_motionBlurWarmup", "0", CVAR_RENDERER | CVAR_INTEGER, "WebGPU motion blur: defer the blur for this many frames so it never stacks on the load-time GPU peak (iOS memory; 0 = desktop)" );
 +idCVar r_pbr( "r_pbr", "1", CVAR_RENDERER | CVAR_BOOL, "WebGPU: enable metallic-roughness PBR (GGX) for ORM materials flagged isPBR in specular_color.w" );
 +idCVar r_pbrForce( "r_pbrForce", "0", CVAR_RENDERER | CVAR_BOOL, "WebGPU PBR: FORCE isPBR on every interaction (A/B test — reinterprets the specular map as ORM; 0 = only real isPBR materials)" );
 +idCVar r_pbrTest( "r_pbrTest", "0", CVAR_RENDERER | CVAR_BOOL, "WebGPU PBR: SYNTHETIC test material — render every surface as correct PBR using constant roughness/metallic/ao (r_pbrTest*) over the real diffuse, so the GGX look is visibly demonstrable before content's ORM GLB lands" );
@@ -7555,7 +7562,7 @@ index 7914093..b1b1992 100644
  idCVar r_skipLightScale( "r_skipLightScale", "0", CVAR_RENDERER | CVAR_BOOL, "don't do any post-interaction light scaling, makes things dim on low-dynamic range cards" );
  idCVar r_skipInteractions( "r_skipInteractions", "0", CVAR_RENDERER | CVAR_BOOL, "skip all light/surface interaction drawing" );
  idCVar r_skipDynamicTextures( "r_skipDynamicTextures", "0", CVAR_RENDERER | CVAR_BOOL, "don't dynamically create textures" );
-@@ -158,6 +225,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
+@@ -158,6 +226,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
  idCVar r_useExternalShadows( "r_useExternalShadows", "1", CVAR_RENDERER | CVAR_INTEGER, "1 = skip drawing caps when outside the light volume, 2 = force to no caps for testing", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
  idCVar r_useOptimizedShadows( "r_useOptimizedShadows", "1", CVAR_RENDERER | CVAR_BOOL, "use the dmap generated static shadow volumes" );
  idCVar r_useScissor( "r_useScissor", "1", CVAR_RENDERER | CVAR_BOOL, "scissor clip as portals and lights are processed" );
@@ -7563,7 +7570,7 @@ index 7914093..b1b1992 100644
  idCVar r_useCombinerDisplayLists( "r_useCombinerDisplayLists", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "put all nvidia register combiner programming in display lists" );
  idCVar r_useDepthBoundsTest( "r_useDepthBoundsTest", "1", CVAR_RENDERER | CVAR_BOOL, "use depth bounds test to reduce shadow fill" );
  
-@@ -819,11 +887,63 @@ void R_InitOpenGL( void ) {
+@@ -819,11 +888,63 @@ void R_InitOpenGL( void ) {
  		r_multiSamples.SetInteger( 0 );
  	}
  
@@ -7627,7 +7634,7 @@ index 7914093..b1b1992 100644
  
  #include "renderer/qgl_proc.h"
  
-@@ -910,6 +1030,18 @@ GL_CheckErrors
+@@ -910,6 +1031,18 @@ GL_CheckErrors
  ==================
  */
  void GL_CheckErrors( void ) {
@@ -7646,7 +7653,7 @@ index 7914093..b1b1992 100644
  	int		err;
  	char	s[64];
  	int		i;
-@@ -2505,6 +2637,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
+@@ -2505,6 +2638,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
  	// is destroyed (relevant when starting a mod which also recreates window)
  	Sys_ShutdownInput();
  
@@ -9165,7 +9172,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..8e3d89d 100644
+index c83ebb5..9ae7014 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -9191,7 +9198,7 @@ index c83ebb5..8e3d89d 100644
  
  /*
  
-@@ -38,6 +50,1147 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,1148 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -9426,6 +9433,7 @@ index c83ebb5..8e3d89d 100644
 +    uint32_t g_capMotionBlurZeroVel = 0;
 +    float    g_capMotionBlurMinDepth = 0.0f;
 +    uint32_t g_capMotionBlurNoDepth = 0;   // diagnostic: skip the depth sample (WebKit A/B)
++    uint32_t g_capMotionBlurWarmup = 0;    // defer the blur N frames past the load peak (iOS memory)
 +    uint32_t g_capPbr = 1;          // R-PBR P0: master enable for GGX on isPBR materials
 +    uint32_t g_capPbrForce = 0;     // R-PBR P0: force isPBR on every interaction (A/B)
 +    uint32_t g_capPbrTest = 0;      // R-PBR P0: synthetic test material (constant ORM)
@@ -10339,7 +10347,7 @@ index c83ebb5..8e3d89d 100644
  
  /*
  =================
-@@ -49,6 +1202,22 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +1203,22 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -10362,7 +10370,7 @@ index c83ebb5..8e3d89d 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +1247,22 @@ RB_DrawElementsWithCounters
+@@ -78,6 +1248,22 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -10385,7 +10393,7 @@ index c83ebb5..8e3d89d 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1301,23 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1302,23 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -10409,7 +10417,7 @@ index c83ebb5..8e3d89d 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1368,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1369,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -10417,7 +10425,7 @@ index c83ebb5..8e3d89d 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1595,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1596,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -10430,7 +10438,7 @@ index c83ebb5..8e3d89d 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -553,26 +1760,164 @@ Any mirrored or portaled views have already been drawn, so prepare
+@@ -553,26 +1761,165 @@ Any mirrored or portaled views have already been drawn, so prepare
  to actually render the visible surfaces for this view
  =================
  */
@@ -10539,6 +10547,7 @@ index c83ebb5..8e3d89d 100644
 +		g_capMotionBlurZeroVel = r_motionBlurZeroVelocity.GetBool() ? 1u : 0u;
 +		g_capMotionBlurMinDepth = r_motionBlurMinDepth.GetFloat();
 +		g_capMotionBlurNoDepth = r_motionBlurNoDepth.GetBool() ? 1u : 0u;
++		extern idCVar r_motionBlurWarmup; g_capMotionBlurWarmup = (uint32_t)r_motionBlurWarmup.GetInteger();
 +		extern idCVar r_pbr, r_pbrForce, r_pbrTest, r_pbrTestRough, r_pbrTestMetal, r_pbrTestAO;
 +		g_capPbr = r_pbr.GetBool() ? 1u : 0u;
 +		g_capPbrForce = r_pbrForce.GetBool() ? 1u : 0u;
@@ -10605,7 +10614,7 @@ index c83ebb5..8e3d89d 100644
  	backEnd.currentScissor = viewDef->scissor;
  
  	// ensures that depth writes are enabled for the depth clear
-@@ -897,6 +2242,26 @@ void RB_DrawView( const void *data ) {
+@@ -897,6 +2244,26 @@ void RB_DrawView( const void *data ) {
  
  	backEnd.viewDef = cmd->viewDef;
  
