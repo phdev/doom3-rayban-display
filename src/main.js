@@ -383,8 +383,13 @@ function wireTouchLook() {
 // FX panel: live sliders for bloom + lighting calibration (every change runs
 // a console command next frame via d3cmd — no rebuild, works on-device too).
 function wireFxPanel() {
-  // Iter 73: no dev fx panel on the glasses (clean wearable view).
-  if (onGlasses) return;
+  // Iter 73: no dev fx panel on the glasses (clean wearable view) — BUT show it on
+  // iOS (iPhone/iPad), which trip onGlasses via the <=640 heuristic yet are the
+  // dev/test devices where live tuning of motion blur / tonemap / PBR is wanted
+  // (iter-126 did the same for the D-pad). The real glasses are Android-wv -> stay clean.
+  const isIOSTouch = /iPad|iPhone|iPod/.test(navigator.userAgent)
+    || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  if (onGlasses && !isIOSTouch) return;
   const btn = document.createElement("button");
   btn.id = "fxToggle";
   btn.type = "button";
@@ -410,6 +415,22 @@ function wireFxPanel() {
     // (1 = vanilla per-light masking only, lower = darker shadows).
     { label: "shadow dark",  cvar: "r_shadowDarken",   min: 0.2, max: 1,   step: 0.05,
       value: /[?&]bfg\b/.test(location.search) ? 0.6 : 1.0 },
+    // R-MBLUR: camera motion blur (depth-reconstruction). Toggle it on here, then
+    // tune intensity/taps/clamp live. On iOS the URL ?motionblur sets a warm-up so
+    // it engages after load; toggling here post-boot is past the load peak (safe).
+    { label: "motion blur",  cvar: "r_motionBlur",       min: 0, max: 1,   step: 1,    value: 0 },
+    { label: "mb scale",     cvar: "r_motionBlurScale",  min: 0, max: 2,   step: 0.1,  value: 1.0 },
+    { label: "mb taps",      cvar: "r_motionBlurSamples", min: 2, max: 8,  step: 1,    value: 4 },
+    { label: "mb max px",    cvar: "r_motionBlurMaxOffsetPixels", min: 5, max: 100, step: 5, value: 50 },
+    // R0: ACES filmic tonemap (opt-in BFG-look curve). When on, set r_gamma 1.0
+    // above so the per-fragment gamma doesn't double-shape; exposure is the knob.
+    { label: "tonemap",      cvar: "r_tonemap",          min: 0, max: 1,   step: 1,    value: 0 },
+    { label: "tm exposure",  cvar: "r_tonemapExposure",  min: 0.3, max: 2, step: 0.05, value: 1.0 },
+    // R-PBR P0: synthetic test material (every surface = a chosen metal/roughness),
+    // so the GGX look is visible before content's ORM assets land.
+    { label: "pbr test",     cvar: "r_pbrTest",          min: 0, max: 1,   step: 1,    value: 0 },
+    { label: "pbr rough",    cvar: "r_pbrTestRough",     min: 0, max: 1,   step: 0.05, value: 0.3 },
+    { label: "pbr metal",    cvar: "r_pbrTestMetal",     min: 0, max: 1,   step: 0.05, value: 1.0 },
   ];
   for (const s of SLIDERS) {
     const row = document.createElement("div");
