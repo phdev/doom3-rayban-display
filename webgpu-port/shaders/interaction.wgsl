@@ -283,7 +283,14 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     // the textureSample inside the else are legal.
     var brdfTerm: vec3<f32>;
     if (u.specular_color.w > 0.5) {
-        brdfTerm = pbr_direct(N, L, V, diffuse, tspec.g, tspec.b, tspec.r);
+        // ORM from the LINEAR specular map (R=AO,G=rough,B=metal); OR, for the
+        // r_pbrTest synthetic material (w==2), constant rough/metal/ao packed in
+        // specular_color.xyz so PBR is visibly demonstrable before content's ORM lands.
+        var rough = tspec.g; var metal = tspec.b; var aov = tspec.r;
+        if (u.specular_color.w > 1.5) {
+            rough = u.specular_color.x; metal = u.specular_color.y; aov = u.specular_color.z;
+        }
+        brdfTerm = pbr_direct(N, L, V, diffuse, rough, metal, aov);
     } else {
         let spec = tspec * u.specular_color.rgb;
         // Specular falloff, two modes (iter 29):

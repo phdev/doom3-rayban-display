@@ -1982,7 +1982,7 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..ec668cc
+index 0000000..80e29bc
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
 @@ -0,0 +1,5451 @@
@@ -2468,23 +2468,23 @@ index 0000000..ec668cc
 +                        detFrameCounter >= 90 && (detFrameCounter - 90) % 240 == 0) {
 +                        runDeterminismRound();
 +                    }
-+                    // R0 operator gate: run the LUT self-test once (independent of
-+                    // r_tonemap / the scene) so window.__d3TonemapLut is always set.
-+                    if (!tmLutDone && tonemapPipeline && tonemapUB && detFrameCounter >= 30) {
++                    // Diagnostic operator self-tests (tonemap LUT / motion-blur velocity +
++                    // identity / PBR GGX) are gated on g_capDetTest — like the iter-28 det
++                    // self-test — so they NEVER run on the end-user mobile path (they create
++                    // offscreen targets + async MapRead + a pipeline, the mobile-GPU pattern
++                    // iter-28 disabled on phones; running them on mobile froze the device a
++                    // few frames in). They run on desktop (detTest 1) + the test rig
++                    // (?args=+set r_wgpuDetTest 1) where the verification harnesses read them.
++                    if (g_capDetTest && !tmLutDone && tonemapPipeline && tonemapUB && detFrameCounter >= 30) {
 +                        runTonemapLutSelfTest();
 +                    }
-+                    // R-MBLUR P4: operator self-test once after a few frames (independent
-+                    // of r_motionBlur — it validates the reconstruction math directly).
-+                    if (!mbSelfDone && motionBlurPipeline && motionBlurUB && depthSampleView && detFrameCounter >= 32) {
++                    if (g_capDetTest && !mbSelfDone && motionBlurPipeline && motionBlurUB && depthSampleView && detFrameCounter >= 32) {
 +                        runMotionBlurSelfTest();
 +                    }
-+                    // R-MBLUR P4 gate 3: zero-velocity identity self-test (one-shot,
-+                    // independent of r_motionBlur — uses a known step + controlled depth).
-+                    if (!mbIdDone && motionBlurPipeline && motionBlurBGL && depthSampleView && detFrameCounter >= 34) {
++                    if (g_capDetTest && !mbIdDone && motionBlurPipeline && motionBlurBGL && depthSampleView && detFrameCounter >= 34) {
 +                        runMotionBlurIdentitySelfTest();
 +                    }
-+                    // R-PBR P0 operator gate: one-shot GGX-vs-CPU-reference self-test.
-+                    if (!pbrSelfDone && detFrameCounter >= 36) {
++                    if (g_capDetTest && !pbrSelfDone && detFrameCounter >= 36) {
 +                        runPbrSelfTest();
 +                    }
 +                }
@@ -7470,7 +7470,7 @@ index 0000000..0f9c8e6
 +    return nullptr;
 +}
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
-index 7914093..7d5e8d7 100644
+index 7914093..579d495 100644
 --- a/neo/renderer/RenderSystem_init.cpp
 +++ b/neo/renderer/RenderSystem_init.cpp
 @@ -39,6 +39,11 @@ If you have questions concerning this license or the applicable additional terms
@@ -7485,7 +7485,7 @@ index 7914093..7d5e8d7 100644
  
  #include "framework/GameCallbacks_local.h"
  #include "framework/Game.h"
-@@ -102,6 +107,63 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
+@@ -102,6 +107,67 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
  
  idCVar r_skipSuppress( "r_skipSuppress", "0", CVAR_RENDERER | CVAR_BOOL, "ignore the per-view suppressions" );
  idCVar r_skipPostProcess( "r_skipPostProcess", "0", CVAR_RENDERER | CVAR_BOOL, "skip all post-process renderings" );
@@ -7540,6 +7540,10 @@ index 7914093..7d5e8d7 100644
 +idCVar r_motionBlurMinDepth( "r_motionBlurMinDepth", "0", CVAR_RENDERER | CVAR_FLOAT, "WebGPU motion blur: skip blur where depth < this (view-weapon exclusion; 0 = off, ~0.2 excludes the gun's compressed near slice)" );
 +idCVar r_pbr( "r_pbr", "1", CVAR_RENDERER | CVAR_BOOL, "WebGPU: enable metallic-roughness PBR (GGX) for ORM materials flagged isPBR in specular_color.w" );
 +idCVar r_pbrForce( "r_pbrForce", "0", CVAR_RENDERER | CVAR_BOOL, "WebGPU PBR: FORCE isPBR on every interaction (A/B test — reinterprets the specular map as ORM; 0 = only real isPBR materials)" );
++idCVar r_pbrTest( "r_pbrTest", "0", CVAR_RENDERER | CVAR_BOOL, "WebGPU PBR: SYNTHETIC test material — render every surface as correct PBR using constant roughness/metallic/ao (r_pbrTest*) over the real diffuse, so the GGX look is visibly demonstrable before content's ORM GLB lands" );
++idCVar r_pbrTestRough( "r_pbrTestRough", "0.3", CVAR_RENDERER | CVAR_FLOAT, "WebGPU PBR synthetic test: roughness (0=mirror, 1=matte)" );
++idCVar r_pbrTestMetal( "r_pbrTestMetal", "1.0", CVAR_RENDERER | CVAR_FLOAT, "WebGPU PBR synthetic test: metallic (0=dielectric, 1=metal)" );
++idCVar r_pbrTestAO( "r_pbrTestAO", "1.0", CVAR_RENDERER | CVAR_FLOAT, "WebGPU PBR synthetic test: ambient occlusion" );
 +idCVar r_skipGLDraw( "r_skipGLDraw", "0", CVAR_RENDERER | CVAR_BOOL,
 +	"skip GL draw calls (WebGPU-primary cutover; the WebGPU echo renders instead). "
 +	"Tiny views (lightgem) keep drawing so gameplay light readback works." );
@@ -7549,7 +7553,7 @@ index 7914093..7d5e8d7 100644
  idCVar r_skipLightScale( "r_skipLightScale", "0", CVAR_RENDERER | CVAR_BOOL, "don't do any post-interaction light scaling, makes things dim on low-dynamic range cards" );
  idCVar r_skipInteractions( "r_skipInteractions", "0", CVAR_RENDERER | CVAR_BOOL, "skip all light/surface interaction drawing" );
  idCVar r_skipDynamicTextures( "r_skipDynamicTextures", "0", CVAR_RENDERER | CVAR_BOOL, "don't dynamically create textures" );
-@@ -158,6 +220,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
+@@ -158,6 +224,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
  idCVar r_useExternalShadows( "r_useExternalShadows", "1", CVAR_RENDERER | CVAR_INTEGER, "1 = skip drawing caps when outside the light volume, 2 = force to no caps for testing", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
  idCVar r_useOptimizedShadows( "r_useOptimizedShadows", "1", CVAR_RENDERER | CVAR_BOOL, "use the dmap generated static shadow volumes" );
  idCVar r_useScissor( "r_useScissor", "1", CVAR_RENDERER | CVAR_BOOL, "scissor clip as portals and lights are processed" );
@@ -7557,7 +7561,7 @@ index 7914093..7d5e8d7 100644
  idCVar r_useCombinerDisplayLists( "r_useCombinerDisplayLists", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "put all nvidia register combiner programming in display lists" );
  idCVar r_useDepthBoundsTest( "r_useDepthBoundsTest", "1", CVAR_RENDERER | CVAR_BOOL, "use depth bounds test to reduce shadow fill" );
  
-@@ -819,11 +882,63 @@ void R_InitOpenGL( void ) {
+@@ -819,11 +886,63 @@ void R_InitOpenGL( void ) {
  		r_multiSamples.SetInteger( 0 );
  	}
  
@@ -7621,7 +7625,7 @@ index 7914093..7d5e8d7 100644
  
  #include "renderer/qgl_proc.h"
  
-@@ -910,6 +1025,18 @@ GL_CheckErrors
+@@ -910,6 +1029,18 @@ GL_CheckErrors
  ==================
  */
  void GL_CheckErrors( void ) {
@@ -7640,7 +7644,7 @@ index 7914093..7d5e8d7 100644
  	int		err;
  	char	s[64];
  	int		i;
-@@ -2505,6 +2632,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
+@@ -2505,6 +2636,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
  	// is destroyed (relevant when starting a mod which also recreates window)
  	Sys_ShutdownInput();
  
@@ -8370,7 +8374,7 @@ index ec0184e..2cfe895 100644
  		}
  	}
 diff --git a/neo/renderer/draw_arb2.cpp b/neo/renderer/draw_arb2.cpp
-index c1d0d3e..fc0de16 100644
+index c1d0d3e..06b8e91 100644
 --- a/neo/renderer/draw_arb2.cpp
 +++ b/neo/renderer/draw_arb2.cpp
 @@ -31,6 +31,10 @@ If you have questions concerning this license or the applicable additional terms
@@ -8384,7 +8388,7 @@ index c1d0d3e..fc0de16 100644
  // DG: if this is defined, the soft particle shaders will be compiled into the executable
  //  otherwise soft_particle.vfp will be opened as a file just like the other shaders
  //  (useful when tweaking that shader - when loaded from disk, you can use `reloadARBprograms`
-@@ -62,7 +66,213 @@ static void GL_SelectTextureNoClient( int unit ) {
+@@ -62,7 +66,222 @@ static void GL_SelectTextureNoClient( int unit ) {
  RB_ARB2_DrawInteraction
  ==================
  */
@@ -8572,8 +8576,17 @@ index c1d0d3e..fc0de16 100644
 +			// is wired when content's ORM .mtr lands (gated on R-GLTF). ALWAYS written
 +			// (overwrites the material's spec alpha) so legacy records get exactly 0.
 +			{
-+				extern uint32_t g_capPbr, g_capPbrForce;
-+				r.specularColor[3] = ( g_capPbr && g_capPbrForce ) ? 1.0f : 0.0f;
++				extern uint32_t g_capPbr, g_capPbrForce, g_capPbrTest;
++				extern float g_capPbrTestRough, g_capPbrTestMetal, g_capPbrTestAO;
++				if ( g_capPbr && g_capPbrTest ) {
++					// synthetic ORM (constant rough/metal/ao in specular_color.xyz, w=2)
++					r.specularColor[0] = g_capPbrTestRough;
++					r.specularColor[1] = g_capPbrTestMetal;
++					r.specularColor[2] = g_capPbrTestAO;
++					r.specularColor[3] = 2.0f;
++				} else {
++					r.specularColor[3] = ( g_capPbr && g_capPbrForce ) ? 1.0f : 0.0f;
++				}
 +			}
 +			// Iter 7: image pointers per binding slot (matches the order in
 +			// RB_ARB2_DrawInteraction below + interaction.wgsl bindings).
@@ -8598,7 +8611,7 @@ index c1d0d3e..fc0de16 100644
  	// load all the vertex program parameters
  	qglProgramEnvParameter4fvARB( GL_VERTEX_PROGRAM_ARB, PP_LIGHT_ORIGIN, din->localLightOrigin.ToFloatPtr() );
  	qglProgramEnvParameter4fvARB( GL_VERTEX_PROGRAM_ARB, PP_VIEW_ORIGIN, din->localViewOrigin.ToFloatPtr() );
-@@ -190,6 +400,7 @@ void RB_ARB2_CreateDrawInteractions( const drawSurf_t *surf ) {
+@@ -190,6 +409,7 @@ void RB_ARB2_CreateDrawInteractions( const drawSurf_t *surf ) {
  	} else {
  		globalImages->specularTableImage->Bind();
  	}
@@ -8606,7 +8619,7 @@ index c1d0d3e..fc0de16 100644
  
  
  	for ( ; surf ; surf=surf->nextOnLight ) {
-@@ -258,6 +469,45 @@ void RB_ARB2_DrawInteractions( void ) {
+@@ -258,6 +478,45 @@ void RB_ARB2_DrawInteractions( void ) {
  	//
  	for ( vLight = backEnd.viewDef->viewLights ; vLight ; vLight = vLight->next ) {
  		backEnd.vLight = vLight;
@@ -8652,7 +8665,7 @@ index c1d0d3e..fc0de16 100644
  
  		// do fogging later
  		if ( vLight->lightShader->IsFogLight() ) {
-@@ -314,7 +564,9 @@ void RB_ARB2_DrawInteractions( void ) {
+@@ -314,7 +573,9 @@ void RB_ARB2_DrawInteractions( void ) {
  		qglStencilFunc( GL_ALWAYS, 128, 255 );
  
  		backEnd.depthFunc = GLS_DEPTHFUNC_LESS;
@@ -8662,7 +8675,7 @@ index c1d0d3e..fc0de16 100644
  
  		backEnd.depthFunc = GLS_DEPTHFUNC_EQUAL;
  	}
-@@ -757,6 +1009,26 @@ int R_FindARBProgram( GLenum target, const char *program ) {
+@@ -757,6 +1018,26 @@ int R_FindARBProgram( GLenum target, const char *program ) {
  	return progs[i].ident;
  }
  
@@ -9150,7 +9163,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..b3e3218 100644
+index c83ebb5..71a3978 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -9176,7 +9189,7 @@ index c83ebb5..b3e3218 100644
  
  /*
  
-@@ -38,6 +50,1142 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,1146 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -9412,6 +9425,10 @@ index c83ebb5..b3e3218 100644
 +    float    g_capMotionBlurMinDepth = 0.0f;
 +    uint32_t g_capPbr = 1;          // R-PBR P0: master enable for GGX on isPBR materials
 +    uint32_t g_capPbrForce = 0;     // R-PBR P0: force isPBR on every interaction (A/B)
++    uint32_t g_capPbrTest = 0;      // R-PBR P0: synthetic test material (constant ORM)
++    float    g_capPbrTestRough = 0.3f;
++    float    g_capPbrTestMetal = 1.0f;
++    float    g_capPbrTestAO = 1.0f;
 +    uint32_t g_capInCinematic = 0;
 +    float    g_mbViewProj[16]    = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
 +    float    g_mbInvViewProj[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
@@ -10319,7 +10336,7 @@ index c83ebb5..b3e3218 100644
  
  /*
  =================
-@@ -49,6 +1197,22 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +1201,22 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -10342,7 +10359,7 @@ index c83ebb5..b3e3218 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +1242,22 @@ RB_DrawElementsWithCounters
+@@ -78,6 +1246,22 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -10365,7 +10382,7 @@ index c83ebb5..b3e3218 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1296,23 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1300,23 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -10389,7 +10406,7 @@ index c83ebb5..b3e3218 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1363,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1367,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -10397,7 +10414,7 @@ index c83ebb5..b3e3218 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1590,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1594,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -10410,7 +10427,7 @@ index c83ebb5..b3e3218 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -553,26 +1755,159 @@ Any mirrored or portaled views have already been drawn, so prepare
+@@ -553,26 +1759,163 @@ Any mirrored or portaled views have already been drawn, so prepare
  to actually render the visible surfaces for this view
  =================
  */
@@ -10518,9 +10535,13 @@ index c83ebb5..b3e3218 100644
 +		g_capMotionBlurMaxOffset = r_motionBlurMaxOffsetPixels.GetFloat();
 +		g_capMotionBlurZeroVel = r_motionBlurZeroVelocity.GetBool() ? 1u : 0u;
 +		g_capMotionBlurMinDepth = r_motionBlurMinDepth.GetFloat();
-+		extern idCVar r_pbr, r_pbrForce;
++		extern idCVar r_pbr, r_pbrForce, r_pbrTest, r_pbrTestRough, r_pbrTestMetal, r_pbrTestAO;
 +		g_capPbr = r_pbr.GetBool() ? 1u : 0u;
 +		g_capPbrForce = r_pbrForce.GetBool() ? 1u : 0u;
++		g_capPbrTest = r_pbrTest.GetBool() ? 1u : 0u;
++		g_capPbrTestRough = r_pbrTestRough.GetFloat();
++		g_capPbrTestMetal = r_pbrTestMetal.GetFloat();
++		g_capPbrTestAO = r_pbrTestAO.GetFloat();
 +#ifdef __EMSCRIPTEN__
 +		g_capInCinematic = (uint32_t)EM_ASM_INT({ return ( window.__d3InCinematic ? 1 : 0 ); });
 +#endif
@@ -10580,7 +10601,7 @@ index c83ebb5..b3e3218 100644
  	backEnd.currentScissor = viewDef->scissor;
  
  	// ensures that depth writes are enabled for the depth clear
-@@ -897,6 +2232,26 @@ void RB_DrawView( const void *data ) {
+@@ -897,6 +2240,26 @@ void RB_DrawView( const void *data ) {
  
  	backEnd.viewDef = cmd->viewDef;
  
@@ -10609,10 +10630,10 @@ index c83ebb5..b3e3218 100644
  	backEnd.currentRenderCopied = false;
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..5e4e3ec
+index 0000000..f4c29f4
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,1179 @@
+@@ -0,0 +1,1186 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -11407,7 +11428,14 @@ index 0000000..5e4e3ec
 +"    // the textureSample inside the else are legal.\n"
 +"    var brdfTerm: vec3<f32>;\n"
 +"    if (u.specular_color.w > 0.5) {\n"
-+"        brdfTerm = pbr_direct(N, L, V, diffuse, tspec.g, tspec.b, tspec.r);\n"
++"        // ORM from the LINEAR specular map (R=AO,G=rough,B=metal); OR, for the\n"
++"        // r_pbrTest synthetic material (w==2), constant rough/metal/ao packed in\n"
++"        // specular_color.xyz so PBR is visibly demonstrable before content's ORM lands.\n"
++"        var rough = tspec.g; var metal = tspec.b; var aov = tspec.r;\n"
++"        if (u.specular_color.w > 1.5) {\n"
++"            rough = u.specular_color.x; metal = u.specular_color.y; aov = u.specular_color.z;\n"
++"        }\n"
++"        brdfTerm = pbr_direct(N, L, V, diffuse, rough, metal, aov);\n"
 +"    } else {\n"
 +"        let spec = tspec * u.specular_color.rgb;\n"
 +"        // Specular falloff, two modes (iter 29):\n"
