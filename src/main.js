@@ -1735,6 +1735,7 @@ function handleRuntimeLog(text) {
     armAutoFlashlight();
     armCinematicShadowGuard();
     armSpawnLoadout();
+    armTracerDemo();
   }
 }
 
@@ -1838,6 +1839,40 @@ function armSpawnLoadout() {
     diag("loadout: assault rifle equipped");
   };
   window.setTimeout(() => tryGive(0), 3000);
+}
+
+// R-TRACER demo (`?tracerdemo`): a phone-friendly way to SEE the tracer with no
+// console — after spawn, give the rifle + god + a clearly-visible streak, then keep
+// an imp spawned in front so the close-range auto-fire stays active (every shot
+// draws a tracer). Opt-in only; normal play is untouched.
+let tracerDemoArmed = false;
+function armTracerDemo() {
+  if (tracerDemoArmed) return;
+  if (!/[?&]tracerdemo\b/.test(window.location.search)) return;
+  tracerDemoArmed = true;
+  const start = (attempt) => {
+    if (typeof window.d3cmd !== "function" && attempt < 60) { window.setTimeout(() => start(attempt + 1), 1000); return; }
+    if (window.__d3InCinematic === 1 && attempt < 120) { window.setTimeout(() => start(attempt + 1), 1000); return; }
+    window.d3cmd("give all");
+    window.d3cmd("god");
+    window.d3cmd("r_tracerWidth 0.012");      // fatter + brighter than the default so it reads on a phone
+    window.d3cmd("r_tracerIntensity 2.6");
+    // Also enable our ACES "LUT filter" (R0 tonemap) so this demo shows the full
+    // look. r_gamma 1.0 so the per-fragment gamma doesn't double-shape the grade;
+    // exposure 0.5 = a punchy cinematic curve with deep blacks (the BFG-ref look)
+    // AND headroom so the muzzle-flash-lit firing frames don't blow out (exp 1.0
+    // LIFTS this lit scene; 0.7 clipped on fire peaks — measured). Toggle live via
+    // the fx panel (tonemap / tm exposure sliders).
+    window.d3cmd("r_gamma 1.0");
+    window.d3cmd("r_tonemap 1");
+    window.d3cmd("r_tonemapExposure 0.5");
+    window.setTimeout(() => tapKey(WEAPON_MACHINEGUN_KEY), 600);   // raise the rifle
+    diag("tracer demo: god + rifle + ACES tonemap; spawning imps to auto-fire at");
+    const spawnImp = () => { if (typeof window.d3cmd === "function") window.d3cmd("spawn monster_demon_imp"); };
+    spawnImp();
+    window.setInterval(spawnImp, 5000);       // respawn so there's always a target in front
+  };
+  window.setTimeout(() => start(0), 3500);
 }
 
 // Iter 40: phone defense-in-depth. Cinematic flythroughs legitimately push
