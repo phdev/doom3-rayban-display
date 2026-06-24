@@ -40,6 +40,21 @@ prepass depth, lit depth, and pass-stage depth all live in `[0,0.5]` and never s
   `drawVolumes` call (stencil shadow volumes are world-space and must mark/test at full range);
 - **final pass-record loop** — per weapon pass stage.
 
+### Shadow exemption (regression found + fixed 2026-06-24)
+
+Moving the weapon into the `[0,0.5]` slab while the stencil shadow volumes stayed at `[0,1]`
+introduced a regression: a world/player volume *behind* the gun fails the depth test over the
+gun's now-shallow depth and increments the stencil there, so the interaction pipeline's
+`stencilRef(128) GreaterEqual stencilValue` test drops those pixels to black — a hard-edged
+**shadow gash on the gun/arm** (user-reported; A/B confirmed: ON had it, OFF + `r_shadows 0` did
+not). Native DOOM3 never world-shadows the view weapon (`noSelfShadow`). **Fix:** in the lit
+interaction pass, draw weapon records with the **stencil reference at 255** (`255 >= anyValue`
+always passes → never shadowed); the pipeline's stencil ops are `Keep`, so this only exempts the
+weapon from the shadow *test* and cannot corrupt the stencil. Gated by `r_weaponDepthSep` (OFF →
+ref stays 128 → byte-identical). `litResetWorld()` restores ref 128 (alongside the viewport)
+before every `drawVolumes` so volume marking is unaffected. Re-verified on Dawn: ON now renders
+the gun/arm clean (matches OFF) **and** det stays IDENTICAL.
+
 Gated by `r_weaponDepthSep` (default **1** = GL parity; **0** = the old projection-only WebGPU
 behavior, for A/B). With the cvar 0, `setWeaponDepthRange` emits **zero** `SetViewport` calls →
 byte-identical to the pre-R-VIEWMODEL frame (OFF-identity).

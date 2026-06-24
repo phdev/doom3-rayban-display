@@ -1982,10 +1982,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..98d8740
+index 0000000..e92b2c9
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,5513 @@
+@@ -0,0 +1,5527 @@
 +/*
 +================================================================================
 +
@@ -5618,11 +5618,21 @@ index 0000000..98d8740
 +                }
 +            };
 +            uint32_t i = 0;
-+            int wmLit = 0;   // R-VIEWMODEL: viewport depth-range state for the lit pass
-+            // Shadow volumes are world-space — they must mark/test stencil at the
-+            // full [0,1] depth range, so reset before any drawVolumes call.
++            int wmLit = 0;          // R-VIEWMODEL: viewport depth-range state for the lit pass
++            int wmStencilRef = 128; // R-VIEWMODEL: stencil reference (128 = world/shadow-tested; 255 = view-weapon, always-lit)
++            // R-VIEWMODEL: the view weapon now lives in the [0,0.5] depth slab, but the world/player
++            // stencil shadow volumes mark at [0,1] — so a volume behind the gun spuriously fails the
++            // depth test over the gun's now-shallow depth and marks it "shadowed", and the interaction
++            // pipeline's GEQUAL-128 stencil test then drops those pixels to black (the gun/arm shadow
++            // artifact). Native DOOM3 never world-shadows the view weapon (noSelfShadow). Fix: draw
++            // weapon interactions with the stencil reference at 255 so GEQUAL always passes (the
++            // pipeline's ops are Keep — no stencil write — so this only exempts the weapon from the
++            // shadow TEST, it can't corrupt the stencil). Gated by g_capWeaponDepthSep so OFF is
++            // byte-identical (weapon at [0,1], ref 128, as before). Shadow volumes are world-space and
++            // must mark/test at [0,1] + ref 128, so litResetWorld restores BOTH before drawVolumes.
 +            auto litResetWorld = [&]() {
 +                if (wmLit != 0) { wgpuRenderPassEncoderSetViewport(rp, 0.0f, 0.0f, (float)depthW, (float)depthH, 0.0f, 1.0f); wmLit = 0; }
++                if (wmStencilRef != 128) { wgpuRenderPassEncoderSetStencilReference(rp, 128); wmStencilRef = 128; }
 +            };
 +            while (i < lastRecordCount) {
 +                const uint32_t light = lastRecords[i].lightId;
@@ -5632,6 +5642,10 @@ index 0000000..98d8740
 +                while (i < lastRecordCount && lastRecords[i].lightId == light) {
 +                    const Rec& r = lastRecords[i];
 +                    setWeaponDepthRange(rp, r, wmLit);   // R-VIEWMODEL: weapon lit interactions -> [0,0.5]
++                    {
++                        const int wantRef = (g_capWeaponDepthSep && r.sPad1 == 1u) ? 255 : 128;
++                        if (wantRef != wmStencilRef) { wgpuRenderPassEncoderSetStencilReference(rp, (uint32_t)wantRef); wmStencilRef = wantRef; }
++                    }
 +                    wgpuRenderPassEncoderSetBindGroup(rp, 0, recordBindGroups[i], 0, nullptr);
 +                    wgpuRenderPassEncoderSetBindGroup(rp, 1, lastMatGroups[i] ? lastMatGroups[i] : fallbackMatGroup(), 0, nullptr);
 +                    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, recordVertexBuf, r.vertOffset, (uint64_t)r.vertCount * 60u);
