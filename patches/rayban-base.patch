@@ -3565,6 +3565,24 @@ index dcba853..6f97139 100644
  	void						ReloadAnims( void );
  	void						ListAnims( void ) const;
  	int							JointIndex( const char *name );
+diff --git a/neo/game/anim/Anim_Blend.cpp b/neo/game/anim/Anim_Blend.cpp
+index e3409ba..2e7c6d7 100644
+--- a/neo/game/anim/Anim_Blend.cpp
++++ b/neo/game/anim/Anim_Blend.cpp
+@@ -2619,7 +2619,12 @@ bool idDeclModelDef::Parse( const char *text, const int textLength ) {
+ 			}
+ 			filename = token2;
+ 			filename.ExtractFileExtension( extension );
+-			if ( extension != MD5_MESH_EXT ) {
++			// R-GLTF: accept glTF meshes (SPINE-blessed relax, Arco/doom commit 5637199 /
++			// combat-p0-idai.patch:422) so a modelDef can bind a .glb/.gltf and the unmodified
++			// idAnimator combat wire drives a CPU-skinned glTF enemy. Everything after this check
++			// uses only the abstract idRenderModel interface our glTF model implements. Synced into
++			// the render-track base patch so the WASM engine I build includes the client half.
++			if ( extension != MD5_MESH_EXT && extension.Icmp( "glb" ) != 0 && extension.Icmp( "gltf" ) != 0 ) {
+ 				src.Warning( "Invalid model for MD5 mesh" );
+ 				MakeDefault();
+ 				return false;
 diff --git a/neo/game/gamesys/SysCmds.cpp b/neo/game/gamesys/SysCmds.cpp
 index 105ff57..e4b3f00 100644
 --- a/neo/game/gamesys/SysCmds.cpp
