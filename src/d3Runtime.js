@@ -1103,6 +1103,16 @@ function buildAutoexecConfig(config) {
     // on hit (the HUD health still shows damage); the view-shake removal is a plus
     // on a head-mounted display. g_hitEffect 1 restores all of it.
     "seta g_hitEffect \"0\"",
+    // View-smoothing (SPINE viewsmooth-rayban-base): a RENDER-ONLY temporal low-pass on
+    // the first-person camera origin to damp the browser's variable-fps-vs-16ms-tic judder
+    // (smoother camera feel on the phone). Render-only — GetEyePosition/weapon-traces/AI/
+    // audio read the raw origin, so sim + hit-detection are unchanged; snaps on
+    // teleport/spawn (g_viewInterpMaxDelta). Enabled on the mobile profile (the iPhone/iPad
+    // target); desktop stays SPINE's default-off (testable via +set g_viewInterpolate 1).
+    // k=g_viewSmooth 0.30 (owner tune range 0.2–0.4; larger = snappier/less smooth).
+    ...(config.inputMode === "wearable"
+      ? ["seta g_viewInterpolate \"1\"", "seta g_viewSmooth \"0.30\""]
+      : []),
     // Iter 31: PIN shadows here, not just in the +set args. r_shadows is
     // CVAR_ARCHIVE, and the engine's first-run sysDetect path (which fires
     // EVERY boot — /save is MEMFS, so the _spec.cfg marker never persists)

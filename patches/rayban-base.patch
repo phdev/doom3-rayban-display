@@ -3215,6 +3215,64 @@ index b411a0c..eeafeb5 100644
  	// save games
  	void					Save( idSaveGame *savefile ) const;					// archives object for save game file
  	void					Restore( idRestoreGame *savefile );					// unarchives object from save game file
+diff --git a/neo/game/PlayerView.cpp b/neo/game/PlayerView.cpp
+index 16dc809..83d336e 100644
+--- a/neo/game/PlayerView.cpp
++++ b/neo/game/PlayerView.cpp
+@@ -65,6 +65,8 @@ idPlayerView::idPlayerView() {
+ 	fadeToColor.Zero();
+ 	fadeColor.Zero();
+ 	shakeAng.Zero();
++	smoothedViewOrg.Zero();
++	viewSmoothingInitialized = false;
+ 
+ 	ClearEffects();
+ }
+@@ -453,6 +455,30 @@ void idPlayerView::SingleView( idUserInterface *hud, const renderView_t *view )
+ 	renderView_t	hackedView = *view;
+ 	hackedView.viewaxis = hackedView.viewaxis * ShakeAxis();
+ 
++	// RENDER-ONLY view smoothing: a temporal low-pass on the local first-person / free-fly-SPECTATOR
++	// camera origin to damp the render-vs-sim jitter (the browser renders at a variable fps while the
++	// sim steps in discrete 16ms tics, so firstPersonViewOrigin jumps unevenly = judder). NOTE this is a
++	// low-pass, NOT true interpolation: dhewm3 computes the view ONCE per render frame at current time
++	// (no sub-tick fraction is reachable at this seam — a prior lerp attempt degenerated to alpha=0).
++	// Touches ONLY this local hackedView copy — GetEyePosition()/weapon-traces/AI/audio-listener all read
++	// the raw authoritative origin, so gameplay + server hit-detection are unchanged. SNAPS (no smear) on
++	// a big delta: teleport / spawn / spectate-target switch / large snapshot re-base. Excludes 3rd-person /
++	// death / camera POVs (their vieworg isn't firstPersonViewOrigin). Gated g_viewInterpolate; k=g_viewSmooth.
++	if ( g_viewInterpolate.GetBool() && player &&
++		 player->entityNumber == gameLocal.localClientNum &&
++		 !pm_thirdPerson.GetBool() && !pm_thirdPersonDeath.GetBool() &&
++		 !player->GetPrivateCameraView() && !gameLocal.GetCamera() ) {
++		const idVec3 rawOrg = view->vieworg;
++		if ( !viewSmoothingInitialized ||
++			 ( rawOrg - smoothedViewOrg ).LengthSqr() >= Square( g_viewInterpMaxDelta.GetFloat() ) ) {
++			smoothedViewOrg = rawOrg;					// first frame or discontinuity → snap
++			viewSmoothingInitialized = true;
++		} else {
++			smoothedViewOrg += ( rawOrg - smoothedViewOrg ) * g_viewSmooth.GetFloat();
++		}
++		hackedView.vieworg = smoothedViewOrg;
++	}
++
+ 	gameRenderWorld->RenderScene( &hackedView );
+ 
+ 	if ( player->spectating ) {
+diff --git a/neo/game/PlayerView.h b/neo/game/PlayerView.h
+index bc90458..5523e56 100644
+--- a/neo/game/PlayerView.h
++++ b/neo/game/PlayerView.h
+@@ -127,6 +127,9 @@ private:
+ 
+ 	idAngles			shakeAng;			// from the sound sources
+ 
++	idVec3				smoothedViewOrg;			// render-only low-pass of the view origin (g_viewInterpolate)
++	bool				viewSmoothingInitialized;	// has smoothedViewOrg been seeded yet
++
+ 	idPlayer *			player;
+ 	renderView_t		view;
+ };
 diff --git a/neo/game/SecurityCamera.cpp b/neo/game/SecurityCamera.cpp
 index 36a0cbe..58d9a22 100644
 --- a/neo/game/SecurityCamera.cpp
@@ -3629,7 +3687,7 @@ index 105ff57..e4b3f00 100644
  	cmdSystem->AddCommand( "sayTeam",				Cmd_SayTeam_f,				CMD_FL_GAME,				"team text chat" );
  	cmdSystem->AddCommand( "addChatLine",			Cmd_AddChatLine_f,			CMD_FL_GAME,				"internal use - core to game chat lines" );
 diff --git a/neo/game/gamesys/SysCvar.cpp b/neo/game/gamesys/SysCvar.cpp
-index 824d9c2..510f360 100644
+index 824d9c2..4bda411 100644
 --- a/neo/game/gamesys/SysCvar.cpp
 +++ b/neo/game/gamesys/SysCvar.cpp
 @@ -97,14 +97,16 @@ idCVar r_aspectRatio(				"r_aspectRatio",			"-1",			CVAR_RENDERER | CVAR_INTEGER
@@ -3650,8 +3708,19 @@ index 824d9c2..510f360 100644
  idCVar g_knockback(					"g_knockback",				"1000",			CVAR_GAME | CVAR_INTEGER, "" );
  idCVar g_skill(						"g_skill",					"1",			CVAR_GAME | CVAR_INTEGER, "" );
  idCVar g_nightmare(					"g_nightmare",				"0",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "if nightmare mode is allowed" );
+@@ -271,6 +273,10 @@ idCVar pm_thirdPersonDeath(			"pm_thirdPersonDeath",		"0",			CVAR_GAME | CVAR_NE
+ idCVar pm_modelView(				"pm_modelView",				"0",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_INTEGER, "draws camera from POV of player model (1 = always, 2 = when dead)", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
+ idCVar pm_airTics(					"pm_air",					"1800",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_INTEGER, "how long in milliseconds the player can go without air before he starts taking damage" );
+ 
++idCVar g_viewInterpolate(			"g_viewInterpolate",		"0",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "render-only temporal low-pass smoothing of the first-person/spectator camera origin (damps fps!=60 jitter)" );
++idCVar g_viewSmooth(				"g_viewSmooth",				"0.30",			CVAR_GAME | CVAR_ARCHIVE | CVAR_FLOAT, "view low-pass factor k (smoothed += (raw-smoothed)*k); larger = snappier/less smooth", 0.05f, 0.95f );
++idCVar g_viewInterpMaxDelta(		"g_viewInterpMaxDelta",		"512",			CVAR_GAME | CVAR_FLOAT, "origin delta (units) above which the view snaps instead of smoothing (teleport/spawn/spectate-snap guard)", 64.0f, 4096.0f );
++
+ idCVar g_showPlayerShadow(			"g_showPlayerShadow",		"0",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "enables shadow of player model" );
+ idCVar g_showHud(					"g_showHud",				"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "" );
+ idCVar g_showProjectilePct(			"g_showProjectilePct",		"0",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "enables display of player hit percentage" );
 diff --git a/neo/game/gamesys/SysCvar.h b/neo/game/gamesys/SysCvar.h
-index a4883b5..233abca 100644
+index a4883b5..67918b8 100644
 --- a/neo/game/gamesys/SysCvar.h
 +++ b/neo/game/gamesys/SysCvar.h
 @@ -35,6 +35,7 @@ extern idCVar	developer;
@@ -3670,6 +3739,16 @@ index a4883b5..233abca 100644
  extern idCVar	g_projectileLights;
  extern idCVar	g_doubleVision;
  extern idCVar	g_hitEffect;
+@@ -200,6 +202,9 @@ extern idCVar	pm_thirdPersonDeath;
+ extern idCVar	pm_modelView;
+ extern idCVar	pm_airTics;
+ 
++extern idCVar	g_viewInterpolate;
++extern idCVar	g_viewSmooth;
++extern idCVar	g_viewInterpMaxDelta;
+ extern idCVar	g_showPlayerShadow;
+ extern idCVar	g_showHud;
+ extern idCVar	g_showProjectilePct;
 diff --git a/neo/idlib/MapFile.cpp b/neo/idlib/MapFile.cpp
 index afbfa1d..cf83f9d 100644
 --- a/neo/idlib/MapFile.cpp
