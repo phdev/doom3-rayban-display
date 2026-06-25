@@ -1982,10 +1982,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..ff7172c
+index 0000000..932b919
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,5621 @@
+@@ -0,0 +1,5828 @@
 +/*
 +================================================================================
 +
@@ -2116,6 +2116,55 @@ index 0000000..ff7172c
 +        out[c]=kd*albedo[c]*ao + spec;   // NOTE: WGSL applies ao to diffuse only -> diffuse*ao + spec
 +    }
 +}
++// R-IBL: CPU mirror of interaction.wgsl synth_irradiance / synth_radiance /
++// env_brdf_approx / ibl_ambient (byte-for-byte the same math) — the IBL operator-gate reference.
++static void ibl_synth_irr_cpu(const float N[3], float out[3]) {
++    float t = N[2]*0.5f+0.5f; if (t<0.f) t=0.f; if (t>1.f) t=1.f;
++    const float sky[3]={0.55f,0.70f,1.05f}, gnd[3]={0.12f,0.10f,0.09f};
++    for (int c=0;c<3;c++) out[c]=gnd[c]+(sky[c]-gnd[c])*t;
++}
++static void ibl_synth_rad_cpu(const float R[3], float mip, float out[3]) {
++    float lobe[3]={0.30f,0.40f,0.85f};
++    float ll=sqrtf(lobe[0]*lobe[0]+lobe[1]*lobe[1]+lobe[2]*lobe[2]);
++    lobe[0]/=ll; lobe[1]/=ll; lobe[2]/=ll;
++    float r[3]={R[0],R[1],R[2]};
++    float rl=sqrtf(r[0]*r[0]+r[1]*r[1]+r[2]*r[2]); if(rl>0.f){r[0]/=rl;r[1]/=rl;r[2]/=rl;}
++    float sharp=64.0f/(mip+1.0f); if (sharp<1.0f) sharp=1.0f;
++    float d=r[0]*lobe[0]+r[1]*lobe[1]+r[2]*lobe[2]; if (d<0.f) d=0.f;
++    float hi=powf(d,sharp);
++    const float fill[3]={0.10f,0.12f,0.16f}, hic[3]={1.40f,1.25f,0.95f};
++    for (int c=0;c<3;c++) out[c]=fill[c]+hic[c]*hi;
++}
++static void ibl_cpu(const float N[3], const float V[3], const float albedo[3],
++                    float roughness, float metallic, float ao, float dScale, float sScale,
++                    float maxMip, float out[3]) {
++    auto nz=[](float* v){ float l=sqrtf(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]); if(l>0.f){v[0]/=l;v[1]/=l;v[2]/=l;} };
++    float n[3]={N[0],N[1],N[2]}, v[3]={V[0],V[1],V[2]}; nz(n); nz(v);
++    // R = reflect(-v, n) = i - 2*dot(i,n)*n, i = -v
++    float i[3]={-v[0],-v[1],-v[2]};
++    float dn=i[0]*n[0]+i[1]*n[1]+i[2]*n[2];
++    float R[3]={i[0]-2.f*dn*n[0], i[1]-2.f*dn*n[1], i[2]-2.f*dn*n[2]};
++    float NoV=n[0]*v[0]+n[1]*v[1]+n[2]*v[2]; if (NoV<1e-4f) NoV=1e-4f;
++    float mm=fmaxf(maxMip,1.0f);
++    float irr[3], pref[3];
++    ibl_synth_irr_cpu(n, irr);
++    ibl_synth_rad_cpu(R, roughness*(mm-1.0f), pref);
++    // env_brdf_approx
++    float c0[4]={-1.0f,-0.0275f,-0.572f,0.022f}, c1[4]={1.0f,0.0425f,1.04f,-0.04f};
++    float r0=roughness*c0[0]+c1[0], r1=roughness*c0[1]+c1[1], r2=roughness*c0[2]+c1[2], r3=roughness*c0[3]+c1[3];
++    float a004=fminf(r0*r0, exp2f(-9.28f*NoV))*r0 + r1;
++    float sb_x=-1.04f*a004 + r2, sb_y=1.04f*a004 + r3;
++    float horizon=1.0f+(R[0]*n[0]+R[1]*n[1]+R[2]*n[2]);
++    if(horizon<0.f)horizon=0.f; if(horizon>1.f)horizon=1.f; horizon*=horizon;
++    for (int c=0;c<3;c++){
++        float F0=0.04f+(albedo[c]-0.04f)*metallic;
++        float fr=F0+(fmaxf(1.0f-roughness,F0)-F0)*powf(1.0f-NoV,5.0f);
++        float kd=(1.0f-fr)*(1.0f-metallic);
++        float diff=irr[c]*albedo[c]*ao*kd*dScale;
++        float spec=pref[c]*(F0*sb_x+sb_y)*ao*horizon*sScale;
++        out[c]=diff+spec;
++    }
++}
 +static void mbb_mulvec(float* o, const float* m, const float* v) {
 +    for (int r = 0; r < 4; r++) { o[r] = 0.0f; for (int k = 0; k < 4; k++) o[r] += m[k*4+r]*v[k]; }
 +}
@@ -2180,6 +2229,12 @@ index 0000000..ff7172c
 +extern "C" uint32_t g_capDetTest;       // iter 28: determinism self-test gate
 +extern "C" uint32_t g_capVertDedupCount; // iter 28: frame geometry-dedup table fill (reset on drain)
 +extern "C" float    g_capBfgSpec;       // iter 29: 1 = BFG analytic specular, 0 = classic LUT
++// R-IBL (Full PBR look): image-based lighting params (isPBR-scoped), written into ub[56..59].
++extern "C" uint32_t g_capIbl;            // master enable (r_ibl)
++extern "C" float    g_capIblDiffuseScale;
++extern "C" float    g_capIblSpecScale;
++extern "C" uint32_t g_capIblMaxMip;
++extern "C" uint32_t g_capIblMutate;      // falsifiability mutation (r_iblMutate)
 +// Iter 55: progressive texture streaming — idImage ptrs whose CPU pixels were
 +// just refreshed (a streamed file arrived + the image reloaded). The backend
 +// evicts these from its GPU caches at the next drain so the real texture
@@ -2497,6 +2552,9 @@ index 0000000..ff7172c
 +                    }
 +                    if (g_capDetTest && !pbrSelfDone && detFrameCounter >= 36) {
 +                        runPbrSelfTest();
++                    }
++                    if (g_capDetTest && !iblSelfDone && detFrameCounter >= 38) {
++                        runIblSelfTest();
 +                    }
 +                }
 +                // R-MBLUR Build B: det-safe prev-VP swap. ONCE per frame, AFTER the live
@@ -4327,7 +4385,11 @@ index 0000000..ff7172c
 +            }
 +
 +            WGPUBindGroupEntry e = {};
-+            e.binding = 0; e.buffer = recordUBuf; e.offset = (uint64_t)i * kUBStride; e.size = 224;
++            // R-IBL P0: grow 224 -> 256 (the Uniforms struct gained ibl/ibl2; the
++            // slot already strides kUBStride=256 so no buffer realloc). The drain
++            // explicitly zero-fills ub[56..63] for EVERY record so the grown range
++            // is fully defined (OFF-identity + det-safe).
++            e.binding = 0; e.buffer = recordUBuf; e.offset = (uint64_t)i * kUBStride; e.size = 256;
 +            WGPUBindGroupDescriptor bgd = {};
 +            bgd.entryCount = 1;
 +            bgd.entries = &e;
@@ -4340,7 +4402,11 @@ index 0000000..ff7172c
 +            // shared interaction vs_main reads for clip position — so this
 +            // fills correct depth for opaque material pass records.
 +            WGPUBindGroupEntry pe = {};
-+            pe.binding = 0; pe.buffer = passUBuf; pe.offset = (uint64_t)i * kUBStride; pe.size = 224;
++            // R-IBL P0: bglDepth comes from depthPipeline = interaction vs_main, whose
++            // Uniforms struct grew to 256 -> minBindingSize 256, so this must bind 256
++            // too (was 224). The depth VS reads only mvp (offset 0); passUBuf strides
++            // kUBStride=256 so binding 256 is in-range and safe.
++            pe.binding = 0; pe.buffer = passUBuf; pe.offset = (uint64_t)i * kUBStride; pe.size = 256;
 +            WGPUBindGroupDescriptor pbgd = {};
 +            pbgd.entryCount = 1; pbgd.entries = &pe; pbgd.layout = bglDepth;
 +            passDepthBindGroups[i] = wgpuDeviceCreateBindGroup(device, &pbgd);
@@ -4571,7 +4637,7 @@ index 0000000..ff7172c
 +        extern float g_capInvGamma;
 +        for (uint32_t i = 0; i < n; ++i) {
 +            const Rec& r = g_capRecords[i];
-+            float ub[56];
++            float ub[64];
 +            memcpy(ub +  0, r.modelMatrix, 64);
 +            memcpy(ub + 16, r.localLightOrigin, 16);
 +            memcpy(ub + 20, r.localViewOrigin,  16);
@@ -4634,7 +4700,20 @@ index 0000000..ff7172c
 +            // to 1 to reproduce the raw (unclamped) behavior; -870/-1 keep the
 +            // fix on. Lets a Dawn run simulate the WebKit falloff-bleed.
 +            ub[55] = (g_capWgpuSingleLight == -871 || g_capWgpuSingleLight == -872) ? 1.0f : 0.0f;
-+            memcpy(recordUBStage + (size_t)i * kUBStride, ub, 224);
++            // R-IBL P0 (ub[56..63]): zero-fill the grown range for EVERY record (the
++            // named OFF-identity + det guarantee — legacy reads ibl.x==0 -> no IBL),
++            // then set the IBL params for isPBR records when r_ibl is on. isPBR =
++            // specularColor[3] > 0.5 (real ORM w==1 OR synthetic r_pbrTest w==2).
++            ub[56] = 0.0f; ub[57] = 0.0f; ub[58] = 0.0f; ub[59] = 0.0f;
++            ub[60] = 0.0f; ub[61] = 0.0f; ub[62] = 0.0f; ub[63] = 0.0f;
++            if (g_capIbl && r.specularColor[3] > 0.5f) {
++                ub[56] = 1.0f;                       // ibl.x = enable
++                ub[57] = g_capIblDiffuseScale;       // ibl.y
++                ub[58] = g_capIblSpecScale;          // ibl.z
++                ub[59] = (float)g_capIblMaxMip;      // ibl.w
++                ub[60] = g_capIblMutate ? 1.0f : 0.0f; // ibl2.x (falsifiability)
++            }
++            memcpy(recordUBStage + (size_t)i * kUBStride, ub, 256);
 +            if (i + 1 > recordUBHigh) recordUBHigh = i + 1;
 +            // Iter 7b: resolve the material bind group (creates GPU textures
 +            // from the CPU image cache on first sight of each image).
@@ -6659,7 +6738,7 @@ index 0000000..ff7172c
 +            WGPUShaderModule mod = wgpuDeviceCreateShaderModule(device, &smd);
 +            WGPUBindGroupLayoutEntry ble = {};
 +            ble.binding = 0; ble.visibility = WGPUShaderStage_Fragment;
-+            ble.buffer.type = WGPUBufferBindingType_Uniform; ble.buffer.minBindingSize = 224;
++            ble.buffer.type = WGPUBufferBindingType_Uniform; ble.buffer.minBindingSize = 256;  // R-IBL: Uniforms grew 224->256
 +            WGPUBindGroupLayoutDescriptor bld = {}; bld.entryCount = 1; bld.entries = &ble;
 +            pbrSelfBGL = wgpuDeviceCreateBindGroupLayout(device, &bld);
 +            WGPUPipelineLayoutDescriptor pld = {}; pld.bindGroupLayoutCount = 1; pld.bindGroupLayouts = &pbrSelfBGL;
@@ -6677,8 +6756,8 @@ index 0000000..ff7172c
 +            wgpuPipelineLayoutRelease(pl); wgpuShaderModuleRelease(mod);
 +        }
 +        if (!pbrSelfPipeline) return;
-+        if (!pbrSelfUB) { WGPUBufferDescriptor ud = {}; ud.size = 224; ud.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst; pbrSelfUB = wgpuDeviceCreateBuffer(device, &ud); }
-+        float ub[56]; memset(ub, 0, sizeof(ub));
++        if (!pbrSelfUB) { WGPUBufferDescriptor ud = {}; ud.size = 256; ud.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst; pbrSelfUB = wgpuDeviceCreateBuffer(device, &ud); }
++        float ub[64]; memset(ub, 0, sizeof(ub));
 +        // config A -> light_origin_tangent(16..19), view_origin_tangent(20..23), diffuse_color(24..27), specular_color(28..30)
 +        ub[16]=n[0]; ub[17]=n[1]; ub[18]=n[2]; ub[19]=0.5f;            // N, roughA
 +        ub[20]=lv[0]; ub[21]=lv[1]; ub[22]=lv[2]; ub[23]=0.0f;         // L, metalA
@@ -6689,9 +6768,9 @@ index 0000000..ff7172c
 +        ub[36]=lv[0]; ub[37]=lv[1]; ub[38]=lv[2]; ub[39]=1.0f;         // L, metalB
 +        ub[40]=lv[0]; ub[41]=lv[1]; ub[42]=lv[2]; ub[43]=1.0f;         // V, aoB
 +        ub[44]=alb[0]; ub[45]=alb[1]; ub[46]=alb[2];                   // albedoB
-+        wgpuQueueWriteBuffer(queue, pbrSelfUB, 0, ub, 224);
++        wgpuQueueWriteBuffer(queue, pbrSelfUB, 0, ub, 256);
 +        if (!pbrSelfBG) {
-+            WGPUBindGroupEntry e = {}; e.binding = 0; e.buffer = pbrSelfUB; e.size = 224;
++            WGPUBindGroupEntry e = {}; e.binding = 0; e.buffer = pbrSelfUB; e.size = 256;
 +            WGPUBindGroupDescriptor bgd = {}; bgd.layout = pbrSelfBGL; bgd.entryCount = 1; bgd.entries = &e;
 +            pbrSelfBG = wgpuDeviceCreateBindGroup(device, &bgd);
 +        }
@@ -6724,6 +6803,123 @@ index 0000000..ff7172c
 +        cbi.callback = &idRenderBackend_WebGPU::pbrSelfMapCallback;
 +        cbi.userdata1 = this;
 +        wgpuBufferMapAsync(pbrSelfBuf, WGPUMapMode_Read, 0, 256*4, cbi);
++    }
++
++    // R-IBL operator gate: read back the 256x1 fs_ibl_selftest output and byte-compare both
++    // configs (pixel 64 = dielectric, pixel 192 = metal) to the ibl_cpu reference. BGRA8.
++    static void iblSelfMapCallback(WGPUMapAsyncStatus status, WGPUStringView /*msg*/, void* ud1, void* /*ud2*/) {
++        idRenderBackend_WebGPU* self = (idRenderBackend_WebGPU*)ud1;
++        if (status != WGPUMapAsyncStatus_Success) { EM_ASM({ console.warn("[d3] IBL self-test: map FAILED"); }); return; }
++        const uint8_t* p = (const uint8_t*)wgpuBufferGetConstMappedRange(self->iblSelfBuf, 0, 256*4);
++        int maxErr = 1000000;
++        if (p) {
++            maxErr = 0;
++            for (int c = 0; c < 3; c++) {
++                int expA = (int)(self->iblExpA[c]*255.0f+0.5f); if(expA>255)expA=255; if(expA<0)expA=0;
++                int expB = (int)(self->iblExpB[c]*255.0f+0.5f); if(expB>255)expB=255; if(expB<0)expB=0;
++                int gA = (int)p[64*4 + (2 - c)];     // R@byte2,G@byte1,B@byte0 (BGRA8)
++                int gB = (int)p[192*4 + (2 - c)];
++                int eA = gA-expA; if(eA<0)eA=-eA;
++                int eB = gB-expB; if(eB<0)eB=-eB;
++                if(eA>maxErr)maxErr=eA;
++                if(eB>maxErr)maxErr=eB;
++            }
++        }
++        wgpuBufferUnmap(self->iblSelfBuf);
++        const int pass = (p && maxErr <= 2) ? 1 : 0;   // 8-bit readback: ~1 LSB rounding tolerance
++        EM_ASM({
++            window.__d3IblSelfErr = $0;
++            window.__d3Ibl = ($1 ? true : false);
++            console.info("[d3] IBL operator self-test: maxErr=" + $0 + " -> " + ($1 ? "PASS (IBL matches CPU ref)" : "FAIL/RED"));
++        }, maxErr, pass);
++    }
++
++    void runIblSelfTest() {
++        if (iblSelfDone) return;
++        if (!device || !queue) return;
++        iblSelfDone = true;
++        const float dS = 0.6f, sS = 0.8f, maxMip = 5.0f;
++        // A (dielectric): N=(0,0,1) rough .5 metal 0, V=norm(.2,.1,1), albedo=(.6,.5,.4), ao 1.
++        const float nA[3]={0.f,0.f,1.f};
++        float vA[3]={0.2f,0.1f,1.0f}; { float l=sqrtf(vA[0]*vA[0]+vA[1]*vA[1]+vA[2]*vA[2]); vA[0]/=l;vA[1]/=l;vA[2]/=l; }
++        const float albA[3]={0.6f,0.5f,0.4f};
++        // B (metal): N=norm(0,.3,.95) rough .25 metal 1, V=norm(.5,0,.86), albedo=(.55,.58,.62), ao 1.
++        float nB[3]={0.f,0.3f,0.95f}; { float l=sqrtf(nB[0]*nB[0]+nB[1]*nB[1]+nB[2]*nB[2]); nB[0]/=l;nB[1]/=l;nB[2]/=l; }
++        float vB[3]={0.5f,0.f,0.86f}; { float l=sqrtf(vB[0]*vB[0]+vB[1]*vB[1]+vB[2]*vB[2]); vB[0]/=l;vB[1]/=l;vB[2]/=l; }
++        const float albB[3]={0.55f,0.58f,0.62f};
++        ibl_cpu(nA, vA, albA, 0.5f,  0.0f, 1.0f, dS, sS, maxMip, iblExpA);
++        ibl_cpu(nB, vB, albB, 0.25f, 1.0f, 1.0f, dS, sS, maxMip, iblExpB);
++        if (!iblSelfPipeline) {
++            WGPUShaderSourceWGSL wgsl = {};
++            wgsl.chain.sType = WGPUSType_ShaderSourceWGSL;
++            wgsl.code = { kWGSL_interaction, WGPU_STRLEN };
++            WGPUShaderModuleDescriptor smd = {}; smd.nextInChain = &wgsl.chain;
++            WGPUShaderModule mod = wgpuDeviceCreateShaderModule(device, &smd);
++            WGPUBindGroupLayoutEntry ble = {};
++            ble.binding=0; ble.visibility=WGPUShaderStage_Fragment;
++            ble.buffer.type=WGPUBufferBindingType_Uniform; ble.buffer.minBindingSize=256;
++            WGPUBindGroupLayoutDescriptor bld = {}; bld.entryCount=1; bld.entries=&ble;
++            iblSelfBGL = wgpuDeviceCreateBindGroupLayout(device, &bld);
++            WGPUPipelineLayoutDescriptor pld = {}; pld.bindGroupLayoutCount=1; pld.bindGroupLayouts=&iblSelfBGL;
++            WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(device, &pld);
++            WGPURenderPipelineDescriptor rp = {};
++            rp.layout = pl;
++            rp.vertex.module = mod; rp.vertex.entryPoint = { "vs_fs_main", WGPU_STRLEN };
++            WGPUColorTargetState cts = {}; cts.format=surfaceFormat; cts.writeMask=WGPUColorWriteMask_All;
++            WGPUFragmentState fs = {}; fs.module=mod; fs.entryPoint={ "fs_ibl_selftest", WGPU_STRLEN };
++            fs.targetCount=1; fs.targets=&cts;
++            rp.fragment=&fs;
++            rp.primitive.topology=WGPUPrimitiveTopology_TriangleList;
++            rp.multisample.count=1; rp.multisample.mask=0xFFFFFFFF;
++            iblSelfPipeline = wgpuDeviceCreateRenderPipeline(device, &rp);
++            wgpuPipelineLayoutRelease(pl); wgpuShaderModuleRelease(mod);
++        }
++        if (!iblSelfPipeline) return;
++        if (!iblSelfUB) { WGPUBufferDescriptor ud = {}; ud.size=256; ud.usage=WGPUBufferUsage_Uniform|WGPUBufferUsage_CopyDst; iblSelfUB=wgpuDeviceCreateBuffer(device,&ud); }
++        float ub[64]; memset(ub,0,sizeof(ub));
++        ub[16]=nA[0];ub[17]=nA[1];ub[18]=nA[2];ub[19]=0.5f;          // A: N, rough
++        ub[20]=vA[0];ub[21]=vA[1];ub[22]=vA[2];ub[23]=0.0f;         //    V, metal
++        ub[24]=albA[0];ub[25]=albA[1];ub[26]=albA[2];ub[27]=1.0f;   //    albedo, ao
++        ub[32]=nB[0];ub[33]=nB[1];ub[34]=nB[2];ub[35]=0.25f;        // B: N, rough
++        ub[36]=vB[0];ub[37]=vB[1];ub[38]=vB[2];ub[39]=1.0f;         //    V, metal
++        ub[40]=albB[0];ub[41]=albB[1];ub[42]=albB[2];ub[43]=1.0f;   //    albedo, ao
++        ub[56]=1.0f; ub[57]=dS; ub[58]=sS; ub[59]=maxMip;           // ibl: enable, dScale, sScale, maxMip
++        ub[60]=g_capIblMutate ? 1.0f : 0.0f;                       // ibl2.x: mutation (RED) hook
++        wgpuQueueWriteBuffer(queue, iblSelfUB, 0, ub, 256);
++        if (!iblSelfBG) {
++            WGPUBindGroupEntry e = {}; e.binding=0; e.buffer=iblSelfUB; e.size=256;
++            WGPUBindGroupDescriptor bgd = {}; bgd.layout=iblSelfBGL; bgd.entryCount=1; bgd.entries=&e;
++            iblSelfBG = wgpuDeviceCreateBindGroup(device, &bgd);
++        }
++        if (!iblSelfOut) {
++            WGPUTextureDescriptor otd = {}; otd.size={256,1,1}; otd.mipLevelCount=1; otd.sampleCount=1;
++            otd.dimension=WGPUTextureDimension_2D; otd.format=surfaceFormat;
++            otd.usage=WGPUTextureUsage_RenderAttachment|WGPUTextureUsage_CopySrc;
++            iblSelfOut = wgpuDeviceCreateTexture(device,&otd);
++            iblSelfOutView = wgpuTextureCreateView(iblSelfOut, nullptr);
++            WGPUBufferDescriptor bd = {}; bd.size=256*4; bd.usage=WGPUBufferUsage_MapRead|WGPUBufferUsage_CopyDst;
++            iblSelfBuf = wgpuDeviceCreateBuffer(device,&bd);
++        }
++        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(device, nullptr);
++        WGPURenderPassColorAttachment ca = {}; ca.view=iblSelfOutView; ca.loadOp=WGPULoadOp_Clear; ca.storeOp=WGPUStoreOp_Store;
++        ca.clearValue={0,0,0,1}; ca.depthSlice=WGPU_DEPTH_SLICE_UNDEFINED;
++        WGPURenderPassDescriptor rpd = {}; rpd.colorAttachmentCount=1; rpd.colorAttachments=&ca;
++        WGPURenderPassEncoder rp2 = wgpuCommandEncoderBeginRenderPass(enc, &rpd);
++        wgpuRenderPassEncoderSetPipeline(rp2, iblSelfPipeline);
++        wgpuRenderPassEncoderSetBindGroup(rp2, 0, iblSelfBG, 0, nullptr);
++        wgpuRenderPassEncoderDraw(rp2, 3, 1, 0, 0);
++        wgpuRenderPassEncoderEnd(rp2); wgpuRenderPassEncoderRelease(rp2);
++        WGPUTexelCopyTextureInfo srcT = {}; srcT.texture=iblSelfOut;
++        WGPUTexelCopyBufferInfo dstB = {}; dstB.buffer=iblSelfBuf; dstB.layout.bytesPerRow=256*4; dstB.layout.rowsPerImage=1;
++        WGPUExtent3D ext1 = {256,1,1};
++        wgpuCommandEncoderCopyTextureToBuffer(enc, &srcT, &dstB, &ext1);
++        WGPUCommandBuffer cb = wgpuCommandEncoderFinish(enc, nullptr); wgpuCommandEncoderRelease(enc);
++        wgpuQueueSubmit(queue, 1, &cb); wgpuCommandBufferRelease(cb);
++        WGPUBufferMapCallbackInfo cbi = {};
++        cbi.mode = WGPUCallbackMode_AllowSpontaneous;
++        cbi.callback = &idRenderBackend_WebGPU::iblSelfMapCallback;
++        cbi.userdata1 = this;
++        wgpuBufferMapAsync(iblSelfBuf, WGPUMapMode_Read, 0, 256*4, cbi);
 +    }
 +
 +    // Run one self-test round: two identical passes → two readback buffers
@@ -7564,6 +7760,17 @@ index 0000000..ff7172c
 +    WGPUTextureView         pbrSelfOutView = nullptr;
 +    WGPUBindGroup           pbrSelfBG = nullptr;
 +    float                   pbrExpA[3] = {0,0,0}, pbrExpB[3] = {0,0,0};   // CPU-reference expected RGB (0..1)
++    // R-IBL operator self-test (one-shot): drive the REAL ibl_ambient + synth probe via a
++    // dedicated fullscreen pipeline (interaction module: vs_fs_main + fs_ibl_selftest) and
++    // compare two known configs to the CPU ibl_cpu reference. window.__d3Ibl / __d3IblSelfErr.
++    bool                    iblSelfDone = false;
++    WGPURenderPipeline      iblSelfPipeline = nullptr;
++    WGPUBindGroupLayout     iblSelfBGL = nullptr;
++    WGPUBuffer              iblSelfUB = nullptr, iblSelfBuf = nullptr;
++    WGPUTexture             iblSelfOut = nullptr;
++    WGPUTextureView         iblSelfOutView = nullptr;
++    WGPUBindGroup           iblSelfBG = nullptr;
++    float                   iblExpA[3] = {0,0,0}, iblExpB[3] = {0,0,0};
 +    // P4 operator self-test (one-shot): reconstruct velocity for a synthetic
 +    // VP-delta and compare to a forward-projection ground truth (window.__d3MotionBlurVelErr).
 +    bool                    mbSelfDone = false;
@@ -7640,7 +7847,7 @@ index 0000000..0f9c8e6
 +    return nullptr;
 +}
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
-index 7914093..07ac55f 100644
+index 7914093..7b735e1 100644
 --- a/neo/renderer/RenderSystem_init.cpp
 +++ b/neo/renderer/RenderSystem_init.cpp
 @@ -39,6 +39,11 @@ If you have questions concerning this license or the applicable additional terms
@@ -7655,7 +7862,7 @@ index 7914093..07ac55f 100644
  
  #include "framework/GameCallbacks_local.h"
  #include "framework/Game.h"
-@@ -102,6 +107,76 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
+@@ -102,6 +107,85 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
  
  idCVar r_skipSuppress( "r_skipSuppress", "0", CVAR_RENDERER | CVAR_BOOL, "ignore the per-view suppressions" );
  idCVar r_skipPostProcess( "r_skipPostProcess", "0", CVAR_RENDERER | CVAR_BOOL, "skip all post-process renderings" );
@@ -7723,6 +7930,15 @@ index 7914093..07ac55f 100644
 +idCVar r_pbrTestRough( "r_pbrTestRough", "0.3", CVAR_RENDERER | CVAR_FLOAT, "WebGPU PBR synthetic test: roughness (0=mirror, 1=matte)" );
 +idCVar r_pbrTestMetal( "r_pbrTestMetal", "1.0", CVAR_RENDERER | CVAR_FLOAT, "WebGPU PBR synthetic test: metallic (0=dielectric, 1=metal)" );
 +idCVar r_pbrTestAO( "r_pbrTestAO", "1.0", CVAR_RENDERER | CVAR_FLOAT, "WebGPU PBR synthetic test: ambient occlusion" );
++// R-IBL (Full PBR look): image-based lighting (diffuse irradiance + split-sum specular),
++// isPBR-scoped (only surfaces with specular_color.w>0.5, i.e. real ORM or r_pbrTest, get it;
++// legacy DOOM3 world stays near-black). The probe is SYNTHETIC/procedural for the solo Dawn
++// demo; real per-area cube probes are the content-forge join (P5). Demo: r_pbrTest 1 + r_ibl 1.
++idCVar r_ibl( "r_ibl", "0", CVAR_RENDERER | CVAR_BOOL, "WebGPU R-IBL: enable image-based lighting (diffuse irradiance + specular reflection) on isPBR surfaces. Default OFF (the look is opt-in; legacy world unaffected)" );
++idCVar r_iblDiffuseScale( "r_iblDiffuseScale", "0.4", CVAR_RENDERER | CVAR_FLOAT, "WebGPU R-IBL: diffuse-irradiance ambient scale — keep LOW so a PBR surface integrates with the near-black world rather than reading as a lit decal" );
++idCVar r_iblSpecScale( "r_iblSpecScale", "1.0", CVAR_RENDERER | CVAR_FLOAT, "WebGPU R-IBL: specular-reflection (split-sum) scale" );
++idCVar r_iblMaxMip( "r_iblMaxMip", "5", CVAR_RENDERER | CVAR_INTEGER, "WebGPU R-IBL: prefiltered-radiance mip count (roughness -> LOD)" );
++idCVar r_iblMutate( "r_iblMutate", "0", CVAR_RENDERER | CVAR_BOOL, "WebGPU R-IBL: falsifiability mutation — corrupt the IBL term (×0.5) while the self-test CPU mirror stays correct, so the operator gate goes RED. A/B / gate use only" );
 +idCVar r_skipGLDraw( "r_skipGLDraw", "0", CVAR_RENDERER | CVAR_BOOL,
 +	"skip GL draw calls (WebGPU-primary cutover; the WebGPU echo renders instead). "
 +	"Tiny views (lightgem) keep drawing so gameplay light readback works." );
@@ -7732,7 +7948,7 @@ index 7914093..07ac55f 100644
  idCVar r_skipLightScale( "r_skipLightScale", "0", CVAR_RENDERER | CVAR_BOOL, "don't do any post-interaction light scaling, makes things dim on low-dynamic range cards" );
  idCVar r_skipInteractions( "r_skipInteractions", "0", CVAR_RENDERER | CVAR_BOOL, "skip all light/surface interaction drawing" );
  idCVar r_skipDynamicTextures( "r_skipDynamicTextures", "0", CVAR_RENDERER | CVAR_BOOL, "don't dynamically create textures" );
-@@ -158,6 +233,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
+@@ -158,6 +242,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
  idCVar r_useExternalShadows( "r_useExternalShadows", "1", CVAR_RENDERER | CVAR_INTEGER, "1 = skip drawing caps when outside the light volume, 2 = force to no caps for testing", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
  idCVar r_useOptimizedShadows( "r_useOptimizedShadows", "1", CVAR_RENDERER | CVAR_BOOL, "use the dmap generated static shadow volumes" );
  idCVar r_useScissor( "r_useScissor", "1", CVAR_RENDERER | CVAR_BOOL, "scissor clip as portals and lights are processed" );
@@ -7740,7 +7956,7 @@ index 7914093..07ac55f 100644
  idCVar r_useCombinerDisplayLists( "r_useCombinerDisplayLists", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "put all nvidia register combiner programming in display lists" );
  idCVar r_useDepthBoundsTest( "r_useDepthBoundsTest", "1", CVAR_RENDERER | CVAR_BOOL, "use depth bounds test to reduce shadow fill" );
  
-@@ -819,11 +895,63 @@ void R_InitOpenGL( void ) {
+@@ -819,11 +904,63 @@ void R_InitOpenGL( void ) {
  		r_multiSamples.SetInteger( 0 );
  	}
  
@@ -7804,7 +8020,7 @@ index 7914093..07ac55f 100644
  
  #include "renderer/qgl_proc.h"
  
-@@ -910,6 +1038,18 @@ GL_CheckErrors
+@@ -910,6 +1047,18 @@ GL_CheckErrors
  ==================
  */
  void GL_CheckErrors( void ) {
@@ -7823,7 +8039,7 @@ index 7914093..07ac55f 100644
  	int		err;
  	char	s[64];
  	int		i;
-@@ -2505,6 +2645,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
+@@ -2505,6 +2654,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
  	// is destroyed (relevant when starting a mod which also recreates window)
  	Sys_ShutdownInput();
  
@@ -9394,7 +9610,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..c0bce45 100644
+index c83ebb5..1934c4c 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -9420,7 +9636,7 @@ index c83ebb5..c0bce45 100644
  
  /*
  
-@@ -38,6 +50,1171 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,1177 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -9680,6 +9896,12 @@ index c83ebb5..c0bce45 100644
 +    float    g_capPbrTestRough = 0.3f;
 +    float    g_capPbrTestMetal = 1.0f;
 +    float    g_capPbrTestAO = 1.0f;
++    // R-IBL (Full PBR look): image-based lighting params, isPBR-scoped.
++    uint32_t g_capIbl = 0;             // master enable (r_ibl)
++    float    g_capIblDiffuseScale = 0.4f;
++    float    g_capIblSpecScale = 1.0f;
++    uint32_t g_capIblMaxMip = 5;
++    uint32_t g_capIblMutate = 0;       // falsifiability mutation (r_iblMutate)
 +    uint32_t g_capInCinematic = 0;
 +    float    g_mbViewProj[16]    = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
 +    float    g_mbInvViewProj[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
@@ -10592,7 +10814,7 @@ index c83ebb5..c0bce45 100644
  
  /*
  =================
-@@ -49,6 +1226,22 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +1232,22 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -10615,7 +10837,7 @@ index c83ebb5..c0bce45 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +1271,22 @@ RB_DrawElementsWithCounters
+@@ -78,6 +1277,22 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -10638,7 +10860,7 @@ index c83ebb5..c0bce45 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1325,23 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1331,23 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -10662,7 +10884,7 @@ index c83ebb5..c0bce45 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1392,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1398,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -10670,7 +10892,7 @@ index c83ebb5..c0bce45 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1619,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1625,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -10683,7 +10905,7 @@ index c83ebb5..c0bce45 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -553,26 +1784,174 @@ Any mirrored or portaled views have already been drawn, so prepare
+@@ -553,26 +1790,180 @@ Any mirrored or portaled views have already been drawn, so prepare
  to actually render the visible surfaces for this view
  =================
  */
@@ -10809,6 +11031,12 @@ index c83ebb5..c0bce45 100644
 +		g_capPbrTestRough = r_pbrTestRough.GetFloat();
 +		g_capPbrTestMetal = r_pbrTestMetal.GetFloat();
 +		g_capPbrTestAO = r_pbrTestAO.GetFloat();
++		extern idCVar r_ibl, r_iblDiffuseScale, r_iblSpecScale, r_iblMaxMip, r_iblMutate;
++		g_capIbl = r_ibl.GetBool() ? 1u : 0u;
++		g_capIblDiffuseScale = r_iblDiffuseScale.GetFloat();
++		g_capIblSpecScale = r_iblSpecScale.GetFloat();
++		g_capIblMaxMip = (uint32_t)r_iblMaxMip.GetInteger();
++		g_capIblMutate = r_iblMutate.GetBool() ? 1u : 0u;
 +#ifdef __EMSCRIPTEN__
 +		g_capInCinematic = (uint32_t)EM_ASM_INT({ return ( window.__d3InCinematic ? 1 : 0 ); });
 +#endif
@@ -10868,7 +11096,7 @@ index c83ebb5..c0bce45 100644
  	backEnd.currentScissor = viewDef->scissor;
  
  	// ensures that depth writes are enabled for the depth clear
-@@ -897,6 +2276,26 @@ void RB_DrawView( const void *data ) {
+@@ -897,6 +2288,26 @@ void RB_DrawView( const void *data ) {
  
  	backEnd.viewDef = cmd->viewDef;
  
@@ -10897,10 +11125,10 @@ index c83ebb5..c0bce45 100644
  	backEnd.currentRenderCopied = false;
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..19761ca
+index 0000000..63b9581
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,1226 @@
+@@ -0,0 +1,1358 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -11501,6 +11729,16 @@ index 0000000..19761ca
 +"    //               volume; see the enpro warm-wash bug)\n"
 +"    params:               vec4<f32>,\n"
 +"    params2:              vec4<f32>,\n"
++"    // R-IBL (Full PBR look, P0): image-based-lighting params, isPBR-scoped.\n"
++"    //   ibl.x = enable (1 = this record is isPBR AND r_ibl is on; legacy = 0)\n"
++"    //   ibl.y = diffuse-irradiance scale (r_iblDiffuseScale, default LOW so a PBR\n"
++"    //           surface integrates with the near-black world, not a lit decal)\n"
++"    //   ibl.z = specular-reflection scale (r_iblSpecScale)\n"
++"    //   ibl.w = max mip count (roughness -> prefiltered-radiance LOD)\n"
++"    //   ibl2.x = self-test/live mutation flag (r_iblMutate; 1 = corrupt the IBL\n"
++"    //            term so the operator self-test goes RED — falsifiability hook)\n"
++"    ibl:                  vec4<f32>,\n"
++"    ibl2:                 vec4<f32>,\n"
 +"};\n"
 +"\n"
 +"@group(0) @binding(0) var<uniform> u: Uniforms;\n"
@@ -11532,6 +11770,14 @@ index 0000000..19761ca
 +"    @location(5) light_proj_uvw: vec3<f32>,   // projection cookie uv + perspective w\n"
 +"    @location(6) light_falloff_u: f32,\n"
 +"    @location(7) vertex_color:   vec4<f32>,\n"
++"    // R-IBL P0: model-space TBN basis + view vector, so the fragment shader can\n"
++"    // rotate the tangent-space normal map into the probe's space (model space ==\n"
++"    // world space for static world geometry; the world-accurate transform for\n"
++"    // moving entities is the P5 join). Only read inside the isPBR IBL branch.\n"
++"    @location(8)  m_tangent:   vec3<f32>,\n"
++"    @location(9)  m_bitangent: vec3<f32>,\n"
++"    @location(10) m_normal:    vec3<f32>,\n"
++"    @location(11) view_model:  vec3<f32>,\n"
 +"};\n"
 +"\n"
 +"@vertex\n"
@@ -11567,6 +11813,14 @@ index 0000000..19761ca
 +"    out.tex_diffuse  = in.texcoord;\n"
 +"    out.tex_specular = in.texcoord;\n"
 +"    out.vertex_color = in.color;\n"
++"\n"
++"    // R-IBL P0: pass the model-space TBN basis + the model-space view vector.\n"
++"    // (u.view_origin_tangent.xyz is the view origin in MODEL space — it's\n"
++"    // transformed to tangent space above; here we keep the model-space vector.)\n"
++"    out.m_tangent   = in.tangent;\n"
++"    out.m_bitangent = in.bitangent;\n"
++"    out.m_normal    = in.normal;\n"
++"    out.view_model  = u.view_origin_tangent.xyz - in.position;\n"
 +"    return out;\n"
 +"}\n"
 +"\n"
@@ -11600,6 +11854,62 @@ index 0000000..19761ca
 +"    return diffuse * ao + spec;\n"
 +"}\n"
 +"\n"
++"// ============================ R-IBL (Full PBR look) ============================\n"
++"// Image-based lighting: cosine-convolved diffuse-irradiance ambient + Karis\n"
++"// split-sum specular reflections, evaluated INSIDE fs_main's PBR branch and summed\n"
++"// into the float color register BEFORE the gamma/clamp store (no separate 8-bit\n"
++"// pass — direct + IBL share one clamp point). isPBR-scoped, so the legacy near-black\n"
++"// DOOM 3 world is byte-identical (ibl.x is 0 for legacy records by construction).\n"
++"//\n"
++"// SOLO PROBE: the irradiance/radiance below are SYNTHETIC + procedural (directionally\n"
++"// varying so the N-space / reflection mutations are non-vacuous). This proves the IBL\n"
++"// MATH on Dawn with no content cubes. The real per-area cube probes (sampled by N/R)\n"
++"// are the P5 content-forge join; ibl_ambient() is format-agnostic — swap synth_* for a\n"
++"// textureSampleLevel(cube,...) and the math is unchanged.\n"
++"\n"
++"// Hemispherical-gradient irradiance: warm sky (+Z, intentionally >1 in B to exercise\n"
++"// the float accumulation) fading to a dim ground (-Z). Directional by construction.\n"
++"fn synth_irradiance(N: vec3<f32>) -> vec3<f32> {\n"
++"    let t = clamp(N.z * 0.5 + 0.5, 0.0, 1.0);\n"
++"    let sky    = vec3<f32>(0.55, 0.70, 1.05);\n"
++"    let ground = vec3<f32>(0.12, 0.10, 0.09);\n"
++"    return mix(ground, sky, t);\n"
++"}\n"
++"// Single-lobe radiance: a bright directional lobe + dim fill; mip (roughness) widens\n"
++"// and dims the lobe (prefilter stand-in). Reflection-direction dependent by construction.\n"
++"fn synth_radiance(R: vec3<f32>, mip: f32) -> vec3<f32> {\n"
++"    let lobe  = normalize(vec3<f32>(0.30, 0.40, 0.85));\n"
++"    let sharp = max(64.0 / (mip + 1.0), 1.0);\n"
++"    let hi    = pow(max(dot(normalize(R), lobe), 0.0), sharp);\n"
++"    let fill  = vec3<f32>(0.10, 0.12, 0.16);\n"
++"    return fill + vec3<f32>(1.40, 1.25, 0.95) * hi;\n"
++"}\n"
++"// Karis 2013 mobile analytic env-BRDF (no LUT): returns (scale, bias) applied to F0.\n"
++"fn env_brdf_approx(roughness: f32, NoV: f32) -> vec2<f32> {\n"
++"    let c0 = vec4<f32>(-1.0, -0.0275, -0.572, 0.022);\n"
++"    let c1 = vec4<f32>( 1.0,  0.0425,  1.04, -0.04);\n"
++"    let r  = roughness * c0 + c1;\n"
++"    let a004 = min(r.x * r.x, exp2(-9.28 * NoV)) * r.x + r.y;\n"
++"    return vec2<f32>(-1.04, 1.04) * a004 + r.zw;\n"
++"}\n"
++"// Combined diffuse + specular IBL ambient (float, pre-clamp). irr/pref come from the\n"
++"// probe (synthetic now; cube at P5). dScale/sScale are the per-record intensity knobs.\n"
++"fn ibl_ambient(N: vec3<f32>, V: vec3<f32>, R: vec3<f32>, albedo: vec3<f32>,\n"
++"               roughness: f32, metallic: f32, ao: f32,\n"
++"               irr: vec3<f32>, pref: vec3<f32>, dScale: f32, sScale: f32) -> vec3<f32> {\n"
++"    let NoV = max(dot(N, V), 1e-4);\n"
++"    let F0  = mix(vec3<f32>(0.04), albedo, metallic);\n"
++"    // roughness-aware Fresnel (Lagarde) so rough dielectrics don't over-reflect at grazing\n"
++"    let F_rough = F0 + (max(vec3<f32>(1.0 - roughness), F0) - F0) * pow(1.0 - NoV, 5.0);\n"
++"    let kd = (vec3<f32>(1.0) - F_rough) * (1.0 - metallic);\n"
++"    let diffuseIBL = irr * albedo * ao * kd * dScale;\n"
++"    let sb = env_brdf_approx(roughness, NoV);\n"
++"    var horizon = clamp(1.0 + dot(R, N), 0.0, 1.0);   // suppress below-surface leak\n"
++"    horizon = horizon * horizon;\n"
++"    let specIBL = pref * (F0 * sb.x + sb.y) * ao * horizon * sScale;\n"
++"    return diffuseIBL + specIBL;\n"
++"}\n"
++"\n"
 +"// R-PBR P0 operator gate: a fullscreen self-test that drives the REAL pbr_direct with\n"
 +"// two known configs (left half = dielectric/diffuse-dominant; right half = metal/spec)\n"
 +"// packed in the uniforms, so a CPU reference can byte-compare. vs_fs_main = the same\n"
@@ -11630,6 +11940,34 @@ index 0000000..19761ca
 +"    }\n"
 +"    let brdf = pbr_direct(normalize(N), normalize(L), normalize(V), albedo, rough, metal, ao);\n"
 +"    return vec4<f32>(brdf, 1.0);\n"
++"}\n"
++"\n"
++"// R-IBL operator gate: drives the REAL ibl_ambient + synth probe with two known configs\n"
++"// (left = dielectric, right = metal) packed in the uniforms, so a CPU mirror byte-compares.\n"
++"// Config A (fc.x<128): N/rough=light_origin_tangent, V/metal=view_origin_tangent, albedo/ao=diffuse_color.\n"
++"// Config B: N/rough=light_proj_s, V/metal=light_proj_t, albedo/ao=light_proj_q. ibl.{y,z,w}=dScale,sScale,maxMip.\n"
++"@fragment\n"
++"fn fs_ibl_selftest(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {\n"
++"    var N: vec3<f32>; var V: vec3<f32>; var albedo: vec3<f32>;\n"
++"    var rough: f32; var metal: f32; var ao: f32;\n"
++"    if (fc.x < 128.0) {\n"
++"        N = u.light_origin_tangent.xyz; rough = u.light_origin_tangent.w;\n"
++"        V = u.view_origin_tangent.xyz;  metal = u.view_origin_tangent.w;\n"
++"        albedo = u.diffuse_color.xyz;   ao = u.diffuse_color.w;\n"
++"    } else {\n"
++"        N = u.light_proj_s.xyz; rough = u.light_proj_s.w;\n"
++"        V = u.light_proj_t.xyz; metal = u.light_proj_t.w;\n"
++"        albedo = u.light_proj_q.xyz; ao = u.light_proj_q.w;\n"
++"    }\n"
++"    let Nn = normalize(N);\n"
++"    let Vn = normalize(V);\n"
++"    let R  = reflect(-Vn, Nn);\n"
++"    let maxMip = max(u.ibl.w, 1.0);\n"
++"    let irr  = synth_irradiance(Nn);\n"
++"    let pref = synth_radiance(R, rough * (maxMip - 1.0));\n"
++"    var term = ibl_ambient(Nn, Vn, R, albedo, rough, metal, ao, irr, pref, u.ibl.y, u.ibl.z);\n"
++"    if (u.ibl2.x > 0.5) { term = term * 0.5; }   // falsifiability mutation (CPU mirror stays correct -> RED)\n"
++"    return vec4<f32>(term, 1.0);\n"
 +"}\n"
 +"\n"
 +"@fragment\n"
@@ -11730,6 +12068,7 @@ index 0000000..19761ca
 +"    // specular_color.w is a per-record uniform -> uniform control flow -> the branch +\n"
 +"    // the textureSample inside the else are legal.\n"
 +"    var brdfTerm: vec3<f32>;\n"
++"    var iblTerm = vec3<f32>(0.0);\n"
 +"    if (u.specular_color.w > 0.5) {\n"
 +"        // ORM from the LINEAR specular map (R=AO,G=rough,B=metal); OR, for the\n"
 +"        // r_pbrTest synthetic material (w==2), constant rough/metal/ao packed in\n"
@@ -11739,6 +12078,23 @@ index 0000000..19761ca
 +"            rough = u.specular_color.x; metal = u.specular_color.y; aov = u.specular_color.z;\n"
 +"        }\n"
 +"        brdfTerm = pbr_direct(N, L, V, diffuse, rough, metal, aov);\n"
++"        // R-IBL (isPBR-only): rotate the tangent-space normal map into the probe's\n"
++"        // (model) space via the model-space TBN, derive the model-space view +\n"
++"        // reflection vectors, sample the (synthetic) probe, accumulate ambient.\n"
++"        if (u.ibl.x > 0.5) {\n"
++"            let TBNm = mat3x3<f32>(normalize(in.m_tangent),\n"
++"                                   normalize(in.m_bitangent),\n"
++"                                   normalize(in.m_normal));\n"
++"            let N_ibl = normalize(TBNm * N);\n"
++"            let V_ibl = normalize(in.view_model);\n"
++"            let R_ibl = reflect(-V_ibl, N_ibl);\n"
++"            let maxMip = max(u.ibl.w, 1.0);\n"
++"            let irr  = synth_irradiance(N_ibl);\n"
++"            let pref = synth_radiance(R_ibl, rough * (maxMip - 1.0));\n"
++"            iblTerm = ibl_ambient(N_ibl, V_ibl, R_ibl, diffuse, rough, metal, aov,\n"
++"                                  irr, pref, u.ibl.y, u.ibl.z);\n"
++"            if (u.ibl2.x > 0.5) { iblTerm = iblTerm * 0.5; }   // falsifiability mutation\n"
++"        }\n"
 +"    } else {\n"
 +"        let spec = tspec * u.specular_color.rgb;\n"
 +"        // Specular falloff, two modes (iter 29):\n"
@@ -11756,6 +12112,10 @@ index 0000000..19761ca
 +"                * NdotL\n"
 +"                * light_proj_color\n"
 +"                * light_falloff;\n"
++"    // R-IBL: ambient irradiance + specular reflection, added in float registers\n"
++"    // BEFORE the gamma/clamp store so direct + IBL share one 8-bit clamp point\n"
++"    // (no inter-pass re-quantize). Zero for legacy (ibl.x==0) -> OFF-identity.\n"
++"    color = color + iblTerm;\n"
 +"\n"
 +"    // Vertex color, engine-style: vc' = vc * modulate + add. SVC_IGNORE is\n"
 +"    // (0, 1) → multiply by 1; SVC_MODULATE (1, 0); SVC_INVERSE (-1, 1).\n"

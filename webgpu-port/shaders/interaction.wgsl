@@ -53,6 +53,16 @@ struct Uniforms {
     //               volume; see the enpro warm-wash bug)
     params:               vec4<f32>,
     params2:              vec4<f32>,
+    // R-IBL (Full PBR look, P0): image-based-lighting params, isPBR-scoped.
+    //   ibl.x = enable (1 = this record is isPBR AND r_ibl is on; legacy = 0)
+    //   ibl.y = diffuse-irradiance scale (r_iblDiffuseScale, default LOW so a PBR
+    //           surface integrates with the near-black world, not a lit decal)
+    //   ibl.z = specular-reflection scale (r_iblSpecScale)
+    //   ibl.w = max mip count (roughness -> prefiltered-radiance LOD)
+    //   ibl2.x = self-test/live mutation flag (r_iblMutate; 1 = corrupt the IBL
+    //            term so the operator self-test goes RED — falsifiability hook)
+    ibl:                  vec4<f32>,
+    ibl2:                 vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -84,6 +94,14 @@ struct VSOut {
     @location(5) light_proj_uvw: vec3<f32>,   // projection cookie uv + perspective w
     @location(6) light_falloff_u: f32,
     @location(7) vertex_color:   vec4<f32>,
+    // R-IBL P0: model-space TBN basis + view vector, so the fragment shader can
+    // rotate the tangent-space normal map into the probe's space (model space ==
+    // world space for static world geometry; the world-accurate transform for
+    // moving entities is the P5 join). Only read inside the isPBR IBL branch.
+    @location(8)  m_tangent:   vec3<f32>,
+    @location(9)  m_bitangent: vec3<f32>,
+    @location(10) m_normal:    vec3<f32>,
+    @location(11) view_model:  vec3<f32>,
 };
 
 @vertex
@@ -119,6 +137,14 @@ fn vs_main(in: VSIn) -> VSOut {
     out.tex_diffuse  = in.texcoord;
     out.tex_specular = in.texcoord;
     out.vertex_color = in.color;
+
+    // R-IBL P0: pass the model-space TBN basis + the model-space view vector.
+    // (u.view_origin_tangent.xyz is the view origin in MODEL space — it's
+    // transformed to tangent space above; here we keep the model-space vector.)
+    out.m_tangent   = in.tangent;
+    out.m_bitangent = in.bitangent;
+    out.m_normal    = in.normal;
+    out.view_model  = u.view_origin_tangent.xyz - in.position;
     return out;
 }
 
@@ -152,6 +178,62 @@ fn pbr_direct(N: vec3<f32>, L: vec3<f32>, V: vec3<f32>, albedo: vec3<f32>,
     return diffuse * ao + spec;
 }
 
+// ============================ R-IBL (Full PBR look) ============================
+// Image-based lighting: cosine-convolved diffuse-irradiance ambient + Karis
+// split-sum specular reflections, evaluated INSIDE fs_main's PBR branch and summed
+// into the float color register BEFORE the gamma/clamp store (no separate 8-bit
+// pass — direct + IBL share one clamp point). isPBR-scoped, so the legacy near-black
+// DOOM 3 world is byte-identical (ibl.x is 0 for legacy records by construction).
+//
+// SOLO PROBE: the irradiance/radiance below are SYNTHETIC + procedural (directionally
+// varying so the N-space / reflection mutations are non-vacuous). This proves the IBL
+// MATH on Dawn with no content cubes. The real per-area cube probes (sampled by N/R)
+// are the P5 content-forge join; ibl_ambient() is format-agnostic — swap synth_* for a
+// textureSampleLevel(cube,...) and the math is unchanged.
+
+// Hemispherical-gradient irradiance: warm sky (+Z, intentionally >1 in B to exercise
+// the float accumulation) fading to a dim ground (-Z). Directional by construction.
+fn synth_irradiance(N: vec3<f32>) -> vec3<f32> {
+    let t = clamp(N.z * 0.5 + 0.5, 0.0, 1.0);
+    let sky    = vec3<f32>(0.55, 0.70, 1.05);
+    let ground = vec3<f32>(0.12, 0.10, 0.09);
+    return mix(ground, sky, t);
+}
+// Single-lobe radiance: a bright directional lobe + dim fill; mip (roughness) widens
+// and dims the lobe (prefilter stand-in). Reflection-direction dependent by construction.
+fn synth_radiance(R: vec3<f32>, mip: f32) -> vec3<f32> {
+    let lobe  = normalize(vec3<f32>(0.30, 0.40, 0.85));
+    let sharp = max(64.0 / (mip + 1.0), 1.0);
+    let hi    = pow(max(dot(normalize(R), lobe), 0.0), sharp);
+    let fill  = vec3<f32>(0.10, 0.12, 0.16);
+    return fill + vec3<f32>(1.40, 1.25, 0.95) * hi;
+}
+// Karis 2013 mobile analytic env-BRDF (no LUT): returns (scale, bias) applied to F0.
+fn env_brdf_approx(roughness: f32, NoV: f32) -> vec2<f32> {
+    let c0 = vec4<f32>(-1.0, -0.0275, -0.572, 0.022);
+    let c1 = vec4<f32>( 1.0,  0.0425,  1.04, -0.04);
+    let r  = roughness * c0 + c1;
+    let a004 = min(r.x * r.x, exp2(-9.28 * NoV)) * r.x + r.y;
+    return vec2<f32>(-1.04, 1.04) * a004 + r.zw;
+}
+// Combined diffuse + specular IBL ambient (float, pre-clamp). irr/pref come from the
+// probe (synthetic now; cube at P5). dScale/sScale are the per-record intensity knobs.
+fn ibl_ambient(N: vec3<f32>, V: vec3<f32>, R: vec3<f32>, albedo: vec3<f32>,
+               roughness: f32, metallic: f32, ao: f32,
+               irr: vec3<f32>, pref: vec3<f32>, dScale: f32, sScale: f32) -> vec3<f32> {
+    let NoV = max(dot(N, V), 1e-4);
+    let F0  = mix(vec3<f32>(0.04), albedo, metallic);
+    // roughness-aware Fresnel (Lagarde) so rough dielectrics don't over-reflect at grazing
+    let F_rough = F0 + (max(vec3<f32>(1.0 - roughness), F0) - F0) * pow(1.0 - NoV, 5.0);
+    let kd = (vec3<f32>(1.0) - F_rough) * (1.0 - metallic);
+    let diffuseIBL = irr * albedo * ao * kd * dScale;
+    let sb = env_brdf_approx(roughness, NoV);
+    var horizon = clamp(1.0 + dot(R, N), 0.0, 1.0);   // suppress below-surface leak
+    horizon = horizon * horizon;
+    let specIBL = pref * (F0 * sb.x + sb.y) * ao * horizon * sScale;
+    return diffuseIBL + specIBL;
+}
+
 // R-PBR P0 operator gate: a fullscreen self-test that drives the REAL pbr_direct with
 // two known configs (left half = dielectric/diffuse-dominant; right half = metal/spec)
 // packed in the uniforms, so a CPU reference can byte-compare. vs_fs_main = the same
@@ -182,6 +264,34 @@ fn fs_pbr_selftest(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
     }
     let brdf = pbr_direct(normalize(N), normalize(L), normalize(V), albedo, rough, metal, ao);
     return vec4<f32>(brdf, 1.0);
+}
+
+// R-IBL operator gate: drives the REAL ibl_ambient + synth probe with two known configs
+// (left = dielectric, right = metal) packed in the uniforms, so a CPU mirror byte-compares.
+// Config A (fc.x<128): N/rough=light_origin_tangent, V/metal=view_origin_tangent, albedo/ao=diffuse_color.
+// Config B: N/rough=light_proj_s, V/metal=light_proj_t, albedo/ao=light_proj_q. ibl.{y,z,w}=dScale,sScale,maxMip.
+@fragment
+fn fs_ibl_selftest(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
+    var N: vec3<f32>; var V: vec3<f32>; var albedo: vec3<f32>;
+    var rough: f32; var metal: f32; var ao: f32;
+    if (fc.x < 128.0) {
+        N = u.light_origin_tangent.xyz; rough = u.light_origin_tangent.w;
+        V = u.view_origin_tangent.xyz;  metal = u.view_origin_tangent.w;
+        albedo = u.diffuse_color.xyz;   ao = u.diffuse_color.w;
+    } else {
+        N = u.light_proj_s.xyz; rough = u.light_proj_s.w;
+        V = u.light_proj_t.xyz; metal = u.light_proj_t.w;
+        albedo = u.light_proj_q.xyz; ao = u.light_proj_q.w;
+    }
+    let Nn = normalize(N);
+    let Vn = normalize(V);
+    let R  = reflect(-Vn, Nn);
+    let maxMip = max(u.ibl.w, 1.0);
+    let irr  = synth_irradiance(Nn);
+    let pref = synth_radiance(R, rough * (maxMip - 1.0));
+    var term = ibl_ambient(Nn, Vn, R, albedo, rough, metal, ao, irr, pref, u.ibl.y, u.ibl.z);
+    if (u.ibl2.x > 0.5) { term = term * 0.5; }   // falsifiability mutation (CPU mirror stays correct -> RED)
+    return vec4<f32>(term, 1.0);
 }
 
 @fragment
@@ -282,6 +392,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     // specular_color.w is a per-record uniform -> uniform control flow -> the branch +
     // the textureSample inside the else are legal.
     var brdfTerm: vec3<f32>;
+    var iblTerm = vec3<f32>(0.0);
     if (u.specular_color.w > 0.5) {
         // ORM from the LINEAR specular map (R=AO,G=rough,B=metal); OR, for the
         // r_pbrTest synthetic material (w==2), constant rough/metal/ao packed in
@@ -291,6 +402,23 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             rough = u.specular_color.x; metal = u.specular_color.y; aov = u.specular_color.z;
         }
         brdfTerm = pbr_direct(N, L, V, diffuse, rough, metal, aov);
+        // R-IBL (isPBR-only): rotate the tangent-space normal map into the probe's
+        // (model) space via the model-space TBN, derive the model-space view +
+        // reflection vectors, sample the (synthetic) probe, accumulate ambient.
+        if (u.ibl.x > 0.5) {
+            let TBNm = mat3x3<f32>(normalize(in.m_tangent),
+                                   normalize(in.m_bitangent),
+                                   normalize(in.m_normal));
+            let N_ibl = normalize(TBNm * N);
+            let V_ibl = normalize(in.view_model);
+            let R_ibl = reflect(-V_ibl, N_ibl);
+            let maxMip = max(u.ibl.w, 1.0);
+            let irr  = synth_irradiance(N_ibl);
+            let pref = synth_radiance(R_ibl, rough * (maxMip - 1.0));
+            iblTerm = ibl_ambient(N_ibl, V_ibl, R_ibl, diffuse, rough, metal, aov,
+                                  irr, pref, u.ibl.y, u.ibl.z);
+            if (u.ibl2.x > 0.5) { iblTerm = iblTerm * 0.5; }   // falsifiability mutation
+        }
     } else {
         let spec = tspec * u.specular_color.rgb;
         // Specular falloff, two modes (iter 29):
@@ -308,6 +436,10 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 * NdotL
                 * light_proj_color
                 * light_falloff;
+    // R-IBL: ambient irradiance + specular reflection, added in float registers
+    // BEFORE the gamma/clamp store so direct + IBL share one 8-bit clamp point
+    // (no inter-pass re-quantize). Zero for legacy (ibl.x==0) -> OFF-identity.
+    color = color + iblTerm;
 
     // Vertex color, engine-style: vc' = vc * modulate + add. SVC_IGNORE is
     // (0, 1) → multiply by 1; SVC_MODULATE (1, 0); SVC_INVERSE (-1, 1).
