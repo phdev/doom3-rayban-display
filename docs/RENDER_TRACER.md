@@ -13,16 +13,28 @@ observing the muzzle-flash light the game already spawns on fire.
   (`LIGHTID_VIEW_MUZZLE_FLASH` + player entnum; map lights leave `lightId` 0). When seen in the
   big 3D view, stash `g_capMuzzleFired = 1` + the muzzle **world origin** (the light origin) + an
   **aim point** ahead along the view forward (`origin + viewaxis[0]*512`).
-- **Draw (backend, `RenderBackend_WebGPU.cpp`):** project both world points to screen UV via
-  `g_lastProjMatrix * g_lastViewMatrix`, then draw an **additive screen-space streak** between
-  them — a bufferless fullscreen pass (`bloom.wgsl` `fs_tracer`: distance-to-segment glow, warm
-  color, fades toward the muzzle). Reuses the bloom scaffold (`bloomBGL` + `vs_main` + a 32-byte
-  UB + a dummy texture binding) and `makeBloom("fs_tracer", additive=true)`. A **color-only**
-  pass (the bloom pipelines carry no depth-stencil), drawn after the 3D pass, before
-  bloom/tonemap + the GUI (`tracerActive` is folded into `splitGUI`, so the streak stays under
-  the HUD).
+- **Draw (backend, `RenderBackend_WebGPU.cpp`):** the aim point is projected to screen UV via
+  `g_lastProjMatrix * g_lastViewMatrix` (the streak END), then an **additive screen-space streak**
+  is drawn from the **gun barrel** to the aim — a bufferless fullscreen pass (`bloom.wgsl`
+  `fs_tracer`). Reuses the bloom scaffold (`bloomBGL` + `vs_main` + a 32-byte UB + a dummy texture
+  binding) and `makeBloom("fs_tracer", additive=true)`. A **color-only** pass (the bloom pipelines
+  carry no depth-stencil), drawn after the 3D pass, before bloom/tonemap + the GUI (`tracerActive`
+  is folded into `splitGUI`, so the streak stays under the HUD).
+- **The START is the VISIBLE GUN BARREL, not the projected 3D muzzle (2026-06-24 fix).** The gun
+  fires straight ahead, so the 3D muzzle world point projects to ~**screen-center** — anchoring the
+  streak there read as *"originating at the center of the player"* (user report). The gun MODEL,
+  though, sits **lower-right**. So the START is now a fixed screen-UV anchor at the barrel
+  (`r_tracerStartU`/`r_tracerStartV`, default `0.63, 0.74`) and the END stays the projected aim
+  point — a diagonal **barrel→target** streak that reads as coming from the gun. (The old
+  `r_tracerLength` muzzle-extension knob is retired; the barrel anchor replaces it.)
+- **The streak now has a tapered hot core, not a flat line (2026-06-24 fix).** `fs_tracer` is a
+  perspective-tapered streak — **wide at the near barrel, narrowing toward the far target** — with a
+  warm outer glow + a near-white **hot core** down the center, so it reads as a tracer round rather
+  than *"just a line"* (user report).
 - **Cvars:** `r_tracers` (default 1; 0 / `?notracers` = off), `r_tracerIntensity` (1.6),
-  `r_tracerWidth` (0.0045 UV half-width).
+  `r_tracerWidth` (0.0045 UV half-width, the width at the barrel end), `r_tracerStartU` (0.63),
+  `r_tracerStartV` (0.74). The barrel anchor is on the fx panel (`barrel X` / `barrel Y`) so it can
+  be calibrated on-device per weapon/FOV.
 
 ## Determinism + mobile
 

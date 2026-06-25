@@ -430,8 +430,10 @@ function wireFxPanel() {
     // above so the per-fragment gamma doesn't double-shape; exposure is the knob.
     { label: "tonemap",      cvar: "r_tonemap",          min: 0, max: 1,   step: 1,    value: 0 },
     { label: "tm exposure",  cvar: "r_tonemapExposure",  min: 0.3, max: 2, step: 0.05, value: 1.0 },
-    // R-TRACER: bullet-tracer streak — length (1.0 = from the barrel, short) + width.
-    { label: "tracer len",   cvar: "r_tracerLength",     min: 1, max: 4,   step: 0.1,  value: 1.2 },
+    // R-TRACER: bullet-tracer streak — anchor the START at the visible gun barrel
+    // (lower-right) so it reads as coming from the gun, not screen-center; + width.
+    { label: "barrel X",     cvar: "r_tracerStartU",     min: 0.40, max: 0.85, step: 0.01, value: 0.63 },
+    { label: "barrel Y",     cvar: "r_tracerStartV",     min: 0.55, max: 0.95, step: 0.01, value: 0.74 },
     { label: "tracer wide",  cvar: "r_tracerWidth",      min: 0.002, max: 0.03, step: 0.001, value: 0.0045 },
     // R-PBR P0: synthetic test material (every surface = a chosen metal/roughness),
     // so the GGX look is visible before content's ORM assets land.
@@ -562,6 +564,7 @@ try {
   let frames = 0;
   let last = performance.now();
   let loadingHiddenByRender = false;
+  let renderSeenAt = 0;
   const tick = () => {
     frames++;
     // Dismiss the loading overlay the instant the engine renders a real game
@@ -577,8 +580,25 @@ try {
     if (!loadingHiddenByRender &&
         ((typeof window.__d3ViewPos === "string" && window.__d3ViewPos) ||
          typeof window.__d3ShadowVols === "number")) {
-      loadingHiddenByRender = true;
-      setLoadingVisible(false);
+      // The first rendered frames are WASHED OUT — most GPU textures are still
+      // the white fallback until the background pre-warm sweep (iter-132,
+      // wearable/phone only) creates them, which on the slow phone GPU takes a
+      // few seconds (this is the "washed-out / blurry" boot the user caught on
+      // iPhone). Hold the overlay over the canvas until the scene has actually
+      // textured so the player never sees that transient. Desktop has no
+      // pre-warm sweep (image_preload 1) so __d3PreloadTotal stays undefined and
+      // it hides immediately, as before. Hard 7s cap so a stalled/partial sweep
+      // can never strand the overlay.
+      const nowMs = performance.now();
+      if (renderSeenAt === 0) renderSeenAt = nowMs;
+      const total = window.__d3PreloadTotal, warm = window.__d3PreloadWarm;
+      const prewarming = typeof total === "number" && total > 0;
+      const textured = !prewarming ||
+        (typeof warm === "number" && warm / total >= 0.85);
+      if (textured || nowMs - renderSeenAt > 7000) {
+        loadingHiddenByRender = true;
+        setLoadingVisible(false);
+      }
     }
     const now = performance.now();
     if (now - last >= 2000) {

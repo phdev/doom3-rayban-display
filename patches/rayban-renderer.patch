@@ -1982,10 +1982,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..edddd6a
+index 0000000..ff7172c
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,5620 @@
+@@ -0,0 +1,5621 @@
 +/*
 +================================================================================
 +
@@ -2208,6 +2208,8 @@ index 0000000..edddd6a
 +extern "C" float    g_capTracerIntensity;
 +extern "C" float    g_capTracerWidth;
 +extern "C" float    g_capTracerLength;
++extern "C" float    g_capTracerStartU;     // screen-UV of the visible gun barrel (streak START — lower-right)
++extern "C" float    g_capTracerStartV;
 +extern "C" uint32_t g_capMuzzleFired;      // set this frame when a view muzzle-flash light is captured
 +extern "C" float    g_capMuzzleUV[4];      // muzzle + aim points projected to screen UV at capture
 +extern "C" uint32_t g_capInCinematic;
@@ -5927,24 +5929,23 @@ index 0000000..edddd6a
 +            // matrices -> byte-identical), so __d3WgpuDet stays IDENTICAL with the tracer on.
 +            if (tracerActive) {
 +                {
-+                    // g_capMuzzleUV was projected at CAPTURE in the main view (draw_arb2) —
-+                    // use it directly (the backend's g_lastViewMatrix can be the lightgem's).
-+                    // The true muzzle->aim screen segment is SHORT (a forward tracer
-+                    // foreshortens to ~0.12 UV, ending at the vanishing point), so it reads
-+                    // as a stub. Extend the muzzle end AWAY from the aim so the streak is a
-+                    // clear line from the gun down low up to the target (the aim end stays
-+                    // pinned on the enemy/crosshair).
-+                    const float aU = g_capMuzzleUV[2], aV = g_capMuzzleUV[3];
-+                    const float kLen = (g_capTracerLength > 0.01f) ? g_capTracerLength : 1.0f;
-+                    const float exU = aU + (g_capMuzzleUV[0] - aU) * kLen;
-+                    const float exV = aV + (g_capMuzzleUV[1] - aV) * kLen;
-+                    float ub[8] = { exU, exV, aU, aV,
++                    // START at the visible gun BARREL (lower-right of screen), NOT the 3D
++                    // muzzle: the gun fires straight ahead, so the muzzle world point projects
++                    // to ~screen-center (g_capMuzzleUV[0,1]) — which read as "originating at
++                    // the center of the player." The gun MODEL sits lower-right; anchor the
++                    // streak there (r_tracerStartU/V). END at the projected aim point
++                    // (g_capMuzzleUV[2,3], ~where the bullet goes), giving a diagonal
++                    // barrel->target streak. g_capMuzzleUV is projected at CAPTURE (draw_arb2)
++                    // in the main view (the backend's g_lastViewMatrix can be the lightgem's).
++                    const float aU = g_capTracerStartU, aV = g_capTracerStartV;   // barrel (start, t=0)
++                    const float bU = g_capMuzzleUV[2],  bV = g_capMuzzleUV[3];     // aim    (end,   t=1)
++                    float ub[8] = { aU, aV, bU, bV,
 +                                    g_capTracerIntensity, g_capTracerWidth, 2.0f, 0.0f };
 +                    wgpuQueueWriteBuffer(queue, tracerUB, 0, ub, 32);
-+                    // debug (live surface only): publish the streak endpoints in UV.
++                    // debug (live surface only): publish barrel-start -> aim-end in UV.
 +                    if (colorTex && colorTex != detTexA && colorTex != detTexB) {
 +                        EM_ASM_({ window.__d3TracerUV = $0.toFixed(3)+','+$1.toFixed(3)+' -> '+$2.toFixed(3)+','+$3.toFixed(3); },
-+                                g_capMuzzleUV[0], g_capMuzzleUV[1], g_capMuzzleUV[2], g_capMuzzleUV[3]);
++                                aU, aV, bU, bV);
 +                    }
 +                    if (!tracerBG && fbWhiteView) {
 +                        WGPUBindGroupEntry e[3] = {};
@@ -7639,7 +7640,7 @@ index 0000000..0f9c8e6
 +    return nullptr;
 +}
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
-index 7914093..9e930c3 100644
+index 7914093..07ac55f 100644
 --- a/neo/renderer/RenderSystem_init.cpp
 +++ b/neo/renderer/RenderSystem_init.cpp
 @@ -39,6 +39,11 @@ If you have questions concerning this license or the applicable additional terms
@@ -7654,7 +7655,7 @@ index 7914093..9e930c3 100644
  
  #include "framework/GameCallbacks_local.h"
  #include "framework/Game.h"
-@@ -102,6 +107,74 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
+@@ -102,6 +107,76 @@ idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel
  
  idCVar r_skipSuppress( "r_skipSuppress", "0", CVAR_RENDERER | CVAR_BOOL, "ignore the per-view suppressions" );
  idCVar r_skipPostProcess( "r_skipPostProcess", "0", CVAR_RENDERER | CVAR_BOOL, "skip all post-process renderings" );
@@ -7714,6 +7715,8 @@ index 7914093..9e930c3 100644
 +idCVar r_tracerIntensity( "r_tracerIntensity", "1.6", CVAR_RENDERER | CVAR_FLOAT, "WebGPU R-TRACER: additive streak brightness" );
 +idCVar r_tracerWidth( "r_tracerWidth", "0.0045", CVAR_RENDERER | CVAR_FLOAT, "WebGPU R-TRACER: streak half-width in screen-UV units" );
 +idCVar r_tracerLength( "r_tracerLength", "1.2", CVAR_RENDERER | CVAR_FLOAT, "WebGPU R-TRACER: streak length multiplier — 1.0 = the true (short, foreshortened) muzzle->aim segment starting at the barrel; higher extends the muzzle end downward (longer, but moves the start below the barrel)" );
++idCVar r_tracerStartU( "r_tracerStartU", "0.63", CVAR_RENDERER | CVAR_FLOAT | CVAR_ARCHIVE, "WebGPU R-TRACER: screen-UV U of the visible gun barrel (the streak START). The 3D muzzle projects to screen-center (gun fires straight ahead), but the gun MODEL sits lower-right — anchor the streak there so it reads as coming from the barrel. 0=left,1=right" );
++idCVar r_tracerStartV( "r_tracerStartV", "0.74", CVAR_RENDERER | CVAR_FLOAT | CVAR_ARCHIVE, "WebGPU R-TRACER: screen-UV V of the visible gun barrel (the streak START). 0=top,1=bottom (lower-right gun = ~0.74)" );
 +idCVar r_pbr( "r_pbr", "1", CVAR_RENDERER | CVAR_BOOL, "WebGPU: enable metallic-roughness PBR (GGX) for ORM materials flagged isPBR in specular_color.w" );
 +idCVar r_pbrForce( "r_pbrForce", "0", CVAR_RENDERER | CVAR_BOOL, "WebGPU PBR: FORCE isPBR on every interaction (A/B test — reinterprets the specular map as ORM; 0 = only real isPBR materials)" );
 +idCVar r_pbrTest( "r_pbrTest", "0", CVAR_RENDERER | CVAR_BOOL, "WebGPU PBR: SYNTHETIC test material — render every surface as correct PBR using constant roughness/metallic/ao (r_pbrTest*) over the real diffuse, so the GGX look is visibly demonstrable before content's ORM GLB lands" );
@@ -7729,7 +7732,7 @@ index 7914093..9e930c3 100644
  idCVar r_skipLightScale( "r_skipLightScale", "0", CVAR_RENDERER | CVAR_BOOL, "don't do any post-interaction light scaling, makes things dim on low-dynamic range cards" );
  idCVar r_skipInteractions( "r_skipInteractions", "0", CVAR_RENDERER | CVAR_BOOL, "skip all light/surface interaction drawing" );
  idCVar r_skipDynamicTextures( "r_skipDynamicTextures", "0", CVAR_RENDERER | CVAR_BOOL, "don't dynamically create textures" );
-@@ -158,6 +231,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
+@@ -158,6 +233,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
  idCVar r_useExternalShadows( "r_useExternalShadows", "1", CVAR_RENDERER | CVAR_INTEGER, "1 = skip drawing caps when outside the light volume, 2 = force to no caps for testing", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
  idCVar r_useOptimizedShadows( "r_useOptimizedShadows", "1", CVAR_RENDERER | CVAR_BOOL, "use the dmap generated static shadow volumes" );
  idCVar r_useScissor( "r_useScissor", "1", CVAR_RENDERER | CVAR_BOOL, "scissor clip as portals and lights are processed" );
@@ -7737,7 +7740,7 @@ index 7914093..9e930c3 100644
  idCVar r_useCombinerDisplayLists( "r_useCombinerDisplayLists", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "put all nvidia register combiner programming in display lists" );
  idCVar r_useDepthBoundsTest( "r_useDepthBoundsTest", "1", CVAR_RENDERER | CVAR_BOOL, "use depth bounds test to reduce shadow fill" );
  
-@@ -819,11 +893,63 @@ void R_InitOpenGL( void ) {
+@@ -819,11 +895,63 @@ void R_InitOpenGL( void ) {
  		r_multiSamples.SetInteger( 0 );
  	}
  
@@ -7801,7 +7804,7 @@ index 7914093..9e930c3 100644
  
  #include "renderer/qgl_proc.h"
  
-@@ -910,6 +1036,18 @@ GL_CheckErrors
+@@ -910,6 +1038,18 @@ GL_CheckErrors
  ==================
  */
  void GL_CheckErrors( void ) {
@@ -7820,7 +7823,7 @@ index 7914093..9e930c3 100644
  	int		err;
  	char	s[64];
  	int		i;
-@@ -2505,6 +2643,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
+@@ -2505,6 +2645,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
  	// is destroyed (relevant when starting a mod which also recreates window)
  	Sys_ShutdownInput();
  
@@ -9391,7 +9394,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..527eac8 100644
+index c83ebb5..c0bce45 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -9417,7 +9420,7 @@ index c83ebb5..527eac8 100644
  
  /*
  
-@@ -38,6 +50,1169 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,1171 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -9664,6 +9667,8 @@ index c83ebb5..527eac8 100644
 +    float    g_capTracerIntensity = 1.6f;
 +    float    g_capTracerWidth = 0.0045f;   // streak half-width in UV
 +    float    g_capTracerLength = 1.2f;     // streak length multiplier (1.0 = from the barrel, short)
++    float    g_capTracerStartU = 0.63f;    // screen-UV of the visible gun barrel (the streak START — lower-right)
++    float    g_capTracerStartV = 0.74f;
 +    uint32_t g_capMuzzleFired = 0;         // set this frame when a view muzzle-flash light is captured
 +    // muzzle + aim points PROJECTED to screen UV at CAPTURE time (the main view's proj*modelView)
 +    // — NOT projected in the backend, where g_lastViewMatrix can be the lightgem's (a 64px view
@@ -10587,7 +10592,7 @@ index c83ebb5..527eac8 100644
  
  /*
  =================
-@@ -49,6 +1224,22 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +1226,22 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -10610,7 +10615,7 @@ index c83ebb5..527eac8 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +1269,22 @@ RB_DrawElementsWithCounters
+@@ -78,6 +1271,22 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -10633,7 +10638,7 @@ index c83ebb5..527eac8 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1323,23 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1325,23 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -10657,7 +10662,7 @@ index c83ebb5..527eac8 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1390,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1392,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -10665,7 +10670,7 @@ index c83ebb5..527eac8 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1617,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1619,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -10678,7 +10683,7 @@ index c83ebb5..527eac8 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -553,26 +1782,171 @@ Any mirrored or portaled views have already been drawn, so prepare
+@@ -553,26 +1784,174 @@ Any mirrored or portaled views have already been drawn, so prepare
  to actually render the visible surfaces for this view
  =================
  */
@@ -10794,6 +10799,9 @@ index c83ebb5..527eac8 100644
 +		g_capTracerIntensity = r_tracerIntensity.GetFloat();
 +		g_capTracerWidth = r_tracerWidth.GetFloat();
 +		extern idCVar r_tracerLength; g_capTracerLength = r_tracerLength.GetFloat();
++		extern idCVar r_tracerStartU, r_tracerStartV;
++		g_capTracerStartU = r_tracerStartU.GetFloat();
++		g_capTracerStartV = r_tracerStartV.GetFloat();
 +		extern idCVar r_pbr, r_pbrForce, r_pbrTest, r_pbrTestRough, r_pbrTestMetal, r_pbrTestAO;
 +		g_capPbr = r_pbr.GetBool() ? 1u : 0u;
 +		g_capPbrForce = r_pbrForce.GetBool() ? 1u : 0u;
@@ -10860,7 +10868,7 @@ index c83ebb5..527eac8 100644
  	backEnd.currentScissor = viewDef->scissor;
  
  	// ensures that depth writes are enabled for the depth clear
-@@ -897,6 +2271,26 @@ void RB_DrawView( const void *data ) {
+@@ -897,6 +2276,26 @@ void RB_DrawView( const void *data ) {
  
  	backEnd.viewDef = cmd->viewDef;
  
@@ -10889,10 +10897,10 @@ index c83ebb5..527eac8 100644
  	backEnd.currentRenderCopied = false;
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..9438a17
+index 0000000..19761ca
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,1219 @@
+@@ -0,0 +1,1226 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -11169,25 +11177,32 @@ index 0000000..9438a17
 +"// color-only pass. Deterministic: a pure function of the uniform endpoints +\n"
 +"// in.uv — no time/RNG/feedback — so both det re-encodes are byte-identical.\n"
 +"//\n"
-+"// params.xy = muzzle UV, params.zw = far/aim UV (same space as in.uv).\n"
-+"// dir.x = intensity, dir.y = half-width (UV units), dir.z = core power.\n"
++"// params.xy = barrel-START UV (t=0), params.zw = aim-END UV (t=1) (same space as in.uv).\n"
++"// dir.x = intensity, dir.y = base half-width (UV units, at the barrel), dir.z = unused.\n"
 +"@fragment\n"
 +"fn fs_tracer(in: VSOut) -> @location(0) vec4<f32> {\n"
-+"    let a = u.params.xy;            // muzzle\n"
-+"    let b = u.params.zw;            // aim/far\n"
++"    let a = u.params.xy;            // gun barrel (lower-right)   t=0\n"
++"    let b = u.params.zw;            // aim / target (toward center) t=1\n"
 +"    let ab = b - a;\n"
 +"    let denom = max(dot(ab, ab), 1e-6);\n"
-+"    let t = clamp(dot(in.uv - a, ab) / denom, 0.0, 1.0);   // nearest point on the segment\n"
++"    let t = clamp(dot(in.uv - a, ab) / denom, 0.0, 1.0);   // 0 at the barrel, 1 at the target\n"
 +"    let d = distance(in.uv, a + ab * t);                   // distance to the segment\n"
-+"    let halfW = max(u.dir.y, 1e-4);\n"
++"    // perspective taper: the streak leaves the NEAR barrel wide and narrows toward the\n"
++"    // FAR target, so it recedes into the scene instead of reading as a flat line.\n"
++"    let halfW = max(u.dir.y, 1e-4) * (1.0 - 0.55 * t);\n"
++"    // soft warm outer glow across the width\n"
 +"    var glow = 1.0 - smoothstep(0.0, halfW, d);\n"
-+"    glow = pow(glow, max(u.dir.z, 1.0));                   // soft falloff across the width\n"
-+"    // bright + fairly uniform ALONG the streak so it reads as a line toward the\n"
-+"    // target (slightly hotter at the leading/aim end); only fade out very near the\n"
-+"    // muzzle so it doesn't fight the muzzle-flash glow.\n"
-+"    glow = glow * (0.7 + 0.3 * t) * smoothstep(0.0, 0.06, t);\n"
-+"    let col = vec3<f32>(1.0, 0.85, 0.5);                   // warm tracer\n"
-+"    return vec4<f32>(col * glow * u.dir.x, 1.0);           // additive (pipeline blend One/One)\n"
++"    glow = glow * glow;\n"
++"    // bright near-white HOT CORE down the center — this is what makes it read as a\n"
++"    // tracer round rather than a thin coloured line.\n"
++"    let core = 1.0 - smoothstep(0.0, halfW * 0.34, d);\n"
++"    // fade in just off the barrel (don't smear the gun model), slightly hotter toward\n"
++"    // the leading/target end.\n"
++"    let along = smoothstep(0.0, 0.06, t) * (0.6 + 0.4 * t);\n"
++"    let warm = vec3<f32>(1.0, 0.80, 0.42);                 // warm body\n"
++"    let hot  = vec3<f32>(1.0, 0.96, 0.85);                 // near-white core\n"
++"    let rgb  = warm * glow + hot * (core * core * 1.5);\n"
++"    return vec4<f32>(rgb * along * u.dir.x, 1.0);          // additive (pipeline blend One/One)\n"
 +"}\n"
 +"\n"
 +"@fragment\n"

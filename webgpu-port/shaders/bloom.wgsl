@@ -117,25 +117,32 @@ fn ordered8(p: vec2<u32>) -> f32 {
 // color-only pass. Deterministic: a pure function of the uniform endpoints +
 // in.uv — no time/RNG/feedback — so both det re-encodes are byte-identical.
 //
-// params.xy = muzzle UV, params.zw = far/aim UV (same space as in.uv).
-// dir.x = intensity, dir.y = half-width (UV units), dir.z = core power.
+// params.xy = barrel-START UV (t=0), params.zw = aim-END UV (t=1) (same space as in.uv).
+// dir.x = intensity, dir.y = base half-width (UV units, at the barrel), dir.z = unused.
 @fragment
 fn fs_tracer(in: VSOut) -> @location(0) vec4<f32> {
-    let a = u.params.xy;            // muzzle
-    let b = u.params.zw;            // aim/far
+    let a = u.params.xy;            // gun barrel (lower-right)   t=0
+    let b = u.params.zw;            // aim / target (toward center) t=1
     let ab = b - a;
     let denom = max(dot(ab, ab), 1e-6);
-    let t = clamp(dot(in.uv - a, ab) / denom, 0.0, 1.0);   // nearest point on the segment
+    let t = clamp(dot(in.uv - a, ab) / denom, 0.0, 1.0);   // 0 at the barrel, 1 at the target
     let d = distance(in.uv, a + ab * t);                   // distance to the segment
-    let halfW = max(u.dir.y, 1e-4);
+    // perspective taper: the streak leaves the NEAR barrel wide and narrows toward the
+    // FAR target, so it recedes into the scene instead of reading as a flat line.
+    let halfW = max(u.dir.y, 1e-4) * (1.0 - 0.55 * t);
+    // soft warm outer glow across the width
     var glow = 1.0 - smoothstep(0.0, halfW, d);
-    glow = pow(glow, max(u.dir.z, 1.0));                   // soft falloff across the width
-    // bright + fairly uniform ALONG the streak so it reads as a line toward the
-    // target (slightly hotter at the leading/aim end); only fade out very near the
-    // muzzle so it doesn't fight the muzzle-flash glow.
-    glow = glow * (0.7 + 0.3 * t) * smoothstep(0.0, 0.06, t);
-    let col = vec3<f32>(1.0, 0.85, 0.5);                   // warm tracer
-    return vec4<f32>(col * glow * u.dir.x, 1.0);           // additive (pipeline blend One/One)
+    glow = glow * glow;
+    // bright near-white HOT CORE down the center — this is what makes it read as a
+    // tracer round rather than a thin coloured line.
+    let core = 1.0 - smoothstep(0.0, halfW * 0.34, d);
+    // fade in just off the barrel (don't smear the gun model), slightly hotter toward
+    // the leading/target end.
+    let along = smoothstep(0.0, 0.06, t) * (0.6 + 0.4 * t);
+    let warm = vec3<f32>(1.0, 0.80, 0.42);                 // warm body
+    let hot  = vec3<f32>(1.0, 0.96, 0.85);                 // near-white core
+    let rgb  = warm * glow + hot * (core * core * 1.5);
+    return vec4<f32>(rgb * along * u.dir.x, 1.0);          // additive (pipeline blend One/One)
 }
 
 @fragment
