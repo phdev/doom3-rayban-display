@@ -1873,29 +1873,17 @@ function armTracerDemo() {
     window.d3cmd("r_gamma 1.0");
     window.d3cmd("r_tonemap 1");
     window.d3cmd("r_tonemapExposure 0.5");
-    window.d3cmd("notarget");                 // imp won't charge into melee — stays out at range
     window.setTimeout(() => tapKey(WEAPON_MACHINEGUN_KEY), 600);   // raise the rifle
-    diag("tracer demo: god + rifle + ACES tonemap; spawning imps downrange");
-    // Spawn the imp ~260u down the player's forward (the console `spawn` hardcodes
-    // 80u — right in your face). __d3ViewPos = "X Y Z | yaw .. pitch ..". The spawn
-    // command applies key/value pairs AFTER its own origin, so an explicit `origin`
-    // overrides the 80u placement (SysCmds.cpp:823-830); physics settles it on the floor.
-    const spawnImp = () => {
-      if (typeof window.d3cmd !== "function") return;
-      const vp = typeof window.__d3ViewPos === "string" ? window.__d3ViewPos : "";
-      const m = vp.match(/(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+\|\s+yaw\s+(-?\d+)/);
-      if (m) {
-        const x = +m[1], y = +m[2], z = +m[3], r = (+m[4]) * Math.PI / 180, d = 260;
-        const ox = Math.round(x + Math.cos(r) * d);
-        const oy = Math.round(y + Math.sin(r) * d);
-        const oz = Math.round(z - 56);        // eye -> ~foot; the imp drops to the floor
-        window.d3cmd(`spawn monster_demon_imp origin "${ox} ${oy} ${oz}"`);
-      } else {
-        window.d3cmd("spawn monster_demon_imp");   // fallback: the 80u placement
-      }
-    };
+    diag("tracer demo: god + rifle + ACES tonemap; spawning imps in front");
+    // STOCK spawn (forward*80, foot-level) — D3 places it robustly. (An earlier
+    // `origin`-override to push it further was UNRELIABLE: the computed Z/point
+    // landed in geometry/void at some player positions -> "no enemy in front".)
+    // The imp charges in so it stays centered + the auto-fire reliably engages it;
+    // respawn keeps a fresh one. A reliable FURTHER spawn needs a game-side trace
+    // (SPINE), not a JS coordinate guess.
+    const spawnImp = () => { if (typeof window.d3cmd === "function") window.d3cmd("spawn monster_demon_imp"); };
     spawnImp();
-    window.setInterval(spawnImp, 5000);       // respawn so there's always a target downrange
+    window.setInterval(spawnImp, 3000);       // respawn often so there's consistently a target in front
   };
   window.setTimeout(() => start(0), 3500);
 }
