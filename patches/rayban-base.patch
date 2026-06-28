@@ -2956,6 +2956,291 @@ index 60b0b88..ce679bf 100644
  	idMapFile *				GetLevelMap( void );
  	const char *			GetMapName( void ) const;
  
+diff --git a/neo/game/Game_network.cpp b/neo/game/Game_network.cpp
+index 5e24df7..30caed9 100644
+--- a/neo/game/Game_network.cpp
++++ b/neo/game/Game_network.cpp
+@@ -37,6 +37,10 @@ If you have questions concerning this license or the applicable additional terms
+ 
+ #include "Game_local.h"
+ 
++#ifdef __EMSCRIPTEN__
++#include <emscripten/emscripten.h>
++#endif
++
+ /*
+ ===============================================================================
+ 
+@@ -59,6 +63,177 @@ idCVar net_clientSmoothing( "net_clientSmoothing", "0.8", CVAR_GAME | CVAR_FLOAT
+ idCVar net_clientSelfSmoothing( "net_clientSelfSmoothing", "0.6", CVAR_GAME | CVAR_FLOAT, "smooth self position if network causes prediction error.", 0.0f, 0.95f );
+ idCVar net_clientMaxPrediction( "net_clientMaxPrediction", "1000", CVAR_SYSTEM | CVAR_INTEGER | CVAR_NOCHEAT, "maximum number of milliseconds a client can predict ahead of server." );
+ idCVar net_clientLagOMeter( "net_clientLagOMeter", "1", CVAR_GAME | CVAR_BOOL | CVAR_NOCHEAT | CVAR_ARCHIVE, "draw prediction graph" );
++idCVar net_clientTrace( "net_clientTrace", "0", CVAR_GAME | CVAR_BOOL | CVAR_NOCHEAT, "publish client snapshot/prediction correction trace to JS" );
++idCVar net_clientSpectatorNoSnap( "net_clientSpectatorNoSnap", "1", CVAR_GAME | CVAR_BOOL | CVAR_NOCHEAT, "keep local free-fly spectator physics predicted instead of applying snapshot origin snaps" );
++idCVar net_clientViewCorrection( "net_clientViewCorrection", "1", CVAR_GAME | CVAR_BOOL | CVAR_NOCHEAT, "smooth local spectator snapshot correction in the rendered camera" );
++idCVar net_clientViewCorrectionBlend( "net_clientViewCorrectionBlend", "0.20", CVAR_GAME | CVAR_FLOAT | CVAR_NOCHEAT, "fraction of pending local view correction retired each rendered frame", 0.05f, 0.95f );
++idCVar net_clientViewCorrectionMax( "net_clientViewCorrectionMax", "96", CVAR_GAME | CVAR_FLOAT | CVAR_NOCHEAT, "maximum local correction smoothed in the rendered camera; larger corrections snap", 8.0f, 1024.0f );
++
++const int ARCO_PRED_HISTORY = 2048;
++
++struct arcoPredTrace_t {
++	bool valid;
++	int client;
++	int frame;
++	int time;
++	idVec3 org;
++	idVec3 vel;
++	bool spectating;
++	int spectator;
++	bool ground;
++	int cmdForward;
++	int cmdRight;
++	int cmdUp;
++	int cmdButtons;
++	int cmdFrame;
++	int cmdTime;
++	int cmdDuplicate;
++	int cmdSequence;
++	int cmdFlags;
++};
++
++#ifdef __EMSCRIPTEN__
++static void D3_ArcoNetTracePush( const char *json ) {
++	EM_ASM_({
++		try {
++			var e = JSON.parse(UTF8ToString($0));
++			var w = window;
++			var a = w.__arcoNetTrace || (w.__arcoNetTrace = []);
++			a.push(e);
++			if (a.length > 2400) a.splice(0, a.length - 2400);
++			w.__arcoNetLast = e;
++			if (e.type === "snap") {
++				var sa = w.__arcoNetSnapTrace || (w.__arcoNetSnapTrace = []);
++				sa.push(e);
++				if (sa.length > 1200) sa.splice(0, sa.length - 1200);
++				w.__arcoNetLastSnap = e;
++				w.__arcoNetCorr = e.corrLen;
++				w.__arcoNetCorrZ = e.corrZ;
++				w.__arcoNetAhead = e.ahead;
++				w.__arcoNetDupe = e.dupe;
++				if (!w.__arcoNetCorrMax || e.corrLen > w.__arcoNetCorrMax) w.__arcoNetCorrMax = e.corrLen;
++			} else if (e.type === "predict") {
++				var pa = w.__arcoNetPredictTrace || (w.__arcoNetPredictTrace = []);
++				pa.push(e);
++				if (pa.length > 1200) pa.splice(0, pa.length - 1200);
++				w.__arcoNetLastPredict = e;
++				w.__arcoNetPredictStep = e.stepLen;
++			}
++		} catch (x) {}
++	}, json);
++}
++
++static arcoPredTrace_t arcoPredHistory[ ARCO_PRED_HISTORY ];
++
++static const arcoPredTrace_t *D3_ArcoFindPredTrace( int clientNum, int frameNum ) {
++	const arcoPredTrace_t &h = arcoPredHistory[ frameNum & ( ARCO_PRED_HISTORY - 1 ) ];
++	if ( h.valid && h.client == clientNum && h.frame == frameNum ) {
++		return &h;
++	}
++	return NULL;
++}
++
++static void D3_ArcoRememberPredTrace( int clientNum, int frameNum, int gameTime,
++		const idPlayer *player, const idVec3 &org, const idVec3 &vel ) {
++	if ( !player ) {
++		return;
++	}
++	arcoPredTrace_t &h = arcoPredHistory[ frameNum & ( ARCO_PRED_HISTORY - 1 ) ];
++	const usercmd_t &cmd = player->usercmd;
++	idPhysics *physics = const_cast< idPlayer * >( player )->GetPlayerPhysics();
++	h.valid = true;
++	h.client = clientNum;
++	h.frame = frameNum;
++	h.time = gameTime;
++	h.org = org;
++	h.vel = vel;
++	h.spectating = player->spectating;
++	h.spectator = player->spectator;
++	h.ground = physics && physics->HasGroundContacts();
++	h.cmdForward = cmd.forwardmove;
++	h.cmdRight = cmd.rightmove;
++	h.cmdUp = cmd.upmove;
++	h.cmdButtons = cmd.buttons;
++	h.cmdFrame = cmd.gameFrame;
++	h.cmdTime = cmd.gameTime;
++	h.cmdDuplicate = cmd.duplicateCount;
++	h.cmdSequence = cmd.sequence;
++	h.cmdFlags = cmd.flags;
++}
++#else
++static void D3_ArcoNetTracePush( const char *json ) {}
++#endif
++
++static void D3_ArcoNetTraceSnapshot( int sequence, int gameFrame, int gameTime, int dupeUsercmds, int aheadOfServer,
++		int timeSincePacket, idPlayer *player, bool hadLocalPlayer, const idVec3 &preOrg, const idVec3 &postOrg,
++		const idVec3 &preVel, const idVec3 &postVel ) {
++	if ( !net_clientTrace.GetBool() || !player ) {
++		return;
++	}
++
++	const idVec3 corr = postOrg - preOrg;
++	const idVec3 velDelta = postVel - preVel;
++	const float corrXY = idMath::Sqrt( corr.x * corr.x + corr.y * corr.y );
++#ifdef __EMSCRIPTEN__
++	const arcoPredTrace_t *pred = hadLocalPlayer ? D3_ArcoFindPredTrace( player->entityNumber, gameFrame ) : NULL;
++#else
++	const arcoPredTrace_t *pred = NULL;
++#endif
++	const idVec3 predErr = pred ? ( postOrg - pred->org ) : vec3_zero;
++	const idVec3 predVelErr = pred ? ( postVel - pred->vel ) : vec3_zero;
++	const float predErrXY = idMath::Sqrt( predErr.x * predErr.x + predErr.y * predErr.y );
++	char buf[ 2048 ];
++	idStr::snPrintf( buf, sizeof( buf ),
++		"{\"type\":\"snap\",\"now\":%d,\"seq\":%d,\"frame\":%d,\"time\":%d,\"dupe\":%d,\"ahead\":%d,\"packetAge\":%d,"
++		"\"hasLocal\":%d,\"spectating\":%d,\"spectator\":%d,\"selfSmooth\":%d,\"corrLen\":%.3f,\"corrXY\":%.3f,\"corrZ\":%.3f,"
++		"\"velDelta\":%.3f,\"pre\":[%.3f,%.3f,%.3f],\"post\":[%.3f,%.3f,%.3f],\"vel\":[%.3f,%.3f,%.3f],"
++		"\"predHit\":%d,\"predErrLen\":%.3f,\"predErrXY\":%.3f,\"predErrZ\":%.3f,\"predVelErr\":%.3f,"
++		"\"pred\":[%.3f,%.3f,%.3f],\"predVel\":[%.3f,%.3f,%.3f],\"predGround\":%d,"
++		"\"predCmd\":[%d,%d,%d,%d],\"predCmdMeta\":[%d,%d,%d,%d,%d]}",
++		Sys_Milliseconds(), sequence, gameFrame, gameTime, dupeUsercmds, aheadOfServer, timeSincePacket,
++		hadLocalPlayer ? 1 : 0, player->spectating ? 1 : 0, player->spectator, player->SelfSmooth() ? 1 : 0, corr.Length(), corrXY, corr.z,
++		velDelta.Length(), preOrg.x, preOrg.y, preOrg.z, postOrg.x, postOrg.y, postOrg.z, postVel.x, postVel.y, postVel.z,
++		pred ? 1 : 0, predErr.Length(), predErrXY, predErr.z, predVelErr.Length(),
++		pred ? pred->org.x : 0.0f, pred ? pred->org.y : 0.0f, pred ? pred->org.z : 0.0f,
++		pred ? pred->vel.x : 0.0f, pred ? pred->vel.y : 0.0f, pred ? pred->vel.z : 0.0f,
++		( pred && pred->ground ) ? 1 : 0,
++		pred ? pred->cmdForward : 0, pred ? pred->cmdRight : 0, pred ? pred->cmdUp : 0, pred ? pred->cmdButtons : 0,
++		pred ? pred->cmdFrame : 0, pred ? pred->cmdTime : 0, pred ? pred->cmdDuplicate : 0,
++		pred ? pred->cmdSequence : 0, pred ? pred->cmdFlags : 0 );
++	D3_ArcoNetTracePush( buf );
++}
++
++static void D3_ArcoNetTracePrediction( int clientNum, int frameNum, int gameTime, int realClientTime, int timeSincePacket,
++		bool isNewFrame, bool lastPredictFrame, const idPlayer *player, const idVec3 &preOrg, const idVec3 &postOrg,
++		const idVec3 &postVel ) {
++	if ( !net_clientTrace.GetBool() || !player ) {
++		return;
++	}
++
++	const idVec3 step = postOrg - preOrg;
++	const usercmd_t &cmd = player->usercmd;
++	idPhysics *physics = const_cast< idPlayer * >( player )->GetPlayerPhysics();
++	const bool onGround = physics && physics->HasGroundContacts();
++#ifdef __EMSCRIPTEN__
++	D3_ArcoRememberPredTrace( clientNum, frameNum, gameTime, player, postOrg, postVel );
++#endif
++	char buf[ 1536 ];
++	idStr::snPrintf( buf, sizeof( buf ),
++		"{\"type\":\"predict\",\"now\":%d,\"client\":%d,\"frame\":%d,\"time\":%d,\"real\":%d,\"packetAge\":%d,"
++		"\"newFrame\":%d,\"last\":%d,\"lagged\":%d,\"spectating\":%d,\"spectator\":%d,"
++		"\"stepLen\":%.3f,\"stepZ\":%.3f,\"pos\":[%.3f,%.3f,%.3f],\"vel\":[%.3f,%.3f,%.3f],"
++		"\"ground\":%d,\"ang\":[%.3f,%.3f,%.3f],\"cmdAng\":[%.3f,%.3f,%.3f],"
++		"\"cmd\":[%d,%d,%d,%d],\"cmdMeta\":[%d,%d,%d,%d,%d]}",
++		Sys_Milliseconds(), clientNum, frameNum, gameTime, realClientTime, timeSincePacket,
++		isNewFrame ? 1 : 0, lastPredictFrame ? 1 : 0, player->isLagged ? 1 : 0, player->spectating ? 1 : 0, player->spectator,
++		step.Length(), step.z, postOrg.x, postOrg.y, postOrg.z, postVel.x, postVel.y, postVel.z,
++		onGround ? 1 : 0,
++		player->viewAngles.pitch, player->viewAngles.yaw, player->viewAngles.roll,
++		player->cmdAngles.pitch, player->cmdAngles.yaw, player->cmdAngles.roll,
++		cmd.forwardmove, cmd.rightmove, cmd.upmove, cmd.buttons,
++		cmd.gameFrame, cmd.gameTime, cmd.duplicateCount, cmd.sequence, cmd.flags );
++	D3_ArcoNetTracePush( buf );
++}
+ 
+ /*
+ ================
+@@ -974,6 +1149,11 @@ void idGameLocal::ClientReadSnapshot( int clientNum, int sequence, const int gam
+ 	int				spawnId;
+ 	int				numSourceAreas, sourceAreas[ idEntity::MAX_PVS_AREAS ];
+ 	idWeapon		*weap;
++	bool			traceLocalPlayer;
++	idVec3			tracePreOrg, tracePostOrg, tracePreVel, tracePostVel;
++
++	traceLocalPlayer = false;
++	tracePreOrg = tracePostOrg = tracePreVel = tracePostVel = vec3_zero;
+ 
+ 	if ( net_clientLagOMeter.GetBool() && renderSystem ) {
+ 		UpdateLagometer( aheadOfServer, dupeUsercmds );
+@@ -1083,9 +1263,27 @@ void idGameLocal::ClientReadSnapshot( int clientNum, int sequence, const int gam
+ 		ent->snapshotNode.AddToEnd( snapshotEntities );
+ 		ent->snapshotSequence = sequence;
+ 
++		const bool traceThisEntity = net_clientTrace.GetBool() && i == clientNum && ent && ent->IsType( idPlayer::Type );
++		if ( traceThisEntity ) {
++			idPhysics *phys = static_cast< idPlayer * >( ent )->GetPlayerPhysics();
++			if ( phys ) {
++				tracePreOrg = phys->GetOrigin();
++				tracePreVel = phys->GetLinearVelocity();
++			}
++		}
++
+ 		// read the class specific data from the snapshot
+ 		ent->ReadFromSnapshot( deltaMsg );
+ 
++		if ( traceThisEntity ) {
++			idPhysics *phys = static_cast< idPlayer * >( ent )->GetPlayerPhysics();
++			if ( phys ) {
++				tracePostOrg = phys->GetOrigin();
++				tracePostVel = phys->GetLinearVelocity();
++				traceLocalPlayer = true;
++			}
++		}
++
+ 		ent->snapshotBits = msg.GetNumBitsRead() - numBitsRead;
+ 
+ #if ASYNC_WRITE_TAGS
+@@ -1108,6 +1306,9 @@ void idGameLocal::ClientReadSnapshot( int clientNum, int sequence, const int gam
+ 
+ 	// if prediction is off, enable local client smoothing
+ 	player->SetSelfSmooth( dupeUsercmds > 2 );
++	D3_ArcoNetTraceSnapshot( sequence, gameFrame, gameTime, dupeUsercmds, aheadOfServer,
++		networkSystem ? networkSystem->ClientGetTimeSinceLastPacket() : -1, player, traceLocalPlayer,
++		tracePreOrg, tracePostOrg, tracePreVel, tracePostVel );
+ 
+ 	if ( player->spectating && player->spectator != clientNum && entities[ player->spectator ] ) {
+ 		spectated = static_cast< idPlayer * >( entities[ player->spectator ] );
+@@ -1472,6 +1673,8 @@ gameReturn_t idGameLocal::ClientPrediction( int clientNum, const usercmd_t *clie
+ 	idEntity *ent;
+ 	idPlayer *player;
+ 	gameReturn_t ret;
++	bool tracePrediction;
++	idVec3 tracePreOrg, tracePostOrg, tracePostVel;
+ 
+ 	ret.sessionCommand[ 0 ] = '\0';
+ 
+@@ -1487,6 +1690,15 @@ gameReturn_t idGameLocal::ClientPrediction( int clientNum, const usercmd_t *clie
+ 		player->isLagged = false;
+ 	}
+ 
++	tracePrediction = net_clientTrace.GetBool();
++	tracePreOrg = tracePostOrg = tracePostVel = vec3_zero;
++	if ( tracePrediction ) {
++		idPhysics *phys = player->GetPlayerPhysics();
++		if ( phys ) {
++			tracePreOrg = phys->GetOrigin();
++		}
++	}
++
+ 	InitLocalClient( clientNum );
+ 
+ 	// update the game time
+@@ -1523,6 +1735,16 @@ gameReturn_t idGameLocal::ClientPrediction( int clientNum, const usercmd_t *clie
+ 	if ( sessionCommand.Length() ) {
+ 		idStr::Copynz( ret.sessionCommand, sessionCommand, sizeof( ret.sessionCommand ) );
+ 	}
++	if ( tracePrediction ) {
++		idPhysics *phys = player->GetPlayerPhysics();
++		if ( phys ) {
++			tracePostOrg = phys->GetOrigin();
++			tracePostVel = phys->GetLinearVelocity();
++		}
++		D3_ArcoNetTracePrediction( clientNum, framenum, time, realClientTime,
++			networkSystem ? networkSystem->ClientGetTimeSinceLastPacket() : -1, isNewFrame,
++			lastPredictFrame, player, tracePreOrg, tracePostOrg, tracePostVel );
++	}
+ 	return ret;
+ }
+ 
 diff --git a/neo/game/Item.cpp b/neo/game/Item.cpp
 index 97ae952..ac0a910 100644
 --- a/neo/game/Item.cpp
@@ -3013,10 +3298,10 @@ index e3458b3..4443dad 100644
  
  	// if the model should be shrinked
 diff --git a/neo/game/Player.cpp b/neo/game/Player.cpp
-index 01b05ab..f1d9ed6 100644
+index 01b05ab..f443481 100644
 --- a/neo/game/Player.cpp
 +++ b/neo/game/Player.cpp
-@@ -37,6 +37,7 @@ If you have questions concerning this license or the applicable additional terms
+@@ -37,10 +37,15 @@ If you have questions concerning this license or the applicable additional terms
  #include "ai/AI.h"
  #include "WorldSpawn.h"
  #include "Player.h"
@@ -3024,10 +3309,132 @@ index 01b05ab..f1d9ed6 100644
  #include "Camera.h"
  #include "Fx.h"
  #include "Misc.h"
-@@ -1133,6 +1134,15 @@ idPlayer::idPlayer() {
+ 
++#ifdef __EMSCRIPTEN__
++#include <emscripten/emscripten.h>
++#endif
++
+ const int ASYNC_PLAYER_INV_AMMO_BITS = idMath::BitsForInteger( 999 );	// 9 bits to cover the range [0, 999]
+ const int ASYNC_PLAYER_INV_CLIP_BITS = -7;								// -7 bits to cover the range [-1, 60]
+ 
+@@ -68,6 +73,102 @@ const int WEAPON_SWITCH_DELAY = 150;
+ // how many units to raise spectator above default view height so it's in the head of someone
+ const int SPECTATE_RAISE = 25;
+ 
++extern idCVar net_clientSpectatorNoSnap;
++extern idCVar net_clientViewCorrection;
++extern idCVar net_clientViewCorrectionBlend;
++extern idCVar net_clientViewCorrectionMax;
++
++#ifdef __EMSCRIPTEN__
++extern idCVar net_clientTrace;
++
++static void D3_ArcoNetTracePresent( idPlayer *player, const idVec3 &rawViewOrg, const idMat3 &rawViewAxis,
++		const idVec3 &presentViewOrg, const idMat3 &presentViewAxis, const idVec3 &physicsOrg, bool smoothed ) {
++	if ( !net_clientTrace.GetBool() || !player ) {
++		return;
++	}
++
++	static bool haveLast = false;
++	static int lastEntity = -1;
++	static idVec3 lastRawViewOrg = vec3_zero;
++	static idVec3 lastPresentViewOrg = vec3_zero;
++	static idVec3 lastPhysicsOrg = vec3_zero;
++	static idVec3 lastRawStep = vec3_zero;
++	static idVec3 lastViewStep = vec3_zero;
++	static idVec3 lastPhysStep = vec3_zero;
++
++	const idVec3 smooth = presentViewOrg - rawViewOrg;
++	idVec3 rawStep = vec3_zero;
++	idVec3 viewStep = vec3_zero;
++	idVec3 physStep = vec3_zero;
++	int rawBack = 0;
++	int viewBack = 0;
++	int physBack = 0;
++	int replayHold = 0;
++	if ( haveLast && lastEntity == player->entityNumber ) {
++		rawStep = rawViewOrg - lastRawViewOrg;
++		viewStep = presentViewOrg - lastPresentViewOrg;
++		physStep = physicsOrg - lastPhysicsOrg;
++		rawBack = ( rawStep.LengthSqr() > Square( 0.01f ) && ( rawStep * lastRawStep ) < 0.0f ) ? 1 : 0;
++		viewBack = ( viewStep.LengthSqr() > Square( 0.01f ) && ( viewStep * lastViewStep ) < 0.0f ) ? 1 : 0;
++		physBack = ( physStep.LengthSqr() > Square( 0.01f ) && ( physStep * lastPhysStep ) < 0.0f ) ? 1 : 0;
++		replayHold = ( viewStep.LengthSqr() <= Square( 0.01f ) && physStep.LengthSqr() > Square( 0.01f ) ) ? 1 : 0;
++	}
++	haveLast = true;
++	lastEntity = player->entityNumber;
++	lastRawViewOrg = rawViewOrg;
++	lastPresentViewOrg = presentViewOrg;
++	lastPhysicsOrg = physicsOrg;
++	lastRawStep = rawStep;
++	lastViewStep = viewStep;
++	lastPhysStep = physStep;
++
++	idPhysics *physics = player->GetPlayerPhysics();
++	const bool onGround = physics && physics->HasGroundContacts();
++	const idVec3 velocity = physics ? physics->GetLinearVelocity() : vec3_zero;
++	const idAngles rawViewAngles = rawViewAxis.ToAngles();
++	const idAngles presentViewAngles = presentViewAxis.ToAngles();
++	const idAngles playerAngles = player->viewAngles;
++	const float rawStepLen = rawStep.Length();
++	const float viewStepLen = viewStep.Length();
++	const float physStepLen = physStep.Length();
++	const float holdGapLen = idMath::Fabs( viewStepLen - physStepLen );
++	char buf[ 3072 ];
++	idStr::snPrintf( buf, sizeof( buf ),
++		"{\"type\":\"present\",\"now\":%d,\"frame\":%d,\"time\":%d,\"spectating\":%d,\"spectator\":%d,"
++		"\"ground\":%d,\"smoothed\":%d,\"smoothLen\":%.3f,\"smoothZ\":%.3f,"
++		"\"rawStepLen\":%.3f,\"viewStepLen\":%.3f,\"physStepLen\":%.3f,\"holdGapLen\":%.3f,"
++		"\"rawBack\":%d,\"viewBack\":%d,\"physBack\":%d,\"replayHold\":%d,"
++		"\"viewCorrLen\":%.3f,\"viewCorr\":[%.3f,%.3f,%.3f],\"phys\":[%.3f,%.3f,%.3f],"
++		"\"playerVel\":[%.3f,%.3f,%.3f],\"playerAng\":[%.3f,%.3f,%.3f],"
++		"\"raw\":[%.3f,%.3f,%.3f],\"rawAng\":[%.3f,%.3f,%.3f],"
++		"\"view\":[%.3f,%.3f,%.3f],\"viewAng\":[%.3f,%.3f,%.3f]}",
++		Sys_Milliseconds(), gameLocal.framenum, gameLocal.time, player->spectating ? 1 : 0, player->spectator,
++		onGround ? 1 : 0, smoothed ? 1 : 0, smooth.Length(), smooth.z,
++		rawStepLen, viewStepLen, physStepLen, holdGapLen, rawBack, viewBack, physBack, replayHold,
++		player->renderViewCorrection.Length(), player->renderViewCorrection.x, player->renderViewCorrection.y, player->renderViewCorrection.z,
++		physicsOrg.x, physicsOrg.y, physicsOrg.z,
++		velocity.x, velocity.y, velocity.z, playerAngles.pitch, playerAngles.yaw, playerAngles.roll,
++		rawViewOrg.x, rawViewOrg.y, rawViewOrg.z, rawViewAngles.pitch, rawViewAngles.yaw, rawViewAngles.roll,
++		presentViewOrg.x, presentViewOrg.y, presentViewOrg.z, presentViewAngles.pitch, presentViewAngles.yaw, presentViewAngles.roll );
++	EM_ASM_({
++		try {
++			var e = JSON.parse(UTF8ToString($0));
++			var w = window;
++			var a = w.__arcoNetTrace || (w.__arcoNetTrace = []);
++			a.push(e);
++			if (a.length > 2400) a.splice(0, a.length - 2400);
++			var pr = w.__arcoNetPresentTrace || (w.__arcoNetPresentTrace = []);
++			pr.push(e);
++			if (pr.length > 1200) pr.splice(0, pr.length - 1200);
++			w.__arcoNetLast = e;
++			w.__arcoNetLastPresent = e;
++			w.__arcoNetSmooth = e.smoothLen;
++			w.__arcoNetSmoothZ = e.smoothZ;
++		} catch (x) {}
++	}, buf);
++}
++#endif
++
+ const int HEALTHPULSE_TIME = 333;
+ 
+ // minimum speed to bob and play run/walk animations at
+@@ -1008,6 +1109,9 @@ idPlayer::idPlayer() {
+ 
+ 	firstPersonViewOrigin	= vec3_zero;
+ 	firstPersonViewAxis		= mat3_identity;
++	renderViewOrigin		= vec3_zero;
++	renderViewOriginSmoothed = false;
++	renderViewSmoothingInitialized = false;
+ 
+ 	hipJoint				= INVALID_JOINT;
+ 	chestJoint				= INVALID_JOINT;
+@@ -1133,6 +1237,16 @@ idPlayer::idPlayer() {
  	isChatting				= false;
  
  	selfSmooth				= false;
++	renderViewCorrection.Zero();
 +
 +#ifdef __EMSCRIPTEN__
 +	// Permanent view-attached flashlight (iter 72). Zero the light def now; its
@@ -3040,7 +3447,7 @@ index 01b05ab..f1d9ed6 100644
  }
  
  /*
-@@ -1609,6 +1619,12 @@ Release any resources used by the player.
+@@ -1609,6 +1723,12 @@ Release any resources used by the player.
  ==============
  */
  idPlayer::~idPlayer() {
@@ -3053,7 +3460,7 @@ index 01b05ab..f1d9ed6 100644
  	delete weapon.GetEntity();
  	weapon = NULL;
  }
-@@ -5575,6 +5591,16 @@ void idPlayer::PerformImpulse( int impulse ) {
+@@ -5575,6 +5695,16 @@ void idPlayer::PerformImpulse( int impulse ) {
  		ClientSendEvent( EVENT_IMPULSE, &msg );
  	}
  
@@ -3070,7 +3477,7 @@ index 01b05ab..f1d9ed6 100644
  	if ( impulse >= IMPULSE_0 && impulse <= IMPULSE_12 ) {
  		SelectWeapon( impulse, false );
  		return;
-@@ -6206,6 +6232,78 @@ idPlayer::Think
+@@ -6206,6 +6336,78 @@ idPlayer::Think
  Called every tic for each player
  ==============
  */
@@ -3149,7 +3556,7 @@ index 01b05ab..f1d9ed6 100644
  void idPlayer::Think( void ) {
  	renderEntity_t *headRenderEnt;
  
-@@ -6220,6 +6318,20 @@ void idPlayer::Think( void ) {
+@@ -6220,6 +6422,20 @@ void idPlayer::Think( void ) {
  	buttonMask &= usercmd.buttons;
  	usercmd.buttons &= ~buttonMask;
  
@@ -3170,7 +3577,7 @@ index 01b05ab..f1d9ed6 100644
  	if ( gameLocal.inCinematic && gameLocal.skipCinematic ) {
  		return;
  	}
-@@ -6343,6 +6455,11 @@ void idPlayer::Think( void ) {
+@@ -6343,9 +6559,17 @@ void idPlayer::Think( void ) {
  	// this may use firstPersonView, or a thirdPeroson / camera view
  	CalculateRenderView();
  
@@ -3182,14 +3589,193 @@ index 01b05ab..f1d9ed6 100644
  	inventory.UpdateArmor();
  
  	if ( spectating ) {
++		if ( weapon.GetEntity() ) {
++			weapon.GetEntity()->FreeModelDef();
++		}
+ 		UpdateSpectating();
+ 	} else if ( health > 0 ) {
+ 		UpdateWeapon();
+@@ -7109,8 +7333,10 @@ void idPlayer::CalculateViewWeaponPos( idVec3 &origin, idMat3 &axis ) {
+ 	idAngles	angles;
+ 	int			delta;
+ 
+-	// CalculateRenderView must have been called first
+-	const idVec3 &viewOrigin = firstPersonViewOrigin;
++	// CalculateRenderView must have been called first.  The view weapon is a
++	// presented model, so anchor it to the same render-only smoothed origin as
++	// the world camera.  Gameplay traces still read firstPersonViewOrigin.
++	const idVec3 &viewOrigin = renderViewOriginSmoothed ? renderViewOrigin : firstPersonViewOrigin;
+ 	const idMat3 &viewAxis = firstPersonViewAxis;
+ 
+ 	// these cvars are just for hand tweaking before moving a value to the weapon def
+@@ -7387,6 +7613,54 @@ void idPlayer::CalculateRenderView( void ) {
+ 		common->Error( "renderView->fov_y == 0" );
+ 	}
+ 
++	renderViewOriginSmoothed = false;
++#ifdef __EMSCRIPTEN__
++	const idVec3 traceRawViewOrg = renderView->vieworg;
++	const idMat3 traceRawViewAxis = renderView->viewaxis;
++#endif
++	const bool localPresentedView =
++		entityNumber == gameLocal.localClientNum &&
++		!pm_thirdPerson.GetBool() && !pm_thirdPersonDeath.GetBool() &&
++		!privateCameraView && !gameLocal.GetCamera();
++	if ( gameLocal.isMultiplayer &&
++		 net_clientViewCorrection.GetBool() &&
++		 localPresentedView ) {
++		if ( renderViewCorrection.LengthSqr() > Square( 0.01f ) ) {
++			renderView->vieworg += renderViewCorrection;
++			renderViewCorrection -= renderViewCorrection * net_clientViewCorrectionBlend.GetFloat();
++			if ( renderViewCorrection.LengthSqr() < Square( 0.01f ) ) {
++				renderViewCorrection.Zero();
++			}
++			renderViewOriginSmoothed = true;
++		}
++	} else {
++		renderViewCorrection.Zero();
++	}
++	if ( g_viewInterpolate.GetBool() &&
++		 localPresentedView &&
++		 spectating ) {
++		const idVec3 rawOrg = renderView->vieworg;
++		if ( !renderViewSmoothingInitialized ||
++			 ( rawOrg - renderViewOrigin ).LengthSqr() >= Square( g_viewInterpMaxDelta.GetFloat() ) ) {
++			renderViewOrigin = rawOrg;
++			renderViewSmoothingInitialized = true;
++		} else {
++			renderViewOrigin += ( rawOrg - renderViewOrigin ) * g_viewSmooth.GetFloat();
++		}
++		renderView->vieworg = renderViewOrigin;
++		renderViewOriginSmoothed = true;
++	} else {
++		renderViewOrigin = renderView->vieworg;
++		renderViewSmoothingInitialized = false;
++	}
++
++#ifdef __EMSCRIPTEN__
++	if ( entityNumber == gameLocal.localClientNum ) {
++		D3_ArcoNetTracePresent( this, traceRawViewOrg, traceRawViewAxis, renderView->vieworg, renderView->viewaxis,
++			physicsObj.GetOrigin(), renderViewOriginSmoothed );
++	}
++#endif
++
+ 	if ( g_showviewpos.GetBool() ) {
+ 		gameLocal.Printf( "%s : %s\n", renderView->vieworg.ToString(), renderView->viewaxis.ToAngles().ToString() );
+ 	}
+@@ -7889,7 +8163,11 @@ void idPlayer::ClientPredictionThink( void ) {
+ 	// this may use firstPersonView, or a thirdPerson / camera view
+ 	CalculateRenderView();
+ 
+-	if ( !gameLocal.inCinematic && weapon.GetEntity() && ( health > 0 ) && !( gameLocal.isMultiplayer && spectating ) ) {
++	if ( gameLocal.isMultiplayer && spectating ) {
++		if ( weapon.GetEntity() ) {
++			weapon.GetEntity()->FreeModelDef();
++		}
++	} else if ( !gameLocal.inCinematic && weapon.GetEntity() && ( health > 0 ) ) {
+ 		UpdateWeapon();
+ 	}
+ 
+@@ -8058,6 +8336,10 @@ idPlayer::ReadFromSnapshot
+ void idPlayer::ReadFromSnapshot( const idBitMsgDelta &msg ) {
+ 	int		i, oldHealth, newIdealWeapon, weaponSpawnId;
+ 	bool	newHitToggle, stateHitch;
++	bool	keepLocalSpectatorPhysics;
++	idVec3	localSpectatorOrigin, localSpectatorVelocity;
++	bool	smoothLocalViewCorrection;
++	idVec3	localCorrectionPreOrigin;
+ 
+ 	if ( snapshotSequence - lastSnapshotSequence > 1 ) {
+ 		stateHitch = true;
+@@ -8068,7 +8350,37 @@ void idPlayer::ReadFromSnapshot( const idBitMsgDelta &msg ) {
+ 
+ 	oldHealth = health;
+ 
++	keepLocalSpectatorPhysics = gameLocal.isClient && entityNumber == gameLocal.localClientNum &&
++		spectating && spectator == entityNumber && net_clientSpectatorNoSnap.GetBool();
++	smoothLocalViewCorrection = gameLocal.isClient && entityNumber == gameLocal.localClientNum &&
++		spectating && net_clientViewCorrection.GetBool();
++	if ( smoothLocalViewCorrection ) {
++		localCorrectionPreOrigin = physicsObj.GetOrigin();
++	}
++	if ( keepLocalSpectatorPhysics ) {
++		localSpectatorOrigin = physicsObj.GetOrigin();
++		localSpectatorVelocity = physicsObj.GetLinearVelocity();
++	}
++
+ 	physicsObj.ReadFromSnapshot( msg );
++	if ( keepLocalSpectatorPhysics ) {
++		physicsObj.SetOrigin( localSpectatorOrigin );
++		physicsObj.SetLinearVelocity( localSpectatorVelocity );
++	}
++	if ( smoothLocalViewCorrection ) {
++		const idVec3 localCorrection = physicsObj.GetOrigin() - localCorrectionPreOrigin;
++		const float maxCorrection = net_clientViewCorrectionMax.GetFloat();
++		if ( stateHitch || localCorrection.LengthSqr() >= Square( maxCorrection ) ) {
++			renderViewCorrection.Zero();
++		} else if ( localCorrection.LengthSqr() > Square( 0.01f ) ) {
++			renderViewCorrection -= localCorrection;
++			if ( renderViewCorrection.LengthSqr() >= Square( maxCorrection ) ) {
++				renderViewCorrection.Zero();
++			}
++		}
++	} else {
++		renderViewCorrection.Zero();
++	}
+ 	ReadBindFromSnapshot( msg );
+ 	deltaViewAngles[0] = msg.ReadDeltaFloat( 0.0f );
+ 	deltaViewAngles[1] = msg.ReadDeltaFloat( 0.0f );
+@@ -8088,6 +8400,17 @@ void idPlayer::ReadFromSnapshot( const idBitMsgDelta &msg ) {
+ 
+ 	// no msg reading below this
+ 
++	if ( gameLocal.isClient && entityNumber == gameLocal.localClientNum &&
++		spectating && spectator == entityNumber && gameLocal.mpGame.IsInGame( entityNumber ) ) {
++		const bool browserJoinIntent =
++			idStr::Icmp( cvarSystem->GetCVarString( "ui_spectate" ), "Play" ) == 0 ||
++			idStr::Icmp( cvarSystem->GetCVarString( "ui_ready" ), "Ready" ) == 0;
++		if ( browserJoinIntent ) {
++			Spectate( false );
++			common->Printf( "[d3] Arco repaired local spectate state from authoritative in-game snapshot.\n" );
++		}
++	}
++
+ 	if ( weapon.SetSpawnId( weaponSpawnId ) ) {
+ 		if ( weapon.GetEntity() ) {
+ 			// maintain ownership locally
+@@ -8206,9 +8529,16 @@ idPlayer::ReadPlayerStateFromSnapshot
+ void idPlayer::ReadPlayerStateFromSnapshot( const idBitMsgDelta &msg ) {
+ 	int i, ammo;
+ 
+-	bobCycle = msg.ReadByte();
+-	stepUpTime = msg.ReadInt();
+-	stepUpDelta = msg.ReadFloat();
++	const int snapshotBobCycle = msg.ReadByte();
++	const int snapshotStepUpTime = msg.ReadInt();
++	const float snapshotStepUpDelta = msg.ReadFloat();
++	const bool keepLocalViewBob = gameLocal.isClient &&
++		entityNumber == gameLocal.localClientNum && !spectating;
++	if ( !keepLocalViewBob ) {
++		bobCycle = snapshotBobCycle;
++		stepUpTime = snapshotStepUpTime;
++		stepUpDelta = snapshotStepUpDelta;
++	}
+ 	inventory.weapons = msg.ReadShort();
+ 	inventory.armor = msg.ReadByte();
+ 
 diff --git a/neo/game/Player.h b/neo/game/Player.h
-index b411a0c..eeafeb5 100644
+index b411a0c..5144b63 100644
 --- a/neo/game/Player.h
 +++ b/neo/game/Player.h
-@@ -325,6 +325,16 @@ public:
+@@ -324,6 +324,20 @@ public:
+ 	// if a third person view is used
  	idVec3					firstPersonViewOrigin;
  	idMat3					firstPersonViewAxis;
- 
++	idVec3					renderViewOrigin;			// presentation-only origin used by renderView/view weapon
++	idVec3					renderViewCorrection;		// inverse local snapshot correction, decayed in presentation only
++	bool					renderViewOriginSmoothed;
++	bool					renderViewSmoothingInitialized;
++
 +#ifdef __EMSCRIPTEN__
 +	// Meta Ray-Ban Display (iter 72): a permanent, view-attached projected
 +	// flashlight that stays lit regardless of the equipped weapon and never
@@ -3199,11 +3785,10 @@ index b411a0c..eeafeb5 100644
 +	int						flashlightHandle;
 +	bool					flashlightOn;
 +#endif
-+
+ 
  	idDragEntity			dragEntity;
  
- public:
-@@ -336,6 +346,11 @@ public:
+@@ -336,6 +350,11 @@ public:
  	void					Spawn( void );
  	void					Think( void );
  
@@ -3215,6 +3800,18 @@ index b411a0c..eeafeb5 100644
  	// save games
  	void					Save( idSaveGame *savefile ) const;					// archives object for save game file
  	void					Restore( idRestoreGame *savefile );					// unarchives object from save game file
+diff --git a/neo/game/PlayerView.cpp b/neo/game/PlayerView.cpp
+index 16dc809..f4114d8 100644
+--- a/neo/game/PlayerView.cpp
++++ b/neo/game/PlayerView.cpp
+@@ -65,7 +65,6 @@ idPlayerView::idPlayerView() {
+ 	fadeToColor.Zero();
+ 	fadeColor.Zero();
+ 	shakeAng.Zero();
+-
+ 	ClearEffects();
+ }
+ 
 diff --git a/neo/game/SecurityCamera.cpp b/neo/game/SecurityCamera.cpp
 index 36a0cbe..58d9a22 100644
 --- a/neo/game/SecurityCamera.cpp
@@ -3346,6 +3943,243 @@ index b038ba4..595b069 100644
  	void					Activate( idEntity *activator );
  	int						ReactionTo( const idEntity *ent );
  	bool					CheckForEnemy( void );
+diff --git a/neo/game/anim/Anim.cpp b/neo/game/anim/Anim.cpp
+index a9f6252..4d960b1 100644
+--- a/neo/game/anim/Anim.cpp
++++ b/neo/game/anim/Anim.cpp
+@@ -330,6 +330,143 @@ bool idMD5Anim::LoadAnim( const char *filename ) {
+ 	return true;
+ }
+ 
++/*
++====================
++idMD5Anim::BuildFromGLTF
++
++In-memory equivalent of LoadAnim() (R-GLTF Spike-B): builds this idMD5Anim from a
++glTF-derived clip (RENDER fills gltfAnimClip_t from a GLB) instead of parsing a
++.md5anim file. Mirrors LoadAnim field-for-field so a glTF-animated entity resolves
++through the SHIPPED combat wire unchanged (animNum -> CycleAnim -> idAnim -> idMD5Anim).
++The clip's quaternions are already normalized with w>=0, so only x,y,z are stored
++per the .md5anim convention and CalcW recovers w at sample time.
++====================
++*/
++bool idMD5Anim::BuildFromGLTF( const gltfAnimClip_t &clip ) {
++	int i, j;
++
++	if ( clip.numJoints <= 0 || clip.numFrames <= 0 || clip.frameRate < 0 ) {
++		return false;
++	}
++	if ( clip.joints.Num() != clip.numJoints ||
++	     clip.baseFrame.Num() != clip.numJoints ||
++	     clip.animBits.Num() != clip.numJoints ||
++	     clip.frames.Num() != clip.numFrames * clip.numJoints ) {
++		return false;
++	}
++
++	Free();
++
++	name = clip.name;
++	numFrames = clip.numFrames;
++	numJoints = clip.numJoints;
++	frameRate = clip.frameRate;
++
++	// hierarchy + per-joint anim bits; LoadAnim reads firstComponent + numAnimatedComponents
++	// from the file, we DERIVE them: firstComponent = running popcount, total = sum of popcounts.
++	jointInfo.SetGranularity( 1 );
++	jointInfo.SetNum( numJoints );
++	numAnimatedComponents = 0;
++	for ( i = 0; i < numJoints; i++ ) {
++		// SAME intern table as the model's idMD5Joint names so CheckModelHierarchy matches.
++		jointInfo[ i ].nameIndex = animationLib.JointIndex( clip.joints[ i ].name );
++		jointInfo[ i ].parentNum = clip.joints[ i ].parentNum;
++		int bits = clip.animBits[ i ] & 63;
++		jointInfo[ i ].animBits = bits;
++		jointInfo[ i ].firstComponent = numAnimatedComponents;
++		for ( j = 0; j < 6; j++ ) {
++			if ( bits & ( 1 << j ) ) {
++				numAnimatedComponents++;
++			}
++		}
++	}
++
++	// base frame (direct idJointQuat assign; q already normalized w>=0).
++	baseFrame.SetGranularity( 1 );
++	baseFrame.SetNum( numJoints );
++	for ( i = 0; i < numJoints; i++ ) {
++		baseFrame[ i ] = clip.baseFrame[ i ];
++	}
++
++	// component frames: pack ONLY the animBits-flagged channels per frame/joint,
++	// in [tx,ty,tz,qx,qy,qz] order (rotations store x,y,z; w recovered by CalcW).
++	componentFrames.SetGranularity( 1 );
++	componentFrames.SetNum( numAnimatedComponents * numFrames );
++	float *componentPtr = componentFrames.Ptr();
++	for ( i = 0; i < numFrames; i++ ) {
++		for ( j = 0; j < numJoints; j++ ) {
++			const idJointQuat &jq = clip.frames[ i * numJoints + j ];
++			int bits = jointInfo[ j ].animBits;
++			if ( bits & ANIM_TX ) { *componentPtr++ = jq.t.x; }
++			if ( bits & ANIM_TY ) { *componentPtr++ = jq.t.y; }
++			if ( bits & ANIM_TZ ) { *componentPtr++ = jq.t.z; }
++			if ( bits & ANIM_QX ) { *componentPtr++ = jq.q.x; }
++			if ( bits & ANIM_QY ) { *componentPtr++ = jq.q.y; }
++			if ( bits & ANIM_QZ ) { *componentPtr++ = jq.q.z; }
++		}
++	}
++
++	// bounds: prefer the clip's per-frame bounds; else a conservative box over the
++	// base-pose joint translations (start >= +-64u) so culling never drops the model.
++	bounds.SetGranularity( 1 );
++	bounds.SetNum( numFrames );
++	if ( clip.bounds.Num() == numFrames ) {
++		for ( i = 0; i < numFrames; i++ ) {
++			bounds[ i ] = clip.bounds[ i ];
++		}
++	} else {
++		idBounds def;
++		def[ 0 ].Set( -64.0f, -64.0f, -64.0f );
++		def[ 1 ].Set(  64.0f,  64.0f,  64.0f );
++		for ( i = 0; i < numJoints; i++ ) {
++			def.AddPoint( clip.baseFrame[ i ].t );
++		}
++		for ( i = 0; i < numFrames; i++ ) {
++			bounds[ i ] = def;
++		}
++	}
++
++	// total movement delta — IDENTICAL extraction to LoadAnim (subtracts baseFrame[0].t
++	// from the root joint's translation columns in place, then zeroes baseFrame[0].t).
++	if ( !numAnimatedComponents ) {
++		totaldelta.Zero();
++	} else {
++		componentPtr = &componentFrames[ jointInfo[ 0 ].firstComponent ];
++		if ( jointInfo[ 0 ].animBits & ANIM_TX ) {
++			for ( i = 0; i < numFrames; i++ ) {
++				componentPtr[ numAnimatedComponents * i ] -= baseFrame[ 0 ].t.x;
++			}
++			totaldelta.x = componentPtr[ numAnimatedComponents * ( numFrames - 1 ) ];
++			componentPtr++;
++		} else {
++			totaldelta.x = 0.0f;
++		}
++		if ( jointInfo[ 0 ].animBits & ANIM_TY ) {
++			for ( i = 0; i < numFrames; i++ ) {
++				componentPtr[ numAnimatedComponents * i ] -= baseFrame[ 0 ].t.y;
++			}
++			totaldelta.y = componentPtr[ numAnimatedComponents * ( numFrames - 1 ) ];
++			componentPtr++;
++		} else {
++			totaldelta.y = 0.0f;
++		}
++		if ( jointInfo[ 0 ].animBits & ANIM_TZ ) {
++			for ( i = 0; i < numFrames; i++ ) {
++				componentPtr[ numAnimatedComponents * i ] -= baseFrame[ 0 ].t.z;
++			}
++			totaldelta.z = componentPtr[ numAnimatedComponents * ( numFrames - 1 ) ];
++		} else {
++			totaldelta.z = 0.0f;
++		}
++	}
++	baseFrame[ 0 ].t.Zero();
++
++	// we don't count last frame because it would cause a 1 frame pause at the end
++	animLength = ( ( numFrames - 1 ) * 1000 + frameRate - 1 ) / frameRate;
++
++	return true;
++}
++
+ /*
+ ====================
+ idMD5Anim::IncreaseRefs
+@@ -999,6 +1136,50 @@ void idAnimManager::ReloadAnims( void ) {
+ 	}
+ }
+ 
++/*
++====================
++idAnimManager::RegisterMemoryAnim
++
++Pre-insert an in-memory idMD5Anim built from a glTF clip under its synthetic
++".md5anim" key, so a later GetAnim(key) (e.g. from idDeclModelDef::ParseAnim) is a
++CACHE HIT and never file-loads. Sibling of GetAnim; RENDER calls this once per clip
++after parsing a GLB. The shipped combat wire (animNum -> CycleAnim -> idAnim ->
++idMD5Anim) then resolves the glTF anim with no wire/idAnim/idAnimator change.
++====================
++*/
++idMD5Anim *idAnimManager::RegisterMemoryAnim( const gltfAnimClip_t &clip ) {
++	idMD5Anim **animptrptr = NULL;
++
++	// idempotent: if already registered (or a real file of that name was loaded), reuse it.
++	if ( animations.Get( clip.name, &animptrptr ) ) {
++		return animptrptr ? *animptrptr : NULL;
++	}
++
++	idMD5Anim *anim = new idMD5Anim();
++	if ( !anim->BuildFromGLTF( clip ) ) {
++		gameLocal.Warning( "Couldn't build in-memory anim: '%s'", clip.name.c_str() );
++		delete anim;
++		anim = NULL;
++	}
++	animations.Set( clip.name, anim );
++
++	return anim;
++}
++
++/*
++====================
++D3_RegisterGltfAnim
++
++Free shim declared by RENDER in renderer/Model.h (so neo/renderer never needs an
++anim header / the animationLib global). RENDER's GLB loader calls this once per
++clip; it routes to the manager. Defined here where animationLib lives (linked into
++the monolithic HARDLINK_GAME build).
++====================
++*/
++idMD5Anim *D3_RegisterGltfAnim( const gltfAnimClip_t &clip ) {
++	return animationLib.RegisterMemoryAnim( clip );
++}
++
+ /*
+ ================
+ idAnimManager::JointIndex
+diff --git a/neo/game/anim/Anim.h b/neo/game/anim/Anim.h
+index dcba853..6f97139 100644
+--- a/neo/game/anim/Anim.h
++++ b/neo/game/anim/Anim.h
+@@ -248,6 +248,7 @@ public:
+ 	size_t					Allocated( void ) const;
+ 	size_t					Size( void ) const { return sizeof( *this ) + Allocated(); };
+ 	bool					LoadAnim( const char *filename );
++	bool					BuildFromGLTF( const gltfAnimClip_t &clip );	// in-memory LoadAnim (R-GLTF Spike-B; RENDER fills the clip from a GLB)
+ 
+ 	void					IncreaseRefs( void ) const;
+ 	void					DecreaseRefs( void ) const;
+@@ -611,6 +612,7 @@ public:
+ 
+ 	void						Shutdown( void );
+ 	idMD5Anim *					GetAnim( const char *name );
++	idMD5Anim *					RegisterMemoryAnim( const gltfAnimClip_t &clip );	// pre-insert a glTF-built anim under its .md5anim key so GetAnim is a cache hit (no file load)
+ 	void						ReloadAnims( void );
+ 	void						ListAnims( void ) const;
+ 	int							JointIndex( const char *name );
+diff --git a/neo/game/anim/Anim_Blend.cpp b/neo/game/anim/Anim_Blend.cpp
+index e3409ba..2e7c6d7 100644
+--- a/neo/game/anim/Anim_Blend.cpp
++++ b/neo/game/anim/Anim_Blend.cpp
+@@ -2619,7 +2619,12 @@ bool idDeclModelDef::Parse( const char *text, const int textLength ) {
+ 			}
+ 			filename = token2;
+ 			filename.ExtractFileExtension( extension );
+-			if ( extension != MD5_MESH_EXT ) {
++			// R-GLTF: accept glTF meshes (SPINE-blessed relax, Arco/doom commit 5637199 /
++			// combat-p0-idai.patch:422) so a modelDef can bind a .glb/.gltf and the unmodified
++			// idAnimator combat wire drives a CPU-skinned glTF enemy. Everything after this check
++			// uses only the abstract idRenderModel interface our glTF model implements. Synced into
++			// the render-track base patch so the WASM engine I build includes the client half.
++			if ( extension != MD5_MESH_EXT && extension.Icmp( "glb" ) != 0 && extension.Icmp( "gltf" ) != 0 ) {
+ 				src.Warning( "Invalid model for MD5 mesh" );
+ 				MakeDefault();
+ 				return false;
 diff --git a/neo/game/gamesys/SysCmds.cpp b/neo/game/gamesys/SysCmds.cpp
 index 105ff57..e4b3f00 100644
 --- a/neo/game/gamesys/SysCmds.cpp
@@ -3392,7 +4226,7 @@ index 105ff57..e4b3f00 100644
  	cmdSystem->AddCommand( "sayTeam",				Cmd_SayTeam_f,				CMD_FL_GAME,				"team text chat" );
  	cmdSystem->AddCommand( "addChatLine",			Cmd_AddChatLine_f,			CMD_FL_GAME,				"internal use - core to game chat lines" );
 diff --git a/neo/game/gamesys/SysCvar.cpp b/neo/game/gamesys/SysCvar.cpp
-index 824d9c2..510f360 100644
+index 824d9c2..4bda411 100644
 --- a/neo/game/gamesys/SysCvar.cpp
 +++ b/neo/game/gamesys/SysCvar.cpp
 @@ -97,14 +97,16 @@ idCVar r_aspectRatio(				"r_aspectRatio",			"-1",			CVAR_RENDERER | CVAR_INTEGER
@@ -3413,8 +4247,19 @@ index 824d9c2..510f360 100644
  idCVar g_knockback(					"g_knockback",				"1000",			CVAR_GAME | CVAR_INTEGER, "" );
  idCVar g_skill(						"g_skill",					"1",			CVAR_GAME | CVAR_INTEGER, "" );
  idCVar g_nightmare(					"g_nightmare",				"0",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "if nightmare mode is allowed" );
+@@ -271,6 +273,10 @@ idCVar pm_thirdPersonDeath(			"pm_thirdPersonDeath",		"0",			CVAR_GAME | CVAR_NE
+ idCVar pm_modelView(				"pm_modelView",				"0",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_INTEGER, "draws camera from POV of player model (1 = always, 2 = when dead)", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
+ idCVar pm_airTics(					"pm_air",					"1800",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_INTEGER, "how long in milliseconds the player can go without air before he starts taking damage" );
+ 
++idCVar g_viewInterpolate(			"g_viewInterpolate",		"0",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "render-only temporal low-pass smoothing of the first-person/spectator camera origin (damps fps!=60 jitter)" );
++idCVar g_viewSmooth(				"g_viewSmooth",				"0.30",			CVAR_GAME | CVAR_ARCHIVE | CVAR_FLOAT, "view low-pass factor k (smoothed += (raw-smoothed)*k); larger = snappier/less smooth", 0.05f, 0.95f );
++idCVar g_viewInterpMaxDelta(		"g_viewInterpMaxDelta",		"512",			CVAR_GAME | CVAR_FLOAT, "origin delta (units) above which the view snaps instead of smoothing (teleport/spawn/spectate-snap guard)", 64.0f, 4096.0f );
++
+ idCVar g_showPlayerShadow(			"g_showPlayerShadow",		"0",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "enables shadow of player model" );
+ idCVar g_showHud(					"g_showHud",				"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "" );
+ idCVar g_showProjectilePct(			"g_showProjectilePct",		"0",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "enables display of player hit percentage" );
 diff --git a/neo/game/gamesys/SysCvar.h b/neo/game/gamesys/SysCvar.h
-index a4883b5..233abca 100644
+index a4883b5..67918b8 100644
 --- a/neo/game/gamesys/SysCvar.h
 +++ b/neo/game/gamesys/SysCvar.h
 @@ -35,6 +35,7 @@ extern idCVar	developer;
@@ -3433,6 +4278,49 @@ index a4883b5..233abca 100644
  extern idCVar	g_projectileLights;
  extern idCVar	g_doubleVision;
  extern idCVar	g_hitEffect;
+@@ -200,6 +202,9 @@ extern idCVar	pm_thirdPersonDeath;
+ extern idCVar	pm_modelView;
+ extern idCVar	pm_airTics;
+ 
++extern idCVar	g_viewInterpolate;
++extern idCVar	g_viewSmooth;
++extern idCVar	g_viewInterpMaxDelta;
+ extern idCVar	g_showPlayerShadow;
+ extern idCVar	g_showHud;
+ extern idCVar	g_showProjectilePct;
+diff --git a/neo/game/physics/Physics_Player.cpp b/neo/game/physics/Physics_Player.cpp
+index 82ac812..b4e1605 100644
+--- a/neo/game/physics/Physics_Player.cpp
++++ b/neo/game/physics/Physics_Player.cpp
+@@ -826,18 +826,20 @@ void idPhysics_Player::SpectatorMove( void ) {
+ 
+ 	idVec3	end;
+ 
+-	// fly movement
+-
+-	idPhysics_Player::Friction();
+-
+ 	scale = idPhysics_Player::CmdScale( command );
+-
+ 	if ( !scale ) {
+-		wishvel = vec3_origin;
+-	} else {
+-		wishvel = scale * (viewForward * command.forwardmove + viewRight * command.rightmove);
++		current.velocity.Zero();
++		return;
++	}
++
++	const float wishVertical = ( viewForward * gravityNormal ) * command.forwardmove + command.upmove;
++	if ( idMath::Fabs( wishVertical ) < 1.0f ) {
++		current.velocity -= ( current.velocity * gravityNormal ) * gravityNormal;
+ 	}
+ 
++	idPhysics_Player::Friction();
++	wishvel = scale * (viewForward * command.forwardmove + viewRight * command.rightmove);
++
+ 	wishdir = wishvel;
+ 	wishspeed = wishdir.Normalize();
+ 
 diff --git a/neo/idlib/MapFile.cpp b/neo/idlib/MapFile.cpp
 index afbfa1d..cf83f9d 100644
 --- a/neo/idlib/MapFile.cpp
@@ -4409,42 +5297,3 @@ index cb91cf5..dfcf586 100644
  
  	int							MemorySize( void ) const;
  	void						ReportRoutingEfficiency( void ) const;
-diff --git a/neo/game/anim/Anim_Blend.cpp b/neo/game/anim/Anim_Blend.cpp
-index e3409ba..fa025e1 100644
---- a/neo/game/anim/Anim_Blend.cpp
-+++ b/neo/game/anim/Anim_Blend.cpp
-@@ -2619,7 +2619,12 @@ bool idDeclModelDef::Parse( const char *text, const int textLength ) {
- 			}
- 			filename = token2;
- 			filename.ExtractFileExtension( extension );
--			if ( extension != MD5_MESH_EXT ) {
-+			// CONTENT/RENDER (arco-doom): accept rigged glTF (.glb/.gltf) as a modelDef mesh, not just
-+			// .md5mesh. RENDER's CPU-skinned glTF render model implements the same abstract idRenderModel
-+			// interface (IsDefaultModel/NumJoints/GetJoints) that everything below this gate uses, so a
-+			// .glb enemy drives through the UNMODIFIED idAnimator + combat wire. Unblocks the content-forge
-+			// rigged-enemy packer->engine path + RENDER's full-animator-drive re-verify.
-+			if ( extension != MD5_MESH_EXT && extension.Icmp( "glb" ) != 0 && extension.Icmp( "gltf" ) != 0 ) {
- 				src.Warning( "Invalid model for MD5 mesh" );
- 				MakeDefault();
- 				return false;
-diff --git a/neo/game/MultiplayerGame.cpp b/neo/game/MultiplayerGame.cpp
-index 90180db..14acaec 100644
---- a/neo/game/MultiplayerGame.cpp
-+++ b/neo/game/MultiplayerGame.cpp
-@@ -1959,7 +1959,16 @@ void idMultiplayerGame::UpdateHud( idPlayer *player, idUserInterface *hud ) {
- 		return;
- 	}
- 
-+#ifdef __EMSCRIPTEN__
-+	// arco-doom: SUPPRESS the "WARMING UP" HUD overlay. A touch client can't ready-up (no menu) and
-+	// forcing GAMEON re-spectates everyone (the documented loop), so warmup is held — but the player is
-+	// already auto-joined (si_spectators 0) and can move/shoot, so just DON'T SHOW the banner. The match
-+	// STATE is unchanged (still warmup, stable); only the HUD display is hidden. Result: drops straight
-+	// into playing, no "warming up" wait shown. (?args=+set ui_showWarmup 1 not wired — pure display gate.)
-+	hud->SetStateBool( "warmup", false );
-+#else
- 	hud->SetStateBool( "warmup", Warmup() );
-+#endif
- 
- 	if ( gameState == WARMUP ) {
- 		if ( player->IsReady() ) {
