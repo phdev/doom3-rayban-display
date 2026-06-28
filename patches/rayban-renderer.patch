@@ -1986,10 +1986,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..8319d59
+index 0000000..b8d90da
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,5920 @@
+@@ -0,0 +1,6078 @@
 +/*
 +================================================================================
 +
@@ -2015,6 +2015,7 @@ index 0000000..8319d59
 +*/
 +
 +#include "RenderBackend.h"
++#include "framework/d3_arco.h"
 +
 +extern "C" int D3_RenderSkipPostProcess();
 +
@@ -2045,7 +2046,10 @@ index 0000000..8319d59
 +
 +#if D3_WEBGPU_AVAILABLE
 +
++extern "C" int g_capWgpuSingleLight;
++
 +static void D3_WGPU_TraceBindGroup(const char* func, int line, const WGPUBindGroupDescriptor* desc) {
++    if (g_capWgpuSingleLight != -889) return;
 +    char buf[2048];
 +    int off = snprintf(buf, sizeof(buf), "%s:%d layout=%p entries=%u",
 +                       func ? func : "?", line, desc ? (void*)desc->layout : nullptr,
@@ -2068,8 +2072,11 @@ index 0000000..8319d59
 +    }, buf);
 +}
 +
++static uint32_t g_wgpuBgCreateTotal = 0;
++
 +static WGPUBindGroup D3_WGPU_CreateBindGroup(WGPUDevice device, const char* func, int line,
 +                                             const WGPUBindGroupDescriptor* desc) {
++    g_wgpuBgCreateTotal++;
 +    D3_WGPU_TraceBindGroup(func, line, desc);
 +    return wgpuDeviceCreateBindGroup(device, desc);
 +}
@@ -2306,6 +2313,7 @@ index 0000000..8319d59
 +extern "C" uint32_t g_capMuzzleFired;      // set this frame when a view muzzle-flash light is captured
 +extern "C" float    g_capMuzzleUV[4];      // muzzle + aim points projected to screen UV at capture
 +extern "C" uint32_t g_capInCinematic;
++extern "C" int      g_capSubmitInterval;
 +extern "C" float    g_mbViewProj[16];
 +extern "C" float    g_mbInvViewProj[16];
 +extern "C" int D3_WebGPU_CachedImageCount( void );
@@ -2321,6 +2329,7 @@ index 0000000..8319d59
 +    WGPUSurface             surface          = nullptr;
 +    WGPUTextureFormat       surfaceFormat    = WGPUTextureFormat_Undefined;
 +    WGPUCommandEncoder      cmdEncoder       = nullptr;
++    bool                    cmdEncoderHasWork = false;
 +    WGPURenderPassEncoder   renderPass       = nullptr;
 +    WGPURenderPipeline      currentPipeline  = nullptr;
 +    // Iter 1 demo
@@ -2389,6 +2398,7 @@ index 0000000..8319d59
 +    // (GUI-only frames) redraw this set.
 +    Rec                     lastRecords[kMaxRecordSlots] = {};
 +    uint32_t                lastRecordCount = 0;
++    uint32_t                submitPaceFrame = 0;
 +    WGPUBindGroup           lastMatGroups[kMaxRecordSlots] = {nullptr};
 +    // Iter 7b: GPU texture cache (engine idImage ptr → WGPUTextureView) and
 +    // material bind-group cache (5-image tuple → group(1) bind group).
@@ -2446,6 +2456,8 @@ index 0000000..8319d59
 +    WGPUBindGroupLayout     passBGL           = nullptr;
 +    Rec                     lastPassRecords[kMaxRecordSlots] = {};
 +    WGPUBindGroup           lastPassGroups[kMaxRecordSlots]  = {nullptr};
++    const void*             lastPassGroupImgs[kMaxRecordSlots] = {};
++    uint8_t                 lastPassGroupClamp[kMaxRecordSlots] = {};
 +    uint32_t                lastPassCount = 0;
 +    struct PassBGEntry { uint32_t slot; const void* img; WGPUBindGroup group; };
 +    // Multiplayer map movement can visit more than 1024 (record slot, image)
@@ -2783,17 +2795,20 @@ index 0000000..8319d59
 +        WGPUCommandEncoderDescriptor cd = {};
 +        cd.label = { "frame", WGPU_STRLEN };
 +        cmdEncoder = wgpuDeviceCreateCommandEncoder(device, &cd);
++        cmdEncoderHasWork = false;
 +#endif
 +    }
 +
 +    void EndFrame() override {
 +#if D3_WEBGPU_AVAILABLE
++        const double arcoEndStart = emscripten_get_now();
 +        // Iter 1 (Phase 5d milestone): instead of a debug clear, render a
 +        // textured quad using texture.wgsl. Lazy-init the pipeline + resources
 +        // on first frame. Proves the full pipeline-create + bindgroup +
 +        // textured-draw path works on iOS Safari WebGPU, end-to-end, inside
 +        // the engine context (not just standalone like wall.html).
 +        if (surface && !demoInit) {
++            const double phaseStart = emscripten_get_now();
 +            demoInit = true;
 +            initDemoQuad();
 +            initInteractionPipeline();
@@ -2808,12 +2823,17 @@ index 0000000..8319d59
 +            initSkyPipeline();
 +            initReflectPipeline();
 +            initRecordSlots();
++            D3Arco_StallTrace( "wgpu.pipelineInit", emscripten_get_now() - phaseStart, 8.0 );
 +        }
 +        // Iter 55: refresh GPU caches for any image whose pixels changed since
 +        // last frame (streamed texture arrived → reloaded → re-cached). Runs
 +        // BEFORE the drain's getEngineTextureView/getMaterialBindGroup calls so
 +        // the rebuild picks up the new pixels this same frame.
++        const int reuploadBefore = g_capReuploadCount;
++        const int reuploadAllBefore = g_capReuploadAll;
++        double phaseStart = emscripten_get_now();
 +        processStreamReuploads();
++        D3Arco_StallTrace( "wgpu.reupload", emscripten_get_now() - phaseStart, 4.0, reuploadBefore, reuploadAllBefore );
 +        // Iter 30: on 120Hz displays rAF outpaces the 60Hz engine, so every
 +        // other EndFrame would re-encode and re-submit a byte-identical
 +        // frame — pure WebKit GPU-process churn (measured: the GPU helper
@@ -2828,16 +2848,36 @@ index 0000000..8319d59
 +                return;
 +            }
 +        }
++        if (recordSlotsReady && (lastRecordCount > 0 || lastPassCount > 0)) {
++            int interval = g_capSubmitInterval;
++            if (interval < 1) interval = 1;
++            if (interval > 4) interval = 4;
++            if (interval > 1) {
++                submitPaceFrame++;
++                if ((submitPaceFrame % (uint32_t)interval) != 0) {
++                    discardCapturedFrame();
++                    D3Arco_StallTrace( "wgpu.skipPacedSubmit", emscripten_get_now() - arcoEndStart, 20.0, (int)lastRecordCount, interval );
++                    return;
++                }
++            }
++        }
 +        // iter-132: background GPU-texture pre-warm — runs only on frames we're
 +        // about to present (past the iter-30 submit-skip), so each warmed batch
 +        // is flushed by this frame's QueueSubmit. No-op unless r_wgpuPreloadPerFrame>0.
++        const int preloadTexBefore = texCacheCount;
++        phaseStart = emscripten_get_now();
 +        preloadSweep();
++        D3Arco_StallTrace( "wgpu.preloadSweep", emscripten_get_now() - phaseStart, 3.0, texCacheCount - preloadTexBefore, texCacheCount );
 +        if (surface && demoPipeline) {
 +            WGPUSurfaceTexture st;
++            phaseStart = emscripten_get_now();
 +            wgpuSurfaceGetCurrentTexture(surface, &st);
++            D3Arco_StallTrace( "wgpu.surfaceAcquire", emscripten_get_now() - phaseStart, 4.0, (int)st.status, 0 );
 +            if (st.status == WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal ||
 +                st.status == WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal) {
++                phaseStart = emscripten_get_now();
 +                WGPUTextureView v = wgpuTextureCreateView(st.texture, nullptr);
++                D3Arco_StallTrace( "wgpu.surfaceView", emscripten_get_now() - phaseStart, 4.0 );
 +                WGPUCommandEncoderDescriptor cd = {};
 +                WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(device, &cd);
 +
@@ -2855,14 +2895,18 @@ index 0000000..8319d59
 +                // the true pre-content boot window.
 +                bool drained = recordSlotsReady && interactionPipeline && depthPipeline &&
 +                               uploadCapturedRecords(multiCount);
++                D3Arco_StallTrace( "wgpu.uploadRecords", emscripten_get_now() - phaseStart, 8.0, (int)multiCount, (int)lastRecordCount );
 +                bool multiOk = drained && (multiCount > 0 || lastPassCount > 0);
 +
 +                if (multiOk) {
 +                    // Full echo: depth pre-pass + additive lit pass, exactly
 +                    // the structure the determinism self-test exercises.
++                    phaseStart = emscripten_get_now();
 +                    encodeRecordsPass(enc, v, depthView, st.texture);
++                    D3Arco_StallTrace( "wgpu.encodeRecords", emscripten_get_now() - phaseStart, 8.0, (int)multiCount, (int)lastPassCount );
 +                } else {
 +                    // Boot/fallback: teal clear + textured demo quad.
++                    phaseStart = emscripten_get_now();
 +                    float ub[32] = {
 +                        1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1,
 +                        1.0f, 1.0f, 1.0f, 1.0f,
@@ -2896,11 +2940,16 @@ index 0000000..8319d59
 +                    wgpuRenderPassEncoderDraw(rp, 6, 1, 0, 0);
 +                    wgpuRenderPassEncoderEnd(rp);
 +                    wgpuRenderPassEncoderRelease(rp);
++                    D3Arco_StallTrace( "wgpu.encodeFallback", emscripten_get_now() - phaseStart, 8.0 );
 +                }
 +
++                phaseStart = emscripten_get_now();
 +                WGPUCommandBuffer cb = wgpuCommandEncoderFinish(enc, nullptr);
 +                wgpuCommandEncoderRelease(enc);
++                D3Arco_StallTrace( "wgpu.finishSurface", emscripten_get_now() - phaseStart, 4.0 );
++                phaseStart = emscripten_get_now();
 +                wgpuQueueSubmit(queue, 1, &cb);
++                D3Arco_StallTrace( "wgpu.submitSurface", emscripten_get_now() - phaseStart, 4.0 );
 +                wgpuCommandBufferRelease(cb);
 +                wgpuTextureViewRelease(v);
 +                wgpuTextureRelease(st.texture);
@@ -2970,14 +3019,26 @@ index 0000000..8319d59
 +                wgpuCommandEncoderCopyBufferToBuffer(cmdEncoder, passUBuf, 2 * kUBStride, dbgReadBuf, 0, 128);
 +                wgpuCommandEncoderCopyBufferToBuffer(cmdEncoder, recordVertexBuf, r2.vertOffset, dbgReadBuf, 256, 240);
 +                dbgReadPending = true;
++                cmdEncoderHasWork = true;
 +            }
++        }
++        if (!cmdEncoderHasWork) {
++            wgpuCommandEncoderRelease(cmdEncoder);
++            cmdEncoder = nullptr;
++            D3Arco_StallTrace( "wgpu.skipMainSubmit", emscripten_get_now() - arcoEndStart, 20.0, (int)lastRecordCount, texCacheCount );
++            D3Arco_StallTrace( "wgpu.endFrameTotal", emscripten_get_now() - arcoEndStart, 20.0, (int)lastRecordCount, texCacheCount );
++            return;
 +        }
 +        WGPUCommandBufferDescriptor cbd = {};
 +        cbd.label = { "frame", WGPU_STRLEN };
++        phaseStart = emscripten_get_now();
 +        WGPUCommandBuffer cb = wgpuCommandEncoderFinish(cmdEncoder, &cbd);
 +        wgpuCommandEncoderRelease(cmdEncoder);
 +        cmdEncoder = nullptr;
++        D3Arco_StallTrace( "wgpu.finishMain", emscripten_get_now() - phaseStart, 4.0 );
++        phaseStart = emscripten_get_now();
 +        wgpuQueueSubmit(queue, 1, &cb);
++        D3Arco_StallTrace( "wgpu.submitMain", emscripten_get_now() - phaseStart, 4.0 );
 +        wgpuCommandBufferRelease(cb);
 +        if (dbgReadPending) {
 +            dbgReadPending = false;
@@ -3004,6 +3065,7 @@ index 0000000..8319d59
 +                };
 +            wgpuBufferMapAsync(dbgReadBuf, WGPUMapMode_Read, 0, 512, cbi);
 +        }
++        D3Arco_StallTrace( "wgpu.endFrameTotal", emscripten_get_now() - arcoEndStart, 20.0, (int)lastRecordCount, texCacheCount );
 +#endif
 +    }
 +
@@ -4436,6 +4498,7 @@ index 0000000..8319d59
 +    // idImage pointer, created+uploaded on first use.
 +    WGPUTextureView getEngineTextureView(const void* imgPtr, WGPUTextureView fallback) {
 +        if (!imgPtr) return fallback;
++        const double arcoTexStart = emscripten_get_now();
 +        // Iter 14: linked subview render targets shadow the engine image.
 +        for (uint32_t i = 0; i < g_subviewLinkCount && i < kMaxSubviews; ++i) {
 +            if (g_subviewLinks[i].img == imgPtr && subviewView[i]) return subviewView[i];
@@ -4549,6 +4612,7 @@ index 0000000..8319d59
 +        texCacheCount++;
 +        gpuTexBytes += newBytes;
 +        publishTexStats();
++        D3Arco_StallTrace( "wgpu.texUpload", emscripten_get_now() - arcoTexStart, 6.0, slot->w, slot->h );
 +        // Diagnostic inventory: name, size, mid-pixel RGBA (first 12 uploads
 +        // only — enough to validate the cache without flooding the console).
 +        if (texCacheCount <= 12) {
@@ -4858,17 +4922,19 @@ index 0000000..8319d59
 +    // dominates the accumulator, so chunk-diffing against a CPU mirror
 +    // cuts the staging churn ~10x. `fresh` forces a full upload (the GPU
 +    // buffer was just recreated).
-+    void deltaUpload(WGPUBuffer buf, const uint8_t* data, uint32_t bytes,
-+                     uint8_t*& mirror, uint32_t& mirrorBytes, uint32_t& mirrorCap,
-+                     bool fresh) {
++    uint32_t deltaUpload(WGPUBuffer buf, const uint8_t* data, uint32_t bytes,
++                         uint8_t*& mirror, uint32_t& mirrorBytes, uint32_t& mirrorCap,
++                         bool fresh, uint32_t* writesOut = nullptr) {
 +        const uint32_t kChunk = 256 * 1024;
-+        if (!buf || bytes == 0) return;
++        if (writesOut) *writesOut = 0;
++        if (!buf || bytes == 0) return 0;
 +        if (mirrorCap < bytes) {
 +            uint8_t* nm = (uint8_t*)realloc(mirror, bytes);
 +            if (!nm) {   // mirror OOM: plain full upload, drop the mirror
 +                free(mirror); mirror = nullptr; mirrorBytes = mirrorCap = 0;
 +                wgpuQueueWriteBuffer(queue, buf, 0, data, bytes);
-+                return;
++                if (writesOut) *writesOut = 1;
++                return bytes;
 +            }
 +            mirror = nm; mirrorCap = bytes;
 +        }
@@ -4876,10 +4942,12 @@ index 0000000..8319d59
 +            memcpy(mirror, data, bytes);
 +            mirrorBytes = bytes;
 +            wgpuQueueWriteBuffer(queue, buf, 0, data, bytes);
-+            return;
++            if (writesOut) *writesOut = 1;
++            return bytes;
 +        }
 +        const uint32_t cmpEnd = bytes < mirrorBytes ? bytes : mirrorBytes;
 +        uint32_t dbgUploaded = 0;
++        uint32_t writeCount = 0;
 +        uint32_t off = 0;
 +        while (off < cmpEnd) {
 +            const uint32_t len = (cmpEnd - off > kChunk) ? kChunk : cmpEnd - off;
@@ -4894,6 +4962,7 @@ index 0000000..8319d59
 +                memcpy(mirror + start, data + start, off - start);
 +                wgpuQueueWriteBuffer(queue, buf, start, data + start, off - start);
 +                dbgUploaded += off - start;
++                writeCount++;
 +            } else {
 +                off += len;
 +            }
@@ -4902,6 +4971,7 @@ index 0000000..8319d59
 +            memcpy(mirror + mirrorBytes, data + mirrorBytes, bytes - mirrorBytes);
 +            wgpuQueueWriteBuffer(queue, buf, mirrorBytes, data + mirrorBytes, bytes - mirrorBytes);
 +            dbgUploaded += bytes - mirrorBytes;
++            writeCount++;
 +        }
 +        {
 +            extern int g_capWgpuSingleLight;
@@ -4913,6 +4983,8 @@ index 0000000..8319d59
 +            }
 +        }
 +        mirrorBytes = bytes;
++        if (writesOut) *writesOut = writeCount;
++        return dbgUploaded;
 +    }
 +
 +    // Iter 6.6: copy CPU-side records → GPU buffers and CONSUME the
@@ -4933,6 +5005,7 @@ index 0000000..8319d59
 +        extern void* g_capImagePtrs[][5];
 +
 +        outCount = 0;
++        const uint32_t bgCreateStart = g_wgpuBgCreateTotal;
 +        if (g_capRecordCount == 0) {
 +            extern uint32_t g_passRecordCount;
 +            extern uint32_t g_shadowRecordCount;
@@ -4983,10 +5056,17 @@ index 0000000..8319d59
 +            extern int g_capWgpuSingleLight;
 +            if (g_capWgpuSingleLight == -896) vertBufFresh = true;   // debug: force full upload
 +        }
-+        deltaUpload(recordVertexBuf, g_capVertsAccum, vNeed,
-+                    vertMirror, vertMirrorBytes, vertMirrorCap, vertBufFresh);
-+        deltaUpload(recordIndexBuf, (const uint8_t*)g_capIndexesAccum, iNeed,
-+                    idxMirror, idxMirrorBytes, idxMirrorCap, idxBufFresh);
++        double phaseStart = emscripten_get_now();
++        uint32_t geomWrites = 0;
++        uint32_t writes = 0;
++        uint32_t geomUploaded = deltaUpload(recordVertexBuf, g_capVertsAccum, vNeed,
++                                            vertMirror, vertMirrorBytes, vertMirrorCap, vertBufFresh, &writes);
++        geomWrites += writes;
++        geomUploaded += deltaUpload(recordIndexBuf, (const uint8_t*)g_capIndexesAccum, iNeed,
++                                    idxMirror, idxMirrorBytes, idxMirrorCap, idxBufFresh, &writes);
++        geomWrites += writes;
++        D3Arco_StallTrace( "wgpu.upload.geom", emscripten_get_now() - phaseStart, 3.0,
++                           (int)(geomUploaded / 1024u), (int)geomWrites );
 +
 +        uint32_t total = (g_capRecordCount < kMaxRecordSlots) ? g_capRecordCount : kMaxRecordSlots;
 +        // Keep only the MAIN view's records. Subviews (mirrors, security
@@ -4996,6 +5076,7 @@ index 0000000..8319d59
 +        uint32_t n = 0;
 +        uint32_t mainN = 0;
 +        subGroupCount = 0;
++        phaseStart = emscripten_get_now();
 +        if (total > 0) {
 +            const uint32_t mainView = g_capRecords[total - 1].pad0;
 +            // In-place compaction would clobber records we still need for the
@@ -5045,10 +5126,14 @@ index 0000000..8319d59
 +                if (n > start) subGroupCount = L + 1;
 +            }
 +        }
++        D3Arco_StallTrace( "wgpu.upload.compact", emscripten_get_now() - phaseStart, 2.0,
++                           (int)mainN, (int)n );
 +        // Per-slot uniform writes. r.modelMatrix holds the FULL MVP, baked
 +        // at capture time in draw_arb2.cpp where this view's projection and
 +        // this surface's modelView are both in scope. Use verbatim.
 +        extern float g_capInvGamma;
++        phaseStart = emscripten_get_now();
++        uint32_t matGroupChanges = 0;
 +        for (uint32_t i = 0; i < n; ++i) {
 +            const Rec& r = g_capRecords[i];
 +            float ub[64];
@@ -5135,11 +5220,17 @@ index 0000000..8319d59
 +            // evict (and release) the entry while redraw-last frames still
 +            // encode from this array; without the ref iOS threw
 +            // "setBindGroup must be an instance of GPUBindGroup".
-+            if (lastMatGroups[i]) wgpuBindGroupRelease(lastMatGroups[i]);
-+            lastMatGroups[i] = getMaterialBindGroup(g_capImagePtrs[i]);
-+            if (lastMatGroups[i]) wgpuBindGroupAddRef(lastMatGroups[i]);
++            WGPUBindGroup nextMatGroup = getMaterialBindGroup(g_capImagePtrs[i]);
++            if (nextMatGroup != lastMatGroups[i]) {
++                if (lastMatGroups[i]) wgpuBindGroupRelease(lastMatGroups[i]);
++                lastMatGroups[i] = nextMatGroup;
++                if (lastMatGroups[i]) wgpuBindGroupAddRef(lastMatGroups[i]);
++                matGroupChanges++;
++            }
 +            ensureRecordBindGroups(i);
 +        }
++        D3Arco_StallTrace( "wgpu.upload.litSlots", emscripten_get_now() - phaseStart, 4.0,
++                           (int)n, (int)matGroupChanges );
 +        // Keep a backend-local copy of the consumed records (the draw loop
 +        // reads offsets/counts from here, and no-capture frames redraw it).
 +        // lastRecordCount counts MAIN-view records only — the subview slot
@@ -5224,6 +5315,8 @@ index 0000000..8319d59
 +            uint32_t pTotal = (g_passRecordCount < kMaxRecordSlots) ? g_passRecordCount : kMaxRecordSlots;
 +            uint32_t pn = 0;
 +            uint32_t skyN = 0;
++            phaseStart = emscripten_get_now();
++            uint32_t passGroupChanges = 0;
 +            lastReflectCount = 0;
 +            if (pTotal > 0) {
 +                // Main-view tag: normally from the interaction records; with
@@ -5428,13 +5521,33 @@ index 0000000..8319d59
 +                    // video frame (per-slot dynamic texture) instead of a
 +                    // cached engine image.
 +                    // Iter 42: own a reference (see lastMatGroups note).
-+                    if (lastPassGroups[pn]) wgpuBindGroupRelease(lastPassGroups[pn]);
-+                    lastPassGroups[pn] = (r.pad3 == 4u)
-+                        ? nullptr   // iter-120 depth-fill record: prepass-only, no color group (would be a null-image bind)
-+                        : (r.sPad3 > 0)
-+                        ? getCinPassBindGroup(pn, r.sPad3 - 1u)
-+                        : getPassBindGroup(pn, g_passImagePtrs[i], false, g_passImageClamp[i] != 0u);   // iter-130: bind ClampToEdge for CLAMP textures (weapon ammo-glow ghosting); iter-121 Bug C REVERTED: white fallback
-+                    if (lastPassGroups[pn]) wgpuBindGroupAddRef(lastPassGroups[pn]);
++                    WGPUBindGroup nextPassGroup = nullptr;
++                    const void* nextPassImg = nullptr;
++                    uint8_t nextPassClamp = 0;
++                    bool forcePassGroupRefresh = false;
++                    if (r.pad3 == 4u) {
++                        nextPassGroup = nullptr;   // iter-120 depth-fill record: prepass-only, no color group (would be a null-image bind)
++                    } else if (r.sPad3 > 0) {
++                        nextPassGroup = getCinPassBindGroup(pn, r.sPad3 - 1u);
++                        forcePassGroupRefresh = true;
++                    } else {
++                        nextPassImg = g_passImagePtrs[i];
++                        nextPassClamp = g_passImageClamp[i] != 0u ? 1u : 0u;
++                        if (lastPassGroups[pn] && lastPassGroupImgs[pn] == nextPassImg &&
++                            lastPassGroupClamp[pn] == nextPassClamp) {
++                            nextPassGroup = lastPassGroups[pn];
++                        } else {
++                            nextPassGroup = getPassBindGroup(pn, nextPassImg, false, nextPassClamp != 0u);   // iter-130: bind ClampToEdge for CLAMP textures (weapon ammo-glow ghosting); iter-121 Bug C REVERTED: white fallback
++                        }
++                    }
++                    if (forcePassGroupRefresh || nextPassGroup != lastPassGroups[pn]) {
++                        if (lastPassGroups[pn]) wgpuBindGroupRelease(lastPassGroups[pn]);
++                        lastPassGroups[pn] = nextPassGroup;
++                        if (lastPassGroups[pn]) wgpuBindGroupAddRef(lastPassGroups[pn]);
++                        lastPassGroupImgs[pn] = nextPassImg;
++                        lastPassGroupClamp[pn] = nextPassClamp;
++                        passGroupChanges++;
++                    }
 +                    if (r.sPad3 > 0) {
 +                        static bool cinAnnounced = false;
 +                        if (!cinAnnounced && lastPassGroups[pn]) {
@@ -5450,6 +5563,8 @@ index 0000000..8319d59
 +            lastPassCount = pn;
 +            lastSkyCount = skyN;
 +            g_passRecordCount = 0;
++            D3Arco_StallTrace( "wgpu.upload.passSlots", emscripten_get_now() - phaseStart, 4.0,
++                               (int)pn, (int)passGroupChanges );
 +        }
 +
 +        // Iter 9: drain shadow records — upload the vec4 vertex accumulator,
@@ -5812,12 +5927,19 @@ index 0000000..8319d59
 +
 +        // Iter 28: flush the slot-uniform stages — ONE writeBuffer per family
 +        // (replaces the per-record writes; ~700 staging copies → ≤3).
++        phaseStart = emscripten_get_now();
 +        if (recordUBHigh && recordUBuf)
 +            wgpuQueueWriteBuffer(queue, recordUBuf, 0, recordUBStage, (uint64_t)recordUBHigh * kUBStride);
 +        if (passUBHigh && passUBuf)
 +            wgpuQueueWriteBuffer(queue, passUBuf, 0, passUBStage, (uint64_t)passUBHigh * kUBStride);
 +        if (shadowUBHigh && shadowUBuf)
 +            wgpuQueueWriteBuffer(queue, shadowUBuf, 0, shadowUBStage, (uint64_t)shadowUBHigh * kUBStride);
++        const uint32_t bgCreatesFrame = g_wgpuBgCreateTotal - bgCreateStart;
++        EM_ASM_({ window.__d3WgpuBgCreates = $0; window.__d3WgpuBgCreatesFrame = $1; },
++                g_wgpuBgCreateTotal, bgCreatesFrame);
++        D3Arco_StallTrace( "wgpu.upload.uniforms", emscripten_get_now() - phaseStart, 3.0,
++                           (int)(recordUBHigh + passUBHigh + shadowUBHigh),
++                           (int)bgCreatesFrame );
 +
 +        // CONSUME: drain the accumulator so next frame starts fresh. The
 +        // geometry-dedup table keys on frame-temp pointers — reset with the
@@ -5864,6 +5986,41 @@ index 0000000..8319d59
 +            g_capDropped = 0;
 +        }
 +        return true;
++    }
++
++    void discardCapturedFrame() {
++        extern uint32_t g_capRecordCount;
++        extern uint32_t g_capVertBytes;
++        extern uint32_t g_capIndexBytes;
++        extern uint32_t g_capDropped;
++        extern uint32_t g_capVertDedupCount;
++        extern uint32_t g_passRecordCount;
++        extern uint32_t g_shadowRecordCount;
++        extern uint32_t g_shadowVertBytes;
++        extern uint32_t g_shadowIndexBytes;
++        extern uint32_t g_fogRecordCount;
++        extern uint32_t g_blendRecordCount;
++        extern uint32_t g_skyDirBytes;
++        extern uint32_t g_hazeRecordCount;
++        extern uint32_t g_hazeVertBytes;
++        extern uint32_t g_hazeIndexBytes;
++        extern uint32_t g_cinFrameCount;
++        g_capRecordCount = 0;
++        g_capVertBytes = 0;
++        g_capIndexBytes = 0;
++        g_capDropped = 0;
++        g_capVertDedupCount = 0;
++        g_passRecordCount = 0;
++        g_shadowRecordCount = 0;
++        g_shadowVertBytes = 0;
++        g_shadowIndexBytes = 0;
++        g_fogRecordCount = 0;
++        g_blendRecordCount = 0;
++        g_skyDirBytes = 0;
++        g_hazeRecordCount = 0;
++        g_hazeVertBytes = 0;
++        g_hazeIndexBytes = 0;
++        g_cinFrameCount = 0;
 +    }
 +
 +    // ─── Iter 6.8: determinism self-test ────────────────────────────────────
@@ -7499,6 +7656,7 @@ index 0000000..8319d59
 +        rpd.depthStencilAttachment = depthView ? &depthAttach : nullptr;
 +
 +        renderPass = wgpuCommandEncoderBeginRenderPass(cmdEncoder, &rpd);
++        cmdEncoderHasWork = true;
 +        wgpuTextureViewRelease(colorView);
 +        if (depthView) wgpuTextureViewRelease(depthView);
 +#else
@@ -7943,7 +8101,7 @@ index 0000000..0f9c8e6
 +    return nullptr;
 +}
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
-index 7914093..3a8fdba 100644
+index 7914093..96fb3c7 100644
 --- a/neo/renderer/RenderSystem_init.cpp
 +++ b/neo/renderer/RenderSystem_init.cpp
 @@ -39,6 +39,11 @@ If you have questions concerning this license or the applicable additional terms
@@ -7958,7 +8116,7 @@ index 7914093..3a8fdba 100644
  
  #include "framework/GameCallbacks_local.h"
  #include "framework/Game.h"
-@@ -101,7 +106,86 @@ idCVar r_renderer( "r_renderer", "best", CVAR_RENDERER | CVAR_ARCHIVE, "hardware
+@@ -101,7 +106,87 @@ idCVar r_renderer( "r_renderer", "best", CVAR_RENDERER | CVAR_ARCHIVE, "hardware
  idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel jitter the projection matrix" );
  
  idCVar r_skipSuppress( "r_skipSuppress", "0", CVAR_RENDERER | CVAR_BOOL, "ignore the per-view suppressions" );
@@ -7996,6 +8154,7 @@ index 7914093..3a8fdba 100644
 +// ~1-3s smoothly instead of stalling per look. 0 = off (desktop / ?hd 256px).
 +idCVar r_wgpuPreloadPerFrame( "r_wgpuPreloadPerFrame", "0", CVAR_RENDERER | CVAR_INTEGER, "WebGPU: background-pre-warm up to N already-decoded images' GPU textures per frame (0 = off; the wearable 96px profile sets it)" );
 +idCVar r_wgpuPreloadMsPerFrame( "r_wgpuPreloadMsPerFrame", "6", CVAR_RENDERER | CVAR_INTEGER, "WebGPU: per-frame wall-time cap (ms) for the background texture pre-warm sweep" );
++idCVar r_wgpuSubmitInterval( "r_wgpuSubmitInterval", "1", CVAR_RENDERER | CVAR_INTEGER, "WebGPU: submit every N captured frames (1 = every frame; iOS pacing can set 2 to avoid GPU-process backlog)", 1, 4, idCmdSystem::ArgCompletion_Integer<1,4> );
 +// Iter 29: BFG-presentation specular. Verified against the id-Software
 +// DOOM-3-BFG source: BFG replaced the 2004 specular table (zero below
 +// N·H 0.75, then (4(x-.75))²) with analytic pow(N·H, 10) — broader, always-
@@ -8046,7 +8205,7 @@ index 7914093..3a8fdba 100644
  idCVar r_skipLightScale( "r_skipLightScale", "0", CVAR_RENDERER | CVAR_BOOL, "don't do any post-interaction light scaling, makes things dim on low-dynamic range cards" );
  idCVar r_skipInteractions( "r_skipInteractions", "0", CVAR_RENDERER | CVAR_BOOL, "skip all light/surface interaction drawing" );
  idCVar r_skipDynamicTextures( "r_skipDynamicTextures", "0", CVAR_RENDERER | CVAR_BOOL, "don't dynamically create textures" );
-@@ -146,7 +230,7 @@ idCVar r_skipSubviews( "r_skipSubviews", "0", CVAR_RENDERER | CVAR_INTEGER, "1 =
+@@ -146,7 +231,7 @@ idCVar r_skipSubviews( "r_skipSubviews", "0", CVAR_RENDERER | CVAR_INTEGER, "1 =
  idCVar r_skipGuiShaders( "r_skipGuiShaders", "0", CVAR_RENDERER | CVAR_INTEGER, "1 = skip all gui elements on surfaces, 2 = skip drawing but still handle events, 3 = draw but skip events", 0, 3, idCmdSystem::ArgCompletion_Integer<0,3> );
  idCVar r_skipParticles( "r_skipParticles", "0", CVAR_RENDERER | CVAR_INTEGER, "1 = skip all particle systems", 0, 1, idCmdSystem::ArgCompletion_Integer<0,1> );
  idCVar r_subviewOnly( "r_subviewOnly", "0", CVAR_RENDERER | CVAR_BOOL, "1 = don't render main view, allowing subviews to be debugged" );
@@ -8055,7 +8214,7 @@ index 7914093..3a8fdba 100644
  idCVar r_testARBProgram( "r_testARBProgram", "0", CVAR_RENDERER | CVAR_BOOL, "experiment with vertex/fragment programs" );
  idCVar r_testGamma( "r_testGamma", "0", CVAR_RENDERER | CVAR_FLOAT, "if > 0 draw a grid pattern to test gamma levels", 0, 195 );
  idCVar r_testGammaBias( "r_testGammaBias", "0", CVAR_RENDERER | CVAR_FLOAT, "if > 0 draw a grid pattern to test gamma levels" );
-@@ -158,6 +242,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
+@@ -158,6 +243,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
  idCVar r_useExternalShadows( "r_useExternalShadows", "1", CVAR_RENDERER | CVAR_INTEGER, "1 = skip drawing caps when outside the light volume, 2 = force to no caps for testing", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
  idCVar r_useOptimizedShadows( "r_useOptimizedShadows", "1", CVAR_RENDERER | CVAR_BOOL, "use the dmap generated static shadow volumes" );
  idCVar r_useScissor( "r_useScissor", "1", CVAR_RENDERER | CVAR_BOOL, "scissor clip as portals and lights are processed" );
@@ -8063,7 +8222,7 @@ index 7914093..3a8fdba 100644
  idCVar r_useCombinerDisplayLists( "r_useCombinerDisplayLists", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "put all nvidia register combiner programming in display lists" );
  idCVar r_useDepthBoundsTest( "r_useDepthBoundsTest", "1", CVAR_RENDERER | CVAR_BOOL, "use depth bounds test to reduce shadow fill" );
  
-@@ -819,11 +904,63 @@ void R_InitOpenGL( void ) {
+@@ -819,11 +905,63 @@ void R_InitOpenGL( void ) {
  		r_multiSamples.SetInteger( 0 );
  	}
  
@@ -8127,7 +8286,7 @@ index 7914093..3a8fdba 100644
  
  #include "renderer/qgl_proc.h"
  
-@@ -910,6 +1047,18 @@ GL_CheckErrors
+@@ -910,6 +1048,18 @@ GL_CheckErrors
  ==================
  */
  void GL_CheckErrors( void ) {
@@ -8146,7 +8305,7 @@ index 7914093..3a8fdba 100644
  	int		err;
  	char	s[64];
  	int		i;
-@@ -2505,6 +2654,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
+@@ -2505,6 +2655,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
  	// is destroyed (relevant when starting a mod which also recreates window)
  	Sys_ShutdownInput();
  
@@ -8162,7 +8321,7 @@ index 7914093..3a8fdba 100644
  	GLimp_Shutdown();
  
 diff --git a/neo/renderer/RenderWorld.cpp b/neo/renderer/RenderWorld.cpp
-index 2f77916..63f0485 100644
+index 2f77916..c0503e6 100644
 --- a/neo/renderer/RenderWorld.cpp
 +++ b/neo/renderer/RenderWorld.cpp
 @@ -130,6 +130,7 @@ idRenderWorldLocal::idRenderWorldLocal
@@ -8173,6 +8332,64 @@ index 2f77916..63f0485 100644
  
  	generateAllInteractionsCalled = false;
  
+@@ -168,11 +169,52 @@ ResizeInteractionTable
+ ===================
+ */
+ void idRenderWorldLocal::ResizeInteractionTable() {
+-	// we overflowed the interaction table, so dump it
+-	// we may want to resize this in the future if it turns out to be common
+-	common->Printf( "idRenderWorldLocal::ResizeInteractionTable: overflowed interactionTableWidth, dumping\n" );
+-	R_StaticFree( interactionTable );
+-	interactionTable = NULL;
++	// Dynamic multiplayer play can add enough entities/lights after level load to
++	// exceed the original padding.  Dropping the table forces the renderer into
++	// linked-list interaction lookups for the rest of the session, which shows up
++	// as movement hitches on mobile WebGPU.  Grow and repopulate instead.
++	if ( !r_useInteractionTable.GetBool() ) {
++		R_StaticFree( interactionTable );
++		interactionTable = NULL;
++		interactionTableWidth = 0;
++		interactionTableHeight = 0;
++		return;
++	}
++
++	const int oldWidth = interactionTableWidth;
++	const int oldHeight = interactionTableHeight;
++	const int minWidth = entityDefs.Num() + 512;
++	const int minHeight = lightDefs.Num() + 128;
++	const int newWidth = ( ( minWidth + 255 ) / 256 ) * 256;
++	const int newHeight = ( ( minHeight + 63 ) / 64 ) * 64;
++	const int size = newWidth * newHeight * sizeof( *interactionTable );
++
++	idInteraction **oldTable = interactionTable;
++	idInteraction **newTable = (idInteraction **)R_ClearedStaticAlloc( size );
++
++	int count = 0;
++	for ( int i = 0 ; i < lightDefs.Num() ; i++ ) {
++		idRenderLightLocal	*ldef = lightDefs[i];
++		if ( !ldef ) {
++			continue;
++		}
++		for ( idInteraction *inter = ldef->firstInteraction ; inter != NULL ; inter = inter->lightNext ) {
++			idRenderEntityLocal *edef = inter->entityDef;
++			if ( !edef || ldef->index < 0 || edef->index < 0 || ldef->index >= newHeight || edef->index >= newWidth ) {
++				continue;
++			}
++			newTable[ ldef->index * newWidth + edef->index ] = inter;
++			count++;
++		}
++	}
++
++	interactionTable = newTable;
++	interactionTableWidth = newWidth;
++	interactionTableHeight = newHeight;
++	R_StaticFree( oldTable );
++
++	common->Printf( "idRenderWorldLocal::ResizeInteractionTable: grew interaction table %ix%i -> %ix%i (%i bytes, %i interactions)\n",
++		oldWidth, oldHeight, interactionTableWidth, interactionTableHeight, size, count );
+ }
+ 
+ /*
 diff --git a/neo/renderer/RenderWorld.h b/neo/renderer/RenderWorld.h
 index 462774e..d0fb180 100644
 --- a/neo/renderer/RenderWorld.h
@@ -9717,7 +9934,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..6bea1c0 100644
+index c83ebb5..26b21d1 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -9743,7 +9960,7 @@ index c83ebb5..6bea1c0 100644
  
  /*
  
-@@ -38,6 +50,1182 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,1183 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -9963,6 +10180,7 @@ index c83ebb5..6bea1c0 100644
 +    // access). 0 = off.
 +    int      g_capPreloadPerFrame = 0;
 +    int      g_capPreloadMsPerFrame = 6;
++    int      g_capSubmitInterval = 1;
 +    // R0: ACES filmic tonemap grade (opt-in ?tonemap; default OFF all tiers).
 +    // Mirrors r_tonemap / r_tonemapExposure / r_tonemapDither (backend has no idCVar).
 +    uint32_t g_capTonemapOn = 0;
@@ -10926,7 +11144,7 @@ index c83ebb5..6bea1c0 100644
  
  /*
  =================
-@@ -49,6 +1237,22 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +1238,22 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -10949,7 +11167,7 @@ index c83ebb5..6bea1c0 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +1282,22 @@ RB_DrawElementsWithCounters
+@@ -78,6 +1283,22 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -10972,7 +11190,7 @@ index c83ebb5..6bea1c0 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1336,23 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1337,23 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -10996,7 +11214,7 @@ index c83ebb5..6bea1c0 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1403,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1404,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -11004,7 +11222,7 @@ index c83ebb5..6bea1c0 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1630,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1631,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -11017,7 +11235,7 @@ index c83ebb5..6bea1c0 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -553,26 +1795,199 @@ Any mirrored or portaled views have already been drawn, so prepare
+@@ -553,26 +1796,200 @@ Any mirrored or portaled views have already been drawn, so prepare
  to actually render the visible surfaces for this view
  =================
  */
@@ -11128,9 +11346,10 @@ index c83ebb5..6bea1c0 100644
 +			}
 +			extern idCVar r_bfgSpecular;
 +			g_capBfgSpec = r_bfgSpecular.GetBool() ? 1.0f : 0.0f;
-+		extern idCVar r_wgpuPreloadPerFrame, r_wgpuPreloadMsPerFrame;
++		extern idCVar r_wgpuPreloadPerFrame, r_wgpuPreloadMsPerFrame, r_wgpuSubmitInterval;
 +		g_capPreloadPerFrame = r_wgpuPreloadPerFrame.GetInteger();
 +		g_capPreloadMsPerFrame = r_wgpuPreloadMsPerFrame.GetInteger();
++		g_capSubmitInterval = r_wgpuSubmitInterval.GetInteger();
 +		extern idCVar r_tonemap, r_tonemapExposure, r_tonemapDither;
 +		g_capTonemapOn = r_tonemap.GetBool() ? 1u : 0u;
 +		g_capTonemapExposure = r_tonemapExposure.GetFloat();
@@ -11227,7 +11446,7 @@ index c83ebb5..6bea1c0 100644
  	backEnd.currentScissor = viewDef->scissor;
  
  	// ensures that depth writes are enabled for the depth clear
-@@ -897,6 +2312,26 @@ void RB_DrawView( const void *data ) {
+@@ -897,6 +2314,26 @@ void RB_DrawView( const void *data ) {
  
  	backEnd.viewDef = cmd->viewDef;
  

@@ -62,6 +62,22 @@ The script now `git clean -fdq neo` before applying and fails loud if the patch
 doesn't apply. Toolchain: emsdk at `/Users/peterhowell/glquake2-rayban-display/.build/emsdk`
 (`source emsdk_env.sh`), `GL4ES_PATH=$PWD/.build/gl4es`.
 
+**2026-06-27 active-player iPad jitter fix:** stock `idAsyncClient::RunFrame`
+blocks in `GetPacketBlocking(...)` while waiting for the next usercmd tick. That
+is fine natively, but under Emscripten it blocks the browser's only render/UI
+thread and showed up on physical iPad as active-player rAF hitches under
+`common.asyncNetwork`, while WebGPU upload/encode and first-person weapon metrics
+were clean. The `__EMSCRIPTEN__` path now drains currently available packets with
+a zero-timeout poll and returns to rAF; native builds keep the original blocking
+wait. Verified via the Arco preview `net-nonblock-2026-06-27a`: physical iPad MP
+autojoin+automove completed with `gpu_lost=false`, verdict `raf_p95 38ms`,
+`predErrP95 0.38u` (`max 3.23u`), and the `automove-done` movement window had
+`rafP95 17ms`, `weaponLocalStepP95 0`, `weaponRelAngStepP95 0.36`, and
+`locoBobAdvanceP95/cycleStepP95 5/5`. The same patch also grows the render
+interaction table instead of dumping it after multiplayer entity/light growth,
+avoiding the slow linked-list interaction path that appeared in the iPad trace
+as a movement hitch source.
+
 ## Area streaming (experimental, default OFF — `com_streamAreas 0`)
 
 Incremental per-render-area load so the player can start in the boot region while

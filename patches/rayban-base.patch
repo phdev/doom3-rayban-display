@@ -1135,7 +1135,7 @@ index 562344f..107f5cb 100644
  					// polygons and brush for trm model
  	cm_polygonRef_t*trmPolygons[MAX_TRACEMODEL_POLYS];
 diff --git a/neo/framework/Common.cpp b/neo/framework/Common.cpp
-index dbf6c54..cecbc33 100644
+index dbf6c54..d474133 100644
 --- a/neo/framework/Common.cpp
 +++ b/neo/framework/Common.cpp
 @@ -26,6 +26,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -1146,7 +1146,15 @@ index dbf6c54..cecbc33 100644
  #include "sys/sys_sdl.h"
  
  #if SDL_VERSION_ATLEAST(3, 0, 0)
-@@ -108,6 +109,13 @@ idCVar com_timescale( "timescale", "1", CVAR_SYSTEM | CVAR_FLOAT, "scales the ti
+@@ -42,6 +43,7 @@ If you have questions concerning this license or the applicable additional terms
+ #include "framework/async/NetworkSystem.h"
+ #include "framework/BuildVersion.h"
+ #include "framework/Licensee.h"
++#include "framework/d3_arco.h"
+ #include "framework/Console.h"
+ #include "framework/Session.h"
+ #include "framework/Game.h"
+@@ -108,6 +110,13 @@ idCVar com_timescale( "timescale", "1", CVAR_SYSTEM | CVAR_FLOAT, "scales the ti
  idCVar com_makingBuild( "com_makingBuild", "0", CVAR_BOOL | CVAR_SYSTEM, "1 when making a build" );
  idCVar com_updateLoadSize( "com_updateLoadSize", "0", CVAR_BOOL | CVAR_SYSTEM | CVAR_NOCHEAT, "update the load size after loading a map" );
  
@@ -1160,7 +1168,7 @@ index dbf6c54..cecbc33 100644
  idCVar com_enableDebuggerServer( "com_enableDebuggerServer", "0", CVAR_BOOL | CVAR_SYSTEM, "toggle debugger server and try to connect to com_dbgClientAdr" );
  idCVar com_dbgClientAdr( "com_dbgClientAdr", "localhost", CVAR_SYSTEM | CVAR_ARCHIVE, "debuggerApp client address" );
  idCVar com_dbgServerAdr( "com_dbgServerAdr", "localhost", CVAR_SYSTEM | CVAR_ARCHIVE, "debugger server address" );
-@@ -874,7 +882,7 @@ doom set test blah + map test
+@@ -874,7 +883,7 @@ doom set test blah + map test
  ============================================================================
  */
  
@@ -1169,7 +1177,7 @@ index dbf6c54..cecbc33 100644
  int			com_numConsoleLines;
  idCmdArgs	com_consoleLines[MAX_CONSOLE_LINES];
  
-@@ -885,14 +893,31 @@ idCommonLocal::ParseCommandLine
+@@ -885,14 +894,31 @@ idCommonLocal::ParseCommandLine
  */
  void idCommonLocal::ParseCommandLine( int argc, char **argv ) {
  	int i;
@@ -1201,15 +1209,71 @@ index dbf6c54..cecbc33 100644
  			if ( !com_numConsoleLines ) {
  				com_numConsoleLines++;
  			}
-@@ -2531,7 +2556,6 @@ void idCommonLocal::Frame( void ) {
+@@ -2491,16 +2517,21 @@ idCommonLocal::Frame
+ */
+ void idCommonLocal::Frame( void ) {
+ 	D3P_ScopedCPUSample(Common_Frame);
++	const double arcoFrameStart = Sys_MillisecondsPrecise();
+ 	try {
+ 		// DG: update tic number here for ticNumAtStart (used below to decide whether to sleep before next frame)
+ 		Com_UpdateTicNumber();
+ 		int ticNumAtStart = com_ticNumber;
+ 
+ 		// pump all the events
++		double arcoPhaseStart = Sys_MillisecondsPrecise();
+ 		Sys_GenerateEvents();
++		D3Arco_StallTrace( "common.sysEvents", Sys_MillisecondsPrecise() - arcoPhaseStart, 8.0 );
+ 
+ 		// write config file if anything changed
++		arcoPhaseStart = Sys_MillisecondsPrecise();
+ 		WriteConfiguration();
++		D3Arco_StallTrace( "common.writeConfig", Sys_MillisecondsPrecise() - arcoPhaseStart, 8.0 );
+ 
+ 		// change SIMD implementation if required
+ 		if ( com_forceGenericSIMD.IsModified() ) {
+@@ -2515,26 +2546,40 @@ void idCommonLocal::Frame( void ) {
+ 			}
+ 		}
+ 
++		arcoPhaseStart = Sys_MillisecondsPrecise();
+ 		eventLoop->RunEventLoop();
++		D3Arco_StallTrace( "common.eventLoop", Sys_MillisecondsPrecise() - arcoPhaseStart, 8.0 );
+ 
+ 		// DG: prepare new ImGui frame - I guess this is a good place, as all new events should be available?
++		arcoPhaseStart = Sys_MillisecondsPrecise();
+ 		D3::ImGuiHooks::NewFrame();
++		D3Arco_StallTrace( "common.imguiNewFrame", Sys_MillisecondsPrecise() - arcoPhaseStart, 8.0 );
+ 
+ 		Com_UpdateFrameTime(); // DG: put updating com_frameTime into a function
+ 
++		arcoPhaseStart = Sys_MillisecondsPrecise();
+ 		idAsyncNetwork::RunFrame();
++		D3Arco_StallTrace( "common.asyncNetwork", Sys_MillisecondsPrecise() - arcoPhaseStart, 8.0 );
+ 
+ 		if ( idAsyncNetwork::IsActive() ) {
+ 			if ( idAsyncNetwork::serverDedicated.GetInteger() != 1 ) {
++				arcoPhaseStart = Sys_MillisecondsPrecise();
+ 				session->GuiFrameEvents();
++				D3Arco_StallTrace( "common.guiEvents.net", Sys_MillisecondsPrecise() - arcoPhaseStart, 8.0 );
++				arcoPhaseStart = Sys_MillisecondsPrecise();
+ 				session->UpdateScreen( false );
++				D3Arco_StallTrace( "common.updateScreen.net", Sys_MillisecondsPrecise() - arcoPhaseStart, 12.0 );
  			}
  		} else {
++			arcoPhaseStart = Sys_MillisecondsPrecise();
  			session->Frame();
 -
++			D3Arco_StallTrace( "common.sessionFrame.sp", Sys_MillisecondsPrecise() - arcoPhaseStart, 12.0 );
  			// normal, in-sequence screen update
++			arcoPhaseStart = Sys_MillisecondsPrecise();
  			session->UpdateScreen( false );
++			D3Arco_StallTrace( "common.updateScreen.sp", Sys_MillisecondsPrecise() - arcoPhaseStart, 12.0 );
  		}
-@@ -2560,8 +2584,17 @@ void idCommonLocal::Frame( void ) {
++		D3Arco_StallTrace( "common.frameTotal", Sys_MillisecondsPrecise() - arcoFrameStart, 25.0 );
+ 
+ 		// report timing information
+ 		if ( com_speeds.GetBool() ) {
+@@ -2560,8 +2605,17 @@ void idCommonLocal::Frame( void ) {
  		if ( com_editors == 0 )
  #endif
  		{
@@ -1229,7 +1293,7 @@ index dbf6c54..cecbc33 100644
  				// if we're using vsync and the display is running at about 60Hz, start next tic
  				// immediately so our internal tic time and vsync don't drift apart
  				double now = Sys_MillisecondsPrecise();
-@@ -3175,8 +3208,14 @@ void idCommonLocal::Init( int argc, char **argv ) {
+@@ -3175,8 +3229,14 @@ void idCommonLocal::Init( int argc, char **argv ) {
  		Sys_Error( "Error during initialization" );
  	}
  
@@ -1244,7 +1308,7 @@ index dbf6c54..cecbc33 100644
  }
  
  
-@@ -3245,6 +3284,7 @@ void idCommonLocal::Shutdown( void ) {
+@@ -3245,6 +3305,7 @@ void idCommonLocal::Shutdown( void ) {
  idCommonLocal::InitGame
  =================
  */
@@ -1252,7 +1316,7 @@ index dbf6c54..cecbc33 100644
  void idCommonLocal::InitGame( void ) {
  	// initialize the file system
  	fileSystem->Init();
-@@ -3357,6 +3397,14 @@ void idCommonLocal::InitGame( void ) {
+@@ -3357,6 +3418,14 @@ void idCommonLocal::InitGame( void ) {
  	// have to do this twice.. first one sets the correct r_mode for the renderer init
  	// this time around the backend is all setup correct.. a bit fugly but do not want
  	// to mess with all the gl init at this point.. an old vid card will never qualify for
@@ -1267,7 +1331,7 @@ index dbf6c54..cecbc33 100644
  	if ( sysDetect ) {
  		SetMachineSpec();
  		Com_ExecMachineSpec_f( args );
-@@ -3364,6 +3412,7 @@ void idCommonLocal::InitGame( void ) {
+@@ -3364,6 +3433,7 @@ void idCommonLocal::InitGame( void ) {
  		cmdSystem->BufferCommandText( CMD_EXEC_NOW, "s_restart\n" );
  		cmdSystem->ExecuteCommandBuffer();
  	}
@@ -1293,7 +1357,7 @@ index 7edeb4d..adae33e 100644
  		Sys_CreateThread( BackgroundDownloadThread, &backgroundThread_exit, backgroundThread, "backgroundDownload" );
  	} else {
 diff --git a/neo/framework/Session.cpp b/neo/framework/Session.cpp
-index 29745c6..d416439 100644
+index 29745c6..a7193d3 100644
 --- a/neo/framework/Session.cpp
 +++ b/neo/framework/Session.cpp
 @@ -36,6 +36,7 @@ If you have questions concerning this license or the applicable additional terms
@@ -1373,7 +1437,44 @@ index 29745c6..d416439 100644
  
  	// set the loading gui that we will wipe to
  	LoadLoadingGui( mapString );
-@@ -2646,9 +2678,160 @@ idSessionLocal::Frame
+@@ -2599,6 +2631,7 @@ idSessionLocal::UpdateScreen
+ */
+ void idSessionLocal::UpdateScreen( bool outOfSequence ) {
+ 	D3P_ScopedCPUSample(Session_UpdateScreen);
++	const double arcoUpdateStart = Sys_MillisecondsPrecise();
+ #ifdef _WIN32
+ 
+ 	if ( com_editors ) {
+@@ -2622,21 +2655,28 @@ void idSessionLocal::UpdateScreen( bool outOfSequence ) {
+ 	}
+ 
+ 	D3P_BeginCPUSample(Render_BeginFrame);
++	double arcoPhaseStart = Sys_MillisecondsPrecise();
+ 	renderSystem->BeginFrame( renderSystem->GetScreenWidth(), renderSystem->GetScreenHeight() );
++	D3Arco_StallTrace( "session.beginFrame", Sys_MillisecondsPrecise() - arcoPhaseStart, 4.0 );
+ 	D3P_EndCPUSample(Render_BeginFrame);
+ 
+ 	// draw everything
++	arcoPhaseStart = Sys_MillisecondsPrecise();
+ 	Draw();
++	D3Arco_StallTrace( "session.draw", Sys_MillisecondsPrecise() - arcoPhaseStart, 8.0 );
+ 
+ 	D3P_BeginCPUSample(Render_EndFrame);
++	arcoPhaseStart = Sys_MillisecondsPrecise();
+ 	if ( com_speeds.GetBool() ) {
+ 		renderSystem->EndFrame( &time_frontend, &time_backend );
+ 	} else {
+ 		renderSystem->EndFrame( NULL, NULL );
+ 	}
++	D3Arco_StallTrace( "session.endFrame", Sys_MillisecondsPrecise() - arcoPhaseStart, 8.0 );
+ 	D3P_EndCPUSample(Render_EndFrame);
+ 
+ 	insideUpdateScreen = false;
++	D3Arco_StallTrace( "session.updateScreen", Sys_MillisecondsPrecise() - arcoUpdateStart, 12.0 );
+ }
+ 
+ /*
+@@ -2646,9 +2686,160 @@ idSessionLocal::Frame
  */
  extern bool CheckOpenALDeviceAndRecoverIfNeeded();
  extern int g_screenshotFormat;
@@ -1534,7 +1635,17 @@ index 29745c6..d416439 100644
  	if ( com_asyncSound.GetInteger() == 0 ) {
  		soundSystem->AsyncUpdateWrite( Sys_Milliseconds() );
  	}
-@@ -3024,6 +3207,14 @@ void idSessionLocal::Init() {
+@@ -2901,7 +3092,9 @@ void idSessionLocal::RunGameTic() {
+ 
+ 	// run the game logic every player move
+ 	int	start = Sys_Milliseconds();
++	double arcoGameStart = Sys_MillisecondsPrecise();
+ 	gameReturn_t	ret = game->RunFrame( &cmd );
++	D3Arco_StallTrace( "session.gameRunFrame", Sys_MillisecondsPrecise() - arcoGameStart, 8.0 );
+ 
+ 	int end = Sys_Milliseconds();
+ 	time_gameFrame += end - start;	// note time used for com_speeds
+@@ -3024,6 +3217,14 @@ void idSessionLocal::Init() {
  	menuSoundWorld = soundSystem->AllocSoundWorld( rw );
  
  	// we have a single instance of the main menu
@@ -1549,7 +1660,7 @@ index 29745c6..d416439 100644
  	guiMainMenu = uiManager->FindGui( "guis/mainmenu.gui", true, false, true );
  	if (!guiMainMenu) {
  		guiMainMenu = uiManager->FindGui( "guis/demo_mainmenu.gui", true, false, true );
-@@ -3032,6 +3223,7 @@ void idSessionLocal::Init() {
+@@ -3032,6 +3233,7 @@ void idSessionLocal::Init() {
  	guiMainMenu_MapList = uiManager->AllocListGUI();
  	guiMainMenu_MapList->Config( guiMainMenu, "mapList" );
  	idAsyncNetwork::client.serverList.GUIConfig( guiMainMenu, "serverList" );
@@ -1609,12 +1720,48 @@ index 6bba28f..9f732b9 100644
  		// check to make sure the angles haven't wrapped
  		if ( viewangles[PITCH] - oldAngles[PITCH] > 90 ) {
  			viewangles[PITCH] = oldAngles[PITCH] + 90;
+diff --git a/neo/framework/async/AsyncClient.cpp b/neo/framework/async/AsyncClient.cpp
+index 6ec28cf..872b9a8 100644
+--- a/neo/framework/async/AsyncClient.cpp
++++ b/neo/framework/async/AsyncClient.cpp
+@@ -1770,6 +1770,23 @@ void idAsyncClient::RunFrame( void ) {
+ 
+ 	gameTimeResidual += msec;
+ 
++	// Native clients can block briefly waiting for packets to align the next
++	// usercmd tick. In the browser that blocks the only UI/render thread, so
++	// drain packets that are already available and let the next rAF continue
++	// accumulating residual time.
++#ifdef __EMSCRIPTEN__
++	do {
++		newPacket = clientPort.GetPacketBlocking( from, msgBuf, size, sizeof( msgBuf ), 0 );
++		if ( newPacket ) {
++			msg.Init( msgBuf, sizeof( msgBuf ) );
++			msg.SetSize( size );
++			msg.BeginReading();
++			ProcessMessage( from, msg );
++		}
++	} while( newPacket );
++	msec = UpdateTime( 100 );
++	gameTimeResidual += msec;
++#else
+ 	// spin in place processing incoming packets until enough time lapsed to run a new game frame
+ 	do {
+ 
+@@ -1790,6 +1807,7 @@ void idAsyncClient::RunFrame( void ) {
+ 		} while( newPacket );
+ 
+ 	} while( gameTimeResidual + clientPredictTime < USERCMD_MSEC );
++#endif
+ 
+ 	// update server list
+ 	serverList.RunFrame();
 diff --git a/neo/framework/d3_arco.cpp b/neo/framework/d3_arco.cpp
 new file mode 100644
-index 0000000..2c2ac24
+index 0000000..0d22e5e
 --- /dev/null
 +++ b/neo/framework/d3_arco.cpp
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,98 @@
 +// B1 (Arco) render-state bridge.
 +//
 +// Feeds dhewm3's idRenderWorld from Arco's authoritative server, run as a PURE
@@ -1691,12 +1838,34 @@ index 0000000..2c2ac24
 +}
 +
 +void D3Arco_AfterFrame( void ) { s_frameCount++; }
++
++void D3Arco_StallTrace( const char *name, double ms, double thresholdMs, int a, int b ) {
++	if ( ms < thresholdMs ) {
++		return;
++	}
++#ifdef __EMSCRIPTEN__
++	EM_ASM_({
++		var arr = window.__arcoStallTrace || (window.__arcoStallTrace = []);
++		var ev = {};
++		ev.type = "engine";
++		ev.name = UTF8ToString($0);
++		ev.ms = Math.round($1 * 10) / 10;
++		ev.threshold = Math.round($2 * 10) / 10;
++		ev.a = $3;
++		ev.b = $4;
++		ev.t = Math.round(performance.now());
++		arr.push(ev);
++		if (arr.length > 220) arr.splice(0, arr.length - 220);
++		window.__arcoStallLast = ev;
++	}, name ? name : "?", ms, thresholdMs, a, b);
++#endif
++}
 diff --git a/neo/framework/d3_arco.h b/neo/framework/d3_arco.h
 new file mode 100644
-index 0000000..eecb62d
+index 0000000..0f2a0bc
 --- /dev/null
 +++ b/neo/framework/d3_arco.h
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,20 @@
 +// B1 (Arco) render-state bridge — declarations.
 +// Pure render-state ONLY. INVARIANT: no usercmd_t writes, no cmdSystem gameplay/
 +// impulse commands, no idGameLocal/game-> access anywhere in d3_arco.cpp.
@@ -1712,6 +1881,9 @@ index 0000000..eecb62d
 +void D3Arco_BuildView( renderView_s &v );
 +// Post-render bookkeeping (frame counter for the JS readiness signal).
 +void D3Arco_AfterFrame( void );
++// Push a compact browser-visible stall event when a measured phase exceeds the
++// threshold. No-op outside Emscripten.
++void D3Arco_StallTrace( const char *name, double ms, double thresholdMs = 12.0, int a = 0, int b = 0 );
 +
 +#endif
 diff --git a/neo/framework/d3_wearable.cpp b/neo/framework/d3_wearable.cpp
@@ -4909,10 +5081,18 @@ index 7efe196..afa6fe1 100644
  
  void GLimp_GrabInput(int flags) {
 diff --git a/neo/sys/linux/main.cpp b/neo/sys/linux/main.cpp
-index 3468d39..a789d1f 100644
+index 3468d39..2dda3d5 100644
 --- a/neo/sys/linux/main.cpp
 +++ b/neo/sys/linux/main.cpp
-@@ -407,9 +407,30 @@ void idSysLocal::OpenURL( const char *url, bool quit ) {
+@@ -37,6 +37,7 @@ If you have questions concerning this license or the applicable additional terms
+ #include "sys/platform.h"
+ #include "framework/Licensee.h"
+ #include "framework/FileSystem.h"
++#include "framework/d3_arco.h"
+ #include "sys/posix/posix_public.h"
+ #include "sys/sys_local.h"
+ 
+@@ -407,9 +408,32 @@ void idSysLocal::OpenURL( const char *url, bool quit ) {
  main
  ===============
  */
@@ -4931,7 +5111,9 @@ index 3468d39..a789d1f 100644
 +		return;
 +	}
 +	nextDue = ( nextDue < now - 50.0 ) ? now + 16.6667 : nextDue + 16.6667;
++	const double frameStart = emscripten_get_now();
 +	common->Frame();
++	D3Arco_StallTrace( "emscripten.commonFrame", emscripten_get_now() - frameStart, 25.0 );
 +}
 +#endif
 +
@@ -4943,7 +5125,7 @@ index 3468d39..a789d1f 100644
  	if (getuid() == 0) {
  		printf("Doom 3 shouldn't be run as root! Backing out to save your ass. If\n");
  		printf("you really know what you're doing, edit neo/sys/linux/main.cpp and remove\n");
-@@ -417,6 +438,7 @@ int main(int argc, char **argv) {
+@@ -417,6 +441,7 @@ int main(int argc, char **argv) {
  
  		return 1;
  	}
@@ -4951,7 +5133,7 @@ index 3468d39..a789d1f 100644
  	// fallback path to the binary for systems without /proc
  	// while not 100% reliable, its good enough
  	if (argc > 0) {
-@@ -448,8 +470,16 @@ int main(int argc, char **argv) {
+@@ -448,8 +473,16 @@ int main(int argc, char **argv) {
  		common->Init( 0, NULL );
  	}
  
