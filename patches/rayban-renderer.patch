@@ -1986,10 +1986,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..b8d90da
+index 0000000..089f7a5
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,6078 @@
+@@ -0,0 +1,6115 @@
 +/*
 +================================================================================
 +
@@ -2309,12 +2309,14 @@ index 0000000..b8d90da
 +extern "C" float    g_capTracerWidth;
 +extern "C" float    g_capTracerLength;
 +extern "C" float    g_capTracerStartU;     // screen-UV of the visible gun barrel (streak START — lower-right)
-+extern "C" float    g_capTracerStartV;
-+extern "C" uint32_t g_capMuzzleFired;      // set this frame when a view muzzle-flash light is captured
-+extern "C" float    g_capMuzzleUV[4];      // muzzle + aim points projected to screen UV at capture
-+extern "C" uint32_t g_capInCinematic;
-+extern "C" int      g_capSubmitInterval;
-+extern "C" float    g_mbViewProj[16];
++	extern "C" float    g_capTracerStartV;
++	extern "C" uint32_t g_capMuzzleFired;      // set this frame when a view muzzle-flash light is captured
++	extern "C" float    g_capMuzzleUV[4];      // muzzle + aim points projected to screen UV at capture
++	extern "C" uint32_t g_capInCinematic;
++	extern "C" int      g_capSubmitInterval;
++	extern "C" int      g_capWgpuRecordBudget;
++	extern "C" int      g_capWgpuPassBudget;
++	extern "C" float    g_mbViewProj[16];
 +extern "C" float    g_mbInvViewProj[16];
 +extern "C" int D3_WebGPU_CachedImageCount( void );
 +extern "C" const void* D3_WebGPU_CachedImagePtr( int i );
@@ -5077,12 +5079,15 @@ index 0000000..b8d90da
 +        uint32_t mainN = 0;
 +        subGroupCount = 0;
 +        phaseStart = emscripten_get_now();
-+        if (total > 0) {
-+            const uint32_t mainView = g_capRecords[total - 1].pad0;
-+            // In-place compaction would clobber records we still need for the
-+            // subview sweep, so partition via a scratch copy of the order.
-+            static Rec scratch[kMaxRecordSlots];
-+            static void* scratchImgs[kMaxRecordSlots][5];
++	        if (total > 0) {
++	            const uint32_t mainView = g_capRecords[total - 1].pad0;
++	            const int recordBudget = g_capWgpuRecordBudget;
++	            uint32_t budgetedMain = 0;
++	            uint32_t droppedMain = 0;
++	            // In-place compaction would clobber records we still need for the
++	            // subview sweep, so partition via a scratch copy of the order.
++	            static Rec scratch[kMaxRecordSlots];
++	            static void* scratchImgs[kMaxRecordSlots][5];
 +            memcpy(scratch, g_capRecords, total * sizeof(Rec));
 +            memcpy(scratchImgs, g_capImagePtrs, total * sizeof(void*) * 5);
 +            // debug isolation: r_wgpuSingleLight N keeps only the Nth light
@@ -5095,22 +5100,28 @@ index 0000000..b8d90da
 +                    if (scratch[i].lightId < frameMinLightId) frameMinLightId = scratch[i].lightId;
 +                }
 +            }
-+            for (uint32_t i = 0; i < total; ++i) {
-+                if (scratch[i].pad0 != mainView) continue;
-+                if (g_capWgpuSingleLight >= 0) {
-+                    const int rel = (int)(scratch[i].lightId - frameMinLightId);
-+                    if (g_capWgpuSingleLight >= 1000) {
++	            for (uint32_t i = 0; i < total; ++i) {
++	                if (scratch[i].pad0 != mainView) continue;
++	                const bool weaponRecord = scratch[i].sPad1 == 1u;
++	                if (g_capWgpuSingleLight >= 0) {
++	                    const int rel = (int)(scratch[i].lightId - frameMinLightId);
++	                    if (g_capWgpuSingleLight >= 1000) {
 +                        // prefix mode: keep lights 0..(N-1000) — bisect tool
 +                        if (rel > g_capWgpuSingleLight - 1000) continue;
 +                    } else if (rel != g_capWgpuSingleLight) {
-+                        continue;
-+                    }
-+                }
-+                g_capRecords[n] = scratch[i];
-+                memcpy(g_capImagePtrs[n], scratchImgs[i], sizeof(void*) * 5);
-+                n++;
-+            }
-+            mainN = n;
++	                        continue;
++	                    }
++	                }
++	                if (recordBudget > 0 && !weaponRecord && budgetedMain >= (uint32_t)recordBudget) {
++	                    droppedMain++;
++	                    continue;
++	                }
++	                g_capRecords[n] = scratch[i];
++	                memcpy(g_capImagePtrs[n], scratchImgs[i], sizeof(void*) * 5);
++	                if (!weaponRecord) budgetedMain++;
++	                n++;
++	            }
++	            mainN = n;
 +            // Iter 14: linked subview records follow, one slot range per link.
 +            for (uint32_t L = 0; L < g_subviewLinkCount && L < kMaxSubviews; ++L) {
 +                const uint32_t start = n;
@@ -5123,9 +5134,17 @@ index 0000000..b8d90da
 +                }
 +                subGroups[L].startSlot = start;
 +                subGroups[L].count = n - start;
-+                if (n > start) subGroupCount = L + 1;
-+            }
-+        }
++	                if (n > start) subGroupCount = L + 1;
++	            }
++	            static uint32_t budgetPubTick = 0;
++	            if (recordBudget > 0 && ((++budgetPubTick & 15u) == 0u || droppedMain > 0)) {
++	                EM_ASM_({
++	                    var b = window.__d3WgpuBudget || {};
++	                    b.recordBudget = $0; b.recordIn = $1; b.recordOut = $2; b.recordDropped = $3;
++	                    window.__d3WgpuBudget = b;
++	                }, recordBudget, (int)total, (int)mainN, (int)droppedMain);
++	            }
++	        }
 +        D3Arco_StallTrace( "wgpu.upload.compact", emscripten_get_now() - phaseStart, 2.0,
 +                           (int)mainN, (int)n );
 +        // Per-slot uniform writes. r.modelMatrix holds the FULL MVP, baked
@@ -5312,11 +5331,14 @@ index 0000000..b8d90da
 +            extern void*    g_passImagePtrs[];
 +            extern unsigned char g_passImageClamp[];   // iter-130: 1 = bind ClampToEdge
 +            extern uint32_t g_passRecordCount;
-+            uint32_t pTotal = (g_passRecordCount < kMaxRecordSlots) ? g_passRecordCount : kMaxRecordSlots;
-+            uint32_t pn = 0;
-+            uint32_t skyN = 0;
-+            phaseStart = emscripten_get_now();
-+            uint32_t passGroupChanges = 0;
++	            uint32_t pTotal = (g_passRecordCount < kMaxRecordSlots) ? g_passRecordCount : kMaxRecordSlots;
++	            uint32_t pn = 0;
++	            uint32_t skyN = 0;
++	            const int passBudget = g_capWgpuPassBudget;
++	            uint32_t budgetedPass3D = 0;
++	            uint32_t droppedPass3D = 0;
++	            phaseStart = emscripten_get_now();
++	            uint32_t passGroupChanges = 0;
 +            lastReflectCount = 0;
 +            if (pTotal > 0) {
 +                // Main-view tag: normally from the interaction records; with
@@ -5430,10 +5452,16 @@ index 0000000..b8d90da
 +                    }
 +                    const bool is2D = g_passRecords[i].pad3 == 1u;
 +                    if (sweep == 0 && (is2D || g_passRecords[i].pad0 != mainView)) continue;
-+                    if (sweep == 1 && !is2D) continue;
-+                    if (pn >= kMaxRecordSlots) break;
-+                    const Rec& r = g_passRecords[i];
-+                    float ub[32];
++	                    if (sweep == 1 && !is2D) continue;
++	                    if (pn >= kMaxRecordSlots) break;
++	                    const Rec& r = g_passRecords[i];
++	                    const bool weaponPass = r.sPad1 == 1u;
++	                    const bool budgeted3DPass = !is2D;
++	                    if (passBudget > 0 && budgeted3DPass && !weaponPass && budgetedPass3D >= (uint32_t)passBudget) {
++	                        droppedPass3D++;
++	                        continue;
++	                    }
++	                    float ub[32];
 +                    memcpy(ub + 0, r.modelMatrix, 64);
 +                    memcpy(ub + 16, r.diffuseColor, 16);
 +                    // iter 123: svc is the low byte of pad2; bit 8 = filter-decal
@@ -5556,15 +5584,24 @@ index 0000000..b8d90da
 +                                    cinTexW[r.sPad3 - 1u], cinTexH[r.sPad3 - 1u]);
 +                        }
 +                    }
-+                    lastPassRecords[pn] = r;
-+                    pn++;
-+                }
-+            }
-+            lastPassCount = pn;
-+            lastSkyCount = skyN;
-+            g_passRecordCount = 0;
-+            D3Arco_StallTrace( "wgpu.upload.passSlots", emscripten_get_now() - phaseStart, 4.0,
-+                               (int)pn, (int)passGroupChanges );
++	                    lastPassRecords[pn] = r;
++	                    if (budgeted3DPass && !weaponPass) budgetedPass3D++;
++	                    pn++;
++	                }
++	            }
++	            lastPassCount = pn;
++	            lastSkyCount = skyN;
++	            g_passRecordCount = 0;
++	            static uint32_t passBudgetPubTick = 0;
++	            if (passBudget > 0 && ((++passBudgetPubTick & 15u) == 0u || droppedPass3D > 0)) {
++	                EM_ASM_({
++	                    var b = window.__d3WgpuBudget || {};
++	                    b.passBudget = $0; b.passIn = $1; b.passOut = $2; b.passDropped = $3;
++	                    window.__d3WgpuBudget = b;
++	                }, passBudget, (int)pTotal, (int)pn, (int)droppedPass3D);
++	            }
++	            D3Arco_StallTrace( "wgpu.upload.passSlots", emscripten_get_now() - phaseStart, 4.0,
++	                               (int)pn, (int)passGroupChanges );
 +        }
 +
 +        // Iter 9: drain shadow records — upload the vec4 vertex accumulator,
@@ -8101,7 +8138,7 @@ index 0000000..0f9c8e6
 +    return nullptr;
 +}
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
-index 7914093..96fb3c7 100644
+index 7914093..81a90fe 100644
 --- a/neo/renderer/RenderSystem_init.cpp
 +++ b/neo/renderer/RenderSystem_init.cpp
 @@ -39,6 +39,11 @@ If you have questions concerning this license or the applicable additional terms
@@ -8116,7 +8153,7 @@ index 7914093..96fb3c7 100644
  
  #include "framework/GameCallbacks_local.h"
  #include "framework/Game.h"
-@@ -101,7 +106,87 @@ idCVar r_renderer( "r_renderer", "best", CVAR_RENDERER | CVAR_ARCHIVE, "hardware
+@@ -101,7 +106,89 @@ idCVar r_renderer( "r_renderer", "best", CVAR_RENDERER | CVAR_ARCHIVE, "hardware
  idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel jitter the projection matrix" );
  
  idCVar r_skipSuppress( "r_skipSuppress", "0", CVAR_RENDERER | CVAR_BOOL, "ignore the per-view suppressions" );
@@ -8155,6 +8192,8 @@ index 7914093..96fb3c7 100644
 +idCVar r_wgpuPreloadPerFrame( "r_wgpuPreloadPerFrame", "0", CVAR_RENDERER | CVAR_INTEGER, "WebGPU: background-pre-warm up to N already-decoded images' GPU textures per frame (0 = off; the wearable 96px profile sets it)" );
 +idCVar r_wgpuPreloadMsPerFrame( "r_wgpuPreloadMsPerFrame", "6", CVAR_RENDERER | CVAR_INTEGER, "WebGPU: per-frame wall-time cap (ms) for the background texture pre-warm sweep" );
 +idCVar r_wgpuSubmitInterval( "r_wgpuSubmitInterval", "1", CVAR_RENDERER | CVAR_INTEGER, "WebGPU: submit every N captured frames (1 = every frame; iOS pacing can set 2 to avoid GPU-process backlog)", 1, 4, idCmdSystem::ArgCompletion_Integer<1,4> );
++idCVar r_wgpuRecordBudget( "r_wgpuRecordBudget", "0", CVAR_RENDERER | CVAR_INTEGER, "WebGPU mobile perf: cap main-view lit interaction records per frame (0 = off; weapon records are preserved)" );
++idCVar r_wgpuPassBudget( "r_wgpuPassBudget", "0", CVAR_RENDERER | CVAR_INTEGER, "WebGPU mobile perf: cap main-view 3D material/depth pass records per frame (0 = off; 2D/HUD and weapon records are preserved)" );
 +// Iter 29: BFG-presentation specular. Verified against the id-Software
 +// DOOM-3-BFG source: BFG replaced the 2004 specular table (zero below
 +// N·H 0.75, then (4(x-.75))²) with analytic pow(N·H, 10) — broader, always-
@@ -8205,7 +8244,7 @@ index 7914093..96fb3c7 100644
  idCVar r_skipLightScale( "r_skipLightScale", "0", CVAR_RENDERER | CVAR_BOOL, "don't do any post-interaction light scaling, makes things dim on low-dynamic range cards" );
  idCVar r_skipInteractions( "r_skipInteractions", "0", CVAR_RENDERER | CVAR_BOOL, "skip all light/surface interaction drawing" );
  idCVar r_skipDynamicTextures( "r_skipDynamicTextures", "0", CVAR_RENDERER | CVAR_BOOL, "don't dynamically create textures" );
-@@ -146,7 +231,7 @@ idCVar r_skipSubviews( "r_skipSubviews", "0", CVAR_RENDERER | CVAR_INTEGER, "1 =
+@@ -146,7 +233,7 @@ idCVar r_skipSubviews( "r_skipSubviews", "0", CVAR_RENDERER | CVAR_INTEGER, "1 =
  idCVar r_skipGuiShaders( "r_skipGuiShaders", "0", CVAR_RENDERER | CVAR_INTEGER, "1 = skip all gui elements on surfaces, 2 = skip drawing but still handle events, 3 = draw but skip events", 0, 3, idCmdSystem::ArgCompletion_Integer<0,3> );
  idCVar r_skipParticles( "r_skipParticles", "0", CVAR_RENDERER | CVAR_INTEGER, "1 = skip all particle systems", 0, 1, idCmdSystem::ArgCompletion_Integer<0,1> );
  idCVar r_subviewOnly( "r_subviewOnly", "0", CVAR_RENDERER | CVAR_BOOL, "1 = don't render main view, allowing subviews to be debugged" );
@@ -8214,7 +8253,7 @@ index 7914093..96fb3c7 100644
  idCVar r_testARBProgram( "r_testARBProgram", "0", CVAR_RENDERER | CVAR_BOOL, "experiment with vertex/fragment programs" );
  idCVar r_testGamma( "r_testGamma", "0", CVAR_RENDERER | CVAR_FLOAT, "if > 0 draw a grid pattern to test gamma levels", 0, 195 );
  idCVar r_testGammaBias( "r_testGammaBias", "0", CVAR_RENDERER | CVAR_FLOAT, "if > 0 draw a grid pattern to test gamma levels" );
-@@ -158,6 +243,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
+@@ -158,6 +245,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
  idCVar r_useExternalShadows( "r_useExternalShadows", "1", CVAR_RENDERER | CVAR_INTEGER, "1 = skip drawing caps when outside the light volume, 2 = force to no caps for testing", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
  idCVar r_useOptimizedShadows( "r_useOptimizedShadows", "1", CVAR_RENDERER | CVAR_BOOL, "use the dmap generated static shadow volumes" );
  idCVar r_useScissor( "r_useScissor", "1", CVAR_RENDERER | CVAR_BOOL, "scissor clip as portals and lights are processed" );
@@ -8222,7 +8261,7 @@ index 7914093..96fb3c7 100644
  idCVar r_useCombinerDisplayLists( "r_useCombinerDisplayLists", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "put all nvidia register combiner programming in display lists" );
  idCVar r_useDepthBoundsTest( "r_useDepthBoundsTest", "1", CVAR_RENDERER | CVAR_BOOL, "use depth bounds test to reduce shadow fill" );
  
-@@ -819,11 +905,63 @@ void R_InitOpenGL( void ) {
+@@ -819,11 +907,63 @@ void R_InitOpenGL( void ) {
  		r_multiSamples.SetInteger( 0 );
  	}
  
@@ -8286,7 +8325,7 @@ index 7914093..96fb3c7 100644
  
  #include "renderer/qgl_proc.h"
  
-@@ -910,6 +1048,18 @@ GL_CheckErrors
+@@ -910,6 +1050,18 @@ GL_CheckErrors
  ==================
  */
  void GL_CheckErrors( void ) {
@@ -8305,7 +8344,7 @@ index 7914093..96fb3c7 100644
  	int		err;
  	char	s[64];
  	int		i;
-@@ -2505,6 +2655,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
+@@ -2505,6 +2657,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
  	// is destroyed (relevant when starting a mod which also recreates window)
  	Sys_ShutdownInput();
  
@@ -9934,7 +9973,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..26b21d1 100644
+index c83ebb5..95c5097 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -9960,7 +9999,7 @@ index c83ebb5..26b21d1 100644
  
  /*
  
-@@ -38,6 +50,1183 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,1185 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -10178,9 +10217,11 @@ index c83ebb5..26b21d1 100644
 +    // iter-132: throttled background GPU-texture pre-warm budget (plain mirror of
 +    // r_wgpuPreloadPerFrame / r_wgpuPreloadMsPerFrame — the backend has no idCVar
 +    // access). 0 = off.
-+    int      g_capPreloadPerFrame = 0;
-+    int      g_capPreloadMsPerFrame = 6;
-+    int      g_capSubmitInterval = 1;
++	int      g_capPreloadPerFrame = 0;
++	int      g_capPreloadMsPerFrame = 6;
++	int      g_capSubmitInterval = 1;
++	int      g_capWgpuRecordBudget = 0;
++	int      g_capWgpuPassBudget = 0;
 +    // R0: ACES filmic tonemap grade (opt-in ?tonemap; default OFF all tiers).
 +    // Mirrors r_tonemap / r_tonemapExposure / r_tonemapDither (backend has no idCVar).
 +    uint32_t g_capTonemapOn = 0;
@@ -11144,7 +11185,7 @@ index c83ebb5..26b21d1 100644
  
  /*
  =================
-@@ -49,6 +1238,22 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +1240,22 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -11167,7 +11208,7 @@ index c83ebb5..26b21d1 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +1283,22 @@ RB_DrawElementsWithCounters
+@@ -78,6 +1285,22 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -11190,7 +11231,7 @@ index c83ebb5..26b21d1 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1337,23 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1339,23 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -11214,7 +11255,7 @@ index c83ebb5..26b21d1 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1404,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1406,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -11222,7 +11263,7 @@ index c83ebb5..26b21d1 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1631,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1633,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -11235,7 +11276,7 @@ index c83ebb5..26b21d1 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -553,26 +1796,200 @@ Any mirrored or portaled views have already been drawn, so prepare
+@@ -553,26 +1798,202 @@ Any mirrored or portaled views have already been drawn, so prepare
  to actually render the visible surfaces for this view
  =================
  */
@@ -11346,10 +11387,12 @@ index c83ebb5..26b21d1 100644
 +			}
 +			extern idCVar r_bfgSpecular;
 +			g_capBfgSpec = r_bfgSpecular.GetBool() ? 1.0f : 0.0f;
-+		extern idCVar r_wgpuPreloadPerFrame, r_wgpuPreloadMsPerFrame, r_wgpuSubmitInterval;
-+		g_capPreloadPerFrame = r_wgpuPreloadPerFrame.GetInteger();
-+		g_capPreloadMsPerFrame = r_wgpuPreloadMsPerFrame.GetInteger();
-+		g_capSubmitInterval = r_wgpuSubmitInterval.GetInteger();
++			extern idCVar r_wgpuPreloadPerFrame, r_wgpuPreloadMsPerFrame, r_wgpuSubmitInterval, r_wgpuRecordBudget, r_wgpuPassBudget;
++			g_capPreloadPerFrame = r_wgpuPreloadPerFrame.GetInteger();
++			g_capPreloadMsPerFrame = r_wgpuPreloadMsPerFrame.GetInteger();
++			g_capSubmitInterval = r_wgpuSubmitInterval.GetInteger();
++			g_capWgpuRecordBudget = r_wgpuRecordBudget.GetInteger();
++			g_capWgpuPassBudget = r_wgpuPassBudget.GetInteger();
 +		extern idCVar r_tonemap, r_tonemapExposure, r_tonemapDither;
 +		g_capTonemapOn = r_tonemap.GetBool() ? 1u : 0u;
 +		g_capTonemapExposure = r_tonemapExposure.GetFloat();
@@ -11446,7 +11489,7 @@ index c83ebb5..26b21d1 100644
  	backEnd.currentScissor = viewDef->scissor;
  
  	// ensures that depth writes are enabled for the depth clear
-@@ -897,6 +2314,26 @@ void RB_DrawView( const void *data ) {
+@@ -897,6 +2318,26 @@ void RB_DrawView( const void *data ) {
  
  	backEnd.viewDef = cmd->viewDef;
  
