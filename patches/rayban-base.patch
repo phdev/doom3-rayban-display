@@ -2957,7 +2957,7 @@ index 60b0b88..ce679bf 100644
  	const char *			GetMapName( void ) const;
  
 diff --git a/neo/game/Game_network.cpp b/neo/game/Game_network.cpp
-index 5e24df7..30caed9 100644
+index 5e24df7..a9b5d71 100644
 --- a/neo/game/Game_network.cpp
 +++ b/neo/game/Game_network.cpp
 @@ -37,6 +37,10 @@ If you have questions concerning this license or the applicable additional terms
@@ -2971,13 +2971,14 @@ index 5e24df7..30caed9 100644
  /*
  ===============================================================================
  
-@@ -59,6 +63,177 @@ idCVar net_clientSmoothing( "net_clientSmoothing", "0.8", CVAR_GAME | CVAR_FLOAT
+@@ -59,6 +63,178 @@ idCVar net_clientSmoothing( "net_clientSmoothing", "0.8", CVAR_GAME | CVAR_FLOAT
  idCVar net_clientSelfSmoothing( "net_clientSelfSmoothing", "0.6", CVAR_GAME | CVAR_FLOAT, "smooth self position if network causes prediction error.", 0.0f, 0.95f );
  idCVar net_clientMaxPrediction( "net_clientMaxPrediction", "1000", CVAR_SYSTEM | CVAR_INTEGER | CVAR_NOCHEAT, "maximum number of milliseconds a client can predict ahead of server." );
  idCVar net_clientLagOMeter( "net_clientLagOMeter", "1", CVAR_GAME | CVAR_BOOL | CVAR_NOCHEAT | CVAR_ARCHIVE, "draw prediction graph" );
 +idCVar net_clientTrace( "net_clientTrace", "0", CVAR_GAME | CVAR_BOOL | CVAR_NOCHEAT, "publish client snapshot/prediction correction trace to JS" );
 +idCVar net_clientSpectatorNoSnap( "net_clientSpectatorNoSnap", "1", CVAR_GAME | CVAR_BOOL | CVAR_NOCHEAT, "keep local free-fly spectator physics predicted instead of applying snapshot origin snaps" );
 +idCVar net_clientViewCorrection( "net_clientViewCorrection", "1", CVAR_GAME | CVAR_BOOL | CVAR_NOCHEAT, "smooth local spectator snapshot correction in the rendered camera" );
++idCVar net_clientActiveViewCorrection( "net_clientActiveViewCorrection", "1", CVAR_GAME | CVAR_BOOL | CVAR_NOCHEAT, "also smooth local active-player snapshot correction in the rendered first-person view" );
 +idCVar net_clientViewCorrectionBlend( "net_clientViewCorrectionBlend", "0.20", CVAR_GAME | CVAR_FLOAT | CVAR_NOCHEAT, "fraction of pending local view correction retired each rendered frame", 0.05f, 0.95f );
 +idCVar net_clientViewCorrectionMax( "net_clientViewCorrectionMax", "96", CVAR_GAME | CVAR_FLOAT | CVAR_NOCHEAT, "maximum local correction smoothed in the rendered camera; larger corrections snap", 8.0f, 1024.0f );
 +
@@ -3149,7 +3150,7 @@ index 5e24df7..30caed9 100644
  
  /*
  ================
-@@ -974,6 +1149,11 @@ void idGameLocal::ClientReadSnapshot( int clientNum, int sequence, const int gam
+@@ -974,6 +1150,11 @@ void idGameLocal::ClientReadSnapshot( int clientNum, int sequence, const int gam
  	int				spawnId;
  	int				numSourceAreas, sourceAreas[ idEntity::MAX_PVS_AREAS ];
  	idWeapon		*weap;
@@ -3161,7 +3162,7 @@ index 5e24df7..30caed9 100644
  
  	if ( net_clientLagOMeter.GetBool() && renderSystem ) {
  		UpdateLagometer( aheadOfServer, dupeUsercmds );
-@@ -1083,9 +1263,27 @@ void idGameLocal::ClientReadSnapshot( int clientNum, int sequence, const int gam
+@@ -1083,9 +1264,27 @@ void idGameLocal::ClientReadSnapshot( int clientNum, int sequence, const int gam
  		ent->snapshotNode.AddToEnd( snapshotEntities );
  		ent->snapshotSequence = sequence;
  
@@ -3189,7 +3190,7 @@ index 5e24df7..30caed9 100644
  		ent->snapshotBits = msg.GetNumBitsRead() - numBitsRead;
  
  #if ASYNC_WRITE_TAGS
-@@ -1108,6 +1306,9 @@ void idGameLocal::ClientReadSnapshot( int clientNum, int sequence, const int gam
+@@ -1108,6 +1307,9 @@ void idGameLocal::ClientReadSnapshot( int clientNum, int sequence, const int gam
  
  	// if prediction is off, enable local client smoothing
  	player->SetSelfSmooth( dupeUsercmds > 2 );
@@ -3199,7 +3200,7 @@ index 5e24df7..30caed9 100644
  
  	if ( player->spectating && player->spectator != clientNum && entities[ player->spectator ] ) {
  		spectated = static_cast< idPlayer * >( entities[ player->spectator ] );
-@@ -1472,6 +1673,8 @@ gameReturn_t idGameLocal::ClientPrediction( int clientNum, const usercmd_t *clie
+@@ -1472,6 +1674,8 @@ gameReturn_t idGameLocal::ClientPrediction( int clientNum, const usercmd_t *clie
  	idEntity *ent;
  	idPlayer *player;
  	gameReturn_t ret;
@@ -3208,7 +3209,7 @@ index 5e24df7..30caed9 100644
  
  	ret.sessionCommand[ 0 ] = '\0';
  
-@@ -1487,6 +1690,15 @@ gameReturn_t idGameLocal::ClientPrediction( int clientNum, const usercmd_t *clie
+@@ -1487,6 +1691,15 @@ gameReturn_t idGameLocal::ClientPrediction( int clientNum, const usercmd_t *clie
  		player->isLagged = false;
  	}
  
@@ -3224,7 +3225,7 @@ index 5e24df7..30caed9 100644
  	InitLocalClient( clientNum );
  
  	// update the game time
-@@ -1523,6 +1735,16 @@ gameReturn_t idGameLocal::ClientPrediction( int clientNum, const usercmd_t *clie
+@@ -1523,6 +1736,16 @@ gameReturn_t idGameLocal::ClientPrediction( int clientNum, const usercmd_t *clie
  	if ( sessionCommand.Length() ) {
  		idStr::Copynz( ret.sessionCommand, sessionCommand, sizeof( ret.sessionCommand ) );
  	}
@@ -3298,7 +3299,7 @@ index e3458b3..4443dad 100644
  
  	// if the model should be shrinked
 diff --git a/neo/game/Player.cpp b/neo/game/Player.cpp
-index 01b05ab..f443481 100644
+index 01b05ab..6df5e7d 100644
 --- a/neo/game/Player.cpp
 +++ b/neo/game/Player.cpp
 @@ -37,10 +37,15 @@ If you have questions concerning this license or the applicable additional terms
@@ -3317,12 +3318,13 @@ index 01b05ab..f443481 100644
  const int ASYNC_PLAYER_INV_AMMO_BITS = idMath::BitsForInteger( 999 );	// 9 bits to cover the range [0, 999]
  const int ASYNC_PLAYER_INV_CLIP_BITS = -7;								// -7 bits to cover the range [-1, 60]
  
-@@ -68,6 +73,102 @@ const int WEAPON_SWITCH_DELAY = 150;
+@@ -68,6 +73,103 @@ const int WEAPON_SWITCH_DELAY = 150;
  // how many units to raise spectator above default view height so it's in the head of someone
  const int SPECTATE_RAISE = 25;
  
 +extern idCVar net_clientSpectatorNoSnap;
 +extern idCVar net_clientViewCorrection;
++extern idCVar net_clientActiveViewCorrection;
 +extern idCVar net_clientViewCorrectionBlend;
 +extern idCVar net_clientViewCorrectionMax;
 +
@@ -3420,7 +3422,7 @@ index 01b05ab..f443481 100644
  const int HEALTHPULSE_TIME = 333;
  
  // minimum speed to bob and play run/walk animations at
-@@ -1008,6 +1109,9 @@ idPlayer::idPlayer() {
+@@ -1008,6 +1110,9 @@ idPlayer::idPlayer() {
  
  	firstPersonViewOrigin	= vec3_zero;
  	firstPersonViewAxis		= mat3_identity;
@@ -3430,7 +3432,7 @@ index 01b05ab..f443481 100644
  
  	hipJoint				= INVALID_JOINT;
  	chestJoint				= INVALID_JOINT;
-@@ -1133,6 +1237,16 @@ idPlayer::idPlayer() {
+@@ -1133,6 +1238,16 @@ idPlayer::idPlayer() {
  	isChatting				= false;
  
  	selfSmooth				= false;
@@ -3447,7 +3449,7 @@ index 01b05ab..f443481 100644
  }
  
  /*
-@@ -1609,6 +1723,12 @@ Release any resources used by the player.
+@@ -1609,6 +1724,12 @@ Release any resources used by the player.
  ==============
  */
  idPlayer::~idPlayer() {
@@ -3460,7 +3462,7 @@ index 01b05ab..f443481 100644
  	delete weapon.GetEntity();
  	weapon = NULL;
  }
-@@ -5575,6 +5695,16 @@ void idPlayer::PerformImpulse( int impulse ) {
+@@ -5575,6 +5696,16 @@ void idPlayer::PerformImpulse( int impulse ) {
  		ClientSendEvent( EVENT_IMPULSE, &msg );
  	}
  
@@ -3477,7 +3479,7 @@ index 01b05ab..f443481 100644
  	if ( impulse >= IMPULSE_0 && impulse <= IMPULSE_12 ) {
  		SelectWeapon( impulse, false );
  		return;
-@@ -6206,6 +6336,78 @@ idPlayer::Think
+@@ -6206,6 +6337,78 @@ idPlayer::Think
  Called every tic for each player
  ==============
  */
@@ -3556,7 +3558,7 @@ index 01b05ab..f443481 100644
  void idPlayer::Think( void ) {
  	renderEntity_t *headRenderEnt;
  
-@@ -6220,6 +6422,20 @@ void idPlayer::Think( void ) {
+@@ -6220,6 +6423,20 @@ void idPlayer::Think( void ) {
  	buttonMask &= usercmd.buttons;
  	usercmd.buttons &= ~buttonMask;
  
@@ -3577,7 +3579,7 @@ index 01b05ab..f443481 100644
  	if ( gameLocal.inCinematic && gameLocal.skipCinematic ) {
  		return;
  	}
-@@ -6343,9 +6559,17 @@ void idPlayer::Think( void ) {
+@@ -6343,9 +6560,17 @@ void idPlayer::Think( void ) {
  	// this may use firstPersonView, or a thirdPeroson / camera view
  	CalculateRenderView();
  
@@ -3595,7 +3597,7 @@ index 01b05ab..f443481 100644
  		UpdateSpectating();
  	} else if ( health > 0 ) {
  		UpdateWeapon();
-@@ -7109,8 +7333,10 @@ void idPlayer::CalculateViewWeaponPos( idVec3 &origin, idMat3 &axis ) {
+@@ -7109,8 +7334,10 @@ void idPlayer::CalculateViewWeaponPos( idVec3 &origin, idMat3 &axis ) {
  	idAngles	angles;
  	int			delta;
  
@@ -3608,7 +3610,7 @@ index 01b05ab..f443481 100644
  	const idMat3 &viewAxis = firstPersonViewAxis;
  
  	// these cvars are just for hand tweaking before moving a value to the weapon def
-@@ -7387,6 +7613,54 @@ void idPlayer::CalculateRenderView( void ) {
+@@ -7387,6 +7614,55 @@ void idPlayer::CalculateRenderView( void ) {
  		common->Error( "renderView->fov_y == 0" );
  	}
  
@@ -3630,6 +3632,7 @@ index 01b05ab..f443481 100644
 +			if ( renderViewCorrection.LengthSqr() < Square( 0.01f ) ) {
 +				renderViewCorrection.Zero();
 +			}
++			renderViewOrigin = renderView->vieworg;
 +			renderViewOriginSmoothed = true;
 +		}
 +	} else {
@@ -3663,7 +3666,7 @@ index 01b05ab..f443481 100644
  	if ( g_showviewpos.GetBool() ) {
  		gameLocal.Printf( "%s : %s\n", renderView->vieworg.ToString(), renderView->viewaxis.ToAngles().ToString() );
  	}
-@@ -7889,7 +8163,11 @@ void idPlayer::ClientPredictionThink( void ) {
+@@ -7889,7 +8165,11 @@ void idPlayer::ClientPredictionThink( void ) {
  	// this may use firstPersonView, or a thirdPerson / camera view
  	CalculateRenderView();
  
@@ -3676,7 +3679,7 @@ index 01b05ab..f443481 100644
  		UpdateWeapon();
  	}
  
-@@ -8058,6 +8336,10 @@ idPlayer::ReadFromSnapshot
+@@ -8058,6 +8338,10 @@ idPlayer::ReadFromSnapshot
  void idPlayer::ReadFromSnapshot( const idBitMsgDelta &msg ) {
  	int		i, oldHealth, newIdealWeapon, weaponSpawnId;
  	bool	newHitToggle, stateHitch;
@@ -3687,14 +3690,15 @@ index 01b05ab..f443481 100644
  
  	if ( snapshotSequence - lastSnapshotSequence > 1 ) {
  		stateHitch = true;
-@@ -8068,7 +8350,37 @@ void idPlayer::ReadFromSnapshot( const idBitMsgDelta &msg ) {
+@@ -8068,7 +8352,38 @@ void idPlayer::ReadFromSnapshot( const idBitMsgDelta &msg ) {
  
  	oldHealth = health;
  
 +	keepLocalSpectatorPhysics = gameLocal.isClient && entityNumber == gameLocal.localClientNum &&
 +		spectating && spectator == entityNumber && net_clientSpectatorNoSnap.GetBool();
-+	smoothLocalViewCorrection = gameLocal.isClient && entityNumber == gameLocal.localClientNum &&
-+		spectating && net_clientViewCorrection.GetBool();
++	const bool localClientPlayer = gameLocal.isClient && entityNumber == gameLocal.localClientNum;
++	smoothLocalViewCorrection = localClientPlayer && net_clientViewCorrection.GetBool() &&
++		( spectating || net_clientActiveViewCorrection.GetBool() );
 +	if ( smoothLocalViewCorrection ) {
 +		localCorrectionPreOrigin = physicsObj.GetOrigin();
 +	}
@@ -3725,7 +3729,7 @@ index 01b05ab..f443481 100644
  	ReadBindFromSnapshot( msg );
  	deltaViewAngles[0] = msg.ReadDeltaFloat( 0.0f );
  	deltaViewAngles[1] = msg.ReadDeltaFloat( 0.0f );
-@@ -8088,6 +8400,17 @@ void idPlayer::ReadFromSnapshot( const idBitMsgDelta &msg ) {
+@@ -8088,6 +8403,17 @@ void idPlayer::ReadFromSnapshot( const idBitMsgDelta &msg ) {
  
  	// no msg reading below this
  
@@ -3743,7 +3747,7 @@ index 01b05ab..f443481 100644
  	if ( weapon.SetSpawnId( weaponSpawnId ) ) {
  		if ( weapon.GetEntity() ) {
  			// maintain ownership locally
-@@ -8206,9 +8529,16 @@ idPlayer::ReadPlayerStateFromSnapshot
+@@ -8206,9 +8532,16 @@ idPlayer::ReadPlayerStateFromSnapshot
  void idPlayer::ReadPlayerStateFromSnapshot( const idBitMsgDelta &msg ) {
  	int i, ammo;
  
