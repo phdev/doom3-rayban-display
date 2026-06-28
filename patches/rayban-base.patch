@@ -3498,7 +3498,7 @@ index e3458b3..4443dad 100644
  
  	// if the model should be shrinked
 diff --git a/neo/game/Player.cpp b/neo/game/Player.cpp
-index 01b05ab..ba55d64 100644
+index 01b05ab..3a8b7ac 100644
 --- a/neo/game/Player.cpp
 +++ b/neo/game/Player.cpp
 @@ -37,10 +37,15 @@ If you have questions concerning this license or the applicable additional terms
@@ -3517,7 +3517,7 @@ index 01b05ab..ba55d64 100644
  const int ASYNC_PLAYER_INV_AMMO_BITS = idMath::BitsForInteger( 999 );	// 9 bits to cover the range [0, 999]
  const int ASYNC_PLAYER_INV_CLIP_BITS = -7;								// -7 bits to cover the range [-1, 60]
  
-@@ -68,6 +73,155 @@ const int WEAPON_SWITCH_DELAY = 150;
+@@ -68,6 +73,160 @@ const int WEAPON_SWITCH_DELAY = 150;
  // how many units to raise spectator above default view height so it's in the head of someone
  const int SPECTATE_RAISE = 25;
  
@@ -3583,7 +3583,7 @@ index 01b05ab..ba55d64 100644
 +	char buf[ 3072 ];
 +	idStr::snPrintf( buf, sizeof( buf ),
 +		"{\"type\":\"present\",\"now\":%d,\"frame\":%d,\"time\":%d,\"spectating\":%d,\"spectator\":%d,"
-+		"\"ground\":%d,\"smoothed\":%d,\"lastPredict\":%d,\"smoothLen\":%.3f,\"smoothZ\":%.3f,"
++		"\"ground\":%d,\"smoothed\":%d,\"lastPredict\":%d,\"commit\":%d,\"held\":%d,\"timeBack\":%d,\"rawInvalid\":%d,\"smoothLen\":%.3f,\"smoothZ\":%.3f,"
 +		"\"rawStepLen\":%.3f,\"viewStepLen\":%.3f,\"physStepLen\":%.3f,\"holdGapLen\":%.3f,"
 +		"\"rawBack\":%d,\"viewBack\":%d,\"physBack\":%d,\"replayHold\":%d,"
 +		"\"viewCorrLen\":%.3f,\"viewCorr\":[%.3f,%.3f,%.3f],\"phys\":[%.3f,%.3f,%.3f],"
@@ -3591,7 +3591,12 @@ index 01b05ab..ba55d64 100644
 +		"\"raw\":[%.3f,%.3f,%.3f],\"rawAng\":[%.3f,%.3f,%.3f],"
 +		"\"view\":[%.3f,%.3f,%.3f],\"viewAng\":[%.3f,%.3f,%.3f]}",
 +		Sys_Milliseconds(), gameLocal.framenum, gameLocal.time, player->spectating ? 1 : 0, player->spectator,
-+		onGround ? 1 : 0, smoothed ? 1 : 0, gameLocal.isLastPredictFrame ? 1 : 0, smooth.Length(), smooth.z,
++		onGround ? 1 : 0, smoothed ? 1 : 0, gameLocal.isLastPredictFrame ? 1 : 0,
++		player->localPresentationFrameVisual ? 1 : 0,
++		player->localPresentationFrameHeld ? 1 : 0,
++		player->localPresentationFrameTimeBack ? 1 : 0,
++		player->localPresentationFrameRawInvalid ? 1 : 0,
++		smooth.Length(), smooth.z,
 +		rawStepLen, viewStepLen, physStepLen, holdGapLen, rawBack, viewBack, physBack, replayHold,
 +		player->renderViewCorrection.Length(), player->renderViewCorrection.x, player->renderViewCorrection.y, player->renderViewCorrection.z,
 +		physicsOrg.x, physicsOrg.y, physicsOrg.z,
@@ -3673,17 +3678,29 @@ index 01b05ab..ba55d64 100644
  const int HEALTHPULSE_TIME = 333;
  
  // minimum speed to bob and play run/walk animations at
-@@ -1008,6 +1162,9 @@ idPlayer::idPlayer() {
+@@ -1008,6 +1167,21 @@ idPlayer::idPlayer() {
  
  	firstPersonViewOrigin	= vec3_zero;
  	firstPersonViewAxis		= mat3_identity;
 +	renderViewOrigin		= vec3_zero;
 +	renderViewOriginSmoothed = false;
 +	renderViewSmoothingInitialized = false;
++	localPresentationViewOrigin = vec3_zero;
++	localPresentationViewAxis = mat3_identity;
++	localPresentationRawOrigin = vec3_zero;
++	localPresentationRawAxis = mat3_identity;
++	localPresentationPoseValid = false;
++	localPresentationFrame = -1;
++	localPresentationTime = -1;
++	localPresentationLastPredictFrame = false;
++	localPresentationFrameVisual = false;
++	localPresentationFrameHeld = false;
++	localPresentationFrameTimeBack = false;
++	localPresentationFrameRawInvalid = false;
  
  	hipJoint				= INVALID_JOINT;
  	chestJoint				= INVALID_JOINT;
-@@ -1133,6 +1290,16 @@ idPlayer::idPlayer() {
+@@ -1133,6 +1307,16 @@ idPlayer::idPlayer() {
  	isChatting				= false;
  
  	selfSmooth				= false;
@@ -3700,7 +3717,7 @@ index 01b05ab..ba55d64 100644
  }
  
  /*
-@@ -1609,6 +1776,12 @@ Release any resources used by the player.
+@@ -1609,6 +1793,12 @@ Release any resources used by the player.
  ==============
  */
  idPlayer::~idPlayer() {
@@ -3713,7 +3730,29 @@ index 01b05ab..ba55d64 100644
  	delete weapon.GetEntity();
  	weapon = NULL;
  }
-@@ -4734,6 +4907,8 @@ void idPlayer::BobCycle( const idVec3 &pushVelocity ) {
+@@ -1929,6 +2119,21 @@ void idPlayer::Restore( idRestoreGame *savefile ) {
+ 
+ 	savefile->ReadVec3( firstPersonViewOrigin );
+ 	savefile->ReadMat3( firstPersonViewAxis );
++	renderViewOrigin = firstPersonViewOrigin;
++	renderViewOriginSmoothed = false;
++	renderViewSmoothingInitialized = false;
++	localPresentationViewOrigin = firstPersonViewOrigin;
++	localPresentationViewAxis = firstPersonViewAxis;
++	localPresentationRawOrigin = firstPersonViewOrigin;
++	localPresentationRawAxis = firstPersonViewAxis;
++	localPresentationPoseValid = false;
++	localPresentationFrame = -1;
++	localPresentationTime = -1;
++	localPresentationLastPredictFrame = false;
++	localPresentationFrameVisual = false;
++	localPresentationFrameHeld = false;
++	localPresentationFrameTimeBack = false;
++	localPresentationFrameRawInvalid = false;
+ 
+ 	// don't bother saving dragEntity since it's a dev tool
+ 	dragEntity.Clear();
+@@ -4734,6 +4939,8 @@ void idPlayer::BobCycle( const idVec3 &pushVelocity ) {
  	float		delta;
  	float		speed;
  	float		f;
@@ -3722,7 +3761,7 @@ index 01b05ab..ba55d64 100644
  
  	//
  	// calculate speed and cycle to be used for
-@@ -4744,6 +4919,8 @@ void idPlayer::BobCycle( const idVec3 &pushVelocity ) {
+@@ -4744,6 +4951,8 @@ void idPlayer::BobCycle( const idVec3 &pushVelocity ) {
  	gravityDir = physicsObj.GetGravityNormal();
  	vel = velocity - ( velocity * gravityDir ) * gravityDir;
  	xyspeed = vel.LengthFast();
@@ -3731,7 +3770,7 @@ index 01b05ab..ba55d64 100644
  
  	// do not evaluate the bob for other clients
  	// when doing a spectate follow, don't do any weapon bobbing
-@@ -4775,6 +4952,8 @@ void idPlayer::BobCycle( const idVec3 &pushVelocity ) {
+@@ -4775,6 +4984,8 @@ void idPlayer::BobCycle( const idVec3 &pushVelocity ) {
  		// check for footstep / splash sounds
  		old = bobCycle;
  		bobCycle = (int)( old + bobmove * gameLocal.msecPrecise ) & 255;
@@ -3740,7 +3779,27 @@ index 01b05ab..ba55d64 100644
  		bobFoot = ( bobCycle & 128 ) >> 7;
  		bobfracsin = idMath::Fabs( sin( ( bobCycle & 127 ) / 127.0 * idMath::PI ) );
  	}
-@@ -4852,6 +5031,12 @@ void idPlayer::BobCycle( const idVec3 &pushVelocity ) {
+@@ -4812,6 +5023,19 @@ void idPlayer::BobCycle( const idVec3 &pushVelocity ) {
+ 	// calculate position for view bobbing
+ 	viewBob.Zero();
+ 
++	if ( gameLocal.isClient && entityNumber == gameLocal.localClientNum ) {
++		// Client prediction replays older frames after snapshots.  These timers are
++		// local presentation state, so never let a replay evaluate them from the future.
++		if ( stepUpTime > gameLocal.time ) {
++			stepUpTime = gameLocal.time;
++			stepUpDelta = 0.0f;
++		}
++		if ( landTime > gameLocal.time ) {
++			landTime = gameLocal.time - ( LAND_DEFLECT_TIME + LAND_RETURN_TIME );
++			landChange = 0;
++		}
++	}
++
+ 	if ( physicsObj.HasSteppedUp() ) {
+ 
+ 		// check for stepping up before a previous step is completed
+@@ -4852,6 +5076,12 @@ void idPlayer::BobCycle( const idVec3 &pushVelocity ) {
  		f = 1.0 - ( delta / LAND_RETURN_TIME );
  		viewBob -= gravity * ( landChange * f );
  	}
@@ -3753,7 +3812,7 @@ index 01b05ab..ba55d64 100644
  }
  
  /*
-@@ -5575,6 +5760,16 @@ void idPlayer::PerformImpulse( int impulse ) {
+@@ -5575,6 +5805,16 @@ void idPlayer::PerformImpulse( int impulse ) {
  		ClientSendEvent( EVENT_IMPULSE, &msg );
  	}
  
@@ -3770,7 +3829,7 @@ index 01b05ab..ba55d64 100644
  	if ( impulse >= IMPULSE_0 && impulse <= IMPULSE_12 ) {
  		SelectWeapon( impulse, false );
  		return;
-@@ -6206,6 +6401,78 @@ idPlayer::Think
+@@ -6206,6 +6446,78 @@ idPlayer::Think
  Called every tic for each player
  ==============
  */
@@ -3849,7 +3908,7 @@ index 01b05ab..ba55d64 100644
  void idPlayer::Think( void ) {
  	renderEntity_t *headRenderEnt;
  
-@@ -6220,6 +6487,20 @@ void idPlayer::Think( void ) {
+@@ -6220,6 +6532,20 @@ void idPlayer::Think( void ) {
  	buttonMask &= usercmd.buttons;
  	usercmd.buttons &= ~buttonMask;
  
@@ -3870,7 +3929,7 @@ index 01b05ab..ba55d64 100644
  	if ( gameLocal.inCinematic && gameLocal.skipCinematic ) {
  		return;
  	}
-@@ -6343,9 +6624,17 @@ void idPlayer::Think( void ) {
+@@ -6343,9 +6669,17 @@ void idPlayer::Think( void ) {
  	// this may use firstPersonView, or a thirdPeroson / camera view
  	CalculateRenderView();
  
@@ -3888,32 +3947,112 @@ index 01b05ab..ba55d64 100644
  		UpdateSpectating();
  	} else if ( health > 0 ) {
  		UpdateWeapon();
-@@ -7109,8 +7398,10 @@ void idPlayer::CalculateViewWeaponPos( idVec3 &origin, idMat3 &axis ) {
+@@ -7109,9 +7443,12 @@ void idPlayer::CalculateViewWeaponPos( idVec3 &origin, idMat3 &axis ) {
  	idAngles	angles;
  	int			delta;
  
 -	// CalculateRenderView must have been called first
 -	const idVec3 &viewOrigin = firstPersonViewOrigin;
+-	const idMat3 &viewAxis = firstPersonViewAxis;
++	idVec3		viewOrigin;
++	idMat3		viewAxis;
++
 +	// CalculateRenderView must have been called first.  The view weapon is a
-+	// presented model, so anchor it to the same render-only smoothed origin as
-+	// the world camera.  Gameplay traces still read firstPersonViewOrigin.
-+	const idVec3 &viewOrigin = renderViewOriginSmoothed ? renderViewOrigin : firstPersonViewOrigin;
- 	const idMat3 &viewAxis = firstPersonViewAxis;
++	// presented model, so anchor it to the exact pose the world camera will use.
++	GetPresentationViewPose( viewOrigin, viewAxis );
  
  	// these cvars are just for hand tweaking before moving a value to the weapon def
-@@ -7387,6 +7678,58 @@ void idPlayer::CalculateRenderView( void ) {
+ 	idVec3	gunpos( g_gun_x.GetFloat(), g_gun_y.GetFloat(), g_gun_z.GetFloat() );
+@@ -7161,6 +7498,53 @@ void idPlayer::CalculateViewWeaponPos( idVec3 &origin, idMat3 &axis ) {
+ 	axis = angles.ToMat3() * viewAxis;
+ }
+ 
++/*
++==============
++idPlayer::ShouldUseLocalPresentationPose
++==============
++*/
++bool idPlayer::ShouldUseLocalPresentationPose( void ) const {
++	return g_localPresentationAtomic.GetBool() &&
++		localPresentationPoseValid &&
++		entityNumber == gameLocal.localClientNum &&
++		!spectating &&
++		health > 0 &&
++		!pm_thirdPerson.GetBool() &&
++		!pm_thirdPersonDeath.GetBool() &&
++		!privateCameraView &&
++		!gameLocal.GetCamera();
++}
++
++/*
++==============
++idPlayer::ShouldRunLocalPredictionVisuals
++==============
++*/
++bool idPlayer::ShouldRunLocalPredictionVisuals( void ) const {
++	if ( !g_localPredictionVisualFinalOnly.GetBool() ) {
++		return !localPresentationFrameHeld;
++	}
++	if ( !gameLocal.isClient || entityNumber != gameLocal.localClientNum ) {
++		return true;
++	}
++	return localPresentationFrameVisual;
++}
++
++/*
++==============
++idPlayer::GetPresentationViewPose
++==============
++*/
++void idPlayer::GetPresentationViewPose( idVec3 &origin, idMat3 &axis ) const {
++	if ( ShouldUseLocalPresentationPose() ) {
++		origin = localPresentationViewOrigin;
++		axis = localPresentationViewAxis;
++		return;
++	}
++	origin = renderViewOriginSmoothed ? renderViewOrigin : firstPersonViewOrigin;
++	axis = firstPersonViewAxis;
++}
++
+ /*
+ ===============
+ idPlayer::OffsetThirdPersonView
+@@ -7387,6 +7771,124 @@ void idPlayer::CalculateRenderView( void ) {
  		common->Error( "renderView->fov_y == 0" );
  	}
  
 +	renderViewOriginSmoothed = false;
-+#ifdef __EMSCRIPTEN__
 +	const idVec3 traceRawViewOrg = renderView->vieworg;
 +	const idMat3 traceRawViewAxis = renderView->viewaxis;
-+#endif
-+		const bool localPresentedView =
-+			entityNumber == gameLocal.localClientNum &&
++	const bool localPresentedView =
++		entityNumber == gameLocal.localClientNum &&
 +			!pm_thirdPerson.GetBool() && !pm_thirdPersonDeath.GetBool() &&
 +			!privateCameraView && !gameLocal.GetCamera();
++	const bool localActivePresentedView = localPresentedView && !spectating && health > 0;
++	const bool localActiveClientView = gameLocal.isClient && localActivePresentedView;
++	const bool localPresentationTimeBack =
++		g_localPresentationMonotonic.GetBool() &&
++		localActiveClientView &&
++		localPresentationPoseValid &&
++		gameLocal.time < localPresentationTime;
++	const idVec3 localPresentationRawGap = traceRawViewOrg - physicsObj.GetOrigin();
++	const float localPresentationRawGapXY =
++		localPresentationRawGap.x * localPresentationRawGap.x +
++		localPresentationRawGap.y * localPresentationRawGap.y;
++	const bool localPresentationRawInvalid =
++		g_localPresentationMonotonic.GetBool() &&
++		localActiveClientView &&
++		( localPresentationRawGap.z < 8.0f ||
++		  localPresentationRawGap.z > 192.0f ||
++		  localPresentationRawGapXY > Square( 128.0f ) );
++	const bool localPresentationCommit =
++		!localPresentationRawInvalid &&
++		( !localActiveClientView ||
++		  !g_localPresentationMonotonic.GetBool() ||
++		  !localPresentationPoseValid ||
++		  ( gameLocal.isLastPredictFrame && !localPresentationTimeBack ) );
++	const bool localPresentationFallback =
++		localActiveClientView && localPresentationRawInvalid && !localPresentationPoseValid;
 +	bool handledRenderViewOrigin = false;
 +	if ( gameLocal.isMultiplayer &&
 +		 net_clientViewCorrection.GetBool() &&
@@ -3933,21 +4072,64 @@ index 01b05ab..ba55d64 100644
 +	}
 +	if ( g_viewInterpolate.GetBool() &&
 +		 localPresentedView &&
-+		 spectating ) {
++		 ( spectating || ( gameLocal.isClient && localActivePresentedView ) ) ) {
 +		const idVec3 rawOrg = renderView->vieworg;
-+		if ( !renderViewSmoothingInitialized ||
-+			 ( rawOrg - renderViewOrigin ).LengthSqr() >= Square( g_viewInterpMaxDelta.GetFloat() ) ) {
-+			renderViewOrigin = rawOrg;
-+			renderViewSmoothingInitialized = true;
-+		} else {
-+			renderViewOrigin += ( rawOrg - renderViewOrigin ) * g_viewSmooth.GetFloat();
++		const bool advanceSmoothing = spectating || localPresentationCommit;
++		if ( advanceSmoothing ) {
++			if ( !renderViewSmoothingInitialized ||
++				 ( rawOrg - renderViewOrigin ).LengthSqr() >= Square( g_viewInterpMaxDelta.GetFloat() ) ) {
++				renderViewOrigin = rawOrg;
++				renderViewSmoothingInitialized = true;
++			} else {
++				renderViewOrigin += ( rawOrg - renderViewOrigin ) * g_viewSmooth.GetFloat();
++			}
 +		}
-+		renderView->vieworg = renderViewOrigin;
-+		renderViewOriginSmoothed = true;
-+		handledRenderViewOrigin = true;
++		if ( renderViewSmoothingInitialized ) {
++			renderView->vieworg = renderViewOrigin;
++			renderViewOriginSmoothed = true;
++			handledRenderViewOrigin = true;
++		}
 +	} else if ( !handledRenderViewOrigin ) {
 +		renderViewOrigin = renderView->vieworg;
 +		renderViewSmoothingInitialized = false;
++	}
++	if ( localActiveClientView && localPresentationPoseValid && !localPresentationCommit ) {
++		renderView->vieworg = localPresentationViewOrigin;
++		renderView->viewaxis = localPresentationViewAxis;
++		renderViewOrigin = localPresentationViewOrigin;
++		renderViewSmoothingInitialized = true;
++		renderViewOriginSmoothed = true;
++		handledRenderViewOrigin = true;
++	} else if ( localPresentationFallback ) {
++		renderView->vieworg = GetEyePosition();
++		renderView->viewaxis = traceRawViewAxis;
++		renderViewOrigin = renderView->vieworg;
++		renderViewSmoothingInitialized = true;
++		renderViewOriginSmoothed = true;
++		handledRenderViewOrigin = true;
++	}
++
++	if ( localActivePresentedView ) {
++		if ( localPresentationCommit || localPresentationFallback ) {
++			localPresentationViewOrigin = renderView->vieworg;
++			localPresentationViewAxis = renderView->viewaxis;
++			localPresentationRawOrigin = traceRawViewOrg;
++			localPresentationRawAxis = traceRawViewAxis;
++			localPresentationFrame = gameLocal.framenum;
++			localPresentationTime = gameLocal.time;
++			localPresentationLastPredictFrame = gameLocal.isLastPredictFrame;
++		}
++		localPresentationPoseValid = true;
++		localPresentationFrameVisual = localPresentationCommit && ( !gameLocal.isClient || gameLocal.isLastPredictFrame );
++		localPresentationFrameHeld = !localPresentationCommit;
++		localPresentationFrameTimeBack = localPresentationTimeBack;
++		localPresentationFrameRawInvalid = localPresentationRawInvalid;
++	} else {
++		localPresentationPoseValid = false;
++		localPresentationFrameVisual = false;
++		localPresentationFrameHeld = false;
++		localPresentationFrameTimeBack = false;
++		localPresentationFrameRawInvalid = false;
 +	}
 +
 +#ifdef __EMSCRIPTEN__
@@ -3960,7 +4142,7 @@ index 01b05ab..ba55d64 100644
  	if ( g_showviewpos.GetBool() ) {
  		gameLocal.Printf( "%s : %s\n", renderView->vieworg.ToString(), renderView->viewaxis.ToAngles().ToString() );
  	}
-@@ -7889,7 +8232,11 @@ void idPlayer::ClientPredictionThink( void ) {
+@@ -7889,7 +8391,11 @@ void idPlayer::ClientPredictionThink( void ) {
  	// this may use firstPersonView, or a thirdPerson / camera view
  	CalculateRenderView();
  
@@ -3973,7 +4155,27 @@ index 01b05ab..ba55d64 100644
  		UpdateWeapon();
  	}
  
-@@ -8058,6 +8405,10 @@ idPlayer::ReadFromSnapshot
+@@ -7932,7 +8438,7 @@ void idPlayer::ClientPredictionThink( void ) {
+ 		headRenderEnt->suppressShadowInLightID = LIGHTID_VIEW_MUZZLE_FLASH + entityNumber;
+ 	}
+ 
+-	if ( !gameLocal.inCinematic ) {
++	if ( !gameLocal.inCinematic && ShouldRunLocalPredictionVisuals() ) {
+ 		UpdateAnimation();
+ 	}
+ 
+@@ -7940,7 +8446,9 @@ void idPlayer::ClientPredictionThink( void ) {
+ 		DrawPlayerIcons();
+ 	}
+ 
+-	Present();
++	if ( ShouldRunLocalPredictionVisuals() ) {
++		Present();
++	}
+ 
+ 	UpdateDamageEffects();
+ 
+@@ -8058,6 +8566,10 @@ idPlayer::ReadFromSnapshot
  void idPlayer::ReadFromSnapshot( const idBitMsgDelta &msg ) {
  	int		i, oldHealth, newIdealWeapon, weaponSpawnId;
  	bool	newHitToggle, stateHitch;
@@ -3984,7 +4186,7 @@ index 01b05ab..ba55d64 100644
  
  	if ( snapshotSequence - lastSnapshotSequence > 1 ) {
  		stateHitch = true;
-@@ -8068,7 +8419,37 @@ void idPlayer::ReadFromSnapshot( const idBitMsgDelta &msg ) {
+@@ -8068,7 +8580,37 @@ void idPlayer::ReadFromSnapshot( const idBitMsgDelta &msg ) {
  
  	oldHealth = health;
  
@@ -4022,7 +4224,7 @@ index 01b05ab..ba55d64 100644
  	ReadBindFromSnapshot( msg );
  	deltaViewAngles[0] = msg.ReadDeltaFloat( 0.0f );
  	deltaViewAngles[1] = msg.ReadDeltaFloat( 0.0f );
-@@ -8088,6 +8469,17 @@ void idPlayer::ReadFromSnapshot( const idBitMsgDelta &msg ) {
+@@ -8088,6 +8630,17 @@ void idPlayer::ReadFromSnapshot( const idBitMsgDelta &msg ) {
  
  	// no msg reading below this
  
@@ -4040,7 +4242,7 @@ index 01b05ab..ba55d64 100644
  	if ( weapon.SetSpawnId( weaponSpawnId ) ) {
  		if ( weapon.GetEntity() ) {
  			// maintain ownership locally
-@@ -8206,9 +8598,16 @@ idPlayer::ReadPlayerStateFromSnapshot
+@@ -8206,9 +8759,16 @@ idPlayer::ReadPlayerStateFromSnapshot
  void idPlayer::ReadPlayerStateFromSnapshot( const idBitMsgDelta &msg ) {
  	int i, ammo;
  
@@ -4050,7 +4252,7 @@ index 01b05ab..ba55d64 100644
 +	const int snapshotBobCycle = msg.ReadByte();
 +	const int snapshotStepUpTime = msg.ReadInt();
 +	const float snapshotStepUpDelta = msg.ReadFloat();
-+	const bool keepLocalViewBob = gameLocal.isClient &&
++	const bool keepLocalViewBob = g_localViewBobKeepClient.GetBool() && gameLocal.isClient &&
 +		entityNumber == gameLocal.localClientNum && !spectating;
 +	if ( !keepLocalViewBob ) {
 +		bobCycle = snapshotBobCycle;
@@ -4061,10 +4263,10 @@ index 01b05ab..ba55d64 100644
  	inventory.armor = msg.ReadByte();
  
 diff --git a/neo/game/Player.h b/neo/game/Player.h
-index b411a0c..5144b63 100644
+index b411a0c..b47547f 100644
 --- a/neo/game/Player.h
 +++ b/neo/game/Player.h
-@@ -324,6 +324,20 @@ public:
+@@ -324,6 +324,32 @@ public:
  	// if a third person view is used
  	idVec3					firstPersonViewOrigin;
  	idMat3					firstPersonViewAxis;
@@ -4072,6 +4274,18 @@ index b411a0c..5144b63 100644
 +	idVec3					renderViewCorrection;		// inverse local snapshot correction, decayed in presentation only
 +	bool					renderViewOriginSmoothed;
 +	bool					renderViewSmoothingInitialized;
++	idVec3					localPresentationViewOrigin;
++	idMat3					localPresentationViewAxis;
++	idVec3					localPresentationRawOrigin;
++	idMat3					localPresentationRawAxis;
++	bool					localPresentationPoseValid;
++	int						localPresentationFrame;
++	int						localPresentationTime;
++	bool					localPresentationLastPredictFrame;
++	bool					localPresentationFrameVisual;
++	bool					localPresentationFrameHeld;
++	bool					localPresentationFrameTimeBack;
++	bool					localPresentationFrameRawInvalid;
 +
 +#ifdef __EMSCRIPTEN__
 +	// Meta Ray-Ban Display (iter 72): a permanent, view-attached projected
@@ -4085,7 +4299,7 @@ index b411a0c..5144b63 100644
  
  	idDragEntity			dragEntity;
  
-@@ -336,6 +350,11 @@ public:
+@@ -336,6 +362,11 @@ public:
  	void					Spawn( void );
  	void					Think( void );
  
@@ -4097,6 +4311,16 @@ index b411a0c..5144b63 100644
  	// save games
  	void					Save( idSaveGame *savefile ) const;					// archives object for save game file
  	void					Restore( idRestoreGame *savefile );					// unarchives object from save game file
+@@ -401,6 +432,9 @@ public:
+ 	float					DefaultFov( void ) const;
+ 	float					CalcFov( bool honorZoom );
+ 	void					CalculateViewWeaponPos( idVec3 &origin, idMat3 &axis );
++	bool					ShouldUseLocalPresentationPose( void ) const;
++	bool					ShouldRunLocalPredictionVisuals( void ) const;
++	void					GetPresentationViewPose( idVec3 &origin, idMat3 &axis ) const;
+ 	idVec3					GetEyePosition( void ) const;
+ 	void					GetViewPos( idVec3 &origin, idMat3 &axis ) const;
+ 	void					OffsetThirdPersonView( float angle, float range, float height, bool clip );
 diff --git a/neo/game/PlayerView.cpp b/neo/game/PlayerView.cpp
 index 16dc809..f4114d8 100644
 --- a/neo/game/PlayerView.cpp
@@ -4131,10 +4355,10 @@ index 36a0cbe..58d9a22 100644
  
  	GetPhysics()->SetContents( CONTENTS_SOLID );
 diff --git a/neo/game/Weapon.cpp b/neo/game/Weapon.cpp
-index b1d6c99..da45492 100644
+index b1d6c99..ee1c4c1 100644
 --- a/neo/game/Weapon.cpp
 +++ b/neo/game/Weapon.cpp
-@@ -40,8 +40,101 @@ If you have questions concerning this license or the applicable additional terms
+@@ -40,8 +40,115 @@ If you have questions concerning this license or the applicable additional terms
  
  #include "Weapon.h"
  
@@ -4158,8 +4382,9 @@ index b1d6c99..da45492 100644
 +	return d;
 +}
 +
-+static void D3_ArcoNetTraceWeapon( const idPlayer *owner, const idVec3 &weaponOrigin,
-+		const idMat3 &weaponAxis, float hideOffset ) {
++static void D3_ArcoNetTraceWeapon( const idPlayer *owner, const idVec3 &playerViewOrigin,
++		const idMat3 &playerViewAxis, const idVec3 &weaponOrigin,
++		const idMat3 &weaponAxis, float hideOffset, bool visualFrame ) {
 +	if ( !net_clientTrace.GetBool() || !owner || owner->entityNumber != gameLocal.localClientNum ) {
 +		return;
 +	}
@@ -4172,15 +4397,20 @@ index b1d6c99..da45492 100644
 +	static idVec3 lastLocal = vec3_zero;
 +	static idAngles lastRelAng = ang_zero;
 +
-+	const idVec3 &cam = owner->renderViewOriginSmoothed ? owner->renderViewOrigin : owner->firstPersonViewOrigin;
-+	const idMat3 &camAxis = owner->firstPersonViewAxis;
++	idVec3 cam;
++	idMat3 camAxis;
++	owner->GetPresentationViewPose( cam, camAxis );
 +	const idVec3 delta = weaponOrigin - cam;
 +	idVec3 local( delta * camAxis[ 0 ], delta * camAxis[ 1 ], delta * camAxis[ 2 ] );
 +	const idAngles camAng = camAxis.ToAngles();
 +	const idAngles weaponAng = weaponAxis.ToAngles();
++	const idAngles playerViewAng = playerViewAxis.ToAngles();
 +	idAngles relAng( D3_ArcoAngleDelta( weaponAng.pitch, camAng.pitch ),
 +		D3_ArcoAngleDelta( weaponAng.yaw, camAng.yaw ),
 +		D3_ArcoAngleDelta( weaponAng.roll, camAng.roll ) );
++	idAngles poseAngSplit( D3_ArcoAngleDelta( playerViewAng.pitch, camAng.pitch ),
++		D3_ArcoAngleDelta( playerViewAng.yaw, camAng.yaw ),
++		D3_ArcoAngleDelta( playerViewAng.roll, camAng.roll ) );
 +
 +	idVec3 weaponStep = vec3_zero;
 +	idVec3 camStep = vec3_zero;
@@ -4205,14 +4435,22 @@ index b1d6c99..da45492 100644
 +
 +	const float relAngStepLen = idMath::Sqrt( relAngStep.pitch * relAngStep.pitch +
 +		relAngStep.yaw * relAngStep.yaw + relAngStep.roll * relAngStep.roll );
-+	char buf[ 2048 ];
++	const float poseAxisSplitLen = idMath::Sqrt( poseAngSplit.pitch * poseAngSplit.pitch +
++		poseAngSplit.yaw * poseAngSplit.yaw + poseAngSplit.roll * poseAngSplit.roll );
++	const idVec3 poseSplit = playerViewOrigin - cam;
++	const idVec3 rawSplit = cam - owner->firstPersonViewOrigin;
++	char buf[ 3072 ];
 +	idStr::snPrintf( buf, sizeof( buf ),
-+		"{\"type\":\"weapon\",\"now\":%d,\"frame\":%d,\"time\":%d,\"newFrame\":%d,"
-+		"\"smoothed\":%d,\"hide\":%.3f,\"weapon\":[%.3f,%.3f,%.3f],\"cam\":[%.3f,%.3f,%.3f],"
++		"{\"type\":\"weapon\",\"now\":%d,\"frame\":%d,\"time\":%d,\"newFrame\":%d,\"lastPredict\":%d,\"visual\":%d,\"held\":%d,\"timeBack\":%d,\"rawInvalid\":%d,"
++		"\"smoothed\":%d,\"hide\":%.3f,\"poseSplitLen\":%.3f,\"poseAxisSplitLen\":%.3f,\"rawSplitLen\":%.3f,"
++		"\"weapon\":[%.3f,%.3f,%.3f],\"cam\":[%.3f,%.3f,%.3f],"
 +		"\"local\":[%.3f,%.3f,%.3f],\"localLen\":%.3f,\"relAng\":[%.3f,%.3f,%.3f],"
 +		"\"weaponStepLen\":%.3f,\"camStepLen\":%.3f,\"localStepLen\":%.3f,\"relAngStepLen\":%.3f}",
-+		Sys_Milliseconds(), gameLocal.framenum, gameLocal.time, newFrame,
-+		owner->renderViewOriginSmoothed ? 1 : 0, hideOffset,
++		Sys_Milliseconds(), gameLocal.framenum, gameLocal.time, newFrame, gameLocal.isLastPredictFrame ? 1 : 0, visualFrame ? 1 : 0,
++		owner->localPresentationFrameHeld ? 1 : 0,
++		owner->localPresentationFrameTimeBack ? 1 : 0,
++		owner->localPresentationFrameRawInvalid ? 1 : 0,
++		owner->renderViewOriginSmoothed ? 1 : 0, hideOffset, poseSplit.Length(), poseAxisSplitLen, rawSplit.Length(),
 +		weaponOrigin.x, weaponOrigin.y, weaponOrigin.z, cam.x, cam.y, cam.z,
 +		local.x, local.y, local.z, local.Length(), relAng.pitch, relAng.yaw, relAng.roll,
 +		weaponStep.Length(), camStep.Length(), localStep.Length(), relAngStepLen );
@@ -4236,17 +4474,45 @@ index b1d6c99..da45492 100644
  /***********************************************************************
  
    idWeapon
-@@ -1915,6 +2008,10 @@ void idWeapon::PresentWeapon( bool showViewModel ) {
+@@ -1887,8 +1994,8 @@ idWeapon::PresentWeapon
+ ================
+ */
+ void idWeapon::PresentWeapon( bool showViewModel ) {
+-	playerViewOrigin = owner->firstPersonViewOrigin;
+-	playerViewAxis = owner->firstPersonViewAxis;
++	owner->GetPresentationViewPose( playerViewOrigin, playerViewAxis );
++	const bool runPredictionVisuals = owner->ShouldRunLocalPredictionVisuals();
+ 
+ 	// calculate weapon position based on player movement bobbing
+ 	owner->CalculateViewWeaponPos( viewWeaponOrigin, viewWeaponAxis );
+@@ -1915,16 +2022,26 @@ void idWeapon::PresentWeapon( bool showViewModel ) {
  	// kick up based on repeat firing
  	MuzzleRise( viewWeaponOrigin, viewWeaponAxis );
  
 +#ifdef __EMSCRIPTEN__
-+	D3_ArcoNetTraceWeapon( owner, viewWeaponOrigin, viewWeaponAxis, hideOffset );
++	D3_ArcoNetTraceWeapon( owner, playerViewOrigin, playerViewAxis, viewWeaponOrigin, viewWeaponAxis, hideOffset, runPredictionVisuals );
 +#endif
 +
  	// set the physics position and orientation
  	GetPhysics()->SetOrigin( viewWeaponOrigin );
  	GetPhysics()->SetAxis( viewWeaponAxis );
+-	UpdateVisuals();
++	if ( runPredictionVisuals ) {
++		UpdateVisuals();
++	}
+ 
+ 	// update the weapon script
+ 	UpdateScript();
+ 
+ 	UpdateGUI();
+ 
++	if ( !runPredictionVisuals ) {
++		return;
++	}
++
+ 	// update animation
+ 	UpdateAnimation();
+ 
 diff --git a/neo/game/ai/AI.cpp b/neo/game/ai/AI.cpp
 index 2ac9948..c374ea8 100644
 --- a/neo/game/ai/AI.cpp
@@ -4640,7 +4906,7 @@ index 105ff57..e4b3f00 100644
  	cmdSystem->AddCommand( "sayTeam",				Cmd_SayTeam_f,				CMD_FL_GAME,				"team text chat" );
  	cmdSystem->AddCommand( "addChatLine",			Cmd_AddChatLine_f,			CMD_FL_GAME,				"internal use - core to game chat lines" );
 diff --git a/neo/game/gamesys/SysCvar.cpp b/neo/game/gamesys/SysCvar.cpp
-index 824d9c2..4bda411 100644
+index 824d9c2..6e2a29b 100644
 --- a/neo/game/gamesys/SysCvar.cpp
 +++ b/neo/game/gamesys/SysCvar.cpp
 @@ -97,14 +97,16 @@ idCVar r_aspectRatio(				"r_aspectRatio",			"-1",			CVAR_RENDERER | CVAR_INTEGER
@@ -4661,19 +4927,23 @@ index 824d9c2..4bda411 100644
  idCVar g_knockback(					"g_knockback",				"1000",			CVAR_GAME | CVAR_INTEGER, "" );
  idCVar g_skill(						"g_skill",					"1",			CVAR_GAME | CVAR_INTEGER, "" );
  idCVar g_nightmare(					"g_nightmare",				"0",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "if nightmare mode is allowed" );
-@@ -271,6 +273,10 @@ idCVar pm_thirdPersonDeath(			"pm_thirdPersonDeath",		"0",			CVAR_GAME | CVAR_NE
+@@ -271,6 +273,14 @@ idCVar pm_thirdPersonDeath(			"pm_thirdPersonDeath",		"0",			CVAR_GAME | CVAR_NE
  idCVar pm_modelView(				"pm_modelView",				"0",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_INTEGER, "draws camera from POV of player model (1 = always, 2 = when dead)", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
  idCVar pm_airTics(					"pm_air",					"1800",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_INTEGER, "how long in milliseconds the player can go without air before he starts taking damage" );
  
 +idCVar g_viewInterpolate(			"g_viewInterpolate",		"0",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "render-only temporal low-pass smoothing of the first-person/spectator camera origin (damps fps!=60 jitter)" );
 +idCVar g_viewSmooth(				"g_viewSmooth",				"0.30",			CVAR_GAME | CVAR_ARCHIVE | CVAR_FLOAT, "view low-pass factor k (smoothed += (raw-smoothed)*k); larger = snappier/less smooth", 0.05f, 0.95f );
 +idCVar g_viewInterpMaxDelta(		"g_viewInterpMaxDelta",		"512",			CVAR_GAME | CVAR_FLOAT, "origin delta (units) above which the view snaps instead of smoothing (teleport/spawn/spectate-snap guard)", 64.0f, 4096.0f );
++idCVar g_localPresentationAtomic(	"g_localPresentationAtomic",	"1",			CVAR_GAME | CVAR_BOOL, "use one locked local first-person presentation pose for camera, weapon, bob, and traces" );
++idCVar g_localPresentationMonotonic( "g_localPresentationMonotonic", "1",			CVAR_GAME | CVAR_BOOL, "hold the local first-person presentation pose across client prediction rollback replays" );
++idCVar g_localPredictionVisualFinalOnly( "g_localPredictionVisualFinalOnly", "1",		CVAR_GAME | CVAR_BOOL, "only advance local first-person visual presentation on the final predicted frame" );
++idCVar g_localViewBobKeepClient(	"g_localViewBobKeepClient",	"0",			CVAR_GAME | CVAR_BOOL, "keep local client bob state across snapshots instead of replaying from the authoritative snapshot" );
 +
  idCVar g_showPlayerShadow(			"g_showPlayerShadow",		"0",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "enables shadow of player model" );
  idCVar g_showHud(					"g_showHud",				"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "" );
  idCVar g_showProjectilePct(			"g_showProjectilePct",		"0",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "enables display of player hit percentage" );
 diff --git a/neo/game/gamesys/SysCvar.h b/neo/game/gamesys/SysCvar.h
-index a4883b5..67918b8 100644
+index a4883b5..ed2caca 100644
 --- a/neo/game/gamesys/SysCvar.h
 +++ b/neo/game/gamesys/SysCvar.h
 @@ -35,6 +35,7 @@ extern idCVar	developer;
@@ -4692,13 +4962,17 @@ index a4883b5..67918b8 100644
  extern idCVar	g_projectileLights;
  extern idCVar	g_doubleVision;
  extern idCVar	g_hitEffect;
-@@ -200,6 +202,9 @@ extern idCVar	pm_thirdPersonDeath;
+@@ -200,6 +202,13 @@ extern idCVar	pm_thirdPersonDeath;
  extern idCVar	pm_modelView;
  extern idCVar	pm_airTics;
  
 +extern idCVar	g_viewInterpolate;
 +extern idCVar	g_viewSmooth;
 +extern idCVar	g_viewInterpMaxDelta;
++extern idCVar	g_localPresentationAtomic;
++extern idCVar	g_localPresentationMonotonic;
++extern idCVar	g_localPredictionVisualFinalOnly;
++extern idCVar	g_localViewBobKeepClient;
  extern idCVar	g_showPlayerShadow;
  extern idCVar	g_showHud;
  extern idCVar	g_showProjectilePct;

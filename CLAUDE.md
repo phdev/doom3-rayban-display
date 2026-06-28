@@ -78,6 +78,20 @@ interaction table instead of dumping it after multiplayer entity/light growth,
 avoiding the slow linked-list interaction path that appeared in the iPad trace
 as a movement hitch source.
 
+**2026-06-28 active-player presentation pose fix:** the remaining MP judder was
+not a GPU/presentation split. Client prediction can replay older `gameLocal.time`
+after a snapshot while local-only bob timers such as `landTime`/`stepUpTime`
+remain from a newer prediction frame, producing huge future-timer bob offsets and
+letting rollback frames advance first-person visuals. The wasm path now commits a
+single monotonic local presentation pose per rendered frame (`g_localPresentation*`)
+and the camera, first-person arms/weapon, bob, and animation all consume that
+pose; rollback/replay frames are traced but held out of presentation, and local
+bob timers are clamped when prediction time moves backward. Production validation
+on `pose-monotonic-2026-06-28a` measured active MP `raf_p95 18.6ms`, committed
+`view/raw/phys back 0/0/0`, committed `rawInvalid 0`, weapon
+`poseSplit/poseAxisSplit p99 0/0`, and `viewBobLen p99 0.63u`; SP control had
+no replay and the same zero-backstep/zero-split result.
+
 ## Area streaming (experimental, default OFF — `com_streamAreas 0`)
 
 Incremental per-render-area load so the player can start in the boot region while
