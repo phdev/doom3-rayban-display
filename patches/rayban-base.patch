@@ -2517,7 +2517,7 @@ index 451aaa8..8211e36 100644
  	}
  
 diff --git a/neo/game/Game_local.cpp b/neo/game/Game_local.cpp
-index 1fca78f..5935183 100644
+index 1fca78f..c142f20 100644
 --- a/neo/game/Game_local.cpp
 +++ b/neo/game/Game_local.cpp
 @@ -27,6 +27,10 @@ If you have questions concerning this license or the applicable additional terms
@@ -2539,7 +2539,15 @@ index 1fca78f..5935183 100644
  	framenum = 0;
  	previousTime = 0;
  	time = 0;
-@@ -972,6 +977,7 @@ void idGameLocal::LoadMap( const char *mapName, int randseed ) {
+@@ -244,6 +249,7 @@ void idGameLocal::Clear( void ) {
+ 	isClient = false;
+ 	realClientTime = 0;
+ 	isNewFrame = true;
++	isLastPredictFrame = true;
+ 	clientSmoothing = 0.1f;
+ 	entityDefBits = 0;
+ 
+@@ -972,6 +978,7 @@ void idGameLocal::LoadMap( const char *mapName, int randseed ) {
  	cinematicSkipTime = 0;
  	cinematicStopTime = 0;
  	cinematicMaxSkipTime = 0;
@@ -2547,7 +2555,7 @@ index 1fca78f..5935183 100644
  
  	clip.Init();
  	pvs.Init();
-@@ -1177,6 +1183,282 @@ void idGameLocal::NextMap_f( const idCmdArgs &args ) {
+@@ -1177,6 +1184,282 @@ void idGameLocal::NextMap_f( const idCmdArgs &args ) {
  	gameLocal.MapRestart( );
  }
  
@@ -2830,7 +2838,7 @@ index 1fca78f..5935183 100644
  /*
  ===================
  idGameLocal::MapPopulate
-@@ -1769,12 +2051,21 @@ void idGameLocal::CacheDictionaryMedia( const idDict *dict ) {
+@@ -1769,12 +2052,21 @@ void idGameLocal::CacheDictionaryMedia( const idDict *dict ) {
  				|| !idStr::Icmp( kv->GetKey(), "gui_inventory" ) ) {
  				// unfortunate flag names, they aren't actually a gui
  			} else {
@@ -2852,7 +2860,7 @@ index 1fca78f..5935183 100644
  			}
  		}
  		kv = dict->MatchPrefix( "gui", kv );
-@@ -2273,6 +2564,19 @@ gameReturn_t idGameLocal::RunFrame( const usercmd_t *clientCmds ) {
+@@ -2273,6 +2565,19 @@ gameReturn_t idGameLocal::RunFrame( const usercmd_t *clientCmds ) {
  			player->Think();
  		}
  	} else do {
@@ -2872,7 +2880,7 @@ index 1fca78f..5935183 100644
  		// update the game time
  		framenum++;
  		previousTime = time;
-@@ -3276,6 +3580,7 @@ idGameLocal::SpawnMapEntities
+@@ -3276,6 +3581,7 @@ idGameLocal::SpawnMapEntities
  Parses textual entity definitions out of an entstring and spawns gentities.
  ==============
  */
@@ -2880,7 +2888,7 @@ index 1fca78f..5935183 100644
  void idGameLocal::SpawnMapEntities( void ) {
  	int			i;
  	int			num;
-@@ -3878,6 +4183,16 @@ void idGameLocal::ProjectDecal( const idVec3 &origin, const idVec3 &dir, float d
+@@ -3878,6 +4184,16 @@ void idGameLocal::ProjectDecal( const idVec3 &origin, const idVec3 &dir, float d
  	idFixedWinding winding;
  	idVec3 windingOrigin, projectionOrigin;
  
@@ -2897,7 +2905,7 @@ index 1fca78f..5935183 100644
  	static idVec3 decalWinding[4] = {
  		idVec3(  1.0f,  1.0f, 0.0f ),
  		idVec3( -1.0f,  1.0f, 0.0f ),
-@@ -3960,9 +4275,30 @@ void idGameLocal::SetCamera( idCamera *cam ) {
+@@ -3960,9 +4276,30 @@ void idGameLocal::SetCamera( idCamera *cam ) {
  	}
  
  	camera = cam;
@@ -2929,7 +2937,7 @@ index 1fca78f..5935183 100644
  			camera->spawnArgs.SetBool( "disconnect", false );
  			cvarSystem->SetCVarFloat( "r_znear", 3.0f );
 diff --git a/neo/game/Game_local.h b/neo/game/Game_local.h
-index 60b0b88..ce679bf 100644
+index 60b0b88..8bff75c 100644
 --- a/neo/game/Game_local.h
 +++ b/neo/game/Game_local.h
 @@ -265,6 +265,7 @@ public:
@@ -2940,7 +2948,15 @@ index 60b0b88..ce679bf 100644
  	bool					inCinematic;			// game is playing cinematic (player controls frozen)
  	bool					skipCinematic;
  
-@@ -363,6 +364,15 @@ public:
+@@ -294,6 +295,7 @@ public:
+ 	idLinkList<idEntity>	snapshotEntities;		// entities from the last snapshot
+ 	int						realClientTime;			// real client time
+ 	bool					isNewFrame;				// true if this is a new game frame, not a rerun due to prediction
++	bool					isLastPredictFrame;		// true for the final predicted frame submitted for presentation
+ 	float					clientSmoothing;		// smoothing of other clients in the view
+ 	int						entityDefBits;			// bits required to store an entity def number
+ 
+@@ -363,6 +365,15 @@ public:
  	bool					NextMap( void );	// returns wether serverinfo settings have been modified
  	static void				NextMap_f( const idCmdArgs &args );
  
@@ -2957,7 +2973,7 @@ index 60b0b88..ce679bf 100644
  	const char *			GetMapName( void ) const;
  
 diff --git a/neo/game/Game_network.cpp b/neo/game/Game_network.cpp
-index 5e24df7..a9b5d71 100644
+index 5e24df7..2db37e2 100644
 --- a/neo/game/Game_network.cpp
 +++ b/neo/game/Game_network.cpp
 @@ -37,6 +37,10 @@ If you have questions concerning this license or the applicable additional terms
@@ -2971,14 +2987,15 @@ index 5e24df7..a9b5d71 100644
  /*
  ===============================================================================
  
-@@ -59,6 +63,178 @@ idCVar net_clientSmoothing( "net_clientSmoothing", "0.8", CVAR_GAME | CVAR_FLOAT
+@@ -59,6 +63,179 @@ idCVar net_clientSmoothing( "net_clientSmoothing", "0.8", CVAR_GAME | CVAR_FLOAT
  idCVar net_clientSelfSmoothing( "net_clientSelfSmoothing", "0.6", CVAR_GAME | CVAR_FLOAT, "smooth self position if network causes prediction error.", 0.0f, 0.95f );
  idCVar net_clientMaxPrediction( "net_clientMaxPrediction", "1000", CVAR_SYSTEM | CVAR_INTEGER | CVAR_NOCHEAT, "maximum number of milliseconds a client can predict ahead of server." );
  idCVar net_clientLagOMeter( "net_clientLagOMeter", "1", CVAR_GAME | CVAR_BOOL | CVAR_NOCHEAT | CVAR_ARCHIVE, "draw prediction graph" );
 +idCVar net_clientTrace( "net_clientTrace", "0", CVAR_GAME | CVAR_BOOL | CVAR_NOCHEAT, "publish client snapshot/prediction correction trace to JS" );
 +idCVar net_clientSpectatorNoSnap( "net_clientSpectatorNoSnap", "1", CVAR_GAME | CVAR_BOOL | CVAR_NOCHEAT, "keep local free-fly spectator physics predicted instead of applying snapshot origin snaps" );
 +idCVar net_clientViewCorrection( "net_clientViewCorrection", "1", CVAR_GAME | CVAR_BOOL | CVAR_NOCHEAT, "smooth local spectator snapshot correction in the rendered camera" );
-+idCVar net_clientActiveViewCorrection( "net_clientActiveViewCorrection", "1", CVAR_GAME | CVAR_BOOL | CVAR_NOCHEAT, "also smooth local active-player snapshot correction in the rendered first-person view" );
++idCVar net_clientActiveViewCorrection( "net_clientActiveViewCorrection", "0", CVAR_GAME | CVAR_BOOL | CVAR_NOCHEAT, "experimental active-player camera smoothing; disabled because step clamps can create visible camera debt" );
++idCVar net_clientActiveViewStepMax( "net_clientActiveViewStepMax", "4.25", CVAR_GAME | CVAR_FLOAT | CVAR_NOCHEAT, "max visible active-player camera step per final prediction frame before render-only smoothing", 0.5f, 64.0f );
 +idCVar net_clientViewCorrectionBlend( "net_clientViewCorrectionBlend", "0.20", CVAR_GAME | CVAR_FLOAT | CVAR_NOCHEAT, "fraction of pending local view correction retired each rendered frame", 0.05f, 0.95f );
 +idCVar net_clientViewCorrectionMax( "net_clientViewCorrectionMax", "96", CVAR_GAME | CVAR_FLOAT | CVAR_NOCHEAT, "maximum local correction smoothed in the rendered camera; larger corrections snap", 8.0f, 1024.0f );
 +
@@ -3150,7 +3167,15 @@ index 5e24df7..a9b5d71 100644
  
  /*
  ================
-@@ -974,6 +1150,11 @@ void idGameLocal::ClientReadSnapshot( int clientNum, int sequence, const int gam
+@@ -85,6 +262,7 @@ void idGameLocal::InitAsyncNetwork( void ) {
+ 	localClientNum = 0; // on a listen server SetLocalUser will set this right
+ 	realClientTime = 0;
+ 	isNewFrame = true;
++	isLastPredictFrame = true;
+ 	clientSmoothing = net_clientSmoothing.GetFloat();
+ }
+ 
+@@ -974,6 +1152,11 @@ void idGameLocal::ClientReadSnapshot( int clientNum, int sequence, const int gam
  	int				spawnId;
  	int				numSourceAreas, sourceAreas[ idEntity::MAX_PVS_AREAS ];
  	idWeapon		*weap;
@@ -3162,7 +3187,7 @@ index 5e24df7..a9b5d71 100644
  
  	if ( net_clientLagOMeter.GetBool() && renderSystem ) {
  		UpdateLagometer( aheadOfServer, dupeUsercmds );
-@@ -1083,9 +1264,27 @@ void idGameLocal::ClientReadSnapshot( int clientNum, int sequence, const int gam
+@@ -1083,9 +1266,27 @@ void idGameLocal::ClientReadSnapshot( int clientNum, int sequence, const int gam
  		ent->snapshotNode.AddToEnd( snapshotEntities );
  		ent->snapshotSequence = sequence;
  
@@ -3190,7 +3215,7 @@ index 5e24df7..a9b5d71 100644
  		ent->snapshotBits = msg.GetNumBitsRead() - numBitsRead;
  
  #if ASYNC_WRITE_TAGS
-@@ -1108,6 +1307,9 @@ void idGameLocal::ClientReadSnapshot( int clientNum, int sequence, const int gam
+@@ -1108,6 +1309,9 @@ void idGameLocal::ClientReadSnapshot( int clientNum, int sequence, const int gam
  
  	// if prediction is off, enable local client smoothing
  	player->SetSelfSmooth( dupeUsercmds > 2 );
@@ -3200,7 +3225,7 @@ index 5e24df7..a9b5d71 100644
  
  	if ( player->spectating && player->spectator != clientNum && entities[ player->spectator ] ) {
  		spectated = static_cast< idPlayer * >( entities[ player->spectator ] );
-@@ -1472,6 +1674,8 @@ gameReturn_t idGameLocal::ClientPrediction( int clientNum, const usercmd_t *clie
+@@ -1472,6 +1676,8 @@ gameReturn_t idGameLocal::ClientPrediction( int clientNum, const usercmd_t *clie
  	idEntity *ent;
  	idPlayer *player;
  	gameReturn_t ret;
@@ -3209,7 +3234,7 @@ index 5e24df7..a9b5d71 100644
  
  	ret.sessionCommand[ 0 ] = '\0';
  
-@@ -1487,6 +1691,15 @@ gameReturn_t idGameLocal::ClientPrediction( int clientNum, const usercmd_t *clie
+@@ -1487,7 +1693,17 @@ gameReturn_t idGameLocal::ClientPrediction( int clientNum, const usercmd_t *clie
  		player->isLagged = false;
  	}
  
@@ -3223,9 +3248,11 @@ index 5e24df7..a9b5d71 100644
 +	}
 +
  	InitLocalClient( clientNum );
++	isLastPredictFrame = lastPredictFrame;
  
  	// update the game time
-@@ -1523,6 +1736,16 @@ gameReturn_t idGameLocal::ClientPrediction( int clientNum, const usercmd_t *clie
+ 	framenum++;
+@@ -1523,6 +1739,16 @@ gameReturn_t idGameLocal::ClientPrediction( int clientNum, const usercmd_t *clie
  	if ( sessionCommand.Length() ) {
  		idStr::Copynz( ret.sessionCommand, sessionCommand, sizeof( ret.sessionCommand ) );
  	}
@@ -3299,7 +3326,7 @@ index e3458b3..4443dad 100644
  
  	// if the model should be shrinked
 diff --git a/neo/game/Player.cpp b/neo/game/Player.cpp
-index 01b05ab..6df5e7d 100644
+index 01b05ab..ba55d64 100644
 --- a/neo/game/Player.cpp
 +++ b/neo/game/Player.cpp
 @@ -37,10 +37,15 @@ If you have questions concerning this license or the applicable additional terms
@@ -3318,13 +3345,12 @@ index 01b05ab..6df5e7d 100644
  const int ASYNC_PLAYER_INV_AMMO_BITS = idMath::BitsForInteger( 999 );	// 9 bits to cover the range [0, 999]
  const int ASYNC_PLAYER_INV_CLIP_BITS = -7;								// -7 bits to cover the range [-1, 60]
  
-@@ -68,6 +73,103 @@ const int WEAPON_SWITCH_DELAY = 150;
+@@ -68,6 +73,155 @@ const int WEAPON_SWITCH_DELAY = 150;
  // how many units to raise spectator above default view height so it's in the head of someone
  const int SPECTATE_RAISE = 25;
  
 +extern idCVar net_clientSpectatorNoSnap;
 +extern idCVar net_clientViewCorrection;
-+extern idCVar net_clientActiveViewCorrection;
 +extern idCVar net_clientViewCorrectionBlend;
 +extern idCVar net_clientViewCorrectionMax;
 +
@@ -3385,7 +3411,7 @@ index 01b05ab..6df5e7d 100644
 +	char buf[ 3072 ];
 +	idStr::snPrintf( buf, sizeof( buf ),
 +		"{\"type\":\"present\",\"now\":%d,\"frame\":%d,\"time\":%d,\"spectating\":%d,\"spectator\":%d,"
-+		"\"ground\":%d,\"smoothed\":%d,\"smoothLen\":%.3f,\"smoothZ\":%.3f,"
++		"\"ground\":%d,\"smoothed\":%d,\"lastPredict\":%d,\"smoothLen\":%.3f,\"smoothZ\":%.3f,"
 +		"\"rawStepLen\":%.3f,\"viewStepLen\":%.3f,\"physStepLen\":%.3f,\"holdGapLen\":%.3f,"
 +		"\"rawBack\":%d,\"viewBack\":%d,\"physBack\":%d,\"replayHold\":%d,"
 +		"\"viewCorrLen\":%.3f,\"viewCorr\":[%.3f,%.3f,%.3f],\"phys\":[%.3f,%.3f,%.3f],"
@@ -3393,7 +3419,7 @@ index 01b05ab..6df5e7d 100644
 +		"\"raw\":[%.3f,%.3f,%.3f],\"rawAng\":[%.3f,%.3f,%.3f],"
 +		"\"view\":[%.3f,%.3f,%.3f],\"viewAng\":[%.3f,%.3f,%.3f]}",
 +		Sys_Milliseconds(), gameLocal.framenum, gameLocal.time, player->spectating ? 1 : 0, player->spectator,
-+		onGround ? 1 : 0, smoothed ? 1 : 0, smooth.Length(), smooth.z,
++		onGround ? 1 : 0, smoothed ? 1 : 0, gameLocal.isLastPredictFrame ? 1 : 0, smooth.Length(), smooth.z,
 +		rawStepLen, viewStepLen, physStepLen, holdGapLen, rawBack, viewBack, physBack, replayHold,
 +		player->renderViewCorrection.Length(), player->renderViewCorrection.x, player->renderViewCorrection.y, player->renderViewCorrection.z,
 +		physicsOrg.x, physicsOrg.y, physicsOrg.z,
@@ -3417,12 +3443,65 @@ index 01b05ab..6df5e7d 100644
 +		} catch (x) {}
 +	}, buf);
 +}
++
++static void D3_ArcoNetTraceLocomotion( const idPlayer *player, const idVec3 &origin, const idVec3 &velocity,
++		float xyspeed, int bobCycle, int bobFoot, float bobfracsin, float bobmove, int bobAdvance,
++		const idVec3 &viewBob, const idAngles &viewBobAngles, bool onGround ) {
++	if ( !net_clientTrace.GetBool() || !player || player->entityNumber != gameLocal.localClientNum ) {
++		return;
++	}
++
++	static bool haveLast = false;
++	static int lastEntity = -1;
++	static idVec3 lastOrigin = vec3_zero;
++	static int lastBobCycle = 0;
++	idVec3 originStep = vec3_zero;
++	int cycleStep = 0;
++	if ( haveLast && lastEntity == player->entityNumber ) {
++		originStep = origin - lastOrigin;
++		cycleStep = ( bobCycle - lastBobCycle ) & 255;
++	}
++	haveLast = true;
++	lastEntity = player->entityNumber;
++	lastOrigin = origin;
++	lastBobCycle = bobCycle;
++
++	const usercmd_t &cmd = player->usercmd;
++	char buf[ 2048 ];
++	idStr::snPrintf( buf, sizeof( buf ),
++		"{\"type\":\"loco\",\"now\":%d,\"frame\":%d,\"time\":%d,\"spectating\":%d,\"ground\":%d,"
++		"\"cmd\":[%d,%d,%d,%d],\"xyspeed\":%.3f,\"vel\":[%.3f,%.3f,%.3f],"
++		"\"bobCycle\":%d,\"bobFoot\":%d,\"bobfracsin\":%.3f,\"bobmove\":%.3f,"
++		"\"bobAdvance\":%d,\"cycleStep\":%d,\"originStepLen\":%.3f,"
++		"\"viewBob\":[%.3f,%.3f,%.3f],\"viewBobLen\":%.3f,"
++		"\"viewBobAng\":[%.3f,%.3f,%.3f]}",
++		Sys_Milliseconds(), gameLocal.framenum, gameLocal.time, player->spectating ? 1 : 0, onGround ? 1 : 0,
++		cmd.forwardmove, cmd.rightmove, cmd.upmove, cmd.buttons,
++		xyspeed, velocity.x, velocity.y, velocity.z,
++		bobCycle, bobFoot, bobfracsin, bobmove, bobAdvance, cycleStep, originStep.Length(),
++		viewBob.x, viewBob.y, viewBob.z, viewBob.Length(),
++		viewBobAngles.pitch, viewBobAngles.yaw, viewBobAngles.roll );
++	EM_ASM_({
++		try {
++			var e = JSON.parse(UTF8ToString($0));
++			var w = window;
++			var a = w.__arcoNetTrace || (w.__arcoNetTrace = []);
++			a.push(e);
++			if (a.length > 2400) a.splice(0, a.length - 2400);
++			var lt = w.__arcoNetLocoTrace || (w.__arcoNetLocoTrace = []);
++			lt.push(e);
++			if (lt.length > 1200) lt.splice(0, lt.length - 1200);
++			w.__arcoNetLast = e;
++			w.__arcoNetLastLoco = e;
++		} catch (x) {}
++	}, buf);
++}
 +#endif
 +
  const int HEALTHPULSE_TIME = 333;
  
  // minimum speed to bob and play run/walk animations at
-@@ -1008,6 +1110,9 @@ idPlayer::idPlayer() {
+@@ -1008,6 +1162,9 @@ idPlayer::idPlayer() {
  
  	firstPersonViewOrigin	= vec3_zero;
  	firstPersonViewAxis		= mat3_identity;
@@ -3432,7 +3511,7 @@ index 01b05ab..6df5e7d 100644
  
  	hipJoint				= INVALID_JOINT;
  	chestJoint				= INVALID_JOINT;
-@@ -1133,6 +1238,16 @@ idPlayer::idPlayer() {
+@@ -1133,6 +1290,16 @@ idPlayer::idPlayer() {
  	isChatting				= false;
  
  	selfSmooth				= false;
@@ -3449,7 +3528,7 @@ index 01b05ab..6df5e7d 100644
  }
  
  /*
-@@ -1609,6 +1724,12 @@ Release any resources used by the player.
+@@ -1609,6 +1776,12 @@ Release any resources used by the player.
  ==============
  */
  idPlayer::~idPlayer() {
@@ -3462,7 +3541,47 @@ index 01b05ab..6df5e7d 100644
  	delete weapon.GetEntity();
  	weapon = NULL;
  }
-@@ -5575,6 +5696,16 @@ void idPlayer::PerformImpulse( int impulse ) {
+@@ -4734,6 +4907,8 @@ void idPlayer::BobCycle( const idVec3 &pushVelocity ) {
+ 	float		delta;
+ 	float		speed;
+ 	float		f;
++	float		traceBobMove;
++	int			traceBobAdvance;
+ 
+ 	//
+ 	// calculate speed and cycle to be used for
+@@ -4744,6 +4919,8 @@ void idPlayer::BobCycle( const idVec3 &pushVelocity ) {
+ 	gravityDir = physicsObj.GetGravityNormal();
+ 	vel = velocity - ( velocity * gravityDir ) * gravityDir;
+ 	xyspeed = vel.LengthFast();
++	traceBobMove = 0.0f;
++	traceBobAdvance = 0;
+ 
+ 	// do not evaluate the bob for other clients
+ 	// when doing a spectate follow, don't do any weapon bobbing
+@@ -4775,6 +4952,8 @@ void idPlayer::BobCycle( const idVec3 &pushVelocity ) {
+ 		// check for footstep / splash sounds
+ 		old = bobCycle;
+ 		bobCycle = (int)( old + bobmove * gameLocal.msecPrecise ) & 255;
++		traceBobMove = bobmove;
++		traceBobAdvance = ( bobCycle - old ) & 255;
+ 		bobFoot = ( bobCycle & 128 ) >> 7;
+ 		bobfracsin = idMath::Fabs( sin( ( bobCycle & 127 ) / 127.0 * idMath::PI ) );
+ 	}
+@@ -4852,6 +5031,12 @@ void idPlayer::BobCycle( const idVec3 &pushVelocity ) {
+ 		f = 1.0 - ( delta / LAND_RETURN_TIME );
+ 		viewBob -= gravity * ( landChange * f );
+ 	}
++
++#ifdef __EMSCRIPTEN__
++	D3_ArcoNetTraceLocomotion( this, physicsObj.GetOrigin(), velocity, xyspeed, bobCycle,
++		bobFoot, bobfracsin, traceBobMove, traceBobAdvance, viewBob, viewBobAngles,
++		physicsObj.HasGroundContacts() );
++#endif
+ }
+ 
+ /*
+@@ -5575,6 +5760,16 @@ void idPlayer::PerformImpulse( int impulse ) {
  		ClientSendEvent( EVENT_IMPULSE, &msg );
  	}
  
@@ -3479,7 +3598,7 @@ index 01b05ab..6df5e7d 100644
  	if ( impulse >= IMPULSE_0 && impulse <= IMPULSE_12 ) {
  		SelectWeapon( impulse, false );
  		return;
-@@ -6206,6 +6337,78 @@ idPlayer::Think
+@@ -6206,6 +6401,78 @@ idPlayer::Think
  Called every tic for each player
  ==============
  */
@@ -3558,7 +3677,7 @@ index 01b05ab..6df5e7d 100644
  void idPlayer::Think( void ) {
  	renderEntity_t *headRenderEnt;
  
-@@ -6220,6 +6423,20 @@ void idPlayer::Think( void ) {
+@@ -6220,6 +6487,20 @@ void idPlayer::Think( void ) {
  	buttonMask &= usercmd.buttons;
  	usercmd.buttons &= ~buttonMask;
  
@@ -3579,7 +3698,7 @@ index 01b05ab..6df5e7d 100644
  	if ( gameLocal.inCinematic && gameLocal.skipCinematic ) {
  		return;
  	}
-@@ -6343,9 +6560,17 @@ void idPlayer::Think( void ) {
+@@ -6343,9 +6624,17 @@ void idPlayer::Think( void ) {
  	// this may use firstPersonView, or a thirdPeroson / camera view
  	CalculateRenderView();
  
@@ -3597,7 +3716,7 @@ index 01b05ab..6df5e7d 100644
  		UpdateSpectating();
  	} else if ( health > 0 ) {
  		UpdateWeapon();
-@@ -7109,8 +7334,10 @@ void idPlayer::CalculateViewWeaponPos( idVec3 &origin, idMat3 &axis ) {
+@@ -7109,8 +7398,10 @@ void idPlayer::CalculateViewWeaponPos( idVec3 &origin, idMat3 &axis ) {
  	idAngles	angles;
  	int			delta;
  
@@ -3610,7 +3729,7 @@ index 01b05ab..6df5e7d 100644
  	const idMat3 &viewAxis = firstPersonViewAxis;
  
  	// these cvars are just for hand tweaking before moving a value to the weapon def
-@@ -7387,6 +7614,55 @@ void idPlayer::CalculateRenderView( void ) {
+@@ -7387,6 +7678,58 @@ void idPlayer::CalculateRenderView( void ) {
  		common->Error( "renderView->fov_y == 0" );
  	}
  
@@ -3619,13 +3738,14 @@ index 01b05ab..6df5e7d 100644
 +	const idVec3 traceRawViewOrg = renderView->vieworg;
 +	const idMat3 traceRawViewAxis = renderView->viewaxis;
 +#endif
-+	const bool localPresentedView =
-+		entityNumber == gameLocal.localClientNum &&
-+		!pm_thirdPerson.GetBool() && !pm_thirdPersonDeath.GetBool() &&
-+		!privateCameraView && !gameLocal.GetCamera();
++		const bool localPresentedView =
++			entityNumber == gameLocal.localClientNum &&
++			!pm_thirdPerson.GetBool() && !pm_thirdPersonDeath.GetBool() &&
++			!privateCameraView && !gameLocal.GetCamera();
++	bool handledRenderViewOrigin = false;
 +	if ( gameLocal.isMultiplayer &&
 +		 net_clientViewCorrection.GetBool() &&
-+		 localPresentedView ) {
++		 localPresentedView && spectating ) {
 +		if ( renderViewCorrection.LengthSqr() > Square( 0.01f ) ) {
 +			renderView->vieworg += renderViewCorrection;
 +			renderViewCorrection -= renderViewCorrection * net_clientViewCorrectionBlend.GetFloat();
@@ -3634,6 +3754,7 @@ index 01b05ab..6df5e7d 100644
 +			}
 +			renderViewOrigin = renderView->vieworg;
 +			renderViewOriginSmoothed = true;
++			handledRenderViewOrigin = true;
 +		}
 +	} else {
 +		renderViewCorrection.Zero();
@@ -3651,7 +3772,8 @@ index 01b05ab..6df5e7d 100644
 +		}
 +		renderView->vieworg = renderViewOrigin;
 +		renderViewOriginSmoothed = true;
-+	} else {
++		handledRenderViewOrigin = true;
++	} else if ( !handledRenderViewOrigin ) {
 +		renderViewOrigin = renderView->vieworg;
 +		renderViewSmoothingInitialized = false;
 +	}
@@ -3666,7 +3788,7 @@ index 01b05ab..6df5e7d 100644
  	if ( g_showviewpos.GetBool() ) {
  		gameLocal.Printf( "%s : %s\n", renderView->vieworg.ToString(), renderView->viewaxis.ToAngles().ToString() );
  	}
-@@ -7889,7 +8165,11 @@ void idPlayer::ClientPredictionThink( void ) {
+@@ -7889,7 +8232,11 @@ void idPlayer::ClientPredictionThink( void ) {
  	// this may use firstPersonView, or a thirdPerson / camera view
  	CalculateRenderView();
  
@@ -3679,7 +3801,7 @@ index 01b05ab..6df5e7d 100644
  		UpdateWeapon();
  	}
  
-@@ -8058,6 +8338,10 @@ idPlayer::ReadFromSnapshot
+@@ -8058,6 +8405,10 @@ idPlayer::ReadFromSnapshot
  void idPlayer::ReadFromSnapshot( const idBitMsgDelta &msg ) {
  	int		i, oldHealth, newIdealWeapon, weaponSpawnId;
  	bool	newHitToggle, stateHitch;
@@ -3690,15 +3812,14 @@ index 01b05ab..6df5e7d 100644
  
  	if ( snapshotSequence - lastSnapshotSequence > 1 ) {
  		stateHitch = true;
-@@ -8068,7 +8352,38 @@ void idPlayer::ReadFromSnapshot( const idBitMsgDelta &msg ) {
+@@ -8068,7 +8419,37 @@ void idPlayer::ReadFromSnapshot( const idBitMsgDelta &msg ) {
  
  	oldHealth = health;
  
 +	keepLocalSpectatorPhysics = gameLocal.isClient && entityNumber == gameLocal.localClientNum &&
 +		spectating && spectator == entityNumber && net_clientSpectatorNoSnap.GetBool();
 +	const bool localClientPlayer = gameLocal.isClient && entityNumber == gameLocal.localClientNum;
-+	smoothLocalViewCorrection = localClientPlayer && net_clientViewCorrection.GetBool() &&
-+		( spectating || net_clientActiveViewCorrection.GetBool() );
++	smoothLocalViewCorrection = localClientPlayer && net_clientViewCorrection.GetBool() && spectating;
 +	if ( smoothLocalViewCorrection ) {
 +		localCorrectionPreOrigin = physicsObj.GetOrigin();
 +	}
@@ -3729,7 +3850,7 @@ index 01b05ab..6df5e7d 100644
  	ReadBindFromSnapshot( msg );
  	deltaViewAngles[0] = msg.ReadDeltaFloat( 0.0f );
  	deltaViewAngles[1] = msg.ReadDeltaFloat( 0.0f );
-@@ -8088,6 +8403,17 @@ void idPlayer::ReadFromSnapshot( const idBitMsgDelta &msg ) {
+@@ -8088,6 +8469,17 @@ void idPlayer::ReadFromSnapshot( const idBitMsgDelta &msg ) {
  
  	// no msg reading below this
  
@@ -3747,7 +3868,7 @@ index 01b05ab..6df5e7d 100644
  	if ( weapon.SetSpawnId( weaponSpawnId ) ) {
  		if ( weapon.GetEntity() ) {
  			// maintain ownership locally
-@@ -8206,9 +8532,16 @@ idPlayer::ReadPlayerStateFromSnapshot
+@@ -8206,9 +8598,16 @@ idPlayer::ReadPlayerStateFromSnapshot
  void idPlayer::ReadPlayerStateFromSnapshot( const idBitMsgDelta &msg ) {
  	int i, ammo;
  
@@ -3837,6 +3958,123 @@ index 36a0cbe..58d9a22 100644
  	}
  
  	GetPhysics()->SetContents( CONTENTS_SOLID );
+diff --git a/neo/game/Weapon.cpp b/neo/game/Weapon.cpp
+index b1d6c99..da45492 100644
+--- a/neo/game/Weapon.cpp
++++ b/neo/game/Weapon.cpp
+@@ -40,8 +40,101 @@ If you have questions concerning this license or the applicable additional terms
+ 
+ #include "Weapon.h"
+ 
++#ifdef __EMSCRIPTEN__
++#include <emscripten/emscripten.h>
++#endif
++
+ extern bool IsDoom3DemoVersion(); // DG: hack to support the Demo version of Doom3
+ 
++#ifdef __EMSCRIPTEN__
++extern idCVar net_clientTrace;
++
++static float D3_ArcoAngleDelta( float a, float b ) {
++	float d = a - b;
++	while ( d > 180.0f ) {
++		d -= 360.0f;
++	}
++	while ( d < -180.0f ) {
++		d += 360.0f;
++	}
++	return d;
++}
++
++static void D3_ArcoNetTraceWeapon( const idPlayer *owner, const idVec3 &weaponOrigin,
++		const idMat3 &weaponAxis, float hideOffset ) {
++	if ( !net_clientTrace.GetBool() || !owner || owner->entityNumber != gameLocal.localClientNum ) {
++		return;
++	}
++
++	static bool haveLast = false;
++	static int lastEntity = -1;
++	static int lastFrame = -1;
++	static idVec3 lastWeapon = vec3_zero;
++	static idVec3 lastCam = vec3_zero;
++	static idVec3 lastLocal = vec3_zero;
++	static idAngles lastRelAng = ang_zero;
++
++	const idVec3 &cam = owner->renderViewOriginSmoothed ? owner->renderViewOrigin : owner->firstPersonViewOrigin;
++	const idMat3 &camAxis = owner->firstPersonViewAxis;
++	const idVec3 delta = weaponOrigin - cam;
++	idVec3 local( delta * camAxis[ 0 ], delta * camAxis[ 1 ], delta * camAxis[ 2 ] );
++	const idAngles camAng = camAxis.ToAngles();
++	const idAngles weaponAng = weaponAxis.ToAngles();
++	idAngles relAng( D3_ArcoAngleDelta( weaponAng.pitch, camAng.pitch ),
++		D3_ArcoAngleDelta( weaponAng.yaw, camAng.yaw ),
++		D3_ArcoAngleDelta( weaponAng.roll, camAng.roll ) );
++
++	idVec3 weaponStep = vec3_zero;
++	idVec3 camStep = vec3_zero;
++	idVec3 localStep = vec3_zero;
++	idAngles relAngStep = ang_zero;
++	if ( haveLast && lastEntity == owner->entityNumber ) {
++		weaponStep = weaponOrigin - lastWeapon;
++		camStep = cam - lastCam;
++		localStep = local - lastLocal;
++		relAngStep.pitch = D3_ArcoAngleDelta( relAng.pitch, lastRelAng.pitch );
++		relAngStep.yaw = D3_ArcoAngleDelta( relAng.yaw, lastRelAng.yaw );
++		relAngStep.roll = D3_ArcoAngleDelta( relAng.roll, lastRelAng.roll );
++	}
++	haveLast = true;
++	lastEntity = owner->entityNumber;
++	const int newFrame = gameLocal.framenum != lastFrame ? 1 : 0;
++	lastFrame = gameLocal.framenum;
++	lastWeapon = weaponOrigin;
++	lastCam = cam;
++	lastLocal = local;
++	lastRelAng = relAng;
++
++	const float relAngStepLen = idMath::Sqrt( relAngStep.pitch * relAngStep.pitch +
++		relAngStep.yaw * relAngStep.yaw + relAngStep.roll * relAngStep.roll );
++	char buf[ 2048 ];
++	idStr::snPrintf( buf, sizeof( buf ),
++		"{\"type\":\"weapon\",\"now\":%d,\"frame\":%d,\"time\":%d,\"newFrame\":%d,"
++		"\"smoothed\":%d,\"hide\":%.3f,\"weapon\":[%.3f,%.3f,%.3f],\"cam\":[%.3f,%.3f,%.3f],"
++		"\"local\":[%.3f,%.3f,%.3f],\"localLen\":%.3f,\"relAng\":[%.3f,%.3f,%.3f],"
++		"\"weaponStepLen\":%.3f,\"camStepLen\":%.3f,\"localStepLen\":%.3f,\"relAngStepLen\":%.3f}",
++		Sys_Milliseconds(), gameLocal.framenum, gameLocal.time, newFrame,
++		owner->renderViewOriginSmoothed ? 1 : 0, hideOffset,
++		weaponOrigin.x, weaponOrigin.y, weaponOrigin.z, cam.x, cam.y, cam.z,
++		local.x, local.y, local.z, local.Length(), relAng.pitch, relAng.yaw, relAng.roll,
++		weaponStep.Length(), camStep.Length(), localStep.Length(), relAngStepLen );
++	EM_ASM_({
++		try {
++			var e = JSON.parse(UTF8ToString($0));
++			var w = window;
++			var a = w.__arcoNetTrace || (w.__arcoNetTrace = []);
++			a.push(e);
++			if (a.length > 2400) a.splice(0, a.length - 2400);
++			var wt = w.__arcoNetWeaponTrace || (w.__arcoNetWeaponTrace = []);
++			wt.push(e);
++			if (wt.length > 1200) wt.splice(0, wt.length - 1200);
++			w.__arcoNetLast = e;
++			w.__arcoNetLastWeapon = e;
++		} catch (x) {}
++	}, buf);
++}
++#endif
++
+ /***********************************************************************
+ 
+   idWeapon
+@@ -1915,6 +2008,10 @@ void idWeapon::PresentWeapon( bool showViewModel ) {
+ 	// kick up based on repeat firing
+ 	MuzzleRise( viewWeaponOrigin, viewWeaponAxis );
+ 
++#ifdef __EMSCRIPTEN__
++	D3_ArcoNetTraceWeapon( owner, viewWeaponOrigin, viewWeaponAxis, hideOffset );
++#endif
++
+ 	// set the physics position and orientation
+ 	GetPhysics()->SetOrigin( viewWeaponOrigin );
+ 	GetPhysics()->SetAxis( viewWeaponAxis );
 diff --git a/neo/game/ai/AI.cpp b/neo/game/ai/AI.cpp
 index 2ac9948..c374ea8 100644
 --- a/neo/game/ai/AI.cpp
