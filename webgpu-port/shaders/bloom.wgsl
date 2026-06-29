@@ -73,3 +73,24 @@ fn fs_darken(in: VSOut) -> @location(0) vec4<f32> {
     let k = u.params.x;
     return vec4<f32>(k, k, k, 1.0);   // pipeline blend: dst * src
 }
+
+// --- consistency entry points (2026-06-29) --------------------------------------
+// RenderBackend_WebGPU.cpp creates `tonemap`/`tracer` pipelines via
+// makeBloom("fs_tonemap"/"fs_tracer", ...). These entry points had been dropped from
+// this module while the C++ kept calling them, so both pipelines were INVALID; binding
+// the tracer on weapon-fire produced an [Invalid CommandBuffer] → Queue.Submit failed →
+// the rendered view FROZE (the rocket-launcher "freeze" bug). Provide valid entry points
+// so the pipelines are valid. arco-doom uses neither effect, so these are inert:
+//   fs_tracer  — transparent (additive One/One → adds nothing; no streak, no black).
+//   fs_tonemap — identity passthrough (REPLACE One/Zero → scene unchanged).
+// No helper functions referenced → the module compiles standalone. The render-track can
+// replace these with the real graded R-TRACER / ACES tonemap implementations later.
+@fragment
+fn fs_tracer(in: VSOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+}
+
+@fragment
+fn fs_tonemap(in: VSOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(textureSampleLevel(tex, samp, in.uv, 0.0).rgb, 1.0);
+}
