@@ -3501,7 +3501,7 @@ index e3458b3..4443dad 100644
  
  	// if the model should be shrinked
 diff --git a/neo/game/Player.cpp b/neo/game/Player.cpp
-index 01b05ab..e006a64 100644
+index 01b05ab..32ec3b8 100644
 --- a/neo/game/Player.cpp
 +++ b/neo/game/Player.cpp
 @@ -37,10 +37,15 @@ If you have questions concerning this license or the applicable additional terms
@@ -3684,7 +3684,7 @@ index 01b05ab..e006a64 100644
  const int HEALTHPULSE_TIME = 333;
  
  // minimum speed to bob and play run/walk animations at
-@@ -1008,6 +1170,28 @@ idPlayer::idPlayer() {
+@@ -1008,6 +1170,29 @@ idPlayer::idPlayer() {
  
  	firstPersonViewOrigin	= vec3_zero;
  	firstPersonViewAxis		= mat3_identity;
@@ -3698,6 +3698,7 @@ index 01b05ab..e006a64 100644
 +	activeViewError			= vec3_zero;
 +	activeViewErrorTime		= 0;
 +	activePrevDisplay		= vec3_zero;
++	activePresentationOffset = vec3_zero;
 +	localPresentationViewOrigin = vec3_zero;
 +	localPresentationViewAxis = mat3_identity;
 +	localPresentationRawOrigin = vec3_zero;
@@ -3713,7 +3714,7 @@ index 01b05ab..e006a64 100644
  
  	hipJoint				= INVALID_JOINT;
  	chestJoint				= INVALID_JOINT;
-@@ -1133,6 +1317,16 @@ idPlayer::idPlayer() {
+@@ -1133,6 +1318,16 @@ idPlayer::idPlayer() {
  	isChatting				= false;
  
  	selfSmooth				= false;
@@ -3730,7 +3731,7 @@ index 01b05ab..e006a64 100644
  }
  
  /*
-@@ -1609,6 +1803,12 @@ Release any resources used by the player.
+@@ -1609,6 +1804,12 @@ Release any resources used by the player.
  ==============
  */
  idPlayer::~idPlayer() {
@@ -3743,7 +3744,7 @@ index 01b05ab..e006a64 100644
  	delete weapon.GetEntity();
  	weapon = NULL;
  }
-@@ -1929,6 +2129,21 @@ void idPlayer::Restore( idRestoreGame *savefile ) {
+@@ -1929,6 +2130,21 @@ void idPlayer::Restore( idRestoreGame *savefile ) {
  
  	savefile->ReadVec3( firstPersonViewOrigin );
  	savefile->ReadMat3( firstPersonViewAxis );
@@ -3765,7 +3766,7 @@ index 01b05ab..e006a64 100644
  
  	// don't bother saving dragEntity since it's a dev tool
  	dragEntity.Clear();
-@@ -4734,6 +4949,8 @@ void idPlayer::BobCycle( const idVec3 &pushVelocity ) {
+@@ -4734,6 +4950,8 @@ void idPlayer::BobCycle( const idVec3 &pushVelocity ) {
  	float		delta;
  	float		speed;
  	float		f;
@@ -3774,7 +3775,7 @@ index 01b05ab..e006a64 100644
  
  	//
  	// calculate speed and cycle to be used for
-@@ -4744,6 +4961,8 @@ void idPlayer::BobCycle( const idVec3 &pushVelocity ) {
+@@ -4744,6 +4962,8 @@ void idPlayer::BobCycle( const idVec3 &pushVelocity ) {
  	gravityDir = physicsObj.GetGravityNormal();
  	vel = velocity - ( velocity * gravityDir ) * gravityDir;
  	xyspeed = vel.LengthFast();
@@ -3783,7 +3784,7 @@ index 01b05ab..e006a64 100644
  
  	// do not evaluate the bob for other clients
  	// when doing a spectate follow, don't do any weapon bobbing
-@@ -4775,6 +4994,8 @@ void idPlayer::BobCycle( const idVec3 &pushVelocity ) {
+@@ -4775,6 +4995,8 @@ void idPlayer::BobCycle( const idVec3 &pushVelocity ) {
  		// check for footstep / splash sounds
  		old = bobCycle;
  		bobCycle = (int)( old + bobmove * gameLocal.msecPrecise ) & 255;
@@ -3792,7 +3793,7 @@ index 01b05ab..e006a64 100644
  		bobFoot = ( bobCycle & 128 ) >> 7;
  		bobfracsin = idMath::Fabs( sin( ( bobCycle & 127 ) / 127.0 * idMath::PI ) );
  	}
-@@ -4812,6 +5033,19 @@ void idPlayer::BobCycle( const idVec3 &pushVelocity ) {
+@@ -4812,6 +5034,19 @@ void idPlayer::BobCycle( const idVec3 &pushVelocity ) {
  	// calculate position for view bobbing
  	viewBob.Zero();
  
@@ -3812,7 +3813,7 @@ index 01b05ab..e006a64 100644
  	if ( physicsObj.HasSteppedUp() ) {
  
  		// check for stepping up before a previous step is completed
-@@ -4852,6 +5086,12 @@ void idPlayer::BobCycle( const idVec3 &pushVelocity ) {
+@@ -4852,6 +5087,12 @@ void idPlayer::BobCycle( const idVec3 &pushVelocity ) {
  		f = 1.0 - ( delta / LAND_RETURN_TIME );
  		viewBob -= gravity * ( landChange * f );
  	}
@@ -3825,7 +3826,7 @@ index 01b05ab..e006a64 100644
  }
  
  /*
-@@ -5575,6 +5815,16 @@ void idPlayer::PerformImpulse( int impulse ) {
+@@ -5575,6 +5816,16 @@ void idPlayer::PerformImpulse( int impulse ) {
  		ClientSendEvent( EVENT_IMPULSE, &msg );
  	}
  
@@ -3842,7 +3843,7 @@ index 01b05ab..e006a64 100644
  	if ( impulse >= IMPULSE_0 && impulse <= IMPULSE_12 ) {
  		SelectWeapon( impulse, false );
  		return;
-@@ -6206,6 +6456,78 @@ idPlayer::Think
+@@ -6206,6 +6457,78 @@ idPlayer::Think
  Called every tic for each player
  ==============
  */
@@ -3921,7 +3922,7 @@ index 01b05ab..e006a64 100644
  void idPlayer::Think( void ) {
  	renderEntity_t *headRenderEnt;
  
-@@ -6220,6 +6542,20 @@ void idPlayer::Think( void ) {
+@@ -6220,6 +6543,20 @@ void idPlayer::Think( void ) {
  	buttonMask &= usercmd.buttons;
  	usercmd.buttons &= ~buttonMask;
  
@@ -3942,7 +3943,7 @@ index 01b05ab..e006a64 100644
  	if ( gameLocal.inCinematic && gameLocal.skipCinematic ) {
  		return;
  	}
-@@ -6343,9 +6679,17 @@ void idPlayer::Think( void ) {
+@@ -6343,9 +6680,17 @@ void idPlayer::Think( void ) {
  	// this may use firstPersonView, or a thirdPeroson / camera view
  	CalculateRenderView();
  
@@ -3960,7 +3961,7 @@ index 01b05ab..e006a64 100644
  		UpdateSpectating();
  	} else if ( health > 0 ) {
  		UpdateWeapon();
-@@ -7109,9 +7453,12 @@ void idPlayer::CalculateViewWeaponPos( idVec3 &origin, idMat3 &axis ) {
+@@ -7109,9 +7454,12 @@ void idPlayer::CalculateViewWeaponPos( idVec3 &origin, idMat3 &axis ) {
  	idAngles	angles;
  	int			delta;
  
@@ -3976,7 +3977,7 @@ index 01b05ab..e006a64 100644
  
  	// these cvars are just for hand tweaking before moving a value to the weapon def
  	idVec3	gunpos( g_gun_x.GetFloat(), g_gun_y.GetFloat(), g_gun_z.GetFloat() );
-@@ -7161,6 +7508,53 @@ void idPlayer::CalculateViewWeaponPos( idVec3 &origin, idMat3 &axis ) {
+@@ -7161,6 +7509,53 @@ void idPlayer::CalculateViewWeaponPos( idVec3 &origin, idMat3 &axis ) {
  	axis = angles.ToMat3() * viewAxis;
  }
  
@@ -4019,7 +4020,7 @@ index 01b05ab..e006a64 100644
 +*/
 +void idPlayer::GetPresentationViewPose( idVec3 &origin, idMat3 &axis ) const {
 +	if ( ShouldUseLocalPresentationPose() ) {
-+		origin = localPresentationViewOrigin;
++		origin = localPresentationViewOrigin + activePresentationOffset;
 +		axis = localPresentationViewAxis;
 +		return;
 +	}
@@ -4030,7 +4031,7 @@ index 01b05ab..e006a64 100644
  /*
  ===============
  idPlayer::OffsetThirdPersonView
-@@ -7387,6 +7781,225 @@ void idPlayer::CalculateRenderView( void ) {
+@@ -7387,6 +7782,235 @@ void idPlayer::CalculateRenderView( void ) {
  		common->Error( "renderView->fov_y == 0" );
  	}
  
@@ -4246,6 +4247,16 @@ index 01b05ab..e006a64 100644
 +		activeViewError = vec3_zero;
 +	}
 +
++	// Keep the first-person weapon/arms ATTACHED to the (possibly extrapolated / error-decayed) camera.
++	// The weapon anchors to localPresentationViewOrigin via GetPresentationViewPose; publish the camera's
++	// smooth displacement from that committed anchor so the weapon follows it (bob/axis stay monotonic).
++	// Zero in the legacy paths (renderView->vieworg == localPresentationViewOrigin) = byte-identical no-op.
++	if ( ShouldUseLocalPresentationPose() ) {
++		activePresentationOffset = renderView->vieworg - localPresentationViewOrigin;
++	} else {
++		activePresentationOffset = vec3_zero;
++	}
++
 +#ifdef __EMSCRIPTEN__
 +	if ( entityNumber == gameLocal.localClientNum ) {
 +		D3_ArcoNetTracePresent( this, traceRawViewOrg, traceRawViewAxis, renderView->vieworg, renderView->viewaxis,
@@ -4256,7 +4267,7 @@ index 01b05ab..e006a64 100644
  	if ( g_showviewpos.GetBool() ) {
  		gameLocal.Printf( "%s : %s\n", renderView->vieworg.ToString(), renderView->viewaxis.ToAngles().ToString() );
  	}
-@@ -7889,7 +8502,11 @@ void idPlayer::ClientPredictionThink( void ) {
+@@ -7889,7 +8513,11 @@ void idPlayer::ClientPredictionThink( void ) {
  	// this may use firstPersonView, or a thirdPerson / camera view
  	CalculateRenderView();
  
@@ -4269,7 +4280,7 @@ index 01b05ab..e006a64 100644
  		UpdateWeapon();
  	}
  
-@@ -7932,7 +8549,7 @@ void idPlayer::ClientPredictionThink( void ) {
+@@ -7932,7 +8560,7 @@ void idPlayer::ClientPredictionThink( void ) {
  		headRenderEnt->suppressShadowInLightID = LIGHTID_VIEW_MUZZLE_FLASH + entityNumber;
  	}
  
@@ -4278,7 +4289,7 @@ index 01b05ab..e006a64 100644
  		UpdateAnimation();
  	}
  
-@@ -7940,7 +8557,9 @@ void idPlayer::ClientPredictionThink( void ) {
+@@ -7940,7 +8568,9 @@ void idPlayer::ClientPredictionThink( void ) {
  		DrawPlayerIcons();
  	}
  
@@ -4289,7 +4300,7 @@ index 01b05ab..e006a64 100644
  
  	UpdateDamageEffects();
  
-@@ -8058,6 +8677,10 @@ idPlayer::ReadFromSnapshot
+@@ -8058,6 +8688,10 @@ idPlayer::ReadFromSnapshot
  void idPlayer::ReadFromSnapshot( const idBitMsgDelta &msg ) {
  	int		i, oldHealth, newIdealWeapon, weaponSpawnId;
  	bool	newHitToggle, stateHitch;
@@ -4300,7 +4311,7 @@ index 01b05ab..e006a64 100644
  
  	if ( snapshotSequence - lastSnapshotSequence > 1 ) {
  		stateHitch = true;
-@@ -8068,7 +8691,37 @@ void idPlayer::ReadFromSnapshot( const idBitMsgDelta &msg ) {
+@@ -8068,7 +8702,37 @@ void idPlayer::ReadFromSnapshot( const idBitMsgDelta &msg ) {
  
  	oldHealth = health;
  
@@ -4338,7 +4349,7 @@ index 01b05ab..e006a64 100644
  	ReadBindFromSnapshot( msg );
  	deltaViewAngles[0] = msg.ReadDeltaFloat( 0.0f );
  	deltaViewAngles[1] = msg.ReadDeltaFloat( 0.0f );
-@@ -8088,6 +8741,17 @@ void idPlayer::ReadFromSnapshot( const idBitMsgDelta &msg ) {
+@@ -8088,6 +8752,17 @@ void idPlayer::ReadFromSnapshot( const idBitMsgDelta &msg ) {
  
  	// no msg reading below this
  
@@ -4356,7 +4367,7 @@ index 01b05ab..e006a64 100644
  	if ( weapon.SetSpawnId( weaponSpawnId ) ) {
  		if ( weapon.GetEntity() ) {
  			// maintain ownership locally
-@@ -8206,9 +8870,16 @@ idPlayer::ReadPlayerStateFromSnapshot
+@@ -8206,9 +8881,16 @@ idPlayer::ReadPlayerStateFromSnapshot
  void idPlayer::ReadPlayerStateFromSnapshot( const idBitMsgDelta &msg ) {
  	int i, ammo;
  
@@ -4377,10 +4388,10 @@ index 01b05ab..e006a64 100644
  	inventory.armor = msg.ReadByte();
  
 diff --git a/neo/game/Player.h b/neo/game/Player.h
-index b411a0c..32acfbc 100644
+index b411a0c..1d0a822 100644
 --- a/neo/game/Player.h
 +++ b/neo/game/Player.h
-@@ -324,6 +324,39 @@ public:
+@@ -324,6 +324,40 @@ public:
  	// if a third person view is used
  	idVec3					firstPersonViewOrigin;
  	idMat3					firstPersonViewAxis;
@@ -4395,6 +4406,7 @@ index b411a0c..32acfbc 100644
 +	idVec3					activeViewError;			// CoD/Quake3 prediction-error decay: residual offset, decays to 0 (net_clientPredictErrorDecay)
 +	int						activeViewErrorTime;		// realClientTime of last error-decay update
 +	idVec3					activePrevDisplay;			// last rendered active-view origin (commit-jump continuity for the error decay)
++	idVec3					activePresentationOffset;	// camera displacement from the committed anchor (extrap+decay) so the weapon/arms follow the camera
 +	idVec3					localPresentationViewOrigin;
 +	idMat3					localPresentationViewAxis;
 +	idVec3					localPresentationRawOrigin;
@@ -4420,7 +4432,7 @@ index b411a0c..32acfbc 100644
  
  	idDragEntity			dragEntity;
  
-@@ -336,6 +369,11 @@ public:
+@@ -336,6 +370,11 @@ public:
  	void					Spawn( void );
  	void					Think( void );
  
@@ -4432,7 +4444,7 @@ index b411a0c..32acfbc 100644
  	// save games
  	void					Save( idSaveGame *savefile ) const;					// archives object for save game file
  	void					Restore( idRestoreGame *savefile );					// unarchives object from save game file
-@@ -401,6 +439,9 @@ public:
+@@ -401,6 +440,9 @@ public:
  	float					DefaultFov( void ) const;
  	float					CalcFov( bool honorZoom );
  	void					CalculateViewWeaponPos( idVec3 &origin, idMat3 &axis );

@@ -130,6 +130,14 @@ and the error only shrinks, unlike the absolute low-pass (which trails by a cons
 client wires `?viewextrap=N`/`?predecay=N`. SELF-QA LIMIT unchanged (JOIN→play doesn't complete in automation → the
 active-player A/B is owner-on-device): deployed to `smooth.arco-doom.pages.dev` (extrap) + `errdecay.arco-doom.pages.dev`
 (extrap+decay); A/B `?viewextrap=80` vs `?viewextrap=80&predecay=120`. Default 0 = byte-identical to legacy (pure opt-in).
+**WEAPON-ATTACH FIX (required for both extrap AND decay):** extrap/decay move the world camera (`renderView->vieworg`)
+but the first-person weapon/arms anchor to `localPresentationViewOrigin` (the committed pose) via
+`GetPresentationViewPose` — so the camera and weapon SPLIT by the smooth offset (mild for extrap, "totally dislodged"
+under decay, owner-reported). Fix: publish `activePresentationOffset = renderView->vieworg − localPresentationViewOrigin`
+(gated on `ShouldUseLocalPresentationPose()`) and add it in `GetPresentationViewPose` so the weapon rigidly follows the
+camera (bob/axis stay monotonic). Zero in legacy paths (camera == anchor) = no-op. VERIFIED in play (autojoin+automove,
+Mac Chrome/Dawn): `|__d3View.org − weaponTrace.cam|` p50/p95/max = 0/0/0 with `predecay=120` (and `=0`) — the weapon
+anchor now tracks the world camera exactly.
 
 ## Area streaming (experimental, default OFF — `com_streamAreas 0`)
 
