@@ -153,6 +153,33 @@ weapon re-submit + view update on iOS/WebKit — measure). 6 files: Game_network
 (ReprojectViewForRender + reprojectBaseMs), Weapon.cpp/.h (ReprojectRender + reprojectBaseOrigin), Game_local.cpp +
 MultiplayerGame.cpp (the Draw hook). Owner feel-test: `reproject.arco-doom.pages.dev/?reproject=1` vs `?viewextrap=80`.
 
+**2026-06-29 REPROJECT P2 — reproject the VIEW ANGLE too (the dominant residual; a 14-agent workflow + empirical
+proof found it).** P1 reprojected the camera ORIGIN but copied the COMMITTED view AXIS verbatim — so TURNING still
+froze-then-snapped (the origin-only `__d3View.org` metric was structurally blind to it; owner "still judder"). FIX:
+in `ReprojectViewForRender` rebuild `renderView->viewaxis` from the PRESENT local look. KEY INSIGHT: the local view
+angle is CLIENT-AUTHORITATIVE input (never server-reconciled), so advancing the committed angle by the look
+accumulated SINCE the commit is EXACT (zero extrapolation error — NOT velocity dead-reckon, which would repeat the
+predecay overshoot). Mechanism: `D3_AddViewAngles` now also accumulates a monotonic `d3_wearable_total_yaw/pitch`
+(never reset); commit-store captures `reprojectViewAngles = viewAngles + viewBobAngles + AngleOffset` (bob/sway folded
+in = stays committed/monotonic) + the look total base; render rebuilds `(reprojectViewAngles + (total − base)).ToMat3()
+* gravityAxis`. The view-weapon RIGIDLY re-attaches (`idWeapon::ReprojectRender(camOrigin, camAxis)` — captures the
+view-model pose in committed-camera space, re-applies it to the reprojected camera origin+axis; the viewmodel entity
+origin sits at the eye so `|weapon−cam|=0` is correct, the gun geometry is in the model). VALIDATED (continuous-turn
+harness, Mac/Dawn): **yaw zeroFrac 0.19→0, cv 1.44→0.12, p95 9°→3° (=p50, perfectly even), max 83°→11°** vs
+reproject-origin-only; weapon renders attached + correctly oriented (screenshot). **VERIFICATION LESSON: the
+origin-step metric anti-correlated with feel because it ignored the AXIS — always sample `__d3View.ax` (forward
+vector) under a SUSTAINED turn, bucket by turning, not just `.org`.** **LINKAGE GOTCHA (cost ~1hr): a new cross-TU
+C++ helper called from Player.cpp was LTO-dead-stripped → runtime `Aborted(missing function: _Z22…)`. Causes: (1)
+`d3_wearable.h` declares it inside `extern "C"` so the definition is UNMANGLED, but Player.cpp's local `extern void`
+referenced the MANGLED name → mismatch (fix: declare `extern "C"` in Player.cpp too); (2) even matched, a non-exported
+extern-"C" function only referenced cross-module gets LTO-stripped → add `EMSCRIPTEN_KEEPALIVE` to force-keep. ALSO:
+after a FAILED build, `cmake --build` can leave a stale `.o` so the relink silently keeps the old object (wasm sha
+UNCHANGED across "rebuilds" = the tell) → `rm` the specific `.o` + the `dhewm3.js/.wasm` to force a clean relink.**
+REMAINING (per Arco `docs/ACTIVE_PLAYER_PREDICTION_REARCH.md` + the workflow `docs/REPROJECT_P0_FINDINGS.md`):
+P2-origin-snap (constant-velocity dead-reckon still snaps the ORIGIN on commit — needs physics re-prediction),
+vertical-Z reproject, remote-entity/weapon-bob reproject, and the on-DEVICE/owner-connection gate (Mac/Dawn can't
+certify WebKit-Metal frame pacing). Owner feel-test: `reproject.arco-doom.pages.dev/?reproject=1` (turn + move).
+
 ## Area streaming (experimental, default OFF — `com_streamAreas 0`)
 
 Incremental per-render-area load so the player can start in the boot region while
