@@ -112,32 +112,24 @@ active-player A/B (viewStep evenness + no added `viewGap` lag, plus FEEL) is own
 if held-frame freezes (poseHeld ~72% of frames) dominate, the next lever is advancing the camera origin on
 held frames too while keeping bob/weapon pose-monotonic.
 
-**2026-06-29 active-player held-frame extrapolation + CoD/Quake3 prediction-error decay (`net_clientActiveViewExtrap`
-+ `net_clientPredictErrorDecay`, both default 0).** The "advance the camera on held frames" lever from above,
-built. `net_clientActiveViewExtrap` (ms): on a held/replay frame (`localPresentationPoseValid && !localPresentationCommit`)
-DEAD-RECKON the camera forward `localPresentationViewOrigin + activeExtrapVel*glide(dt)` (committed velocity captured
-each commit, z=0; viewaxis stays committed so bob/weapon don't detach) instead of holding the last committed pose —
-this fills the freeze-stall that is the perceived active-player judder (owner validated `=80` "hardly exhibits judder";
-the glide is a DECELERATING `vel*dt*tau/(dt+tau)`, self-bounding at `vel*tau`). `net_clientPredictErrorDecay` (ms):
-the CoD/Quake3 refinement layered on top — the extrap glide is the forward-advancing BASE (no freeze), and when a
-commit re-bases the anchor from the extrapolated guess to the new committed pose, the jump is folded into a residual
-error vector (`activeViewError`) and DECAYED to zero over the window (Quake3 `cg_predict.c` `cg_errorDecay` / Source
-`cl_smoothtime`; `view = base + decaying_error`) instead of SNAPPING — converges to ZERO lag because the base is current
-and the error only shrinks, unlike the absolute low-pass (which trails by a constant = the lag-debt that killed
-`net_clientActiveViewCorrection`). Teleport/large jump snaps (guarded by `g_viewInterpMaxDelta`); residual bounded by
-`net_clientViewCorrectionMax`. All in `idPlayer::CalculateRenderView` (members `activeExtrapVel`/`activeExtrapBaseTime`/
-`activeViewError`/`activeViewErrorTime`/`activePrevDisplay`); cvars in Game_network.cpp, externed in Player.cpp. Arco
-client wires `?viewextrap=N`/`?predecay=N`. SELF-QA LIMIT unchanged (JOIN→play doesn't complete in automation → the
-active-player A/B is owner-on-device): deployed to `smooth.arco-doom.pages.dev` (extrap) + `errdecay.arco-doom.pages.dev`
-(extrap+decay); A/B `?viewextrap=80` vs `?viewextrap=80&predecay=120`. Default 0 = byte-identical to legacy (pure opt-in).
-**WEAPON-ATTACH FIX (required for both extrap AND decay):** extrap/decay move the world camera (`renderView->vieworg`)
-but the first-person weapon/arms anchor to `localPresentationViewOrigin` (the committed pose) via
-`GetPresentationViewPose` — so the camera and weapon SPLIT by the smooth offset (mild for extrap, "totally dislodged"
-under decay, owner-reported). Fix: publish `activePresentationOffset = renderView->vieworg − localPresentationViewOrigin`
-(gated on `ShouldUseLocalPresentationPose()`) and add it in `GetPresentationViewPose` so the weapon rigidly follows the
-camera (bob/axis stay monotonic). Zero in legacy paths (camera == anchor) = no-op. VERIFIED in play (autojoin+automove,
-Mac Chrome/Dawn): `|__d3View.org − weaponTrace.cam|` p50/p95/max = 0/0/0 with `predecay=120` (and `=0`) — the weapon
-anchor now tracks the world camera exactly.
+**2026-06-29 active-player held-frame extrapolation (`net_clientActiveViewExtrap`, ms; default 0) — SHIPPED as the
+arco-doom production default `=80`.** The "advance the camera on held frames" lever from above. On a held/replay frame
+(`localPresentationPoseValid && !localPresentationCommit`) DEAD-RECKON the camera forward
+`localPresentationViewOrigin + activeExtrapVel*min(dt,tau)` (LINEAR glide; committed velocity captured each commit,
+z=0; viewaxis stays committed so bob/weapon don't detach) instead of holding the last committed pose — this fills the
+freeze-stall that is the perceived active-player judder. Owner validated `=80` "hardly exhibits judder" → made the
+arco-doom production default (client `?viewextrap=N`, default 80). `idPlayer::CalculateRenderView`; cvar in
+Game_network.cpp, externed in Player.cpp. Default 0 = byte-identical to legacy; `=80` = the shipped behavior.
+**TWO experiments built then REVERTED (kept in git history for the record, NOT in the patch):** (1) `net_clientPredictErrorDecay`
+(CoD/Quake3 prediction-error decay layered on extrap) — owner verdict "awful, spawn through the geometry, more judder":
+decaying the EXTRAP's error ACCUMULATES (extrap is a crude velocity guess with systematic error, not an accurate
+prediction → display-continuity forces the error to grow = wobble; at spawn the teleport glides through walls) = the
+`net_clientActiveViewCorrection` lag-debt failure in a new shape (commits `37dc30e`). (2) `activePresentationOffset`
+weapon-attach (made the gun follow the offset camera; needed for decay, changed extrap's gun feel) — reverted with the
+decay since extrap-80 alone is the shipped state (commit `7ff3ee7`). The genuine residual fix is a re-architecture
+(re-predict the local player to PRESENT every render frame, decoupled from the async replay, + error-decay on THAT
+accurate base) — see Arco `docs/ACTIVE_PLAYER_PREDICTION_REARCH.md`. SELF-QA: `?autojoin` DOES reach play in headed
+Playwright (Mac Chrome/Dawn) — used it to measure the weapon split (0/0/0) before reverting; feel is owner-on-device.
 
 ## Area streaming (experimental, default OFF — `com_streamAreas 0`)
 
