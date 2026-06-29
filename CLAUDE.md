@@ -131,6 +131,28 @@ decay since extrap-80 alone is the shipped state (commit `7ff3ee7`). The genuine
 accurate base) — see Arco `docs/ACTIVE_PLAYER_PREDICTION_REARCH.md`. SELF-QA: `?autojoin` DOES reach play in headed
 Playwright (Mac Chrome/Dawn) — used it to measure the weapon split (0/0/0) before reverting; feel is owner-on-device.
 
+**2026-06-29 RENDER-TIME REPROJECT (`net_clientReproject`, default 0) — the re-architecture P1, branch `active-reproject`.**
+The genuine CoD-style fix for the residual judder that sim-time extrap-80 can't reach. ROOT CAUSE (confirmed):
+`GetRenderView` returns a CACHED renderView computed per SIM frame; the browser renders every rAF (`idGameLocal::Draw`),
+but `common->Frame()` runs 0 sim frames on rAFs where the residual < USERCMD_MSEC → the cached camera is stale → a
+FROZEN rendered frame (measured `zeroFrac 0.45` under jitter even at extrap-80; sim-time extrap can't help a frame where
+CalculateRenderView never runs). FIX: `idPlayer::ReprojectViewForRender()` called once per RENDERED frame from
+`idGameLocal::Draw` (SP) + `idMultiplayerGame::Draw` (MP), before `RenderPlayerView`. It advances the committed camera
+(`localPresentationViewOrigin`) AND the view-weapon to the PRESENT render time by the committed velocity
+(`activeExtrapVel`), `dt = Sys_Milliseconds() − reprojectBaseMs` (wall-clock base captured at commit, bounded 100ms);
+viewaxis stays committed (monotonic). The weapon follows via `idWeapon::ReprojectRender(delta)` — shifts
+`renderEntity.origin = reprojectBaseOrigin + delta` (the committed render origin captured each PresentWeapon, so it's
+idempotent across multiple rAFs between sim frames) and re-submits via `gameRenderWorld->UpdateEntityDef`. Render-only:
+mutates no sim state (det-safe). Gated `net_clientReproject` (Arco `?reproject=1`); default 0 = byte-identical legacy.
+VALIDATED under the jitter harness (autojoin+automove, Mac Chrome/Dawn): **zeroFrac 0.45→0.03, cv 1.40→0.40, max-step
+11.13→5.40** (vs extrap-80, same jitter snapCV ~4.5) — the frozen-frame freeze ELIMINATED + smooth even motion; the
+view-weapon stays attached (play screenshot confirms gun in normal first-person position, not dislodged). REMAINING:
+the velocity reproject still has extrap's systematic error → a small correction when each sim frame commits (P3 = full
+physics re-prediction into scratch state for the accurate base + error-decay on it); phone-perf gate (P4: per-rAF
+weapon re-submit + view update on iOS/WebKit — measure). 6 files: Game_network.cpp (cvar), Player.cpp/.h
+(ReprojectViewForRender + reprojectBaseMs), Weapon.cpp/.h (ReprojectRender + reprojectBaseOrigin), Game_local.cpp +
+MultiplayerGame.cpp (the Draw hook). Owner feel-test: `reproject.arco-doom.pages.dev/?reproject=1` vs `?viewextrap=80`.
+
 ## Area streaming (experimental, default OFF — `com_streamAreas 0`)
 
 Incremental per-render-area load so the player can start in the boot region while
