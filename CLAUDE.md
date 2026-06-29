@@ -112,6 +112,25 @@ active-player A/B (viewStep evenness + no added `viewGap` lag, plus FEEL) is own
 if held-frame freezes (poseHeld ~72% of frames) dominate, the next lever is advancing the camera origin on
 held frames too while keeping bob/weapon pose-monotonic.
 
+**2026-06-29 active-player held-frame extrapolation + CoD/Quake3 prediction-error decay (`net_clientActiveViewExtrap`
++ `net_clientPredictErrorDecay`, both default 0).** The "advance the camera on held frames" lever from above,
+built. `net_clientActiveViewExtrap` (ms): on a held/replay frame (`localPresentationPoseValid && !localPresentationCommit`)
+DEAD-RECKON the camera forward `localPresentationViewOrigin + activeExtrapVel*glide(dt)` (committed velocity captured
+each commit, z=0; viewaxis stays committed so bob/weapon don't detach) instead of holding the last committed pose —
+this fills the freeze-stall that is the perceived active-player judder (owner validated `=80` "hardly exhibits judder";
+the glide is a DECELERATING `vel*dt*tau/(dt+tau)`, self-bounding at `vel*tau`). `net_clientPredictErrorDecay` (ms):
+the CoD/Quake3 refinement layered on top — the extrap glide is the forward-advancing BASE (no freeze), and when a
+commit re-bases the anchor from the extrapolated guess to the new committed pose, the jump is folded into a residual
+error vector (`activeViewError`) and DECAYED to zero over the window (Quake3 `cg_predict.c` `cg_errorDecay` / Source
+`cl_smoothtime`; `view = base + decaying_error`) instead of SNAPPING — converges to ZERO lag because the base is current
+and the error only shrinks, unlike the absolute low-pass (which trails by a constant = the lag-debt that killed
+`net_clientActiveViewCorrection`). Teleport/large jump snaps (guarded by `g_viewInterpMaxDelta`); residual bounded by
+`net_clientViewCorrectionMax`. All in `idPlayer::CalculateRenderView` (members `activeExtrapVel`/`activeExtrapBaseTime`/
+`activeViewError`/`activeViewErrorTime`/`activePrevDisplay`); cvars in Game_network.cpp, externed in Player.cpp. Arco
+client wires `?viewextrap=N`/`?predecay=N`. SELF-QA LIMIT unchanged (JOIN→play doesn't complete in automation → the
+active-player A/B is owner-on-device): deployed to `smooth.arco-doom.pages.dev` (extrap) + `errdecay.arco-doom.pages.dev`
+(extrap+decay); A/B `?viewextrap=80` vs `?viewextrap=80&predecay=120`. Default 0 = byte-identical to legacy (pure opt-in).
+
 ## Area streaming (experimental, default OFF — `com_streamAreas 0`)
 
 Incremental per-render-area load so the player can start in the boot region while
