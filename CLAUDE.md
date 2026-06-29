@@ -92,6 +92,26 @@ on `pose-monotonic-2026-06-28a` measured active MP `raf_p95 18.6ms`, committed
 `poseSplit/poseAxisSplit p99 0/0`, and `viewBobLen p99 0.63u`; SP control had
 no replay and the same zero-backstep/zero-split result.
 
+**2026-06-29 active-player present-commit smoother (`net_clientActiveViewSmoothTau`, default 0 = off).**
+The residual active-player movement judder (Arco MP, owner's connection) is NOT transport — WebTransport
+works but the player's own view is locally predicted, and the judder is in `idPlayer::CalculateRenderView`'s
+commit-frame view smoothing. The committed view advances only on `localPresentationCommit` frames via a
+FIXED per-commit low-pass (`renderViewOrigin += (rawOrg-renderViewOrigin)*g_viewSmooth`, k=0.30); commits
+arrive on an irregular snapshot-driven cadence, so a fixed k advances the view UNEVENLY (measured on a Mac
+Chrome active-play trace: `presentCommitted.viewStep` p50 4.39 / p95 5.96 / max 7.23u where a steady run
+should step ~4.6u/frame; prediction itself is accurate, `predErrP95 0.56u`). New cvar makes that blend
+CADENCE-INDEPENDENT: when `net_clientActiveViewSmoothTau > 0` (ms time constant), the active-client branch
+uses `alpha = dt/(dt+tau)` from REAL elapsed (`gameLocal.realClientTime`) instead of fixed k, plus a HARD
+anti-lag clamp (never trail `rawOrg` by more than `net_clientViewCorrectionMax`, so it can't accumulate the
+camera lag-debt that disabled `net_clientActiveViewCorrection`). Active-only (`localActiveClientView &&
+!spectating`); spectator path unchanged. Default 0 = byte-identical to the legacy g_viewSmooth path (pure
+opt-in A/B). Arco client wires `?viewsmoothtau=N` → `+set net_clientActiveViewSmoothTau N`. SELF-QA LIMIT:
+headed-Playwright reaches connect+spectator but the JOIN→play flip doesn't complete in automation, so the
+active-player A/B (viewStep evenness + no added `viewGap` lag, plus FEEL) is owner-on-device only — A/B
+`?viewsmoothtau=0` vs `=80` (sweep 40–160). Iteration 1; the smoother only evens the commit-frame steps —
+if held-frame freezes (poseHeld ~72% of frames) dominate, the next lever is advancing the camera origin on
+held frames too while keeping bob/weapon pose-monotonic.
+
 ## Area streaming (experimental, default OFF — `com_streamAreas 0`)
 
 Incremental per-render-area load so the player can start in the boot region while
