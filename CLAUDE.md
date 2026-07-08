@@ -2611,3 +2611,38 @@ or a Private tab; Mac Safari = Cmd+Opt+R or Develop → Empty Caches
 (caches only, no history). NOTE: URLSearchParams serializes bare
 flags as "flag=" (e.g. nodiag → nodiag=) — our \b-anchored flag
 regexes still match, keep it that way.
+
+## RENDER track — drain tribal knowledge (ingested Phase 2, from HANDOFF-RENDER)
+
+Auto-loaded render-track memory (the drain handoff is deleted; this is its durable residue).
+
+- **Mac Safari WebGPU thrash + reset:** after ~6 WebDriver/WebGPU sessions the Mac GPU+swap
+  degrades and every fresh Safari session HANGS at map-load (`__d3ViewPos` never appears, JS
+  execute blocks ~60s) — NOT a build bug. Reset between batches:
+  `killall Safari 'com.apple.WebKit.GPU'` + `xcrun simctl shutdown all`. `safaridriver --port N`
+  (Remote Automation already on); raw W3C WebDriver (no selenium). The WebDriver `/screenshot`
+  DOES composite the WebGPU canvas (unlike `canvas.drawImage`/headless). Serve the pak LOCALLY
+  (`?pak=http://localhost:4173/wasm/`) to dodge slow remote re-downloads per fresh session.
+- **`scripts/gltf-spike.mjs` :4180 quirk:** starts/expects its OWN server on 127.0.0.1:4180 and
+  won't point at an existing preview; `DET_URL` does NOT override its hardcoded URL. Anim-bridge
+  preservation is proven via the base-patch delta (Anim.cpp byte-unchanged) + successful link,
+  not by re-running the harness.
+- **256-B four-binding lockstep:** the interaction-module `group(0)` uniform grew 224→256 for
+  R-IBL. ALL FOUR bindings must move together — the record bind group, the record-depth bind
+  group, the **pass-depth** bind group (`depthPipeline` shares interaction `vs_main`, so
+  `bglDepth` minBindingSize is the FULL 256-B struct → a 224 pass-depth binding validation-fails
+  ONLY that path), and the PBR self-test buffer/binding. Any future `Uniforms` grow must bump all
+  four or Dawn silently fails the pass-depth prepass.
+- **Deploy + bare-URL:** `rsync -a --exclude 'wasm/base' --exclude 'wasm/base256' --exclude
+  'wasm/base-stream' --exclude 'wasm/levels' --exclude '*.glb' dist/ /tmp/rr-deploy/` then wrangler
+  pages deploy `/tmp/rr-deploy` (project `rayban-render`). Content bundles are proprietary + NOT
+  deployed → the bare URL 404s the bundle → BLACK screen; always test with the CDN
+  `?pak=https://doom3-pak.pages.dev/`. (Default-pak fallback is parked in Arco
+  `coordination/tasks/parked/render-default-pak-fallback.md`.)
+- **base-patch landmine:** `patches/rayban-base.patch` (SPINE-domain) carries render-track-only
+  `neo/game/anim/Anim.cpp`+`.h` (the Spike-B glTF anim bridge) + `.glb` relax + view smoothing.
+  SPINE base variants DIVERGE and DROP the anim bridge — **never wholesale-overwrite; diff first,
+  extract the intended delta** (Arco `coordination/decisions/0003`). Bit us twice.
+- **OPEN follow-up decision (owner):** fold the Anim.cpp/.h glTF bridge into rayban's canonical
+  base lineage, OR keep RENDER surgically merging. Until decided, surgical-merge is the safe
+  default (0003).
