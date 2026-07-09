@@ -1,0 +1,18 @@
+{
+  "device": "MacBookPro18,4",
+  "macosBuild": "25D125",
+  "chromeVersion": "150.0.7871.101",
+  "engineWasmSha": "33f4801564a963669f0dbd4ff521276f592b8210c43cbe486353b449325181c3",
+  "pakSha": "98e98d0c23a4ba45c5c9d14c738d8f9e50b99c0788f8ecd475c7210da9b69b99",
+  "fixtureSha": "10edeab7fa1b7eaff96a0246beb64de64e0e28d359c42af72412e8ca57cd8aff",
+  "tick": 14,
+  "w": 640,
+  "h": 640,
+  "cvarSetHash": "da072b2ef9940c9cf7b9d07b602b641b23438fed8497d61d58d706ed7898b52e",
+  "rawHash": "03a442bf0470194bd7aaa6c773dab96d8ed8ed5806308ef4414e474cfd5d1668",
+  "nonblackFrac": 0.8631005859375,
+  "distinctColors": 512,
+  "scene_source": "map-pose:game/enpro",
+  "created": "baseline_created",
+  "spine_eyeball": "PENDING — first-baseline frame artifact must be Spine-EYEBALLED and recorded in the baseline_created receipt"
+}
