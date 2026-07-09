@@ -231,8 +231,19 @@ async function main() {
     if (!hooks.captureImmediate) {
       for (const c of PINNED_CVARS) await d3cmd(c);
       const [x, y, z, yaw, pitch] = xform.setviewpos;
-      await d3cmd(`setviewpos ${x} ${y} ${z} ${yaw} ${pitch}`);
-      await sleep(2500);   // let the teleport land + the load-fade clear before the target crossing
+      // Issue the teleport REPEATEDLY across the settle window (idempotent — same target pose).
+      // A single setviewpos near engine-up is droppable (cbuf timing around readiness); the CLEAN
+      // path MASKED that (the stale baseline was captured with the teleport never landed — a
+      // spawn-view frame), and it made MUT-B's +5-yaw perturbation land only ~half the time
+      // (run1 == baseline "no effect" vs run2 perturbed — a RED gate-error flip-flop instead of
+      // the named RED regression). Re-issuing means the LAST teleport lands after readiness, so
+      // the pose at the capture target game-time is guaranteed = requested, for BOTH clean and
+      // perturbed runs. Total wait unchanged (2500ms); determinism unaffected (the frame at the
+      // fixed game-time target depends only on the final landed pose — self-proven by H1==H2).
+      for (const w of [800, 800, 900]) {
+        await d3cmd(`setviewpos ${x} ${y} ${z} ${yaw} ${pitch}`);
+        await sleep(w);
+      }
     }
 
     // Target game-time (ms). Fixed + well above the arm-time game-time so both runs approach the
