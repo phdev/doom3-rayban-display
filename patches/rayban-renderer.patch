@@ -1986,10 +1986,10 @@ index 0000000..e71c87e
 +}
 diff --git a/neo/renderer/RenderBackend_WebGPU.cpp b/neo/renderer/RenderBackend_WebGPU.cpp
 new file mode 100644
-index 0000000..089f7a5
+index 0000000..a02a9e9
 --- /dev/null
 +++ b/neo/renderer/RenderBackend_WebGPU.cpp
-@@ -0,0 +1,6115 @@
+@@ -0,0 +1,6246 @@
 +/*
 +================================================================================
 +
@@ -2272,6 +2272,8 @@ index 0000000..089f7a5
 +extern "C" int      g_capTexBudgetMB;   // iter 28: GPU texture-cache byte budget (0 = unlimited)
 +extern "C" int      g_capTexMaxDim;     // iter 28: pre-upload dimension cap (0 = uncapped)
 +extern "C" uint32_t g_capDetTest;       // iter 28: determinism self-test gate
++extern "C" uint32_t g_capCaptureFrame;  // R3 render-frame: capture arm = target main-view game-time in ms (0 = idle)
++extern "C" uint32_t g_capRenderTimeMs;  // R3 render-frame: current main-view game-time (ms)
 +extern "C" uint32_t g_capVertDedupCount; // iter 28: frame geometry-dedup table fill (reset on drain)
 +extern "C" float    g_capBfgSpec;       // iter 29: 1 = BFG analytic specular, 0 = classic LUT
 +// R-IBL (Full PBR look): image-based lighting params (isPBR-scoped), written into ub[56..59].
@@ -2672,6 +2674,18 @@ index 0000000..089f7a5
 +    uint32_t                detFrameCounter = 0;
 +    uint32_t                detRoundsDone = 0;
 +    static constexpr uint32_t kDetMaxRounds = 6;
++    // R3 render-frame (r_wgpuCaptureFrame): one-shot deterministic frame capture. DEDICATED
++    // offscreen BGRA8 target + depth + MapRead buffer, SEPARATE from the det self-test resources
++    // above so the two can never contend for the same buffer mid-map. Mirrors runDeterminismRound.
++    WGPUTexture             capTex = nullptr;
++    WGPUTextureView         capView = nullptr;
++    WGPUTexture             capDepthTex = nullptr;
++    WGPUTextureView         capDepthView = nullptr;
++    WGPUBuffer              capBuf = nullptr;
++    uint32_t                capBytesPerRow = 0;
++    bool                    capMapPending = false;   // one readback in flight at a time
++    uint32_t                capMapGen = 0;           // token echoed back to the driver in the publish
++    uint32_t                capLastTarget = 0;       // fire ONCE per distinct target, at the first game-time crossing
 +#endif
 +public:
 +    idGpuBackendKind GetKind() const override { return idGpuBackendKind::WebGPU; }
@@ -2989,6 +3003,17 @@ index 0000000..089f7a5
 +                    }
 +                    if (g_capDetTest && !iblSelfDone && detFrameCounter >= 38) {
 +                        runIblSelfTest();
++                    }
++                    // R3 render-frame: fire the capture at the first frame whose main-view game-time
++                    // (g_capRenderTimeMs) has crossed the armed target (g_capCaptureFrame, in ms), ONCE
++                    // per distinct target. Both runs cross the same target at the same game-time, and
++                    // idTech4 game state is a fixed-16ms-timestep function of game-time, so the captured
++                    // scene is identical -> byte-identical capture (com_fixedTic 1 makes the crossing
++                    // tick-exact). Captures whatever lastRecords holds that frame; no g_stopTime needed.
++                    if (g_capCaptureFrame != 0 && g_capRenderTimeMs >= g_capCaptureFrame &&
++                        g_capCaptureFrame != capLastTarget && !capMapPending) {
++                        capLastTarget = g_capCaptureFrame;
++                        runFrameCapture(g_capCaptureFrame);
 +                    }
 +                }
 +                // R-MBLUR Build B: det-safe prev-VP swap. ONCE per frame, AFTER the live
@@ -7547,6 +7572,112 @@ index 0000000..089f7a5
 +        wgpuBufferMapAsync(iblSelfBuf, WGPUMapMode_Read, 0, 256*4, cbi);
 +    }
 +
++    // R3 render-frame capture: readback callback. Strips the 256-aligned row padding, forces
++    // A=0xFF, computes FNV-1a C++-side, and publishes { gen, w, h, hash, pixels } to
++    // window.__d3FrameCapture (pixels = a HEAPU8-copied Uint8Array). The published bytes are the raw
++    // BGRA8 capture with alpha forced to 0xFF; the driver re-hashes the SAME bytes to cross-check
++    // this FNV, then swaps B<->R for the PNG artifact. The hash is order-agnostic (consistent bytes),
++    // and forcing alpha makes it stable against the undefined swapchain-alpha class.
++    static void capMapCallback(WGPUMapAsyncStatus status, WGPUStringView /*msg*/, void* ud1, void* /*ud2*/) {
++        idRenderBackend_WebGPU* self = (idRenderBackend_WebGPU*)ud1;
++        self->capMapPending = false;
++        if (status != WGPUMapAsyncStatus_Success) { EM_ASM({ console.warn("[d3] WebGPU frame-capture: map FAILED"); }); return; }
++        const int w = self->depthW, h = self->depthH;
++        const uint32_t bpr = self->capBytesPerRow;
++        const size_t total = (size_t)bpr * (size_t)h;
++        const uint8_t* srcp = (const uint8_t*)wgpuBufferGetConstMappedRange(self->capBuf, 0, total);
++        if (!srcp) { EM_ASM({ console.warn("[d3] WebGPU frame-capture: mapped range null"); }); wgpuBufferUnmap(self->capBuf); return; }
++        const size_t packed = (size_t)w * (size_t)h * 4u;
++        uint8_t* out = (uint8_t*)malloc(packed);
++        uint32_t hash = 2166136261u;   // FNV-1a 32-bit offset basis
++        if (out) {
++            size_t o = 0;
++            for (int y = 0; y < h; ++y) {
++                const uint8_t* row = srcp + (size_t)y * bpr;
++                for (int x = 0; x < w * 4; x += 4) {
++                    uint8_t b0 = row[x], b1 = row[x+1], b2 = row[x+2];   // strip padding: only w*4 bytes/row
++                    out[o+0] = b0; out[o+1] = b1; out[o+2] = b2; out[o+3] = 0xFFu;   // force alpha
++                    hash ^= b0; hash *= 16777619u;
++                    hash ^= b1; hash *= 16777619u;
++                    hash ^= b2; hash *= 16777619u;
++                    hash ^= 0xFFu; hash *= 16777619u;
++                    o += 4;
++                }
++            }
++        }
++        wgpuBufferUnmap(self->capBuf);
++        if (out) {
++            // $3 is the malloc pointer as int; wasm32 heap can exceed 2GB, so read it unsigned ($3>>>0).
++            // .slice() copies out of the (synchronously-current) heap before we free.
++            // NB: assign object fields ONE AT A TIME — the EM_ASM macro splits on top-level commas
++            // (commas inside {} are NOT protected, only inside ()), so an inline `{a:..,b:..}` literal
++            // would mis-parse (the CLAUDE.md EM_ASM comma footgun).
++            EM_ASM_({
++                var c = {};
++                c.gen = ($5 >>> 0);
++                c.w = $0;
++                c.h = $1;
++                c.hash = ($2 >>> 0);
++                c.pixels = new Uint8Array(HEAPU8.buffer, ($3 >>> 0), $4).slice();
++                window.__d3FrameCapture = c;
++                console.info("[d3] WebGPU frame capture: " + $0 + "x" + $1 + " hash=" + (($2 >>> 0).toString(16)) + " gen=" + ($5 >>> 0));
++            }, w, h, (int)hash, (int)(intptr_t)out, (int)packed, (int)self->capMapGen);
++            free(out);
++        }
++    }
++
++    // R3 render-frame: render the current record set once into the dedicated offscreen BGRA8 target
++    // (reusing encodeRecordsPass — the SAME det-proven pipeline path runDeterminismRound byte-verifies),
++    // copy to a MapRead buffer, and kick the readback callback. Render-only; mutates no sim state.
++    void runFrameCapture(uint32_t gen) {
++        const int w = depthW, h = depthH;
++        if (w <= 0 || h <= 0) return;
++        if (!capTex) {
++            WGPUTextureDescriptor td = {};
++            td.size = { (uint32_t)w, (uint32_t)h, 1 };
++            td.mipLevelCount = 1; td.sampleCount = 1;
++            td.dimension = WGPUTextureDimension_2D;
++            td.format = surfaceFormat;   // BGRA8Unorm — must match interactionPipeline target
++            td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc;
++            capTex = wgpuDeviceCreateTexture(device, &td);
++            WGPUTextureDescriptor dd = td;
++            dd.format = WGPUTextureFormat_Depth24PlusStencil8;
++            dd.usage = WGPUTextureUsage_RenderAttachment;
++            capDepthTex = wgpuDeviceCreateTexture(device, &dd);
++            capView = capTex ? wgpuTextureCreateView(capTex, nullptr) : nullptr;
++            capDepthView = capDepthTex ? wgpuTextureCreateView(capDepthTex, nullptr) : nullptr;
++            capBytesPerRow = ((uint32_t)w * 4u + 255u) & ~255u;
++            WGPUBufferDescriptor bd = {};
++            bd.size = (uint64_t)capBytesPerRow * (uint64_t)h;
++            bd.usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst;
++            capBuf = wgpuDeviceCreateBuffer(device, &bd);
++        }
++        if (!capView || !capDepthView || !capBuf) return;
++
++        WGPUCommandEncoderDescriptor cd = {};
++        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(device, &cd);
++        encodeRecordsPass(enc, capView, capDepthView, capTex);
++        WGPUTexelCopyTextureInfo src = {}; src.texture = capTex;
++        WGPUTexelCopyBufferInfo dst = {};
++        dst.layout.bytesPerRow = capBytesPerRow;
++        dst.layout.rowsPerImage = (uint32_t)h;
++        dst.buffer = capBuf;
++        WGPUExtent3D ext = { (uint32_t)w, (uint32_t)h, 1 };
++        wgpuCommandEncoderCopyTextureToBuffer(enc, &src, &dst, &ext);
++        WGPUCommandBuffer cb = wgpuCommandEncoderFinish(enc, nullptr);
++        wgpuCommandEncoderRelease(enc);
++        wgpuQueueSubmit(queue, 1, &cb);
++        wgpuCommandBufferRelease(cb);
++
++        capMapPending = true;
++        capMapGen = gen;
++        WGPUBufferMapCallbackInfo cbi = {};
++        cbi.mode = WGPUCallbackMode_AllowSpontaneous;
++        cbi.callback = &idRenderBackend_WebGPU::capMapCallback;
++        cbi.userdata1 = this;
++        wgpuBufferMapAsync(capBuf, WGPUMapMode_Read, 0, (size_t)capBytesPerRow * (size_t)h, cbi);
++    }
++
 +    // Run one self-test round: two identical passes → two readback buffers
 +    // → async compare. Called from EndFrame on a frame cadence.
 +    void runDeterminismRound() {
@@ -8138,7 +8269,7 @@ index 0000000..0f9c8e6
 +    return nullptr;
 +}
 diff --git a/neo/renderer/RenderSystem_init.cpp b/neo/renderer/RenderSystem_init.cpp
-index 7914093..81a90fe 100644
+index 7914093..4c7792d 100644
 --- a/neo/renderer/RenderSystem_init.cpp
 +++ b/neo/renderer/RenderSystem_init.cpp
 @@ -39,6 +39,11 @@ If you have questions concerning this license or the applicable additional terms
@@ -8153,7 +8284,7 @@ index 7914093..81a90fe 100644
  
  #include "framework/GameCallbacks_local.h"
  #include "framework/Game.h"
-@@ -101,7 +106,89 @@ idCVar r_renderer( "r_renderer", "best", CVAR_RENDERER | CVAR_ARCHIVE, "hardware
+@@ -101,7 +106,94 @@ idCVar r_renderer( "r_renderer", "best", CVAR_RENDERER | CVAR_ARCHIVE, "hardware
  idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel jitter the projection matrix" );
  
  idCVar r_skipSuppress( "r_skipSuppress", "0", CVAR_RENDERER | CVAR_BOOL, "ignore the per-view suppressions" );
@@ -8181,6 +8312,11 @@ index 7914093..81a90fe 100644
 +idCVar r_wgpuTexBudgetMB( "r_wgpuTexBudgetMB", "0", CVAR_RENDERER | CVAR_INTEGER, "WebGPU texture-cache GPU byte budget in MB (0 = unlimited); over-budget images bind a fallback instead of crashing the device" );
 +idCVar r_wgpuTexMaxDim( "r_wgpuTexMaxDim", "0", CVAR_RENDERER | CVAR_INTEGER, "WebGPU texture-cache max dimension (0 = uncapped); larger cached images are box-reduced before GPU upload" );
 +idCVar r_wgpuDetTest( "r_wgpuDetTest", "0", CVAR_RENDERER | CVAR_BOOL, "run the WebGPU determinism self-test (extra offscreen targets + readback buffers; opt-in diagnostic)" );
++// R3 render-frame (scripts/render-frame.mjs): one-shot deterministic WebGPU frame capture. Set to a
++// fresh nonzero token to arm; the backend renders the current record set into a dedicated offscreen
++// BGRA8 target, reads it back, strips row padding, forces A=0xFF, FNV-1a hashes it C++-side, and
++// publishes { gen, w, h, hash, pixels } to window.__d3FrameCapture. 0 = idle.
++idCVar r_wgpuCaptureFrame( "r_wgpuCaptureFrame", "0", CVAR_RENDERER | CVAR_INTEGER, "R3: one-shot WebGPU frame capture -> window.__d3FrameCapture (arm with a fresh nonzero token; 0 = idle)" );
 +// iter-132: throttled background GPU-texture pre-warm. With image_preload 0
 +// (wearable) the level's textures are CPU-decoded at load but each GPU texture
 +// is created lazily on first DRAW (getEngineTextureView) — an unthrottled
@@ -8244,7 +8380,7 @@ index 7914093..81a90fe 100644
  idCVar r_skipLightScale( "r_skipLightScale", "0", CVAR_RENDERER | CVAR_BOOL, "don't do any post-interaction light scaling, makes things dim on low-dynamic range cards" );
  idCVar r_skipInteractions( "r_skipInteractions", "0", CVAR_RENDERER | CVAR_BOOL, "skip all light/surface interaction drawing" );
  idCVar r_skipDynamicTextures( "r_skipDynamicTextures", "0", CVAR_RENDERER | CVAR_BOOL, "don't dynamically create textures" );
-@@ -146,7 +233,7 @@ idCVar r_skipSubviews( "r_skipSubviews", "0", CVAR_RENDERER | CVAR_INTEGER, "1 =
+@@ -146,7 +238,7 @@ idCVar r_skipSubviews( "r_skipSubviews", "0", CVAR_RENDERER | CVAR_INTEGER, "1 =
  idCVar r_skipGuiShaders( "r_skipGuiShaders", "0", CVAR_RENDERER | CVAR_INTEGER, "1 = skip all gui elements on surfaces, 2 = skip drawing but still handle events, 3 = draw but skip events", 0, 3, idCmdSystem::ArgCompletion_Integer<0,3> );
  idCVar r_skipParticles( "r_skipParticles", "0", CVAR_RENDERER | CVAR_INTEGER, "1 = skip all particle systems", 0, 1, idCmdSystem::ArgCompletion_Integer<0,1> );
  idCVar r_subviewOnly( "r_subviewOnly", "0", CVAR_RENDERER | CVAR_BOOL, "1 = don't render main view, allowing subviews to be debugged" );
@@ -8253,7 +8389,7 @@ index 7914093..81a90fe 100644
  idCVar r_testARBProgram( "r_testARBProgram", "0", CVAR_RENDERER | CVAR_BOOL, "experiment with vertex/fragment programs" );
  idCVar r_testGamma( "r_testGamma", "0", CVAR_RENDERER | CVAR_FLOAT, "if > 0 draw a grid pattern to test gamma levels", 0, 195 );
  idCVar r_testGammaBias( "r_testGammaBias", "0", CVAR_RENDERER | CVAR_FLOAT, "if > 0 draw a grid pattern to test gamma levels" );
-@@ -158,6 +245,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
+@@ -158,6 +250,7 @@ idCVar r_flareSize( "r_flareSize", "1", CVAR_RENDERER | CVAR_FLOAT, "scale the f
  idCVar r_useExternalShadows( "r_useExternalShadows", "1", CVAR_RENDERER | CVAR_INTEGER, "1 = skip drawing caps when outside the light volume, 2 = force to no caps for testing", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
  idCVar r_useOptimizedShadows( "r_useOptimizedShadows", "1", CVAR_RENDERER | CVAR_BOOL, "use the dmap generated static shadow volumes" );
  idCVar r_useScissor( "r_useScissor", "1", CVAR_RENDERER | CVAR_BOOL, "scissor clip as portals and lights are processed" );
@@ -8261,7 +8397,7 @@ index 7914093..81a90fe 100644
  idCVar r_useCombinerDisplayLists( "r_useCombinerDisplayLists", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "put all nvidia register combiner programming in display lists" );
  idCVar r_useDepthBoundsTest( "r_useDepthBoundsTest", "1", CVAR_RENDERER | CVAR_BOOL, "use depth bounds test to reduce shadow fill" );
  
-@@ -819,11 +907,63 @@ void R_InitOpenGL( void ) {
+@@ -819,11 +912,63 @@ void R_InitOpenGL( void ) {
  		r_multiSamples.SetInteger( 0 );
  	}
  
@@ -8325,7 +8461,7 @@ index 7914093..81a90fe 100644
  
  #include "renderer/qgl_proc.h"
  
-@@ -910,6 +1050,18 @@ GL_CheckErrors
+@@ -910,6 +1055,18 @@ GL_CheckErrors
  ==================
  */
  void GL_CheckErrors( void ) {
@@ -8344,7 +8480,7 @@ index 7914093..81a90fe 100644
  	int		err;
  	char	s[64];
  	int		i;
-@@ -2505,6 +2657,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
+@@ -2505,6 +2662,14 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
  	// is destroyed (relevant when starting a mod which also recreates window)
  	Sys_ShutdownInput();
  
@@ -9973,7 +10109,7 @@ index 0e40f19..e201948 100644
  extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
  extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
 diff --git a/neo/renderer/tr_render.cpp b/neo/renderer/tr_render.cpp
-index c83ebb5..95c5097 100644
+index c83ebb5..9c30e48 100644
 --- a/neo/renderer/tr_render.cpp
 +++ b/neo/renderer/tr_render.cpp
 @@ -27,10 +27,22 @@ If you have questions concerning this license or the applicable additional terms
@@ -9999,7 +10135,7 @@ index c83ebb5..95c5097 100644
  
  /*
  
-@@ -38,6 +50,1185 @@ If you have questions concerning this license or the applicable additional terms
+@@ -38,6 +50,1187 @@ If you have questions concerning this license or the applicable additional terms
  
  */
  
@@ -10210,6 +10346,8 @@ index c83ebb5..95c5097 100644
 +    int      g_capTexBudgetMB = 0;        // 0 = unlimited
 +    int      g_capTexMaxDim = 0;          // 0 = uncapped
 +    uint32_t g_capDetTest = 0;
++    uint32_t g_capCaptureFrame = 0;       // R3 render-frame: capture ARM = target game-time in ms (0 = idle)
++    uint32_t g_capRenderTimeMs = 0;       // R3 render-frame: current main-view game-time (ms); the capture fires at the first frame this crosses g_capCaptureFrame
 +    // Iter 29: BFG-presentation specular — the BFG edition replaced the
 +    // classic specular LUT (zero below N·H 0.75) with analytic pow(N·H,10),
 +    // which is most of its visible floor/wall sheen.
@@ -11185,7 +11323,7 @@ index c83ebb5..95c5097 100644
  
  /*
  =================
-@@ -49,6 +1240,22 @@ This should never happen if the vertex cache is operating properly.
+@@ -49,6 +1242,22 @@ This should never happen if the vertex cache is operating properly.
  */
  void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
  
@@ -11208,7 +11346,7 @@ index c83ebb5..95c5097 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -78,6 +1285,22 @@ RB_DrawElementsWithCounters
+@@ -78,6 +1287,22 @@ RB_DrawElementsWithCounters
  */
  void RB_DrawElementsWithCounters( const srfTriangles_t *tri ) {
  
@@ -11231,7 +11369,7 @@ index c83ebb5..95c5097 100644
  	backEnd.pc.c_drawElements++;
  	backEnd.pc.c_drawIndexes += tri->numIndexes;
  	backEnd.pc.c_drawVertexes += tri->numVerts;
-@@ -116,6 +1339,23 @@ May not use all the indexes in the surface if caps are skipped
+@@ -116,6 +1341,23 @@ May not use all the indexes in the surface if caps are skipped
  ================
  */
  void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes ) {
@@ -11255,7 +11393,7 @@ index c83ebb5..95c5097 100644
  	backEnd.pc.c_shadowElements++;
  	backEnd.pc.c_shadowIndexes += numIndexes;
  	backEnd.pc.c_shadowVertexes += tri->numVerts;
-@@ -166,6 +1406,7 @@ RB_T_RenderTriangleSurface
+@@ -166,6 +1408,7 @@ RB_T_RenderTriangleSurface
  ===============
  */
  void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
@@ -11263,7 +11401,7 @@ index c83ebb5..95c5097 100644
  	RB_RenderTriangleSurface( surf->geo );
  }
  
-@@ -392,8 +1633,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
+@@ -392,8 +1635,12 @@ void RB_BindVariableStageImage( const textureStage_t *texture, const float *shad
  
  		if ( cin.image ) {
  			globalImages->cinematicImage->UploadScratch( cin.image, cin.imageWidth, cin.imageHeight );
@@ -11276,7 +11414,7 @@ index c83ebb5..95c5097 100644
  		}
  	} else {
  		//FIXME: see why image is invalid
-@@ -553,26 +1798,202 @@ Any mirrored or portaled views have already been drawn, so prepare
+@@ -553,26 +1800,211 @@ Any mirrored or portaled views have already been drawn, so prepare
  to actually render the visible surfaces for this view
  =================
  */
@@ -11344,8 +11482,15 @@ index c83ebb5..95c5097 100644
 +			char posLine[96];
 +			idStr::snPrintf( posLine, sizeof(posLine), "%.0f %.0f %.0f | yaw %.0f pitch %.0f",
 +			                 o.x, o.y, o.z, yaw, pitch );
-+			EM_ASM_({ window.__d3ViewPos = UTF8ToString($0); }, posLine);
++			EM_ASM_({ window.__d3ViewPos = UTF8ToString($0); window.__d3RenderTimeMs = $1; }, posLine, (int)( backEnd.viewDef->floatTime * 1000.0 + 0.5 ) );
 +		}
++	}
++	// R3 render-frame: publish the main-view game-time (ms). The WebGPU capture fires at the first
++	// frame this crosses the armed target (r_wgpuCaptureFrame). With com_fixedTic 1 (16ms/frame) the
++	// crossing lands at an identical tick in every run regardless of boot timing, and idTech4 game
++	// logic is a fixed-16ms-timestep function of game-time, so the captured scene is deterministic.
++	if ( backEnd.viewDef && backEnd.viewDef->viewEntitys ) {
++		g_capRenderTimeMs = (uint32_t)( backEnd.viewDef->floatTime * 1000.0 + 0.5 );
 +	}
 +	// Splat-overlay camera (splat-track): publish the live view UNROUNDED every main view (vieworg in
 +	// INCHES, viewaxis mat3 where ax[0]=forward, + fov) so the JS splat overlay (Module.arcoOverlay) can
@@ -11366,6 +11511,8 @@ index c83ebb5..95c5097 100644
 +			g_capTexBudgetMB = r_wgpuTexBudgetMB.GetInteger();
 +			g_capTexMaxDim = r_wgpuTexMaxDim.GetInteger();
 +			g_capDetTest = r_wgpuDetTest.GetBool() ? 1u : 0u;
++			extern idCVar r_wgpuCaptureFrame;
++			g_capCaptureFrame = (uint32_t)r_wgpuCaptureFrame.GetInteger();   // R3 render-frame arm token
 +			{
 +				static uint32_t cvarPublishTick = 0;
 +				if ( ( ++cvarPublishTick & 15 ) == 0 ) {
@@ -11489,7 +11636,7 @@ index c83ebb5..95c5097 100644
  	backEnd.currentScissor = viewDef->scissor;
  
  	// ensures that depth writes are enabled for the depth clear
-@@ -897,6 +2318,26 @@ void RB_DrawView( const void *data ) {
+@@ -897,6 +2329,26 @@ void RB_DrawView( const void *data ) {
  
  	backEnd.viewDef = cmd->viewDef;
  
@@ -11518,10 +11665,10 @@ index c83ebb5..95c5097 100644
  	backEnd.currentRenderCopied = false;
 diff --git a/neo/renderer/wgsl/embedded_shaders.h b/neo/renderer/wgsl/embedded_shaders.h
 new file mode 100644
-index 0000000..39744af
+index 0000000..bd7a0cb
 --- /dev/null
 +++ b/neo/renderer/wgsl/embedded_shaders.h
-@@ -0,0 +1,1058 @@
+@@ -0,0 +1,1079 @@
 +// Auto-generated from webgpu-port/shaders/*.wgsl — do not edit.
 +// Regenerate: python3 scripts/embed_wgsl.py
 +#pragma once
@@ -11753,6 +11900,27 @@ index 0000000..39744af
 +"fn fs_darken(in: VSOut) -> @location(0) vec4<f32> {\n"
 +"    let k = u.params.x;\n"
 +"    return vec4<f32>(k, k, k, 1.0);   // pipeline blend: dst * src\n"
++"}\n"
++"\n"
++"// --- consistency entry points (2026-06-29) --------------------------------------\n"
++"// RenderBackend_WebGPU.cpp creates `tonemap`/`tracer` pipelines via\n"
++"// makeBloom(\"fs_tonemap\"/\"fs_tracer\", ...). These entry points had been dropped from\n"
++"// this module while the C++ kept calling them, so both pipelines were INVALID; binding\n"
++"// the tracer on weapon-fire produced an [Invalid CommandBuffer] → Queue.Submit failed →\n"
++"// the rendered view FROZE (the rocket-launcher \"freeze\" bug). Provide valid entry points\n"
++"// so the pipelines are valid. arco-doom uses neither effect, so these are inert:\n"
++"//   fs_tracer  — transparent (additive One/One → adds nothing; no streak, no black).\n"
++"//   fs_tonemap — identity passthrough (REPLACE One/Zero → scene unchanged).\n"
++"// No helper functions referenced → the module compiles standalone. The render-track can\n"
++"// replace these with the real graded R-TRACER / ACES tonemap implementations later.\n"
++"@fragment\n"
++"fn fs_tracer(in: VSOut) -> @location(0) vec4<f32> {\n"
++"    return vec4<f32>(0.0, 0.0, 0.0, 0.0);\n"
++"}\n"
++"\n"
++"@fragment\n"
++"fn fs_tonemap(in: VSOut) -> @location(0) vec4<f32> {\n"
++"    return vec4<f32>(textureSampleLevel(tex, samp, in.uv, 0.0).rgb, 1.0);\n"
 +"}\n"
 +"";
 +

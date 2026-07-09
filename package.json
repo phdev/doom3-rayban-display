@@ -17,6 +17,7 @@
     "reduce:first-map:wearable": "python3 scripts/reduce-d3-map-pk4.py --input dist-pak/base/pak000.pk4 --map game/mars_city1 --audio-rate 11025 --audio-width 1 --output dist-pak/base/pak-display-wearable.pk4"
   },
   "devDependencies": {
+    "playwright-core": "1.60.0",
     "vite": "^8.0.14"
   }
 }

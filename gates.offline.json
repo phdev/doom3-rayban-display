@@ -1,0 +1,21 @@
+{
+  "gates": [
+    {
+      "name": "inspect_render_stable",
+      "cmd": "bash gates/inspect_render/run_gate.sh",
+      "deterministic": true,
+      "gate_version": 1,
+      "gate_env": "gui_required",
+      "rig": "OFFLINE-not-HEADLESS: needs a logged-in Mac GUI session + installed Google Chrome + staged pak/engine/dist prerequisites (STAGING recipe; preflighted by CLAUSE 0 -> RED class missing-fixture, missing item NAMED). Headless Chrome composites the WebGPU canvas black and demotes to GL, so this gate cannot run on a headless/SSH-only box.",
+      "honesty": "CLAIMS: per-tuple cross-invocation byte-stability (self-proven each run via two fresh processes, CLAUSE 3) + regression-vs-baseline on THIS machine, falsifiable via the named mutations; wasm<->patch correspondence at verdict via the Spine rebuild-from-committed-patch. Does NOT claim: cross-device/driver pixel equality (a tuple change = a documented regen event), image CORRECTNESS (a stable wrong frame passes; correctness lives in the existing operator self-tests), coverage beyond the committed fixture, or cross-build engine regression protection (engineWasmSha is in the baseline key, so EVERY renderer-patch change legitimately rotates the baseline; the 'regression' class catches environment/no-op drift only).",
+      "mutations": [
+        "MUT-A unfreeze-stagger: skip the g_stopTime freeze AND stagger run B's capture past run A's unfrozen game time (viewmodel pinned in view = time-varying content) -> H1 != H2 -> RED class nondeterministic. Pre-authorized fallback if forcing fails at this pose: noboot-barrier (skip the residency barrier + capture immediately post-boot, wall-clock-coupled) -> same RED class.",
+        "MUT-B pose-perturb: perturb state.pose.yaw by +5 POST-LOAD (the committed fixture file is untouched; fixtureSha in the key is over the COMMITTED bytes) -> H1 == H2 but != the committed baseline -> RED class regression (writes DISABLED in mutate mode).",
+        "MUT-C1 wrong-backend: force ?backend=gl -> __d3FrameCapture never publishes (navigator.gpu is STILL defined under gl — not the check) -> driver exit 2 -> RED class wrong-backend.",
+        "MUT-C2 vacuous: inject a blank (all-black) captured frame -> CLAUSE-2 vacuity floor (nonblack < 1% / < 64 colours) trips -> RED class vacuous.",
+        "MUT-D tuple-spoof: spoof one baseline-key component (chromeVersion) -> no matching baseline; in mutate mode missing-tuple = RED class baseline-missing (writes DISABLED) -> proves the per-device key routing WITHOUT a junk row or false GREEN (a 2nd physical device is honestly out of gate scope).",
+        "MUT-E scene-source-strip (owner amendment 1): drop the scene_source stamp from the PNG sidecar -> the gate's 3-place consistency check (--json + sidecar + FILENAME) fails -> RED class scene-source-missing. Guards that an S2 frame can never be mistaken for replay-world ground truth."
+      ]
+    }
+  ]
+}
